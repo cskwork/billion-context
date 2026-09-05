@@ -1572,7 +1572,7 @@ const ACP_TAG_MARK = "\x3cacp ";
 // nonexistent (preflight), so acp_summary survives as the carrier and
 // systemToUser later re-voices the survivors as USER messages (leaving them at
 // their anchors) for strict backends (#377).
-function stripKernelSummaries(messages: BiliMessage[], state: CompressionState): BiliMessage[] {
+export function stripKernelSummaries(messages: BiliMessage[], state: CompressionState): BiliMessage[] {
     const carried = new Set<string>();
     for (const b of state.blocks) {
         if (!b.active || !b.compressCallId) continue;
@@ -1581,6 +1581,62 @@ function stripKernelSummaries(messages: BiliMessage[], state: CompressionState):
         }
     }
     return messages.filter((m) => !(m.id ?? "").startsWith("acp_summary_") || !carried.has(m.id));
+}
+
+// #564: folding + stripKernelSummaries can merge two assistant turns into one
+// run, which Responses rejects (run order reasoning* -> message* ->
+// function_call*, <=1 reasoning). Rebuild boundaries from the ORIGINAL history
+// AFTER dedup: drop a reasoning whose turn body was wholly folded away (keep
+// originally-reasoning-only turns), else separate the runs with a user marker.
+const RESPONSES_TURN_SEPARATOR = "[The exchange between these two assistant turns was compressed.]";
+
+export function repairResponsesAssistantOrdering(folded: CoreMessage[], original: CoreMessage[]): CoreMessage[] {
+    const runOf = new Map<string, number>();
+    const runHasBody = new Map<number, boolean>();
+    let run = 0;
+    let inRun = false;
+    for (const m of original) {
+        if (m.role === "assistant") {
+            if (!inRun) { run++; inRun = true; }
+            runOf.set(m.id, run);
+            if (m.contentType !== "reasoning") runHasBody.set(run, true);
+        } else {
+            inRun = false;
+        }
+    }
+    const survivorCount = new Map<number, number>();
+    for (const m of folded) {
+        const r = m.role === "assistant" ? runOf.get(m.id) : undefined;
+        if (r !== undefined) survivorCount.set(r, (survivorCount.get(r) ?? 0) + 1);
+    }
+
+    const out: CoreMessage[] = [];
+    let phase = -1;
+    let seenReasoning = false;
+    let sepSeq = 0;
+    const pushSeparator = (): void => {
+        sepSeq++;
+        out.push({ id: `acp_turn_sep_${sepSeq}`, role: "user", contentType: "text", text: RESPONSES_TURN_SEPARATOR });
+        phase = -1;
+        seenReasoning = false;
+    };
+    for (const m of folded) {
+        if (m.role !== "assistant") {
+            out.push(m);
+            phase = -1;
+            seenReasoning = false;
+            continue;
+        }
+        const kind = m.contentType === "reasoning" ? "reasoning" : m.contentType === "tool-call" ? "tool-call" : "message";
+        const r = runOf.get(m.id);
+        if (kind === "reasoning" && r !== undefined && runHasBody.get(r) && survivorCount.get(r) === 1) continue;
+        if ((kind === "reasoning" && (phase > 0 || seenReasoning)) || (kind === "message" && phase === 2)) pushSeparator();
+        out.push(m);
+        if (kind === "reasoning") { phase = Math.max(phase, 0); seenReasoning = true; }
+        else if (kind === "message") phase = Math.max(phase, 1);
+        else phase = Math.max(phase, 2);
+    }
+    return out;
 }
 
 function diagTagSummary(messages: CoreMessage[], sessionId: string, strategy: string): string {
@@ -2024,7 +2080,7 @@ function prepareResponses(
         log("info", diagTagSummary(turn.messages, sessionId, "text-only"));
         const willInjectNudge = opts.compress.injectNudge && !!turn.nudge && shouldInject && !isCompactionTrigger && (turn.nudge.shouldInject || emergencyNudge(turn.nudge));
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, parsed.model, willInjectNudge));
-        processedMessages = stripKernelSummaries(turn.messages, turn.state);
+        processedMessages = repairResponsesAssistantOrdering(stripKernelSummaries(turn.messages, turn.state), originalMessages);
         reapOrphanBlocks(session, msgs, deactivateBlock);
         rebuiltInput = patchResponsesInput(projection, processedMessages);
         // Fallback path: when the echo did NOT come back this turn (client
@@ -2271,7 +2327,7 @@ function prepareResponsesCompact(
             session.state = prevState;
             return base;
         }
-        const processed = stripKernelSummaries(turn.messages, turn.state);
+        const processed = repairResponsesAssistantOrdering(stripKernelSummaries(turn.messages, turn.state), projection.msgs);
         const output = patchResponsesInput(projection, processed);
         if (typeof output === "string") {
             session.state = prevState;
@@ -3074,7 +3130,7 @@ async function forward(
                 });
                 prepared.session.state = turn.state;
                 const records = current.filter((m) => typeof m.id === "string" && m.id.startsWith("acp_loop_"));
-                return stripKernelSummaries([...turn.messages, ...records] as BiliMessage[], turn.state) as CoreMessage[];
+                return repairResponsesAssistantOrdering(stripKernelSummaries([...turn.messages, ...records] as BiliMessage[], turn.state), prepared.originalMessages);
             };
             const loop = runCompressLoop(
                 streamToRead,
