@@ -104,3 +104,63 @@ test("forward: absolute-URL proxy-mode request reaches the correct upstream (no 
         await close(upstream);
     }
 });
+
+test("forward: a self-targeting absolute-URL request is denied, not forwarded (#562)", async () => {
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    setRegistryForTest({});
+
+    const opts: ProxyOptions = {
+        port: 0,
+        host: "127.0.0.1",
+        upstream: "https://api.anthropic.com",
+        routes: {},
+        modelContextLimit: 400_000,
+        kernelConfig: defaultConfig(400_000),
+        compress: { injectTool: true, injectNudge: true },
+        promptCache: { routing: "auto" },
+        sessionHeader: "x-acp-session",
+        log: false,
+        debug: false,
+        passthrough: false,
+        autoUpdate: false,
+        mitm: { enabled: false, domains: [] },
+    };
+    const proxy = await startServer(opts);
+    await listen(proxy);
+    const proxyPort = (proxy.address() as { port: number }).port;
+
+    try {
+        // A client whose base URL points back at the proxy itself emits an
+        // absolute-form target equal to the proxy origin. It must be rejected
+        // by the tunnel self-guard (bound port + local IP) BEFORE any forward —
+        // never looped back into handle() via the fallback forward path.
+        const outcome = await new Promise<{ status: number; body: string }>((resolve, reject) => {
+            const req = http.request(
+                {
+                    host: "127.0.0.1",
+                    port: proxyPort,
+                    method: "POST",
+                    path: `http://127.0.0.1:${proxyPort}/v1/chat/completions`,
+                    headers: {
+                        "content-type": "application/json",
+                        host: `127.0.0.1:${proxyPort}`,
+                        "content-length": String(Buffer.byteLength("{}")),
+                    },
+                },
+                (res) => {
+                    const chunks: Buffer[] = [];
+                    res.on("data", (c) => chunks.push(c));
+                    res.on("end", () => resolve({ status: res.statusCode ?? 0, body: Buffer.concat(chunks).toString("utf8") }));
+                },
+            );
+            req.on("error", reject);
+            req.write("{}");
+            req.end();
+        });
+
+        assert.equal(outcome.status, 403, `self-target must be denied with 403; got ${outcome.status}: ${outcome.body}`);
+        assert.match(outcome.body, /tunnel_destination_denied/, outcome.body);
+    } finally {
+        await close(proxy);
+    }
+});
