@@ -5,7 +5,7 @@ import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { createInitialState } from "acp-kernel";
+import { createCore, createInitialState, defaultConfig } from "acp-kernel";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _resetSessionsForTest, getSession, initSessions, peekSession, type Session } from "../src/session.ts";
 import { handlePluginStatus } from "../src/plugin.ts";
@@ -98,8 +98,9 @@ await test("boot restore: lastSeen=savedAt, restored flag, freshness-keyed trunc
         // activity, never a restored one — the 245-way-tie regression.
         const active = getSession("sess-active", { protocol: "anthropic", label: "ACTIVE" });
         assert.notEqual(active.restored, true, "a session created by a live request is not restored");
+        const statusDeps = { core: createCore(), config: defaultConfig(200000), log: (_l: string, _m: string) => {} };
         const res1 = mockRes();
-        handlePluginStatus("never-seen", res1.res, true);
+        handlePluginStatus("never-seen", res1.res, statusDeps, true);
         const body1 = JSON.parse(res1.body) as { ok: boolean; fallback?: boolean; label: string | null };
         assert.equal(res1.status, 200);
         assert.equal(body1.ok, true);
@@ -109,7 +110,7 @@ await test("boot restore: lastSeen=savedAt, restored flag, freshness-keyed trunc
         // All sessions restored (no activity since boot): refuse to guess.
         _resetSessionsForTest();
         const res2 = mockRes();
-        handlePluginStatus("never-seen", res2.res, true);
+        handlePluginStatus("never-seen", res2.res, statusDeps, true);
         assert.equal(res2.status, 404);
         assert.ok(res2.body.includes("since boot"), "explicit no-post-boot-activity error instead of a readdir-order guess");
     } finally {

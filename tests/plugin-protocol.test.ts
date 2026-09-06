@@ -330,6 +330,54 @@ test("plugin tool API executes compress under the session lock; next request fol
     }
 });
 
+test("plugin status panel recomputes the nudge after a mid-turn compress (#387)", async () => {
+    const h = await startHarness([compressToolScript(), textScript()]);
+    try {
+        const conv = "plug-conv-panel-fresh";
+        // Same sizing as the tool-API test: the head exceeds
+        // minCompressibleChars while the tail stays inside the
+        // preserveRecentTokens protected zone.
+        const headFiller = "lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. ".repeat(28);
+        const tailFiller = "enim ad minim veniam quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat duis aute irure dolor in reprehenderit in voluptate. ".repeat(28);
+        const history: AnthropicMessage[] = [];
+        for (let i = 1; i <= 2; i++) {
+            history.push({ role: "user", content: `turn-${i}-marker question: ${headFiller}` });
+            history.push({ role: "assistant", content: `turn-${i}-marker answer: ${headFiller}` });
+        }
+        for (let i = 3; i <= 5; i++) {
+            history.push({ role: "user", content: `turn-${i} padding question: ${tailFiller}` });
+            history.push({ role: "assistant", content: `turn-${i} padding answer: ${tailFiller}` });
+        }
+        await callPluginAnthropic(h, conv, history);
+
+        const before = (await (await fetch(`http://127.0.0.1:${h.proxyPort}/__bili/plugin/status?conversationId=${conv}`)).json()) as { panel?: string };
+        assert.match(before.panel ?? "", /m00001/, "pre-compress panel recommends the head range");
+
+        // Compress the head through the plugin tool API — it mutates session
+        // state WITHOUT re-running prepare, which is exactly the window where
+        // the remembered prepare-time nudge goes stale: the old panel mixed
+        // the (live) new block with (stale) already-compressed ranges.
+        const toolResp = await fetch(`http://127.0.0.1:${h.proxyPort}/__bili/plugin/tool`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+                conversationId: conv,
+                tool: "compress",
+                args: { content: [{ topic: "panel-fresh-topic", startId: "m00001", endId: "m00002", summary: "panel freshness probe compressing the two early lorem-ipsum turns so the status nudge must be recomputed from live state" }] },
+            }),
+        });
+        const toolJson = (await toolResp.json()) as { ok: boolean; result: string };
+        assert.equal(toolJson.ok, true, `compress tool failed: ${toolJson.result}`);
+
+        const after = (await (await fetch(`http://127.0.0.1:${h.proxyPort}/__bili/plugin/status?conversationId=${conv}`)).json()) as { panel?: string };
+        const panel = after.panel ?? "";
+        assert.match(panel, /panel-fresh-topic/, "live state: the new block is listed");
+        assert.doesNotMatch(panel, /m00001\.\.m00002/, "fresh nudge: the just-compressed range is no longer recommended");
+    } finally {
+        await h.close();
+    }
+});
+
 test("plugin tool API error paths: bad JSON, unknown tool, unknown conversation", async () => {
     const h = await startHarness([textScript()]);
     try {

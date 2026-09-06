@@ -856,7 +856,7 @@ async function handle(
             res.end(JSON.stringify({ ok: false, error: "conversationId query parameter is required" }));
             return;
         }
-        return handlePluginStatus(conversationId, res, params.get("fallback") === "latest");
+        return handlePluginStatus(conversationId, res, { core, config, log }, params.get("fallback") === "latest");
     }
     if (req.method === "POST" && req.url === "/__bili/plugin/tool") {
         try {
