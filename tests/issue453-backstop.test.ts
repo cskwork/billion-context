@@ -162,27 +162,31 @@ function turn2Compressible(): Record<string, unknown>[] {
 }
 
 test("#453 clamp: oversized max_tokens is reduced when input+system nearly fills the window", async () => {
-    // window 100k, requested max_tokens 40k -> reserved window 60k. The core
-    // conversation estimates ~48k (under 60k, so preflight skips — it ignores the
-    // system), but the 60k-char system pushes the TRUE input past 60k. Only the
-    // clamp sees the system, so it lowers max_tokens to keep input+output under 100k.
+    // window 400k, requested max_tokens 150k -> reserved window 250k. The
+    // conversation text ~40k + an 800k-char system (~200k tokens) puts the
+    // true input at ~240k: UNDER the 250k reserved window (preflight skips —
+    // it counts system+tools since #470, plus the injected compress prompt
+    // ~2.4k, and still fits), but input+output no longer fits the full 400k
+    // window. Only the clamp sees the collision, so it lowers max_tokens.
+    // The band between the clamp threshold (~238k: input+5% margin+150k > 400k)
+    // and the preflight threshold (~250k) is where the clamp acts alone.
     const fired = await drive({
         sessionId: "clamp-fire",
-        window: 100_000,
+        window: 400_000,
         turn1PromptTokens: 5_000,
         turn2Body: {
-            model: "m", max_tokens: 40_000,
+            model: "m", max_tokens: 150_000,
             messages: [
-                { role: "system", content: "z".repeat(60_000) },
+                { role: "system", content: "z".repeat(800_000) },
                 { role: "user", content: "hi" },
-                { role: "assistant", content: "y".repeat(192_000) },
+                { role: "assistant", content: "y".repeat(160_000) },
                 { role: "user", content: "now" },
             ],
         },
     });
     const out = typeof fired.turn2Body.max_tokens === "number" ? fired.turn2Body.max_tokens : undefined;
     assert.ok(out !== undefined, "forwarded body carries a numeric max_tokens");
-    assert.ok(out! < 40_000, `max_tokens clamped below the 40k request (got ${out})`);
+    assert.ok(out! < 150_000, `max_tokens clamped below the 150k request (got ${out})`);
     assert.ok(out! > 0, "clamped budget stays positive");
 
     // Control: no oversized system -> input fits -> max_tokens passes through.

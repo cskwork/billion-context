@@ -273,13 +273,17 @@ test("e2e #330: over-window payload whose only foldable content is in the protec
 
     try {
         // Three messages against a 10k window: a small opener plus two large
-        // recent messages (~8k tokens each, ~16k total). All three sit inside
+        // recent messages (~6k tokens each, ~12k total). All three sit inside
         // the soft-protected recent zone (preserveRecentMessages=5 covers all
         // three), so the normal pass finds nothing foldable. Before #330 this
         // 502'd forever; now preflight relaxes the soft zone, folds the oldest
-        // large message, and forwards the now-fitting payload.
-        const big1 = "A".repeat(32000);
-        const big2 = "B".repeat(32000);
+        // large message, and forwards the now-fitting payload. #470: the wire
+        // overhead (injected compress system prompt + ACP tools, ~2.4k tokens)
+        // now counts toward every size decision, so post-fold fit needs the
+        // second big message at 24k chars, not 32k (the pre-#470 test was
+        // forwarding a payload whose real billed input exceeded the window).
+        const big1 = "A".repeat(24000);
+        const big2 = "B".repeat(24000);
         const r = await fetch(`http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/messages`, {
             method: "POST",
             headers: { "content-type": "application/json", "x-acp-session": "preflight-relax-sess" },
@@ -297,6 +301,53 @@ test("e2e #330: over-window payload whose only foldable content is in the protec
         assert.equal(r.status, 200, "the over-window payload is folded and forwarded, not 502'd");
         assert.ok(calls.filter((c) => !c.stream).length >= 1, "preflight made the summarization call to fold the protected message");
         assert.equal(calls.filter((c) => c.stream).length, 1, "the folded payload was forwarded upstream");
+    } finally {
+        proxy.close();
+        await once(proxy, "close");
+        upstream.close();
+        await once(upstream, "close");
+    }
+});
+
+test("e2e #470: system + tools overhead counts in the preflight trigger — text fits, wire overflows → preflight folds", async () => {
+    const calls: Call[] = [];
+    const upstream = makeUpstreamOk(calls);
+    upstream.listen(0, "127.0.0.1");
+    await once(upstream, "listening");
+    const upstreamPort = upstream.address().port;
+
+    const proxy = await startProxy(upstreamPort, { "claude-small": { context: 10_000 } });
+    await once(proxy, "listening");
+    const proxyPort = proxy.address().port;
+
+    try {
+        // The message text alone (~8.5k) fits the 10k window, but the wire
+        // payload carries more: user system (~2k) + user tool (~1.2k) + the
+        // injected compress system prompt + ACP tools (~2.4k) — the billed
+        // input overflows. Before #470 the trigger counted messages only and
+        // forwarded the payload verbatim (guaranteed upstream 400 later).
+        const big1 = "A".repeat(34_000);
+        const r = await fetch(`http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/messages`, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-acp-session": "preflight-overhead-sess" },
+            body: JSON.stringify({
+                model: "claude-small",
+                max_tokens: 1024,
+                stream: true,
+                system: "S".repeat(8_000),
+                tools: [{ name: "lookup", description: "T".repeat(4_600), input_schema: { type: "object", properties: {} } }],
+                messages: [
+                    { role: "user", content: "start the task" },
+                    { role: "assistant", content: big1 },
+                    { role: "user", content: "wrap up" },
+                ],
+            }),
+        });
+        assert.equal(r.status, 200, "the over-window (incl. system+tools) payload is folded and forwarded");
+        assert.ok(calls.filter((c) => !c.stream).length >= 1, "preflight made the summarization call — the trigger counted the wire overhead");
+        assert.equal(calls.filter((c) => c.stream).length, 1, "the folded payload was forwarded upstream");
+        const forwarded = calls.find((c) => c.stream)?.body ?? "";
+        assert.ok(!forwarded.includes("A".repeat(100)), "the folded big message did NOT ride the forwarded payload");
     } finally {
         proxy.close();
         await once(proxy, "close");
