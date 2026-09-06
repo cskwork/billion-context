@@ -63,13 +63,24 @@ export function renderHandoff(s: Session, full: boolean): string {
 
     const messages = s.lastMessages;
     if (messages && messages.length > 0) {
-        // Full-conversation snapshot (v3 files): render exactly what the model
+        // Conversation snapshot (v3 files): render exactly what the model
         // saw. Default = folded view via the kernel's own renderer (summaries
         // in place of compressed ranges); --full = every original message.
-        lines.push(full ? `## Full conversation (${messages.length} messages)` : `## Conversation (folded view as the model saw it, ${messages.length} client messages)`);
+        // A restored #401 snapshot is ALREADY pruned (and truncated) — its
+        // message ids no longer align with the state ranges, so re-running
+        // prune() would resurrect dropped summaries at index 0. Render it
+        // as-is; --full recovers folded originals from blockContents below.
+        const folded = s.lastMessagesFolded === true;
+        const view = full || folded ? messages : prune(messages, s.state);
+        lines.push(
+            full && !folded
+                ? `## Full conversation (${messages.length} messages)`
+                : folded
+                  ? `## Conversation (persisted folded snapshot, ${messages.length} messages)`
+                  : `## Conversation (folded view as the model saw it, ${messages.length} client messages)`,
+        );
         lines.push("");
         let lastRole = "";
-        const view = full ? messages : prune(messages, s.state);
         for (const m of view) {
             if (m.role !== lastRole) {
                 lines.push(`### ${m.role}`);
@@ -79,6 +90,21 @@ export function renderHandoff(s: Session, full: boolean): string {
             lines.push(renderMessage(m));
         }
         lines.push("");
+        // A folded snapshot has no originals of the folded ranges — --full
+        // recovers them from the blockContents cache (same source the v2
+        // fallback uses).
+        if (full && folded) {
+            for (const b of s.state.blocks.filter((x) => x.active)) {
+                const content = s.blockContents.get(b.blockId);
+                if (!content) continue;
+                lines.push(`## Block ${b.blockId}${b.topic ? ` — ${b.topic}` : ""}`);
+                lines.push("");
+                lines.push(`### Original messages (${content.full.count})`);
+                lines.push("");
+                lines.push(content.full.text.trim());
+                lines.push("");
+            }
+        }
         return lines.join("\n");
     }
 
@@ -148,7 +174,7 @@ export async function exportSession(selector: string | undefined, opts: ExportOp
     const store = new SessionStore({ dir: opts.dir, enabled: true });
     const all = [...(await store.loadAll()).values()];
     if (all.length === 0) {
-        return "No persisted sessions found. Sessions are written under the sessions directory once the proxy has served a request (compression state and compressed originals only — uncompressed conversation text is not persisted).";
+        return "No persisted sessions found. Sessions are written under the sessions directory once the proxy has served a request (compression state, compressed originals, and a bounded folded-view snapshot of the recent conversation).";
     }
     if (!selector) {
         const list = await listSessions(opts);
