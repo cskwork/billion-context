@@ -111,6 +111,7 @@ test("estimateRawBodyTokens: counts string leaves, skips binary-carrying keys (#
     );
     assert.equal(estimateRawBodyTokens({ url: "http://x/y".repeat(1000) }), 0, "url field excluded");
     assert.equal(estimateRawBodyTokens({ b64_json: "A".repeat(10_000) }), 0, "b64_json field excluded");
+    assert.equal(estimateRawBodyTokens({ file_data: "data:application/pdf;base64,".padEnd(10_000, "A") }), 0, "file_data data-URL excluded");
     assert.equal(estimateRawBodyTokens(null), 0, "null body");
     assert.equal(estimateRawBodyTokens(42), 0, "non-object body");
     // CJK must not be undercounted by the chars/4 fast path.
@@ -138,15 +139,17 @@ test("sideRequestGuard: raw-body fit against resolved ∩ learned window minus o
     assert.ok(est > 0);
     assert.equal(sideRequestGuard(body, "anthropic", 0, undefined).blocked, false, "unknown window → forward as before");
     assert.equal(sideRequestGuard(body, "anthropic", est + 1, undefined).blocked, false, "fits");
-    assert.equal(sideRequestGuard(body, "anthropic", est, undefined).blocked, true, "boundary: estimate == limit blocks");
-    assert.equal(sideRequestGuard(body, "anthropic", 1_000_000, est - 1).blocked, true, "learned smaller → blocks");
+    assert.equal(sideRequestGuard(body, "anthropic", Math.floor(est / 1.15), undefined).blocked, true, "boundary: estimate == limit x 1.15 blocks");
+    assert.equal(sideRequestGuard(body, "anthropic", Math.floor(est / 1.10), undefined).blocked, false, "within the 15% estimator tolerance → forward");
+    assert.equal(sideRequestGuard(body, "anthropic", 1_000_000, Math.floor(est / 1.15)).blocked, true, "learned smaller (beyond tolerance) → blocks");
     assert.equal(sideRequestGuard(body, "anthropic", est + 1, 1_000_000).blocked, false, "learned larger than resolved is ignored");
     // OpenAI wire: the output budget counts against the window → headroom reserved.
     const oa = { model: MODEL, max_completion_tokens: 2_000, stream: true, messages: [{ role: "user", content: txt }] };
     const oaEst = estimateRawBodyTokens(oa);
-    const g = sideRequestGuard(oa, "openai", oaEst + 2_000, undefined);
-    assert.equal(g.limit, oaEst, "limit reduced by max_completion_tokens");
-    assert.equal(g.blocked, true, "boundary after reservation blocks");
+    const oaLimit = Math.floor(oaEst / 1.15);
+    const g = sideRequestGuard(oa, "openai", oaLimit + 2_000, undefined);
+    assert.equal(g.limit, oaLimit, "limit reduced by max_completion_tokens");
+    assert.equal(g.blocked, true, "boundary after reservation (with tolerance) blocks");
     assert.equal(sideRequestGuard(oa, "openai", oaEst + 2_001, undefined).blocked, false);
     // Image tokens count toward the estimate.
     const imgBody = { model: MODEL, max_tokens: 100, messages: [{ role: "user", content: [
@@ -154,7 +157,15 @@ test("sideRequestGuard: raw-body fit against resolved ∩ learned window minus o
         { type: "image", source: { type: "base64", media_type: "image/png", data: "A".repeat(8000) } },
     ] }] };
     const imgEst = estimateRawBodyTokens(imgBody) + Math.ceil(8000 / 4);
-    assert.equal(sideRequestGuard(imgBody, "anthropic", imgEst, undefined).blocked, true, "image cost included at boundary");
+    assert.equal(sideRequestGuard(imgBody, "anthropic", Math.floor(imgEst / 1.15), undefined).blocked, true, "image cost included at boundary");
+    // CJK estimator bias: defaultCountTokens counts CJK per-char (~1.6x real),
+    // so a CJK-heavy payload estimated at ~110% of the window must forward —
+    // the upstream's real overflow 400 teaches the learned limit.
+    const cjkBody = { model: MODEL, max_tokens: 100, stream: true, messages: [{ role: "user", content: "汉".repeat(4000) }] };
+    const cjkEst = estimateRawBodyTokens(cjkBody);
+    assert.ok(cjkEst >= 4000, "CJK counted per-char");
+    assert.equal(sideRequestGuard(cjkBody, "anthropic", Math.floor(cjkEst / 1.10), undefined).blocked, false, "CJK over-estimation absorbed by tolerance");
+    assert.equal(sideRequestGuard(cjkBody, "anthropic", Math.floor(cjkEst / 1.20), undefined).blocked, true, "genuinely oversized CJK still blocks");
 });
 
 function okSse(inputTokens: number): string {
@@ -424,19 +435,20 @@ test("e2e: overflow 400 on a side request learns the real window; next one is bl
         const headers: Record<string, string> = { "content-type": "application/json", "x-acp-session": SESSION };
 
         // ~1200 × ~130 ≈ 155k tokens: below the 200k configured window (so the
-        // first attempt forwards) but above the real 150,528 window the upstream
-        // reports in its overflow marker.
+        // first attempt forwards) but above the real 120,000 window the upstream
+        // reports in its overflow marker (ratio ~1.29 > the 15% guard tolerance,
+        // so the learned window still blocks the second attempt locally).
         const big = mainConversation(1200);
         rig.sideErrorStatus = 400;
-        rig.sideErrorBody = JSON.stringify({ error: { message: "exceed_context_size_error (198,277 / 198,661 > 150,528)" } });
+        rig.sideErrorBody = JSON.stringify({ error: { message: "exceed_context_size_error (198,277 / 198,661 > 120,000)" } });
 
         const r1 = await fetch(url, { method: "POST", headers, body: JSON.stringify({ model: MODEL, max_tokens: 100, stream: true, messages: big }) });
         assert.equal(r1.status, 400, "first overflow surfaces to the client");
         await r1.text();
         const s1 = getSession(SESSION);
         assert.ok(s1);
-        assert.equal((s1.metadata.learnedContextLimits as Record<string, number>)[MODEL], 150_528, "real window learned from the overflow marker");
-        assert.equal(s1.stats.lastInputTokens, 150_528, "emergency shrink armed at the learned window");
+        assert.equal((s1.metadata.learnedContextLimits as Record<string, number>)[MODEL], 120_000, "real window learned from the overflow marker");
+        assert.equal(s1.stats.lastInputTokens, 120_000, "emergency shrink armed at the learned window");
 
         // Identical second request: now blocked locally — no second upstream hit.
         const r2 = await fetch(url, { method: "POST", headers, body: JSON.stringify({ model: MODEL, max_tokens: 100, stream: true, messages: big }) });

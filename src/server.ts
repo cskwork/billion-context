@@ -670,6 +670,14 @@ export function restoreOutputBudget(
     }
 }
 
+// defaultCountTokens counts CJK per-char but real tokenizers encode CJK at
+// ~0.6-0.75 tokens/char, so CJK-heavy raw bodies over-estimate by up to ~1.6x.
+// Everywhere else that bias is safe (it only compresses earlier); here it
+// would hard-deny a payload that really fits (retryable: false), so tolerate
+// 15% over the window — borderline payloads forward, and a real overflow 400
+// still teaches the learned limit.
+const SIDE_REQUEST_GUARD_TOLERANCE = 1.15;
+
 /** #554: side requests are forwarded VERBATIM (no pipeline, #388), so a payload
  *  over the upstream window is a guaranteed 400 that the learned self-heal can
  *  never fix from this path — the gate fires before the self-heal read and
@@ -677,7 +685,8 @@ export function restoreOutputBudget(
  *  estimate the RAW body (CJK-aware text + image tokens) against the effective
  *  window = resolved ∩ learned (learned only ever shrinks) minus the output
  *  reservation on wires where output counts against the window. blocked=false
- *  with limit<=0 means "window unknown — forward as before". */
+ *  with limit<=0 means "window unknown — forward as before". blocked requires
+ *  estimate >= limit x SIDE_REQUEST_GUARD_TOLERANCE (estimator bias). */
 export function sideRequestGuard(
     parsed: unknown,
     protocol: WireProtocol,
@@ -690,7 +699,7 @@ export function sideRequestGuard(
     const maxOut = field ? ((parsed as Record<string, unknown>)[field] as number) : 0;
     if (limit > 0 && shouldReserveOutputHeadroom(protocol)) limit = reserveOutputHeadroom(limit, maxOut);
     const estimate = estimateRawBodyTokens(parsed) + imageTokensInParsedBody(protocol, parsed);
-    return { blocked: limit > 0 && estimate >= limit, estimate, limit };
+    return { blocked: limit > 0 && estimate >= limit * SIDE_REQUEST_GUARD_TOLERANCE, estimate, limit };
 }
 
 function isTrustedAdminOrigin(origin: string | undefined, host: string | undefined, trustedHosts: Set<string>): boolean {

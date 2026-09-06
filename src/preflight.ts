@@ -103,7 +103,7 @@ export function estimateCoreMessages(messages: CoreMessage[]): number {
 // imageTokensInParsedBody charges those separately. Slightly overcounts (ids,
 // roles, structural strings) — a conservative bias is right for a guard that
 // fails closed.
-const NON_TEXT_BODY_KEYS = new Set(["data", "url", "b64_json"]);
+const NON_TEXT_BODY_KEYS = new Set(["data", "url", "b64_json", "file_data"]);
 
 export function estimateRawBodyTokens(parsed: unknown): number {
     let tokens = 0;
