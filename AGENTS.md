@@ -221,6 +221,22 @@ When an Agent picks up an issue, these deliverables are MANDATORY:
    minor UX quirks) are reported in the current issue thread only — do NOT
    open separate issues for them.
 
+### Problem Discovery & Fix Reporting (MANDATORY)
+
+Problems discovered or fixed while working MUST leave a trace in the issue
+tracker — never fixed silently and moved on.
+
+1. **Discovered a problem** (bug, defect, wrong behavior, spec violation) —
+   whether while working on this project or any sibling project — file an
+   issue in the project the problem belongs to: repro/steps, impact, root
+   cause (if known), suggested fix.
+2. **Fixed a problem** — after the fix, submit an issue to the owning project
+   recording the problem and how it was fixed. For problems in this project:
+   https://github.com/ranxianglei/billion-context/issues . If the fix ships as
+   a PR, the PR MUST reference its issue (`Fixes #N`); a bare PR without an
+   issue is not acceptable — file the issue first, then link it. An existing
+   PR for the fix counts, but it should carry an accompanying issue.
+
 ### npm Publish — Absolute Prohibition
 
 `npm publish` is **handled by CI automatically** (see §5). The Agent MUST
