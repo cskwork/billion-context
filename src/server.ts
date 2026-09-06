@@ -74,6 +74,7 @@ import { systemToUser, isLoopbackAddress, inspectContextOverflow, reserveOutputH
 import { BILI_TUNNEL_HEADER, checkTunnelDestination, tunnelAllowlistFromEnv } from "./tunnel-guard.js";
 
 import { decodeRequestBody } from "./content-encoding.js";
+import { applyCompatRoles, applyCompatRolesJson, resolveCompatRoles, type CompatRoles } from "./compat-roles.js";
 
 // Body dumps (dumps/req-*.json, raw/*-REQ.txt, raw/*-RES.txt, raw/*-INCOMING.txt,
 // req-*-REREQUEST.json) write the full plaintext request body and are off by
@@ -791,6 +792,7 @@ async function handle(
             opts.proxySource = fresh.proxySource;
             opts.proxyFallback = fresh.proxyFallback;
             opts.compress = fresh.compress;
+            opts.compat = fresh.compat;
             resetProxyCache();
             for (const k of Object.keys(opts.routes)) delete opts.routes[k];
             Object.assign(opts.routes, loadRoutes());
@@ -2424,6 +2426,16 @@ function logUpstreamProxyDecision(opts: ProxyOptions, upstreamUrl: string | unde
     logMsg(opts, "info", `[upstream-proxy] ${maskHostPortForLog(host)} ${via} (source=${decision.source})`);
 }
 
+/** Infer the wire protocol from the request path for compat-role rewrites on
+ *  requests the pipeline did not prepare (passthrough). Mirrors the path
+ *  checks in handleRequest; returns null when unknown (no rewrite). */
+function inferWireProtocol(path: string): "openai" | "responses" | null {
+    const p = path.split("?", 2)[0];
+    if (p.endsWith("/chat/completions")) return "openai";
+    if (p.endsWith("/responses") || p.endsWith("/responses/compact")) return "responses";
+    return null;
+}
+
 function buildForwardTarget(
     req: http.IncomingMessage,
     opts: ProxyOptions,
@@ -2658,7 +2670,42 @@ async function forward(
     // wrongly skip and the user loses compression. When prepared is null any
     // inbound marker (from an upstream bili) is preserved verbatim by
     // buildForwardTarget, so the marker keeps propagating down the chain.
+    // #552: optional wire-compat role rewrite at the FINAL forward boundary —
+    // the only choke point that sees every emission site (client items,
+    // bili's injected compress prompt, instructions hoisting, compress-loop
+    // items). Opt-in via compat.roles (global + per-provider); empty map =
+    // byte-for-byte passthrough.
+    let wireBody: Buffer | string = body;
+    // #552 resolved compat map + protocol, shared with the compress-retry
+    // loops below (re-sent bodies must carry the same rewrite as the initial
+    // forward, or a developer-role 400 would hit mid-stream on retry).
+    let compatRoles: CompatRoles | null = null;
+    let compatProtocol: "openai" | "responses" | null = null;
     const { upstreamUrl, headers, proxyUrl } = buildForwardTarget(req, opts, route, affinity, prepared !== null ? instanceId : undefined);
+    if (typeof body === "string") {
+        // upstreamUrl (the real destination) — not route?.rewrittenUrl, which
+        // is undefined for zero-config requests and would skip provider compat.
+        const roles = resolveCompatRoles(opts.routes, upstreamUrl, opts.compat?.roles);
+        const protocol = prepared?.protocol ?? route?.explicitProtocol ?? inferWireProtocol(req.url ?? "");
+        if (Object.keys(roles).length > 0 && (protocol === "openai" || protocol === "responses")) {
+            compatRoles = roles;
+            compatProtocol = protocol;
+            const applied = applyCompatRoles(body, protocol, roles);
+            if (applied.rewritten > 0) {
+                wireBody = applied.body;
+                log("info", `[${prepared?.session.id ?? "passthrough"}] [compat] rewrote ${applied.rewritten} message role(s) per compat.roles (${Object.entries(roles).map(([f, t]) => `${f}→${t}`).join(",")})`);
+            }
+        }
+    }
+    // #552: wire transform shared by ALL re-send paths (compress-retry loops
+    // below) so re-sent bodies carry the same rewrite as the initial forward —
+    // otherwise a developer-role 400 would hit mid-stream on the first retry.
+    const wireTransform = compatRoles && compatProtocol
+        ? (b: Record<string, unknown>): Record<string, unknown> => {
+            applyCompatRolesJson(b, compatProtocol, compatRoles);
+            return b;
+        }
+        : undefined;
     // Show the final proxied URL (where the request actually lands) as the
     // primary signal. The provider label is appended only for named routes —
     // zero-config requests have a single routing mode now, so the final
@@ -2680,9 +2727,9 @@ async function forward(
             }
         }
     }
-    if (typeof body === "string" && (opts.debug || bodyDumpEnabled())) {
+    if (typeof wireBody === "string" && (opts.debug || bodyDumpEnabled())) {
         try {
-            const parsed = JSON.parse(body);
+            const parsed = JSON.parse(wireBody);
             if (opts.debug) {
                 const toolNames = (parsed.tools ?? []).map((t: Record<string, unknown>) => {
                     const fn = t.function as { name?: string } | undefined;
@@ -2697,10 +2744,10 @@ async function forward(
                 const sid = prepared?.session.id ?? "unknown";
                 const out = `${dumpDir}/req-${Date.now()}-${safeSessionId(sid)}.json`;
                 try {
-                    const pretty = JSON.stringify(JSON.parse(body), null, 2);
+                    const pretty = JSON.stringify(JSON.parse(wireBody), null, 2);
                     fs.writeFileSync(out, pretty);
                 } catch {
-                    fs.writeFileSync(out, body);
+                    fs.writeFileSync(out, wireBody);
                 }
                 log("info", `[debug] forwarded body written to ${out}`);
             }
@@ -2741,9 +2788,9 @@ async function forward(
             const bodyText =
                 req.method === "GET" || req.method === "HEAD"
                     ? ""
-                    : typeof body === "string"
-                      ? body
-                      : Buffer.from(body).toString("utf8");
+                    : typeof wireBody === "string"
+                      ? wireBody
+                      : Buffer.from(wireBody).toString("utf8");
             const reqPath = `${rawBase}-REQ.txt`;
             fs.writeFileSync(reqPath, `${req.method ?? "POST"} ${maskUrlForLog(upstreamUrl)}\n${hdrText}\n\n${bodyText}`);
             log("info", `[debug] RAW request dump: ${reqPath}`);
@@ -2753,7 +2800,7 @@ async function forward(
     const init: Omit<RequestInit, "dispatcher"> & { dispatcher?: object } = {
         method: req.method ?? "GET",
         headers,
-        body: req.method === "GET" || req.method === "HEAD" ? undefined : body,
+        body: req.method === "GET" || req.method === "HEAD" ? undefined : wireBody,
     };
     if (dispatcher) init.dispatcher = dispatcher;
     // Must be created before fetchWithTimeout: the signal aborts the upstream
@@ -3091,7 +3138,7 @@ async function forward(
                 streamToRead,
                 { core, config, messages: prepared.processedMessages.length > 0 ? prepared.processedMessages : prepared.originalMessages, compressMessages: prepared.originalMessages, session: prepared.session, log: ctx.log, proxyUrl, protocol: prepared.protocol, textProtocol, debug: opts.debug, refreshFolded },
                 parsedReq,
-                { url: upstreamUrl, headers: reqHeaders },
+                { url: upstreamUrl, headers: reqHeaders, wireTransform },
                 adapter,
                 systemPrompt,
                 clientAbort.signal,
@@ -3146,7 +3193,7 @@ async function forward(
                         json,
                         { core, config, messages: prepared.originalMessages, session: prepared.session, log: ctx.log, proxyUrl, textProtocol: true },
                         requestBody,
-                        { url: upstreamUrl, headers: requestHeaders },
+                        { url: upstreamUrl, headers: requestHeaders, wireTransform },
                     );
                 }
                 // Capture upstream usage so tokenCount (which drives nudge +
@@ -3370,6 +3417,7 @@ function handleConfigReload(opts: ProxyOptions, res: http.ServerResponse, log: (
     for (const k of Object.keys(opts.routes)) delete opts.routes[k];
     Object.assign(opts.routes, fresh);
     opts.compress = loadOptions().compress;
+    opts.compat = loadOptions().compat;
     // Release cached ProxyAgents so agents for proxy URLs that were
     // removed/changed don't leak for the process lifetime. The next request
     // re-creates the needed agent lazily via proxyDispatcher().

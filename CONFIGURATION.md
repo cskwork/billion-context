@@ -107,6 +107,13 @@ Top-level keys that control how the proxy listens and behaves globally.
 - **Status:** ACTIVE
 - **Description:** Forward every request to the upstream **without** compression, tool injection, or nudging. Equivalent to `ACP_PASSTHROUGH=1`. Handy for A/B comparison against the uncompressed baseline.
 
+### `compat`
+
+- **Type:** `{ roles?: Record<string, string> }`
+- **Default:** `{}` (disabled)
+- **Status:** ACTIVE
+- **Description:** Global wire-compat role map. `roles` maps message roles to the role name your upstream accepts, e.g. `{"compat":{"roles":{"developer":"system"}}}` rewrites `developer` → `system` on the final forwarded body for upstreams that reject the `developer` role (#552, newer codex clients). Applies to `openai` chat-completions and `responses` requests; exact-match roles only, everything else in the body is untouched; re-sent compress-retry bodies carry the same rewrite. Per-provider `compat.roles` entries (see [Providers](#providers)) win per key. Default `{}` forwards bodies byte-for-byte unchanged.
+
 ### `proxy`
 
 - **Type:** `string`
@@ -170,6 +177,13 @@ A shallow key (`https://open.bigmodel.cn`) matches every path on that host. A de
 - **Default:** *(inherits global `compress`)*
 - **Status:** ACTIVE
 - **Description:** Per-provider compression overrides. This is **level 2 of 3** in the merge hierarchy — see [Compression Tuning](#compression-tuning).
+
+### `compat`
+
+- **Type:** `{ roles?: Record<string, string> }`
+- **Default:** `{}` (disabled)
+- **Status:** ACTIVE
+- **Description:** Per-provider wire-compat overrides. `roles` maps message roles to the role name this upstream accepts, e.g. `{"developer": "system"}` for upstreams that reject the `developer` role newer codex clients send (#552). Applied to the final forwarded `openai`/`responses` body — client-sent roles and bili's own injected prompt alike — and to every body the compress-retry loops re-send. Wins per key over the global `compat` block (see [Server Settings](#server-settings)). Default `{}` forwards byte-for-byte unchanged.
 
 ---
 

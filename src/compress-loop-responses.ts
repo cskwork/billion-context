@@ -67,6 +67,9 @@ interface CompressLoopResponsesCtx {
 interface RequestOptions {
     url: string;
     headers: Record<string, string>;
+    /** Final-stage wire transform (compat.roles, #552) — same contract as the
+     *  unified loop's RequestOptions.wireTransform. */
+    wireTransform?: (body: Record<string, unknown>) => Record<string, unknown>;
 }
 
 interface FunctionCallAccumulator {
@@ -215,7 +218,7 @@ export async function compressLoopResponsesJson(
         const result = await fetchWithRetry(requestOptions.url, {
             method: "POST",
             headers: requestOptions.headers,
-            body: JSON.stringify(requestBody),
+            body: JSON.stringify(requestOptions.wireTransform ? requestOptions.wireTransform(requestBody) : requestBody),
             ...(ctx.proxyUrl ? { dispatcher: proxyDispatcher(ctx.proxyUrl) } : {}),
         }, undefined, undefined, (info) => {
             // #189: correlate the rejection with the rewrite that preceded it.

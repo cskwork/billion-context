@@ -355,6 +355,23 @@ So you can give ZCode its own proxy without affecting API-key clients:
 }
 ```
 
+### Wire-compat role rewrite (`compat.roles`)
+
+Some upstreams reject the `developer` role newer codex clients send on the
+Responses API (`400 Invalid role: developer`). `compat.roles` maps roles to
+what the upstream accepts — applied at the forward boundary to the final
+`openai`/`responses` body (client-sent roles **and** bili's own injected
+prompt alike), global or per-provider, default off = byte-for-byte:
+
+```jsonc
+{
+  "compat": { "roles": { "developer": "system" } },
+  "providers": {
+    "https://picky.example.com": { "compat": { "roles": { "developer": "user" } } }
+  }
+}
+```
+
 ## How sessions work
 
 The proxy needs a stable per-conversation identifier to isolate compression
