@@ -1737,6 +1737,33 @@ function diagNudge(turn: { nudge?: { shouldInject: boolean; reason: string; cont
     return `[${sessionId}] nudge ${inject}: usage=${pct} (${tokenCount}/${limit}), growth=${growth}/${floor} (ref=${ref}, interval=${interval}), pendingT1=${pendingT1}/${interval}${modelTag}, reason="${n.reason.slice(0, 120)}"`;
 }
 
+// #590: hosts that get the #408 uncompressed-baseline usage backfill. pi's
+// plugin cancels pi's own auto-compaction (billion-context-pi
+// wireCompactionDisable: "ACP owns compression"), so the baseline drives
+// nothing there — reporting it only put a >100% footer on the host that
+// mismatches the folded request actually forwarded. Hosts whose native
+// compaction stays live (omp anchored-rewrite accounting, codex native-compact
+// interception, plain proxy clients) keep the #408 behavior.
+function armHostUsageCredit(
+    session: Session,
+    originalMessages: CoreMessage[],
+    processedMessages: CoreMessage[],
+    log: (level: string, msg: string) => void,
+): void {
+    session.hostCreditTokens = 0;
+    if (session.metadata.pluginAgent === "pi") return;
+    // #408: tokens folded out of the forwarded view vs the host's own (unfolded)
+    // view — added back into the usage reported to the host so its anchor
+    // reflects the uncompressed baseline. Same estimator both sides, so
+    // systematic error cancels in the difference.
+    session.hostCreditTokens = processedMessages.length > 0
+        ? Math.max(0, estimateCoreMessages(originalMessages) - estimateCoreMessages(processedMessages))
+        : 0;
+    if (session.hostCreditTokens > 0) {
+        log("info", `[${session.id}] host usage backfill armed: +${session.hostCreditTokens} tok (forwarded view is folded); host usage will report the uncompressed baseline`);
+    }
+}
+
 function prepareAnthropic(
     parsed: AnthropicRequestBody,
     req: http.IncomingMessage,
@@ -1846,16 +1873,7 @@ function prepareAnthropic(
     // identity chain (#268), not part of the Anthropic Messages API — strip it
     // so the real upstream never sees a field it doesn't know.
     delete (rebuilt as Record<string, unknown>).prompt_cache_key;
-    // #408: tokens folded out of the forwarded view vs the host's own (unfolded)
-    // view — added back into the usage reported to the host so its anchor
-    // reflects the uncompressed baseline. Same estimator both sides, so
-    // systematic error cancels in the difference.
-    session.hostCreditTokens = processedMessages.length > 0
-        ? Math.max(0, estimateCoreMessages(originalMessages) - estimateCoreMessages(processedMessages))
-        : 0;
-    if (session.hostCreditTokens > 0) {
-        log("info", `[${sessionId}] host usage backfill armed: +${session.hostCreditTokens} tok (forwarded view is folded); host usage will report the uncompressed baseline`);
-    }
+    armHostUsageCredit(session, originalMessages, processedMessages, log);
     return { body: JSON.stringify(rebuilt), session, processedMessages, originalMessages, anthropicSystem: parsed.system, protocol: "anthropic", stream, compressInjected: injectTools, pluginMode, nudge, prompts, renderTags: "text-only" } as Prepared;
 }
 
@@ -2099,16 +2117,7 @@ function prepareOpenai(
     if (stream && (rebuilt as Record<string, unknown>).stream_options === undefined) {
         (rebuilt as Record<string, unknown>).stream_options = { include_usage: true };
     }
-    // #408: tokens folded out of the forwarded view vs the host's own (unfolded)
-    // view — added back into the usage reported to the host so its anchor
-    // reflects the uncompressed baseline. Same estimator both sides, so
-    // systematic error cancels in the difference.
-    session.hostCreditTokens = processedMessages.length > 0
-        ? Math.max(0, estimateCoreMessages(originalMessages) - estimateCoreMessages(processedMessages))
-        : 0;
-    if (session.hostCreditTokens > 0) {
-        log("info", `[${sessionId}] host usage backfill armed: +${session.hostCreditTokens} tok (forwarded view is folded); host usage will report the uncompressed baseline`);
-    }
+    armHostUsageCredit(session, originalMessages, processedMessages, log);
     // #532: title-gen side requests carry their own tiny system and would
     // clobber the conversation's measured overhead — skip them.
     if (!isTitleGen && openaiOutboundSystem !== undefined) {
@@ -2353,16 +2362,7 @@ function prepareResponses(
         });
         log("info", `[${sessionId}] responses forward tools=[${fwdTools.join(",")}] injectTool=${injectTools}${pluginMode ? " (plugin mode: wire injection suppressed)" : ""} NO_INJECT_TOOL=${!!process.env.ACP_NO_INJECT_TOOL} NO_COMPRESS_PROMPT=${!!process.env.ACP_NO_COMPRESS_PROMPT}`);
     }
-    // #408: tokens folded out of the forwarded view vs the host's own (unfolded)
-    // view — added back into the usage reported to the host so its anchor
-    // reflects the uncompressed baseline. Same estimator both sides, so
-    // systematic error cancels in the difference.
-    session.hostCreditTokens = processedMessages.length > 0
-        ? Math.max(0, estimateCoreMessages(originalMessages) - estimateCoreMessages(processedMessages))
-        : 0;
-    if (session.hostCreditTokens > 0) {
-        log("info", `[${sessionId}] host usage backfill armed: +${session.hostCreditTokens} tok (forwarded view is folded); host usage will report the uncompressed baseline`);
-    }
+    armHostUsageCredit(session, originalMessages, processedMessages, log);
     // #532: measure the outbound developer(system)+tools overhead for the panel.
     // On this wire the system rides the injected developer message outside the
     // fold space, so counting devContent + tools does not double-count the
