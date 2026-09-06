@@ -1564,7 +1564,7 @@ test("isLoopbackHost: localhost / ::1 / 127.x only", () => {
     for (const h of ["localhost", "LOCALHOST", "::1", "[::1]", "127.0.0.1", "127.5.6.7"]) {
         assert.equal(isLoopbackHost(h), true, h);
     }
-    for (const h of ["1270.0.0.1", "10.0.0.1", "192.168.1.1", "open.bigmodel.cn", ""]) {
+    for (const h of ["1270.0.0.1", "127.evil.com", "127.abc.def", "10.0.0.1", "192.168.1.1", "open.bigmodel.cn", ""]) {
         assert.equal(isLoopbackHost(h), false, h);
     }
 });

@@ -176,7 +176,9 @@ export function unwrapUpstream(url: string): string {
 export function isLoopbackHost(host: string): boolean {
     const h = host.toLowerCase();
     if (h === "localhost" || h === "::1" || h === "[::1]") return true;
-    return h.split(".")[0] === "127";
+    // Dotted-quad 127/8 only — not "first label starts with 127" (that would
+    // misclassify hostnames like 127.evil.com, #544 review nit).
+    return /^127\.\d+\.\d+\.\d+$/.test(h);
 }
 
 export interface HttpRewrite {
