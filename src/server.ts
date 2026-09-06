@@ -1752,6 +1752,41 @@ export function estimateInputTokens(processedMessages: CoreMessage[], systemText
     return Math.max(lastInputTokens > 0 ? lastInputTokens : 0, est);
 }
 
+/** #470: tokens the wire payload carries OUTSIDE the message array —
+ * system/instructions text and tool definitions (including the proxy-injected
+ * ACP tools). estimateCoreMessages only counts messages, so without this term
+ * the preflight trigger fires ~10-20K late on agent clients with big tool
+ * manifests: text alone "fits" while the real billed input already overflows
+ * the window. Same term estimateInputTokens applies to the output clamp (#467). */
+export function estimateWireOverhead(protocol: "anthropic" | "openai" | "responses", body: string | Buffer): number {
+    let parsed: Record<string, unknown>;
+    try {
+        parsed = JSON.parse(typeof body === "string" ? body : body.toString("utf8")) as Record<string, unknown>;
+    } catch {
+        return 0;
+    }
+    const sysRaw = protocol === "responses" ? parsed.instructions : parsed.system;
+    let sysText = "";
+    if (typeof sysRaw === "string") {
+        sysText = sysRaw;
+    } else if (Array.isArray(sysRaw)) {
+        sysText = sysRaw
+            .map((part) => (typeof (part as { text?: unknown })?.text === "string" ? (part as { text: string }).text : ""))
+            .join("\n");
+    }
+    // openai chat: the kernel hoists leading system/developer messages out of
+    // the array into the rebuilt body's system field — but raw clients that
+    // never went through a rebuild keep them in messages; count both shapes.
+    if (protocol === "openai" && Array.isArray(parsed.messages)) {
+        const hoisted = (parsed.messages as Array<Record<string, unknown>>)
+            .filter((m) => m.role === "system" || m.role === "developer")
+            .map((m) => (typeof m.content === "string" ? m.content : ""))
+            .join("\n");
+        sysText = sysText ? `${sysText}\n${hoisted}` : hoisted;
+    }
+    return defaultCountTokens(sysText) + defaultCountTokens(JSON.stringify(parsed.tools ?? []));
+}
+
 /** Output-budget cap so input+output <= window. Returns the clamped budget, or
  *  undefined when no reduction is needed (requested already fits, or the cap
  *  drops below OUTPUT_CLAMP_FLOOR — i.e. input alone nearly fills the window,
@@ -2537,7 +2572,11 @@ async function preflightCompressIfNeeded(
     // add their cost to every size decision here (trigger, fit gates, self-heal).
     const imageTokens = imageTokensInRawBody(prepared.protocol, prepared.body);
     const textEstimate = estimateCoreMessages(prepared.processedMessages);
-    const payloadEstimate = textEstimate + imageTokens;
+    // #470: system + tool definitions ride the wire too but are invisible to
+    // estimateCoreMessages — without them the trigger fires late (text alone
+    // under the window while the billed input already overflows it).
+    const overheadEstimate = estimateWireOverhead(prepared.protocol, prepared.body);
+    const payloadEstimate = textEstimate + overheadEstimate + imageTokens;
     const tokenCount = Math.max(session.stats.lastInputTokens, payloadEstimate);
     if (limit <= 0 || !model || tokenCount < limit) return prepared;
     // #496 forward-once-then-learn: the default image cost (base64/4) matches byte
@@ -2612,6 +2651,7 @@ async function preflightCompressIfNeeded(
             signal: clientAbort.signal,
             log,
             imageFloor: imageTokens,
+            wireOverhead: overheadEstimate,
         },
         prepared.originalMessages,
     );
@@ -2627,8 +2667,8 @@ async function preflightCompressIfNeeded(
         // runPrepare re-incremented stats.requests; the rebuild is internal
         // to this single client request.
         session.stats.requests -= 1;
-        if (estimateCoreMessages(rebuilt.processedMessages) + imageTokens < limit) return rebuilt;
-    } else if (estimateCoreMessages(prepared.processedMessages) + imageTokens < limit) {
+        if (estimateCoreMessages(rebuilt.processedMessages) + overheadEstimate + imageTokens < limit) return rebuilt;
+    } else if (estimateCoreMessages(prepared.processedMessages) + overheadEstimate + imageTokens < limit) {
         log("warn", `[${session.id}] preflight made no progress but the payload fits; forwarding as-is`);
         return prepared;
     }
