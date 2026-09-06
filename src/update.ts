@@ -113,6 +113,20 @@ async function findInstallDir(packageName: string): Promise<string | undefined> 
     }
 }
 
+/** True when `dir` is a git working tree: `.git` present as a directory
+ *  (normal clone) or as a file (linked worktree / submodule pointer). npm
+ *  installs never contain one — `npm pack` strips VCS metadata — so its
+ *  presence marks a source checkout, not an install. Exported for tests.
+ *  (#580) */
+export async function isGitWorkingTree(dir: string): Promise<boolean> {
+    try {
+        await access(path.join(dir, ".git"));
+        return true;
+    } catch {
+        return false;
+    }
+}
+
 /** Read the version from the on-disk package.json (not the startup constant). */
 async function readDiskVersion(installDir: string): Promise<string | undefined> {
     try {
@@ -335,6 +349,18 @@ export async function checkForUpdate(opts: UpdateOptions, force = false): Promis
         }
         await writeLastCheck(now);
         firstCheckDone = true;
+
+        // Source-checkout guard (#580): findInstallDir() walks up from the
+        // running dist/ and lands on the repo root when bili runs from a git
+        // clone (node dist/index.js start). An in-place tarball copy would
+        // silently rewrite tracked files (the version pin, READMEs), so refuse
+        // to self-update here instead of proceeding.
+        const installDir = await findInstallDir(opts.packageName);
+        if (installDir && await isGitWorkingTree(installDir)) {
+            loggerLog("info", `[update] running from a source checkout (${installDir}) \u2014 skipping auto-update (use npm install -g ${opts.packageName})`);
+            return;
+        }
+
         loggerLog("info", `[update] checking npm registry for ${opts.packageName}${sinceLastSec < 0 ? " (startup check)" : sinceLastSec === 0 ? "" : ` (last check ${sinceLastSec}s ago)`}\u2026`);
 
         const url = `${REGISTRY_BASE}/${opts.packageName}/latest`;
@@ -358,7 +384,6 @@ export async function checkForUpdate(opts: UpdateOptions, force = false): Promis
 
         // Read current version from disk (not from startup constant) so that
         // a successful in-place update is detected without a restart.
-        const installDir = await findInstallDir(opts.packageName);
         const diskVersion = installDir ? await readDiskVersion(installDir) : undefined;
         const currentVersion = diskVersion ?? opts.currentVersion;
 
@@ -451,6 +476,14 @@ export async function installViaTarball(
         await access(installDir, constants.W_OK);
     } catch {
         return { ok: false, error: `install dir not writable: ${installDir}` };
+    }
+
+    // Source-checkout guard (#580): a git working tree must never be merged
+    // over by a published tarball — that rewrites tracked files. checkForUpdate
+    // filters these out already; this keeps the refusal structural for direct
+    // callers.
+    if (await isGitWorkingTree(installDir)) {
+        return { ok: false, error: `install dir is a git working tree (${installDir}) \u2014 refusing to overwrite a source checkout (use npm install -g)` };
     }
 
     // Download tarball. Stream into memory with a hard size cap so a corrupt

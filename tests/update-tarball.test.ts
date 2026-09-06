@@ -5,7 +5,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync
 import { tmpdir } from "node:os";
 import path from "node:path";
 import * as tar from "tar";
-import { installViaTarball, declaredEntryRelPaths } from "../src/update.ts";
+import { installViaTarball, declaredEntryRelPaths, isGitWorkingTree } from "../src/update.ts";
 
 function integrityField(buf: Buffer, alg = "sha512"): string {
     return `${alg}-${crypto.createHash(alg).update(buf).digest("base64")}`;
@@ -142,6 +142,54 @@ test("installViaTarball: tarball missing its declared entry is rejected in stagi
         assert.equal(r.ok, false);
         assert.match(r.error ?? "", /staging verification failed: entry missing: dist\/index\.js/);
         assert.equal(JSON.parse(readFileSync(path.join(fx.installDir, "package.json"), "utf-8")).version, "1.2.3");
+    } finally {
+        delete process.env.XDG_CACHE_HOME;
+        rmSync(fx.root, { recursive: true, force: true });
+    }
+});
+
+test("isGitWorkingTree: .git dir (clone), .git file (worktree), absent", async () => {
+    const root = mkdtempSync(path.join(tmpdir(), "bc-gittest-"));
+    try {
+        const clone = path.join(root, "clone");
+        mkdirSync(path.join(clone, ".git"), { recursive: true });
+        assert.equal(await isGitWorkingTree(clone), true, "normal clone (.git directory)");
+
+        const worktree = path.join(root, "worktree");
+        mkdirSync(worktree, { recursive: true });
+        writeFileSync(path.join(worktree, ".git"), "gitdir: /elsewhere/repo/.git/worktrees/wt\n");
+        assert.equal(await isGitWorkingTree(worktree), true, "linked worktree (.git file)");
+
+        const plain = path.join(root, "plain");
+        mkdirSync(plain, { recursive: true });
+        assert.equal(await isGitWorkingTree(plain), false, "no .git entry");
+    } finally {
+        rmSync(root, { recursive: true, force: true });
+    }
+});
+
+test("installViaTarball: refuses to overwrite a git working tree, install untouched", { timeout: 30_000 }, async () => {
+    const fx = makeFixture();
+    process.env.XDG_CACHE_HOME = fx.cacheDir;
+    try {
+        // Simulate running from a source checkout: the resolved install dir IS a git working tree.
+        mkdirSync(path.join(fx.installDir, ".git"), { recursive: true });
+        writeFileSync(path.join(fx.installDir, "README.md"), "# local docs\n");
+        const { tgz, integrity } = fx.makeTarball({
+            "package.json": pkgJson("2.0.0"),
+            "dist/index.js": "export const loaded = '2.0.0';\n",
+            "README.md": "# published docs\n",
+        });
+        const r = await withTarballFetch(
+            tgz,
+            () => installViaTarball("2.0.0", "https://registry.test/x.tgz", fx.installDir, integrity),
+        );
+        assert.equal(r.ok, false);
+        assert.match(r.error ?? "", /git working tree/);
+        // Anti-corruption guarantee: tracked files byte-for-byte intact.
+        assert.equal(JSON.parse(readFileSync(path.join(fx.installDir, "package.json"), "utf-8")).version, "1.2.3");
+        assert.equal(readFileSync(path.join(fx.installDir, "README.md"), "utf-8"), "# local docs\n");
+        assert.match(readFileSync(path.join(fx.installDir, "dist", "index.js"), "utf-8"), /1\.2\.3/);
     } finally {
         delete process.env.XDG_CACHE_HOME;
         rmSync(fx.root, { recursive: true, force: true });
