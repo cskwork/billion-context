@@ -1,3 +1,5 @@
+import { Agent } from "undici";
+
 /** HTTP robustness helpers for the proxy.
 
   - readBody is capped: an unbounded request body is a memory-exhaustion
@@ -9,15 +11,47 @@
     streams can legitimately run for minutes, so the default is long. */
 
 export const MAX_REQUEST_BYTES = 100 * 1024 * 1024;
-export const UPSTREAM_TIMEOUT_MS = 10 * 60 * 1000;
+export const UPSTREAM_TIMEOUT_MS = 12 * 60 * 1000;
 
 const liveUpstreamTimers = new Set<ReturnType<typeof setTimeout>>();
 /** Test hook: how many fetchWithTimeout idle-timers are currently armed.
- *  #411: an aborted passthrough used to leak its 10-minute timer because
+ *  #411: an aborted passthrough used to leak its idle timer because
  *  clearTimer was only called on the success path — tests assert this stays
  *  at zero after a client abort. */
 export function _liveUpstreamTimersForTest(): number {
     return liveUpstreamTimers.size;
+}
+
+/** Idle-timeout budget for upstream requests; overridable via
+ *  BILI_UPSTREAM_TIMEOUT_MS (milliseconds). Read on each call so tests can
+ *  tune it live. Local-model deployments with very large contexts can need
+ *  prefills longer than the 12-minute default before their first token. */
+export function upstreamTimeoutMs(): number {
+    const raw = Number(process.env.BILI_UPSTREAM_TIMEOUT_MS);
+    return Number.isInteger(raw) && raw > 0 ? raw : UPSTREAM_TIMEOUT_MS;
+}
+
+// Direct (non-proxied) requests go through Node's hidden global agent, whose
+// undici headersTimeout/bodyTimeout defaults are both 300s — that cap silently
+// killed long prefills before this watchdog ever got a chance (#551). Inject an
+// explicit Agent per timeout value so the transport layer matches the watchdog
+// instead of firing first.
+const directDispatchers = new Map<number, Agent>();
+
+function directDispatcher(timeoutMs: number): Agent {
+    let agent = directDispatchers.get(timeoutMs);
+    if (!agent) {
+        agent = new Agent({ headersTimeout: timeoutMs, bodyTimeout: timeoutMs });
+        directDispatchers.set(timeoutMs, agent);
+    }
+    return agent;
+}
+
+export function _resetFetchUtilForTest(): void {
+    for (const agent of directDispatchers.values()) {
+        try { void agent.close().catch(() => undefined); } catch { /* already closed */ }
+    }
+    directDispatchers.clear();
 }
 
 /** undici's fetch accepts a `dispatcher` option (its own Dispatcher type) that
@@ -33,13 +67,16 @@ export type FetchOptions = Omit<RequestInit, "dispatcher"> & { dispatcher?: obje
  *  every response-body chunk, so it becomes an idle timeout once the body is
  *  streaming: a healthy stream that keeps producing chunks is never aborted
  *  mid-flight (LLM generations can legitimately run for minutes — a total
- *  timer would kill a healthy 12-minute stream at the 10-minute mark), while a
+ *  timer would kill a healthy 15-minute stream at the 12-minute mark), while a
  *  genuinely stuck stream (no chunk for `timeoutMs`) still trips the abort.
  *  Callers receive a `clearTimer` callback and invoke it once the response
  *  stream has been fully consumed (or on the error path) to stop the timer.
  *
  *  `opts.dispatcher` (optional) routes the fetch through an upstream proxy
- *  (an `undici.ProxyAgent`). When omitted, fetch uses its default agent.
+ *  (an `undici.ProxyAgent`). When omitted, a direct `undici.Agent` cached per
+ *  timeout value is injected — its headersTimeout/bodyTimeout match the idle
+ *  watchdog below so undici's hidden 300s transport defaults can never fire
+ *  first (#551).
  *
  *  `externalSignal` (optional) lets the caller abort the in-flight request
  *  independently of the timeout — e.g. when the downstream client disconnects.
@@ -48,16 +85,17 @@ export type FetchOptions = Omit<RequestInit, "dispatcher"> & { dispatcher?: obje
 export async function fetchWithTimeout(
     url: string,
     opts: FetchOptions,
-    timeoutMs: number = UPSTREAM_TIMEOUT_MS,
+    timeoutMs?: number,
     externalSignal?: AbortSignal,
 ): Promise<{ response: Response; clearTimer: () => void }> {
+    const effective = timeoutMs ?? upstreamTimeoutMs();
     const controller = new AbortController();
     let cleared = false;
     const armTimer = () => {
         const t = setTimeout(() => {
             liveUpstreamTimers.delete(t);
             controller.abort();
-        }, timeoutMs);
+        }, effective);
         liveUpstreamTimers.add(t);
         return t;
     };
@@ -87,7 +125,11 @@ export async function fetchWithTimeout(
         if (onExternalAbort && externalSignal) externalSignal.removeEventListener("abort", onExternalAbort);
     };
     try {
-        const finalOpts: Omit<RequestInit, "dispatcher"> & { dispatcher?: object } = { ...opts, signal: controller.signal };
+        const finalOpts: Omit<RequestInit, "dispatcher"> & { dispatcher?: object } = {
+            ...opts,
+            signal: controller.signal,
+            dispatcher: opts.dispatcher ?? directDispatcher(effective),
+        };
         // `fetch` is undici's global; it accepts `dispatcher` at runtime. @types/node
         // types RequestInit.dispatcher as its internal `Dispatcher` interface,
         // which structurally conflicts with the `undici` package's exported
@@ -240,7 +282,7 @@ export interface ReplayRetryInfo {
  *  For acp-loop replay requests, where provider risk-control may briefly
  *  reject a request whose context was just rewritten (#189). Network-level
  *  failures (timeout, connection reset) propagate unchanged — NOT retried
- *  here, to avoid stacking the 10-min timeout across attempts. */
+ *  here, to avoid stacking the 12-min timeout across attempts. */
 export async function fetchWithRetry(
     url: string,
     opts: FetchOptions,

@@ -371,6 +371,7 @@
 | `ACP_LOG_FILE` | 日志文件路径（默认 XDG state 路径；`off` 关闭文件只保留 stderr）。10 MB 自动轮转。 |
 | `ACP_DUMP_SSE` | 调试用：转储原始 SSE 帧的目录。 |
 | `BILI_UPSTREAM_PROXY` | 代理自身出站连接的上游代理 —— 优先级最高，高于 per-URL/per-provider 配置。见 README「上游代理」一节。 |
+| `BILI_UPSTREAM_TIMEOUT_MS` | 上游请求的空闲预算（毫秒）：首字节时间（TTFB）与响应体块之间的间隔（默认 `720000` = 12 分钟）。持续产出数据块的健康流永远不会被中途切断；静默的流才会。同一个值同时驱动底层 HTTP 客户端的传输层超时，因此这一个旋钮即可端到端约束本地大模型的超长 prefill（#551）。 |
 | `BILI_PERSIST` | 设 `0` 关闭会话持久化（仅内存，重启即丢）。 |
 | `BILI_PERSIST_DEBOUNCE_MS` | 持久化写盘的防抖窗口（毫秒，默认 `500`）。 |
 | `BILI_PERSIST_EPERM_ALERT_THRESHOLD` | 同一会话连续 N 次持久化写失败（`EPERM`/`EBUSY`/`EACCES`）后触发一次性「把该目录加入杀软排除项」告警的阈值（默认 `5`）。仅 Windows。见下文「Windows：把会话目录加入杀软排除项」章节。 |
