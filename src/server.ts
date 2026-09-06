@@ -1834,6 +1834,10 @@ function prepareAnthropic(
         log("warn", `[${sessionId}] kernel transform failed, forwarding unchanged: ${String(err)}`);
         processedMessages = [];
     }
+    // #532: measure the outbound system+tools overhead for the status panel's
+    // SysPrompt row — the kernel breakdown classifies messages only, and on
+    // this wire the system rides the top-level `system` field outside the fold.
+    session.metadata.systemPromptTokens = countSystemAndToolsTokens(extractSystem(systemOut), toolsOut);
     snapshotMessages(session, originalMessages);
     markDirty(session);
 
@@ -1872,14 +1876,21 @@ const OUTPUT_CLAMP_FLOOR = 1024;
 // host-side: renderNudgeText does not depend on shouldInject.
 const EMERGENCY_NUDGE_ESCALATION_PCT = 0.7;
 
+/** chars/4 measure of the per-request overhead that lives OUTSIDE the kernel's
+ *  fold space: the outbound system prompt (client text plus bili-injected parts)
+ *  and the tool schemas. The kernel's contextBreakdown classifies messages only,
+ *  so this is what the status panel's SysPrompt row must add back (#532). Same
+ *  counting method as estimateInputTokens below. */
+export function countSystemAndToolsTokens(systemText: string | undefined, tools: unknown): number {
+    return defaultCountTokens(systemText ?? "") + defaultCountTokens(JSON.stringify(tools ?? []));
+}
+
 /** Conservative outbound-input estimate: the larger of the upstream-reported
  *  previous-turn input (real tokenizer count, already includes system+tools) and
  *  a fresh count of the rebuilt conversation text + system + tool definitions
  *  (needed on turn 1 / right after a shrink, when lastInputTokens lags). */
 export function estimateInputTokens(processedMessages: CoreMessage[], systemText: string | undefined, tools: unknown, lastInputTokens: number): number {
-    const est = estimateCoreMessages(processedMessages)
-        + defaultCountTokens(systemText ?? "")
-        + defaultCountTokens(JSON.stringify(tools ?? []));
+    const est = estimateCoreMessages(processedMessages) + countSystemAndToolsTokens(systemText, tools);
     return Math.max(lastInputTokens > 0 ? lastInputTokens : 0, est);
 }
 
@@ -1973,6 +1984,7 @@ function prepareOpenai(
     ++session.stats.requests;
     session.hostCreditTokens = 0;
     let openaiSystemText = "";
+    let openaiOutboundSystem: string | undefined;
     let processedMessages: CoreMessage[] = [];
     let originalMessages: CoreMessage[] = [];
     let nudge: NudgeDecision | undefined;
@@ -2040,6 +2052,11 @@ function prepareOpenai(
         if (systemText) sysParts.push(systemText);
         if (shouldInject) sysParts.push(buildCompressSystemPrompt(prompts));
         rebuiltMessages = injectOpenaiSystem(rebuiltMessages, sysParts);
+        // #532: capture what bili injects outside the fold space (client system
+        // + compress prompt). A head system message already in the rebuilt view
+        // is classified by the kernel breakdown — counting only these parts
+        // avoids double-counting it.
+        openaiOutboundSystem = sysParts.join("\n\n");
         if (injectTools) {
             toolsOut = injectOpenaiTool(parsed.tools);
         }
@@ -2092,6 +2109,11 @@ function prepareOpenai(
     if (session.hostCreditTokens > 0) {
         log("info", `[${sessionId}] host usage backfill armed: +${session.hostCreditTokens} tok (forwarded view is folded); host usage will report the uncompressed baseline`);
     }
+    // #532: title-gen side requests carry their own tiny system and would
+    // clobber the conversation's measured overhead — skip them.
+    if (!isTitleGen && openaiOutboundSystem !== undefined) {
+        session.metadata.systemPromptTokens = countSystemAndToolsTokens(openaiOutboundSystem, toolsOut);
+    }
     snapshotMessages(session, originalMessages);
     markDirty(session);
     return { body: JSON.stringify(rebuilt), session, processedMessages, originalMessages, protocol: "openai", stream, compressInjected: injectTools, pluginMode, nudge, prompts, openaiSystemText, renderTags: "text-only" } as Prepared;
@@ -2141,6 +2163,7 @@ function prepareResponses(
     let rebuiltInput: ResponseInputItem[] | string = parsed.input;
     let toolsOut = parsed.tools;
     let transformOk = false;
+    let responsesDevContent: string | undefined;
 
     // #242: over-long input item ids (poisoned rollouts) 400 upstream on every
     // request; rewrite them to short deterministic ids before anything reads
@@ -2219,6 +2242,7 @@ function prepareResponses(
         if (shouldInject && !isCompactionTrigger && !process.env.ACP_NO_COMPRESS_PROMPT) {
             const prompt = responsesTextProtocol ? buildCompressHybridSystemPrompt(prompts) : buildCompressSystemPrompt(prompts);
             const devContent = [...projection.systemParts, ...forgedSummaries, prompt].join("\n\n---\n\n");
+            responsesDevContent = devContent;
             rebuiltInput = injectResponsesDeveloperMessage(rebuiltInput, devContent);
             if (!process.env.ACP_NO_INJECT_TOOL && injectTools) {
                 toolsOut = responsesTextProtocol
@@ -2227,6 +2251,7 @@ function prepareResponses(
             }
         } else if (projection.systemParts.length > 0 || forgedSummaries.length > 0) {
             const devContent = [...projection.systemParts, ...forgedSummaries].join("\n\n---\n\n");
+            responsesDevContent = devContent;
             rebuiltInput = injectResponsesDeveloperMessage(rebuiltInput, devContent);
         }
         // A nudge appended after a trailing `compaction_trigger` would break
@@ -2337,6 +2362,13 @@ function prepareResponses(
         : 0;
     if (session.hostCreditTokens > 0) {
         log("info", `[${sessionId}] host usage backfill armed: +${session.hostCreditTokens} tok (forwarded view is folded); host usage will report the uncompressed baseline`);
+    }
+    // #532: measure the outbound developer(system)+tools overhead for the panel.
+    // On this wire the system rides the injected developer message outside the
+    // fold space, so counting devContent + tools does not double-count the
+    // mid-history items the kernel already classifies.
+    if (transformOk) {
+        session.metadata.systemPromptTokens = countSystemAndToolsTokens(responsesDevContent ?? "", toolsOut);
     }
     snapshotMessages(session, originalMessages);
     markDirty(session);
