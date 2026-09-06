@@ -26,7 +26,7 @@ function restoreEnv(prev: string | undefined): void {
     else process.env[TIMEOUT_ENV] = prev;
 }
 
-test("upstreamTimeoutMs honors BILI_UPSTREAM_TIMEOUT_MS and falls back to the 10-minute default", () => {
+test("upstreamTimeoutMs honors BILI_UPSTREAM_TIMEOUT_MS and falls back to the 12-minute default", () => {
     const prev = process.env[TIMEOUT_ENV];
     try {
         delete process.env[TIMEOUT_ENV];

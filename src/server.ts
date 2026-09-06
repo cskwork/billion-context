@@ -2918,7 +2918,7 @@ async function forward(
     if (prepared?.pluginMode) {
         // #411: clear the idle timer on the abort path too — the pipes rethrow
         // when the client is still connected, and a client cancel throws from
-        // inside them; without a finally each abort leaked a 10-minute timer.
+        // inside them; without a finally each abort leaked an idle timer.
         try {
             let pluginBody = upstream.body as ReadableStream<Uint8Array>;
             if (prepared.stream && maxFakeCompletionRetries() > 0) {
@@ -2954,7 +2954,7 @@ async function forward(
     let responseBody: ReadableStream<Uint8Array> = upstream.body;
     // #411: every body-consuming path below must clear the upstream idle timer
     // even when it throws (client abort / upstream cut) — previously an abort
-    // skipped the trailing clearUpstreamTimer and leaked a live 10-minute
+    // skipped the trailing clearUpstreamTimer and leaked a live idle
     // timer plus its socket for the full window.
     try {
         if (prepared !== null && prepared.stream && !prepared.sidePassthrough && maxFakeCompletionRetries() > 0) {
@@ -3120,7 +3120,7 @@ async function forward(
     } else {
         // Wrap the whole non-streaming branch in try/finally so the upstream
         // timer is always cleared and the session is always persisted — even
-        // when arrayBuffer() throws (10-min abort, connection reset). Without
+        // when arrayBuffer() throws (idle-timeout abort, connection reset). Without
         // this, a thrown arrayBuffer() leaks the timeout and skips markDirty(),
         // losing the persistence of any block this turn's compress created.
         try {

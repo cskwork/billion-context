@@ -11,11 +11,11 @@ import { Agent } from "undici";
     streams can legitimately run for minutes, so the default is long. */
 
 export const MAX_REQUEST_BYTES = 100 * 1024 * 1024;
-export const UPSTREAM_TIMEOUT_MS = 10 * 60 * 1000;
+export const UPSTREAM_TIMEOUT_MS = 12 * 60 * 1000;
 
 const liveUpstreamTimers = new Set<ReturnType<typeof setTimeout>>();
 /** Test hook: how many fetchWithTimeout idle-timers are currently armed.
- *  #411: an aborted passthrough used to leak its 10-minute timer because
+ *  #411: an aborted passthrough used to leak its idle timer because
  *  clearTimer was only called on the success path — tests assert this stays
  *  at zero after a client abort. */
 export function _liveUpstreamTimersForTest(): number {
@@ -25,7 +25,7 @@ export function _liveUpstreamTimersForTest(): number {
 /** Idle-timeout budget for upstream requests; overridable via
  *  BILI_UPSTREAM_TIMEOUT_MS (milliseconds). Read on each call so tests can
  *  tune it live. Local-model deployments with very large contexts can need
- *  prefills longer than the 10-minute default before their first token. */
+ *  prefills longer than the 12-minute default before their first token. */
 export function upstreamTimeoutMs(): number {
     const raw = Number(process.env.BILI_UPSTREAM_TIMEOUT_MS);
     return Number.isInteger(raw) && raw > 0 ? raw : UPSTREAM_TIMEOUT_MS;
@@ -67,7 +67,7 @@ export type FetchOptions = Omit<RequestInit, "dispatcher"> & { dispatcher?: obje
  *  every response-body chunk, so it becomes an idle timeout once the body is
  *  streaming: a healthy stream that keeps producing chunks is never aborted
  *  mid-flight (LLM generations can legitimately run for minutes — a total
- *  timer would kill a healthy 12-minute stream at the 10-minute mark), while a
+ *  timer would kill a healthy 15-minute stream at the 12-minute mark), while a
  *  genuinely stuck stream (no chunk for `timeoutMs`) still trips the abort.
  *  Callers receive a `clearTimer` callback and invoke it once the response
  *  stream has been fully consumed (or on the error path) to stop the timer.
@@ -275,7 +275,7 @@ export interface ReplayRetryInfo {
  *  For acp-loop replay requests, where provider risk-control may briefly
  *  reject a request whose context was just rewritten (#189). Network-level
  *  failures (timeout, connection reset) propagate unchanged — NOT retried
- *  here, to avoid stacking the 10-min timeout across attempts. */
+ *  here, to avoid stacking the 12-min timeout across attempts. */
 export async function fetchWithRetry(
     url: string,
     opts: FetchOptions,
