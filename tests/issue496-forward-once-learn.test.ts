@@ -111,9 +111,9 @@ test("e2e #496 (byte-counting relay): one rejected forward, then fail-fast — t
 
         // The self-heal recognized the overflow and learned a conservative window from
         // the REJECTED payload size (which counts the images, #488), arming the shrink.
-        const s = listSessions().find((x) => (x.metadata.learnedContextLimits as Record<string, number> | undefined)?.["claude-img"] !== undefined);
+        const s = listSessions().find((x) => (x.metadata.confirmedContextLimits as Record<string, number> | undefined)?.["claude-img"] !== undefined);
         assert.ok(s, "session learned a conservative window from the rejected multimodal payload");
-        const learned = (s!.metadata.learnedContextLimits as Record<string, number>)["claude-img"];
+        const learned = (s!.metadata.confirmedContextLimits as Record<string, number>)["claude-img"];
         assert.ok(learned >= 1000 && learned > 10_000, `learned window reflects the image-heavy payload (got ${learned})`);
         assert.ok(s!.stats.lastInputTokens >= learned, "emergency shrink armed (lastInputTokens >= learned window)");
 

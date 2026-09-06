@@ -447,7 +447,7 @@ test("e2e: overflow 400 on a side request learns the real window; next one is bl
         await r1.text();
         const s1 = getSession(SESSION);
         assert.ok(s1);
-        assert.equal((s1.metadata.learnedContextLimits as Record<string, number>)[MODEL], 120_000, "real window learned from the overflow marker");
+        assert.equal((s1.metadata.confirmedContextLimits as Record<string, number>)[MODEL], 120_000, "real window learned (confirmed channel, #572) from the overflow marker");
         assert.equal(s1.stats.lastInputTokens, 120_000, "emergency shrink armed at the learned window");
 
         // Identical second request: now blocked locally — no second upstream hit.
