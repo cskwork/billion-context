@@ -10,7 +10,7 @@ import { startServer } from "../src/server.ts";
 import { loadRoutes, type ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
-import { applyCompatRoles, applyCompatRolesJson, detectRoleRejection, parseCompatRoles, resolveCompatRoles } from "../src/compat-roles.ts";
+import { applyCompatRoles, applyCompatRolesJson, detectRoleRejection, detectSystemPlacementError, parseCompatRoles, resolveCompatRoles } from "../src/compat-roles.ts";
 import { _liveUpstreamTimersForTest } from "../src/fetch-util.ts";
 
 function close(server: http.Server): Promise<void> {
@@ -278,6 +278,34 @@ test("detectRoleRejection: extracts the offending role, conservative otherwise",
     assert.equal(detectRoleRejection(400, '[{"loc":["body","messages",0,"role"],"msg":"Input should be \'system\', \'user\', \'tool\' or \'assistant\'"}]'), null);
 });
 
+test("detectSystemPlacementError: flags #377-class placement 400s, ignores role-name/quota/overflow/auth", () => {
+    const positive = [
+        "Only one 'system' message is allowed and it must be at the beginning",
+        "Multiple system messages found in the request",
+        "Found 2 system messages; expected exactly one",
+        "Expected exactly one system message, got 2",
+        "system message must be at the beginning of the conversation",
+        "system message at index 3 is not allowed",
+        "Value error: system messages are only allowed at index 0 (found system at index 1)",
+        "a second system message was supplied",
+    ];
+    for (const msg of positive) {
+        assert.equal(detectSystemPlacementError(400, JSON.stringify({ error: { message: msg } })), true, `should detect placement error: ${msg}`);
+    }
+    const negative = [
+        '{"error":{"message":"Invalid role: developer"}}',
+        '{"error":{"message":"insufficient quota"}}',
+        '{"error":{"message":"context_length_exceeded"}}',
+        '{"error":{"message":"Missing required parameter: system prompt"}}',
+        "system prompt is required",
+        '{"error":{"message":"invalid api key"}}',
+    ];
+    for (const msg of negative) {
+        assert.equal(detectSystemPlacementError(400, msg), false, `should NOT detect: ${msg}`);
+    }
+    assert.equal(detectSystemPlacementError(401, "Multiple system messages found"), false);
+});
+
 function roleRejectingUpstream(): Promise<{ server: http.Server; seen: string[][] }> {
     const seen: string[][] = [];
     const server = http.createServer((req, res) => {
@@ -357,6 +385,111 @@ test("e2e #552 F: retry that still fails passes the original 400 through verbati
         assert.equal(hits.length, 2, "exactly one retry, no loop");
         await waitFor(() => _liveUpstreamTimersForTest() === 0);
         assert.equal(_liveUpstreamTimersForTest(), 0, "abandoned retry body must not re-arm the idle timer after clearTimer");
+    } finally {
+        await harness.stop();
+        harness.cleanup();
+        await close(upstream);
+    }
+});
+
+function rolesOf(body: unknown): string[] {
+    const b = body as { input?: Array<{ role?: string }>; messages?: Array<{ role?: string }> };
+    return [...(b.input ?? []), ...(b.messages ?? [])].map((m) => m.role ?? "?");
+}
+
+// Payload that keeps a developer MID-LIST at the forward boundary. A well-formed
+// TYPED developer is hoisted to index 0 by the kernel (injectResponsesDeveloperMessage),
+// so the primary developer→system retry already lands at index 0 and succeeds — it
+// can never produce a mid-list system. A non-normalized type-less item is left in
+// place by the projection, which is exactly the precondition #583 needs.
+const MIDLIST_DEV_PAYLOAD = JSON.stringify({ model: "test", input: [
+    { type: "message", role: "user", content: "a" },
+    { role: "developer", content: "sys" },
+    { type: "message", role: "user", content: "b" },
+]});
+
+// Upstream enforcing BOTH halves of the #583 edge: rejects any unknown role
+// (developer) AND enforces system-at-index-0 only (a mid-list system is a
+// #377-class placement 400). acceptUser decides whether the final developer→user
+// rewrite is accepted (true = second-chance succeeds; false = every hop fails,
+// exercising the hard cap). Records every hit's roles.
+function ladderUpstream(acceptUser: boolean): Promise<{ server: http.Server; seen: string[][] }> {
+    const seen: string[][] = [];
+    const server = http.createServer((req, res) => {
+        const chunks: Buffer[] = [];
+        req.on("data", (c: Buffer) => chunks.push(c));
+        req.on("end", () => {
+            let roles: string[] = [];
+            try { roles = rolesOf(JSON.parse(Buffer.concat(chunks).toString("utf8"))); } catch { /* ignore */ }
+            seen.push(roles);
+            const json = (obj: unknown) => JSON.stringify(obj);
+            const offZero = roles.map((r, i) => (r === "system" ? i : -1)).filter((i) => i >= 0).find((i) => i !== 0);
+            if (roles.includes("developer")) {
+                res.writeHead(400, { "content-type": "application/json" });
+                res.end(json({ error: { message: "Invalid role: developer" } }));
+            } else if (offZero !== undefined) {
+                res.writeHead(400, { "content-type": "application/json" });
+                res.end(json({ error: { message: `Value error: system messages are only allowed at index 0 (found system at index ${offZero})` } }));
+            } else if (acceptUser) {
+                res.writeHead(200, { "content-type": "application/json" });
+                res.end(json({ ok: true }));
+            } else {
+                res.writeHead(400, { "content-type": "application/json" });
+                res.end(json({ error: { message: "Invalid role: developer" } }));
+            }
+        });
+    });
+    return new Promise((resolve) => server.listen(0, "127.0.0.1", () => resolve({ server, seen })));
+}
+
+test("e2e #583 G: mid-list developer→system 400s on a placement-strict backend; second-chance learns developer→user", async () => {
+    const { server: upstream, seen } = await ladderUpstream(true);
+    const harness = await startProxy(upstream, { compatJson: `{"providers":{}}` });
+    try {
+        const res1 = await fetch(`http://127.0.0.1:${harness.port}/v1/responses`, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-session-id": "compat-second-chance" },
+            body: MIDLIST_DEV_PAYLOAD,
+        });
+        assert.equal(res1.status, 200, "client sees a transparent 200 after the second-chance retry");
+        assert.equal(seen.length, 3, `expected 3 upstream hits (dev→sys→user), got ${JSON.stringify(seen)}`);
+        assert.ok(seen[0].includes("developer"), "hit 1 carries a developer role → rejected");
+        assert.ok(!seen[1].includes("developer") && seen[1].includes("system"), "hit 2: primary hop rewrote developer→system (mid-list → placement 400)");
+        assert.ok(!seen[2].includes("developer") && !seen[2].includes("system"), "hit 3: second-chance rewrote developer→user → accepted");
+        // Second request: the session learned developer→user, so every developer
+        // (typed or type-less) is pre-rewritten BEFORE fetch — no 400 round-trip.
+        const res2 = await fetch(`http://127.0.0.1:${harness.port}/v1/responses`, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-session-id": "compat-second-chance" },
+            body: MIDLIST_DEV_PAYLOAD,
+        });
+        assert.equal(res2.status, 200);
+        assert.equal(seen.length, 4, `expected 4 upstream hits total (3 + 1), got ${JSON.stringify(seen)}`);
+        assert.ok(!seen[3].includes("developer") && !seen[3].includes("system"), "second request pre-rewritten via learned map");
+        await waitFor(() => _liveUpstreamTimersForTest() === 0);
+        assert.equal(_liveUpstreamTimersForTest(), 0, "abandoned retry bodies must not re-arm the idle timer");
+    } finally {
+        await harness.stop();
+        harness.cleanup();
+        await close(upstream);
+    }
+});
+
+test("e2e #583 H: ladder is capped — every hop failing passes the ORIGINAL 400 verbatim, no loop", async () => {
+    const { server: upstream, seen } = await ladderUpstream(false);
+    const harness = await startProxy(upstream, { compatJson: `{"providers":{}}` });
+    try {
+        const res = await fetch(`http://127.0.0.1:${harness.port}/v1/responses`, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-session-id": "compat-second-chance-cap" },
+            body: MIDLIST_DEV_PAYLOAD,
+        });
+        assert.equal(res.status, 400, "client receives a 400 when every hop fails");
+        const text = await res.text();
+        assert.ok(text.includes("Invalid role: developer"), `original error preserved verbatim, got: ${text}`);
+        assert.equal(seen.length, 3, `expected exactly 3 upstream hits (original + 2 retries), got ${JSON.stringify(seen)}`);
+        await waitFor(() => _liveUpstreamTimersForTest() === 0);
+        assert.equal(_liveUpstreamTimersForTest(), 0, "abandoned retry bodies must not re-arm the idle timer");
     } finally {
         await harness.stop();
         harness.cleanup();

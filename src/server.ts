@@ -74,7 +74,7 @@ import { systemToUser, isLoopbackAddress, inspectContextOverflow, reserveOutputH
 import { BILI_TUNNEL_HEADER, checkTunnelDestination, tunnelAllowlistFromEnv } from "./tunnel-guard.js";
 
 import { decodeRequestBody } from "./content-encoding.js";
-import { applyCompatRoles, applyCompatRolesJson, detectRoleRejection, resolveCompatRoles, type CompatRoles } from "./compat-roles.js";
+import { applyCompatRoles, applyCompatRolesJson, detectRoleRejection, detectSystemPlacementError, resolveCompatRoles, type CompatRoles } from "./compat-roles.js";
 
 // Body dumps (dumps/req-*.json, raw/*-REQ.txt, raw/*-RES.txt, raw/*-INCOMING.txt,
 // req-*-REREQUEST.json) write the full plaintext request body and are off by
@@ -2864,32 +2864,58 @@ async function forward(
             };
             const rejection = detectRoleRejection(upstreamResult.response.status, roleErrText);
             if (rejection && rejection.role !== "system") {
-                const fixed = applyCompatRoles(wireBody, compatProtocol, { [rejection.role]: "system" });
-                if (fixed.rewritten > 0) {
-                    try {
-                        const retry = await fetchWithTimeout(upstreamUrl, { ...init, body: fixed.body }, undefined, clientAbort.signal);
-                        if (retry.response.ok) {
-                            upstreamResult.clearTimer();
-                            const s = prepared?.session;
-                            if (s) {
-                                const prev = (s.metadata.learnedCompatRoles as CompatRoles | undefined) ?? {};
-                                s.metadata.learnedCompatRoles = { ...prev, [rejection.role]: "system" };
-                                markDirty(s);
-                            }
-                            // Same-request re-sends (compress-retry loops) must
-                            // carry the rewrite too — wireTransform reads this
-                            // variable at call time.
-                            compatRoles = { ...compatRoles, [rejection.role]: "system" };
-                            const providerKey = new URL(upstreamUrl).origin;
-                            log("info", `[${prepared?.session.id ?? "passthrough"}] [compat] upstream rejected role "${rejection.role}" — auto-rewrote ${fixed.rewritten} message role(s) to "system", retry OK (remembered for this session only). To make permanent, add: {"providers":{"${providerKey}":{"compat":{"roles":{"${rejection.role}":"system"}}}}`);
-                            upstreamResult = retry;
-                        } else {
-                            retry.clearTimer();
-                        }
-                    } catch {
-                        // retry transport failure — keep the original 400
+                // Learn-on-failure ladder — primary hop (#552: offending role →
+                // "system") plus a SECOND-CHANCE hop (#583: → "user") fired only
+                // when the system hop 400'd with a #377-class system-PLACEMENT
+                // error (backend accepts the role name but forbids system off
+                // index 0, so a mid-list developer→system still 400s). Each hop
+                // rewrites the one offending role to a single target and forwards
+                // exactly once; the sequence is fixed (never a loop), hard-capped
+                // at original + 2 retries. Any other failure stops the ladder and
+                // the original 400 passes through verbatim.
+                const cp = compatProtocol;
+                const wb = wireBody;
+                const remember = (target: string, rewritten: number): void => {
+                    const s = prepared?.session;
+                    if (s) {
+                        const prev = (s.metadata.learnedCompatRoles as CompatRoles | undefined) ?? {};
+                        s.metadata.learnedCompatRoles = { ...prev, [rejection.role]: target };
+                        markDirty(s);
                     }
-                }
+                    // Same-request re-sends (compress-retry loops) carry the
+                    // rewrite too — wireTransform reads compatRoles at call time.
+                    compatRoles = { ...compatRoles, [rejection.role]: target };
+                    const providerKey = new URL(upstreamUrl).origin;
+                    log("info", `[${prepared?.session.id ?? "passthrough"}] [compat] upstream rejected role "${rejection.role}" — auto-rewrote ${rewritten} message role(s) to "${target}", retry OK (remembered for this session only). To make permanent, add: {"providers":{"${providerKey}":{"compat":{"roles":{"${rejection.role}":"${target}"}}}}`);
+                };
+                type HopOutcome = "ok" | "placement-400" | "other";
+                const hop = async (target: string): Promise<HopOutcome> => {
+                    const fixed = applyCompatRoles(wb, cp, { [rejection.role]: target });
+                    if (fixed.rewritten === 0) return "other";
+                    let r: Awaited<ReturnType<typeof fetchWithTimeout>>;
+                    try {
+                        r = await fetchWithTimeout(upstreamUrl, { ...init, body: fixed.body }, undefined, clientAbort.signal);
+                    } catch {
+                        return "other"; // transport failure — keep the original 400
+                    }
+                    if (r.response.ok) {
+                        upstreamResult.clearTimer();
+                        remember(target, fixed.rewritten);
+                        upstreamResult = r;
+                        return "ok";
+                    }
+                    let errText: string | null = null;
+                    if (r.response.body) {
+                        try {
+                            errText = (await readStreamToBuffer(r.response.body)).toString("utf8");
+                        } catch {
+                            errText = null;
+                        }
+                    }
+                    r.clearTimer();
+                    return errText !== null && detectSystemPlacementError(r.response.status, errText) ? "placement-400" : "other";
+                };
+                if ((await hop("system")) === "placement-400") await hop("user");
             }
         }
     }

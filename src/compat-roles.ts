@@ -101,6 +101,30 @@ export function detectRoleRejection(status: number, bodyText: string): { role: s
     return null;
 }
 
+/** Detect the OTHER half of the #552 edge (#583): a backend that ACCEPTS the
+ *  role name but rejects a `system` message that is not at index 0 (or more
+ *  than one system message) — the SGLang-style strict-placement class behind
+ *  #377. Distinct from detectRoleRejection, which names an unsupported ROLE;
+ *  here the role is fine and the POSITION/count is the problem, so there is no
+ *  role to capture — just a boolean gate for the second-chance developer→user
+ *  hop. Conservative: requires a 400 plus the literal word "system" plus one
+ *  strong placement/multiplicity marker, so unrelated 400s (quota, overflow,
+ *  missing-system, auth) never trip it. Quotes/brackets are normalized away so
+ *  phrasings like "Only one 'system' message…" still match. */
+export function detectSystemPlacementError(status: number, bodyText: string): boolean {
+    if (status !== 400) return false;
+    const head = bodyText.slice(0, 4096);
+    if (!/system/i.test(head)) return false;
+    const norm = head.replace(/['"`[\](){}]/g, " ");
+    const PLACEMENT_MARKERS = [
+        /\b(multiple|more\s+than\s+one|exactly\s+one|only\s+one|single|another|second|third)\s+system/i,
+        /\b[2-9]\d*\s+system\s+messages?\b/i,
+        /system\s+messages?\b[^.\n]{0,50}\bindex\s*\d+\b/i,
+        /(system\s+messages?|system\s+roles?)\b[^.\n]{0,50}\b(beginning|start|front|first\s+message|must\s+be\s+first)/i,
+    ];
+    return PLACEMENT_MARKERS.some((re) => re.test(norm));
+}
+
 export function applyCompatRoles(
     body: string,
     protocol: "openai" | "responses",
