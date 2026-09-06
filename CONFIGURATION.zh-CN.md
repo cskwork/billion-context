@@ -107,6 +107,14 @@
 - **状态：** ACTIVE
 - **说明：** 将每个请求**不经过**压缩、工具注入或 nudge，直接转发到上游。等价于 `ACP_PASSTHROUGH=1`。便于与未压缩基线做 A/B 对比。
 
+### `compat`
+
+- **类型：** `{ roles?: Record<string, string> }`
+- **默认值：** `{}`（禁用）
+- **状态：** ACTIVE
+- **说明：** 全局线上兼容角色映射。`roles` 把消息角色映射为上游接受的角色名，例如 `{"compat":{"roles":{"developer":"system"}}}` 把 `developer` → `system`，用于拒绝 `developer` 角色的上游（#552，新版 codex 客户端会发送）。作用于 `openai` chat-completions 与 `responses` 请求；仅精确匹配角色，体内其它内容不动；压缩重试重发的请求体同样携带。按 provider 的 `compat.roles`（见 [Providers](#providers)）按键优先。默认 `{}` 逐字节透明转发。
+- **失败自学习：** 未配置 compat 时，上游返回 `400 Invalid role: …` 会被自动修复 —— bili 把被拒角色改写为 `system`，重试一次，并把学到的映射记在**会话上**（仅内存，绝不写入配置）。该会话后续请求免 400 往返。修复生效时打印的 info 日志附带可永久化的 per-provider 片段。
+
 ### `proxy`
 
 - **类型：** `string`
@@ -168,6 +176,13 @@
 - **默认值：** *（继承全局 `compress`）*
 - **状态：** ACTIVE
 - **说明：** 按 provider 的压缩覆盖项。这是三层合并中的**第 2 层** —— 见[压缩调优](#压缩调优)。
+
+### `compat`
+
+- **类型：** `{ roles?: Record<string, string> }`
+- **默认值：** `{}`（禁用）
+- **状态：** ACTIVE
+- **说明：** 按 provider 的线上兼容覆盖。`roles` 把消息角色映射为该上游接受的角色名，例如 `{"developer": "system"}` —— 用于拒绝 `developer` 角色的上游（#552，新版 codex 客户端会发这个角色）。作用于最终转发的 `openai`/`responses` 请求体 —— 客户端发送的角色和 bili 自己注入的提示一视同仁 —— 压缩重试循环重发的请求体同样携带该改写。按键覆盖全局 `compat` 块（见[服务端设置](#服务端设置)）。默认 `{}` 逐字节透明转发。
 
 ---
 

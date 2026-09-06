@@ -79,6 +79,11 @@ export interface LoopCtx {
 export interface RequestOptions {
     url: string;
     headers: Record<string, string>;
+    /** Final-stage wire transform (e.g. compat.roles role rewrite, #552).
+     *  Applied to every outgoing body this loop re-sends — truncation retry,
+     *  degraded retry, rebuilt rounds — so re-sent bodies carry the same
+     *  compat the initial forward() applied. Returns the body to serialize. */
+    wireTransform?: (body: Record<string, unknown>) => Record<string, unknown>;
 }
 
 export type ParsedStreamEvent =
@@ -211,7 +216,7 @@ export async function* runCompressLoop(
             {
                 method: "POST",
                 headers: requestOptions.headers,
-                body: JSON.stringify(body),
+                body: JSON.stringify(requestOptions.wireTransform ? requestOptions.wireTransform(body) : body),
                 ...(ctx.proxyUrl ? { dispatcher: proxyDispatcher(ctx.proxyUrl) } : {}),
             },
             undefined,

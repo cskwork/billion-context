@@ -5,6 +5,8 @@ import { configFile } from "./paths.js";
 import { log as loggerLog } from "./logger.js";
 import { validateHttpProxy, type ProxyFallbackOptions } from "./upstream-proxy.js";
 
+import { parseCompatRoles } from "./compat-roles.js";
+
 export function safeReadJson(path: string): unknown {
     try {
         // Strip a leading UTF-8 BOM: Windows Notepad saves UTF-8 "with BOM",
@@ -41,6 +43,12 @@ export type ProviderRoute = {
     compressProtocol?: "tools" | "marker";
     /** Per-provider compression overrides (level 2 of 3). See CompressSettings. */
     compress?: CompressSettings;
+    /** Per-provider wire-compat overrides. `roles` maps message roles to the
+     *  role name this upstream accepts (e.g. `"developer": "system"`) —
+     *  applied at the forward boundary to the FINAL wire body, covering
+     *  client-sent roles and bili's own injected prompt alike (#552). Wins
+     *  per key over the global `compat` block. */
+    compat?: { roles?: Record<string, string> };
 };
 export type ProviderRoutes = Record<string, ProviderRoute>; // key = upstream URL prefix (the /bili/<this> string)
 
@@ -234,6 +242,11 @@ export type ProxyOptions = {
         injectNudge: boolean;
     };
     promptCache: { routing: PromptCacheRouting };
+    /** Wire-compat role map (global level; per-provider `compat.roles` overlays
+     *  it per key). `{"developer":"system"}` rewrites developer→system on the
+     *  forwarded body for upstreams without the developer role (#552). Empty =
+     *  byte-for-byte transparent. */
+    compat: { roles: Record<string, string> };
     sessionHeader: string;
     log: boolean;
     debug: boolean;
@@ -373,6 +386,7 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
         promptCache: {
             routing: parsePromptCacheRouting(env.ACP_PROMPT_CACHE_ROUTING ?? fileConfig.promptCache?.routing),
         },
+        compat: { roles: parseCompatRoles(fileConfig.compat?.roles) ?? {} },
         sessionHeader: env.ACP_SESSION_HEADER ?? fileConfig.sessionHeader ?? "x-acp-session",
         log: env.ACP_LOG !== "0" && fileConfig.log !== false,
         debug: (env.ACP_DEBUG ?? (fileConfig.debug ? "1" : "0")) === "1",
@@ -421,6 +435,10 @@ type FileConfig = {
     compress?: CompressSettings & { injectTool?: boolean; injectNudge?: boolean };
     promptCache?: { routing?: string };
     mitm?: { enabled?: boolean; domains?: string[] };
+    /** Global wire-compat block. `roles` maps message roles to the role name
+     *  upstreams accept (e.g. `{"developer":"system"}`) — applied to the
+     *  final forwarded body for openai/responses requests (#552). */
+    compat?: { roles?: Record<string, string> };
 };
 
 function nonEmpty(value: string | undefined): string | undefined {
@@ -495,11 +513,13 @@ export function parseRouteEntry(v: unknown): ProviderRoute | undefined {
     // is the KEY in the providers map (identical to the /bili/<url> string),
     // so it is NOT repeated inside the value.
     if (v && typeof v === "object" && !Array.isArray(v)) {
-        const obj = v as { models?: Record<string, ModelEntry>; proxy?: string; compressProtocol?: string; compress?: CompressSettings };
+        const obj = v as { models?: Record<string, ModelEntry>; proxy?: string; compressProtocol?: string; compress?: CompressSettings; compat?: { roles?: unknown } };
         const route: ProviderRoute = { models: obj.models };
         if (typeof obj.proxy === "string") route.proxy = obj.proxy;
         if (obj.compressProtocol === "marker" || obj.compressProtocol === "tools") route.compressProtocol = obj.compressProtocol;
         if (obj.compress) route.compress = obj.compress;
+        const compatRoles = parseCompatRoles(obj.compat?.roles);
+        if (compatRoles) route.compat = { roles: compatRoles };
         return route;
     }
     // A bare value (e.g. null) means "this upstream exists, no overrides".
