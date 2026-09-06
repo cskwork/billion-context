@@ -114,6 +114,13 @@ export type Session = {
      *  request keeps a bounded, up-to-date copy — that is what makes offline
      *  export complete. Bounded by MAX_SESSIONS, same as blockContents. */
     lastMessages?: CoreMessage[];
+    /** True when lastMessages holds an already-pruned folded-view snapshot
+     *  (restored from disk — #401: the persisted record stores the bounded
+     *  folded view, not the raw history). Export must render it as-is instead
+     *  of re-running prune() (the snapshot's message ids no longer align with
+     *  the state ranges). Cleared by snapshotMessages on the next live
+     *  request — the client re-sends full raw history, restoring the invariant. */
+    lastMessagesFolded?: boolean;
     /** Number of in-flight requests using this session. A session with
      *  inFlight > 0 must NOT be LRU-evicted: evicting it mid-stream flushes a
      *  half-mutated snapshot and then a miss reloads a SECOND Session object,
@@ -268,7 +275,10 @@ export function peekSession(id: string): Session | undefined {
  *  session, replaced every request — bounded, always the newest state. Empty
  *  arrays (parse failures) never clobber a good snapshot. */
 export function snapshotMessages(session: Session, messages: CoreMessage[]): void {
-    if (messages.length > 0) session.lastMessages = messages;
+    if (messages.length > 0) {
+        session.lastMessages = messages;
+        session.lastMessagesFolded = false;
+    }
 }
 
 /** Mark a session's state as changed so it is persisted on the next debounce.

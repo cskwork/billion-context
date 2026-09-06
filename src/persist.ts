@@ -6,7 +6,7 @@ import { StateStore, flatFileNameFor, type PersistedEnvelope } from "acp-kernel/
 import { sessionsDir } from "./paths.js";
 import { log as loggerLog } from "./logger.js";
 import { PersistEpermAlert } from "./persist-eperm.js";
-import { createInitialState, type CompressionState, type CoreMessage } from "acp-kernel";
+import { createInitialState, defaultCountTokens, prune, type CompressionState, type CoreMessage } from "acp-kernel";
 import type { Session, BlockContent, BlockView } from "./session.js";
 
 /**
@@ -108,10 +108,18 @@ interface PersistedSession {
     state: CompressionState;
     /** blockContents serialized as a plain record (Maps do not survive JSON). */
     blockContents: Record<string, BlockContent>;
-    /** Latest full-conversation snapshot (v3+): the client's raw messages
-     *  from its most recent request, overwritten every turn. Absent on v2
-     *  files — export falls back to block-only rendering. */
+    /** Latest folded-view conversation snapshot (v3+): prune() rendered
+     *  summaries in place of folded ranges, then truncated to the newest
+     *  BILI_PERSIST_TAIL_TOKENS tokens (#401) — the raw full history is NOT
+     *  persisted (it duplicated 63% of the corpus; originals of folded
+     *  ranges remain available offline via blockContents). Absent on v2
+     *  files and when the tail budget is 0 — export falls back to
+     *  block-only rendering. */
     messages?: CoreMessage[];
+    /** True when `messages` is an already-pruned folded snapshot (see above);
+     *  absent on records written before #401, whose `messages` held the raw
+     *  history and must still be pruned at export time. */
+    messagesFolded?: boolean;
 }
 
 type Logger = (level: "info" | "warn" | "error", msg: string) => void;
@@ -398,13 +406,15 @@ export class SessionStore {
 }
 
 function buildRecord(session: Session): PersistedSession {
+    const snapshot = boundedFoldedSnapshot(session);
     return {
         version: PERSIST_VERSION,
         savedAt: Date.now(),
         id: session.id,
         meta: { ...session.meta },
         stats: { ...session.stats },
-        messages: session.lastMessages,
+        messages: snapshot,
+        messagesFolded: snapshot ? true : undefined,
         metadata: { ...session.metadata },
         state: session.state,
         blockContents: Object.fromEntries(session.blockContents),
@@ -466,6 +476,7 @@ function buildSession(parsed: PersistedSession): Session {
         restored: true,
         blockContents,
         lastMessages: Array.isArray(parsed.messages) ? parsed.messages : undefined,
+        lastMessagesFolded: parsed.messagesFolded === true,
         inFlight: 0,
         persisted: true,
     };
@@ -494,6 +505,47 @@ function persistEnabled(): boolean {
     const env = process.env.BILI_PERSIST;
     if (env === "0" || env === "false") return false;
     return true;
+}
+
+/** Token budget for the persisted folded-view snapshot (#401). The raw full
+ *  history is never persisted — prune() first replaces folded ranges with
+ *  their summaries (exactly what `bili export` renders by default), then the
+ *  OLDEST messages are dropped until the view fits. 0 disables message
+ *  persistence entirely (block summaries + blockContents survive). */
+function persistTailTokens(): number {
+    const env = process.env.BILI_PERSIST_TAIL_TOKENS;
+    if (env) {
+        const n = Number.parseInt(env, 10);
+        if (Number.isFinite(n) && n >= 0) return n;
+    }
+    return 16384;
+}
+
+/** Bounded folded-view snapshot for the on-disk record (#401). See
+ *  PersistedSession.messages. Truncation keeps whole messages from the NEWEST
+ *  end; at least one message always survives (even if it alone exceeds the
+ *  budget — a handoff doc with an empty tail is useless). */
+function boundedFoldedSnapshot(session: Session): CoreMessage[] | undefined {
+    const msgs = session.lastMessages;
+    if (!msgs || msgs.length === 0) return undefined;
+    const budget = persistTailTokens();
+    if (budget === 0) return undefined;
+    let view = prune(msgs, session.state);
+    let total = 0;
+    for (const m of view) total += defaultCountTokens(m.text ?? "");
+    if (total > budget) {
+        let acc = 0;
+        let start = 0;
+        for (let i = view.length - 1; i >= 0; i--) {
+            acc += defaultCountTokens(view[i]!.text ?? "");
+            if (acc > budget) {
+                start = Math.min(i + 1, view.length - 1);
+                break;
+            }
+        }
+        if (start > 0) view = view.slice(start);
+    }
+    return view;
 }
 
 function epermAlertThreshold(): number {

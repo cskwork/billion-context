@@ -418,7 +418,12 @@ pass an explicit `x-acp-session` header per conversation to avoid collisions.
 
 The proxy persists each session's compression state to the sessions dir
 (`%USERPROFILE%\.local\share\billion-context\` by default) and rewrites the
-file every turn of a long session. On Windows, real-time antivirus (Windows
+file every turn of a long session. Persisted per session: the compression
+state (block summaries), the compressed originals cache (`blockContents`,
+what `bili export --full` recovers), and a bounded folded-view snapshot of
+the recent conversation (newest `BILI_PERSIST_TAIL_TOKENS` tokens, default
+16k) — the raw full history is never duplicated on disk (#401). On
+Windows, real-time antivirus (Windows
 Defender), the search indexer, or a sync tool (OneDrive) can lock that
 directory mid-write, so the rename fails with `EPERM` and every persist for
 that session fails until the lock clears.
