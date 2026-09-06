@@ -115,6 +115,27 @@ function stripFinishReasonChunk(buf: Buffer): Buffer {
     }
 }
 
+function patchUsageChunk(eventStr: string, parsed: Record<string, unknown>, u: Record<string, unknown>, hostCredit: number): Buffer {
+    const pu = typeof u.prompt_tokens === "number" ? u.prompt_tokens : undefined;
+    const tu = typeof u.total_tokens === "number" ? u.total_tokens : undefined;
+    if (hostCredit > 0 && (pu !== undefined || tu !== undefined)) {
+        const patched = {
+            ...parsed,
+            usage: {
+                ...u,
+                ...(pu !== undefined ? { prompt_tokens: pu + hostCredit } : {}),
+                ...(tu !== undefined ? { total_tokens: tu + hostCredit } : {}),
+            },
+        };
+        const out = eventStr
+            .split("\n")
+            .map((l) => (l.startsWith("data:") ? `data: ${JSON.stringify(patched)}` : l))
+            .join("\n");
+        return Buffer.from(out + "\n\n", "utf8");
+    }
+    return Buffer.from(eventStr + "\n\n", "utf8");
+}
+
 export function createOpenaiAdapter(requestBody: Record<string, unknown>, clientSystem?: string, hostCredit = 0): CompressLoopAdapter {
     const model = (requestBody.model as string) ?? "unknown";
     let responseId = `chatcmpl-proxy-${Date.now()}`;
@@ -311,6 +332,13 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
                             outputTokens: typeof u.completion_tokens === "number" ? u.completion_tokens : undefined,
                             cachedTokens: typeof pd?.cached_tokens === "number" ? pd.cached_tokens : undefined,
                         } as ParsedStreamEvent;
+                        // #589: include_usage clients (dsh, OpenAI SDK) read usage
+                        // from this trailing empty-choices frame; raw tool-call rounds
+                        // must forward it (with the prepare-time credit), not swallow
+                        // it into the internal ledger.
+                        if (sawRealToolCall) {
+                            yield { kind: "meta", chunk: patchUsageChunk(eventStr, parsed, u, hostCredit) } as ParsedStreamEvent;
+                        }
                     }
                     continue;
                 }
@@ -334,26 +362,7 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
                         // post-fold usage) reaches the host verbatim — add the
                         // prepare-time credit back so the host anchors on the
                         // uncompressed baseline.
-                        let chunk = rawBuf;
-                        if (hostCredit > 0 && u) {
-                            const pu = typeof u.prompt_tokens === "number" ? u.prompt_tokens : undefined;
-                            const tu = typeof u.total_tokens === "number" ? u.total_tokens : undefined;
-                            if (pu !== undefined || tu !== undefined) {
-                                const patched = {
-                                    ...parsed,
-                                    usage: {
-                                        ...u,
-                                        ...(pu !== undefined ? { prompt_tokens: pu + hostCredit } : {}),
-                                        ...(tu !== undefined ? { total_tokens: tu + hostCredit } : {}),
-                                    },
-                                };
-                                const out = eventStr
-                                    .split("\n")
-                                    .map((l) => (l.startsWith("data:") ? `data: ${JSON.stringify(patched)}` : l))
-                                    .join("\n");
-                                chunk = Buffer.from(out + "\n\n", "utf8");
-                            }
-                        }
+                        const chunk = patchUsageChunk(eventStr, parsed, u ?? {}, hostCredit);
                         // This verbatim chunk IS the round's authoritative completion
                         // (suppressCompletion); write it once and never fall through
                         // to the text/reasoning branches (which would re-emit the same
