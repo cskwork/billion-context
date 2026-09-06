@@ -74,7 +74,7 @@ import { systemToUser, isLoopbackAddress, inspectContextOverflow, reserveOutputH
 import { BILI_TUNNEL_HEADER, checkTunnelDestination, tunnelAllowlistFromEnv } from "./tunnel-guard.js";
 
 import { decodeRequestBody } from "./content-encoding.js";
-import { applyCompatRoles, applyCompatRolesJson, resolveCompatRoles, type CompatRoles } from "./compat-roles.js";
+import { applyCompatRoles, applyCompatRolesJson, detectRoleRejection, resolveCompatRoles, type CompatRoles } from "./compat-roles.js";
 
 // Body dumps (dumps/req-*.json, raw/*-REQ.txt, raw/*-RES.txt, raw/*-INCOMING.txt,
 // req-*-REREQUEST.json) write the full plaintext request body and are off by
@@ -2685,24 +2685,36 @@ async function forward(
     if (typeof body === "string") {
         // upstreamUrl (the real destination) — not route?.rewrittenUrl, which
         // is undefined for zero-config requests and would skip provider compat.
-        const roles = resolveCompatRoles(opts.routes, upstreamUrl, opts.compat?.roles);
+        const configured = resolveCompatRoles(opts.routes, upstreamUrl, opts.compat?.roles);
+        // #552 learn-on-failure: roles this session learned from a role-
+        // rejection 400 overlay the configured map (empirical wins per key),
+        // so later requests skip the 400 round-trip. Session-scoped only —
+        // config stays user-owned.
+        const learned = (prepared?.session.metadata.learnedCompatRoles as CompatRoles | undefined) ?? {};
+        const roles = { ...configured, ...learned };
         const protocol = prepared?.protocol ?? route?.explicitProtocol ?? inferWireProtocol(req.url ?? "");
-        if (Object.keys(roles).length > 0 && (protocol === "openai" || protocol === "responses")) {
-            compatRoles = roles;
+        // compatProtocol is armed even with zero roles: the learn-on-failure
+        // retry below needs it, and roles may be learned mid-request.
+        if (protocol === "openai" || protocol === "responses") {
             compatProtocol = protocol;
-            const applied = applyCompatRoles(body, protocol, roles);
-            if (applied.rewritten > 0) {
-                wireBody = applied.body;
-                log("info", `[${prepared?.session.id ?? "passthrough"}] [compat] rewrote ${applied.rewritten} message role(s) per compat.roles (${Object.entries(roles).map(([f, t]) => `${f}→${t}`).join(",")})`);
+            if (Object.keys(roles).length > 0) {
+                compatRoles = roles;
+                const applied = applyCompatRoles(body, protocol, roles);
+                if (applied.rewritten > 0) {
+                    wireBody = applied.body;
+                    log("info", `[${prepared?.session.id ?? "passthrough"}] [compat] rewrote ${applied.rewritten} message role(s) per compat.roles (${Object.entries(roles).map(([f, t]) => `${f}→${t}`).join(",")})`);
+                }
             }
         }
     }
     // #552: wire transform shared by ALL re-send paths (compress-retry loops
     // below) so re-sent bodies carry the same rewrite as the initial forward —
     // otherwise a developer-role 400 would hit mid-stream on the first retry.
-    const wireTransform = compatRoles && compatProtocol
+    // Reads compatRoles at CALL time: a role learned mid-request (retry below)
+    // applies to later re-sends within the same request.
+    const wireTransform = compatProtocol
         ? (b: Record<string, unknown>): Record<string, unknown> => {
-            applyCompatRolesJson(b, compatProtocol, compatRoles);
+            if (compatRoles) applyCompatRolesJson(b, compatProtocol, compatRoles);
             return b;
         }
         : undefined;
@@ -2818,6 +2830,68 @@ async function forward(
     } catch (error) {
         recordUpstreamConnection(upstreamUrl, proxyUrl, error);
         throw new Error(`upstream request failed: ${formatUpstreamError(error, upstreamUrl, proxyUrl)}`, { cause: error });
+    }
+    // #552 learn-on-failure: a converting upstream that rejects a role (codex
+    // ≥0.153 sends "developer"; vLLM/SGLang-style backends answer 400
+    // "Invalid role: developer") gets ONE auto-retry with the offending role
+    // rewritten to "system". On success the mapping is remembered on the
+    // session (never written to config — the log carries the permanent
+    // per-provider snippet instead). On failure the original response
+    // continues downstream verbatim. 400 bodies are small (buffered below).
+    if (
+        compatProtocol &&
+        typeof wireBody === "string" &&
+        upstreamResult.response.status === 400 &&
+        upstreamResult.response.body
+    ) {
+        let roleErrText: string | null = null;
+        try {
+            roleErrText = (await readStreamToBuffer(upstreamResult.response.body)).toString("utf8");
+        } catch {
+            roleErrText = null;
+        }
+        if (roleErrText !== null) {
+            // Rebuild the consumed body so the error path below re-reads the
+            // same bytes verbatim (fetchWithTimeout ships rebuilt Responses
+            // itself, so this shape is established).
+            upstreamResult = {
+                response: new Response(roleErrText, {
+                    status: upstreamResult.response.status,
+                    statusText: upstreamResult.response.statusText,
+                    headers: new Headers(upstreamResult.response.headers),
+                }),
+                clearTimer: upstreamResult.clearTimer,
+            };
+            const rejection = detectRoleRejection(upstreamResult.response.status, roleErrText);
+            if (rejection && rejection.role !== "system") {
+                const fixed = applyCompatRoles(wireBody, compatProtocol, { [rejection.role]: "system" });
+                if (fixed.rewritten > 0) {
+                    try {
+                        const retry = await fetchWithTimeout(upstreamUrl, { ...init, body: fixed.body }, undefined, clientAbort.signal);
+                        if (retry.response.ok) {
+                            upstreamResult.clearTimer();
+                            const s = prepared?.session;
+                            if (s) {
+                                const prev = (s.metadata.learnedCompatRoles as CompatRoles | undefined) ?? {};
+                                s.metadata.learnedCompatRoles = { ...prev, [rejection.role]: "system" };
+                                markDirty(s);
+                            }
+                            // Same-request re-sends (compress-retry loops) must
+                            // carry the rewrite too — wireTransform reads this
+                            // variable at call time.
+                            compatRoles = { ...compatRoles, [rejection.role]: "system" };
+                            const providerKey = new URL(upstreamUrl).origin;
+                            log("info", `[${prepared?.session.id ?? "passthrough"}] [compat] upstream rejected role "${rejection.role}" — auto-rewrote ${fixed.rewritten} message role(s) to "system", retry OK (remembered for this session only). To make permanent, add: {"providers":{"${providerKey}":{"compat":{"roles":{"${rejection.role}":"system"}}}}`);
+                            upstreamResult = retry;
+                        } else {
+                            retry.clearTimer();
+                        }
+                    } catch {
+                        // retry transport failure — keep the original 400
+                    }
+                }
+            }
+        }
     }
     const { response: upstream, clearTimer: clearUpstreamTimer } = upstreamResult;
     const respHeaders: Record<string, string> = {};

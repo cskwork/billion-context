@@ -372,6 +372,14 @@ prompt alike), global or per-provider, default off = byte-for-byte:
 }
 ```
 
+**No configuration needed for the common case.** When an upstream answers a
+request with `400 Invalid role: …`, bili auto-rewrites the offending role to
+`system`, retries the request once, and — if the retry succeeds — remembers
+the mapping **for that session only** (nothing is written to your config).
+Later requests in the session skip the 400 round-trip. The log line printed
+when the auto-fix fires includes a copy-paste per-provider snippet if you
+want the mapping permanently.
+
 ## How sessions work
 
 The proxy needs a stable per-conversation identifier to isolate compression

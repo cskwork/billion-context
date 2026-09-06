@@ -70,6 +70,37 @@ export function applyCompatRolesJson(
     return rewritten;
 }
 
+/** Stop-words that follow "role" in prose ("Invalid role must be one…"):
+ *  a captured token equal to one of these means the regex grabbed a word
+ *  from the sentence, not a role name. */
+const ROLE_CAPTURE_STOPWORDS = new Set([
+    "must", "should", "be", "is", "one", "of", "the", "a", "an", "in", "for", "not", "was", "and", "or", "to", "only", "allowed", "supported", "valid", "value", "message", "messages",
+]);
+
+const ROLE_REJECTION_PATTERNS = [
+    /(?:invalid|unknown|unsupported|unrecognized|unexpected)[a-z ]{0,24}?role\s*[:=]?\s*["'`]?([a-z][a-z0-9_-]{1,31})["'`]?/i,
+    /role\s*[:=]?\s*["'`]?([a-z][a-z0-9_-]{1,31})["'`]?\s+(?:is\s+)?not\s+(?:supported|allowed|recognized|valid|accepted)/i,
+];
+
+/** Detect an upstream 400 that exists only because of a message role the
+ *  provider does not support (e.g. codex ≥0.153 sends "developer";
+ *  converting backends answer 400 "Invalid role: developer"). Conservative by
+ *  design: status must be 400, the body must blame a role, and the captured
+ *  token must look like a role name. Returns the offending role so the
+ *  caller can auto-rewrite it to a supported one. */
+export function detectRoleRejection(status: number, bodyText: string): { role: string } | null {
+    if (status !== 400) return null;
+    const head = bodyText.slice(0, 4096);
+    for (const re of ROLE_REJECTION_PATTERNS) {
+        const m = re.exec(head);
+        if (!m) continue;
+        const role = m[1].toLowerCase();
+        if (ROLE_CAPTURE_STOPWORDS.has(role)) continue;
+        return { role };
+    }
+    return null;
+}
+
 export function applyCompatRoles(
     body: string,
     protocol: "openai" | "responses",

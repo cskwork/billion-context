@@ -10,7 +10,7 @@ import { startServer } from "../src/server.ts";
 import { loadRoutes, type ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
-import { applyCompatRoles, applyCompatRolesJson, parseCompatRoles, resolveCompatRoles } from "../src/compat-roles.ts";
+import { applyCompatRoles, applyCompatRolesJson, detectRoleRejection, parseCompatRoles, resolveCompatRoles } from "../src/compat-roles.ts";
 
 function close(server: http.Server): Promise<void> {
     return new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
@@ -255,6 +255,105 @@ test("e2e #552 D: per-provider compat.roles wins over global", async () => {
         });
         assert.equal(res.status, 200);
         assert.deepEqual(seen[0], ["user"], "provider compat entry wins per key");
+    } finally {
+        await harness.stop();
+        harness.cleanup();
+        await close(upstream);
+    }
+});
+
+test("detectRoleRejection: extracts the offending role, conservative otherwise", () => {
+    assert.deepEqual(detectRoleRejection(400, '{"error":{"message":"Invalid role: developer"}}'), { role: "developer" });
+    assert.deepEqual(detectRoleRejection(400, "Invalid message role: 'system'"), { role: "system" });
+    assert.deepEqual(detectRoleRejection(400, "400 Bad Request: role developer is not supported"), { role: "developer" });
+    assert.deepEqual(detectRoleRejection(400, 'Unexpected role=assistant for input'), { role: "assistant" });
+    // Prose traps: captured token is a stopword → no detection.
+    assert.equal(detectRoleRejection(400, "Invalid role must be one of: system, user"), null);
+    // Wrong status / unrelated bodies.
+    assert.equal(detectRoleRejection(401, '{"error":{"message":"Invalid role: developer"}}'), null);
+    assert.equal(detectRoleRejection(400, '{"error":{"message":"insufficient quota"}}'), null);
+    // Pydantic-style validation error: the rejected role name is not in the
+    // text at all — must NOT produce a bogus detection.
+    assert.equal(detectRoleRejection(400, '[{"loc":["body","messages",0,"role"],"msg":"Input should be \'system\', \'user\', \'tool\' or \'assistant\'"}]'), null);
+});
+
+function roleRejectingUpstream(): Promise<{ server: http.Server; seen: string[][] }> {
+    const seen: string[][] = [];
+    const server = http.createServer((req, res) => {
+        const chunks: Buffer[] = [];
+        req.on("data", (c: Buffer) => chunks.push(c));
+        req.on("end", () => {
+            let roles: string[] = [];
+            try {
+                const parsed = JSON.parse(Buffer.concat(chunks).toString("utf8")) as { input?: Array<{ role?: string }>; messages?: Array<{ role?: string }> };
+                roles = [...(parsed.input ?? []), ...(parsed.messages ?? [])].map((m) => m.role ?? "?");
+            } catch { /* ignore */ }
+            seen.push(roles);
+            if (roles.includes("developer")) {
+                res.writeHead(400, { "content-type": "application/json" });
+                res.end(JSON.stringify({ error: { message: "Invalid role: developer" } }));
+            } else {
+                res.writeHead(200, { "content-type": "application/json" });
+                res.end(JSON.stringify({ ok: true }));
+            }
+        });
+    });
+    return new Promise((resolve) => server.listen(0, "127.0.0.1", () => resolve({ server, seen })));
+}
+
+test("e2e #552 E: role-rejection 400 auto-retries, learns session-scoped, skips the round-trip next time", async () => {
+    const { server: upstream, seen } = await roleRejectingUpstream();
+    const harness = await startProxy(upstream, { compatJson: `{"providers":{}}` });
+    try {
+        const payload = JSON.stringify({ model: "test", input: [{ type: "message", role: "developer", content: "be terse" }] });
+        const res1 = await fetch(`http://127.0.0.1:${harness.port}/v1/responses`, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-session-id": "compat-roles-learn" },
+            body: payload,
+        });
+        assert.equal(res1.status, 200, "client sees a transparent 200 after the auto-retry");
+        const res2 = await fetch(`http://127.0.0.1:${harness.port}/v1/responses`, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-session-id": "compat-roles-learn" },
+            body: payload,
+        });
+        assert.equal(res2.status, 200);
+        // 3 upstream hits total: req1 rejected (developer), req1-retried (system),
+        // req2 rewritten BEFORE fetch via the learned session map (system).
+        assert.equal(seen.length, 3, `expected 3 upstream hits, got ${JSON.stringify(seen)}`);
+        assert.deepEqual(seen[0], ["developer"], "first hit carries the client's developer role (no compat configured)");
+        assert.deepEqual(seen[1], ["system"], "auto-retry rewrote developer→system");
+        assert.deepEqual(seen[2], ["system"], "second request skipped the 400 round-trip (session learned)");
+    } finally {
+        await harness.stop();
+        harness.cleanup();
+        await close(upstream);
+    }
+});
+
+test("e2e #552 F: retry that still fails passes the original 400 through verbatim", async () => {
+    const hits: number[] = [];
+    const upstream = http.createServer((req, res) => {
+        const chunks: Buffer[] = [];
+        req.on("data", (c: Buffer) => chunks.push(c));
+        req.on("end", () => {
+            hits.push(1);
+            res.writeHead(400, { "content-type": "application/json" });
+            res.end(JSON.stringify({ error: { message: "Invalid role: developer" } }));
+        });
+    });
+    await new Promise<void>((resolve) => upstream.listen(0, "127.0.0.1", () => resolve()));
+    const harness = await startProxy(upstream, { compatJson: `{"providers":{}}` });
+    try {
+        const res = await fetch(`http://127.0.0.1:${harness.port}/v1/responses`, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-session-id": "compat-roles-fail" },
+            body: JSON.stringify({ model: "test", input: [{ type: "message", role: "developer", content: "be terse" }] }),
+        });
+        assert.equal(res.status, 400, "client receives the upstream 400");
+        const text = await res.text();
+        assert.ok(text.includes("Invalid role: developer"), `original error body preserved verbatim, got: ${text}`);
+        assert.equal(hits.length, 2, "exactly one retry, no loop");
     } finally {
         await harness.stop();
         harness.cleanup();
