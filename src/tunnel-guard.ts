@@ -44,15 +44,30 @@ export function parseIpLiteral(s: string): string | null {
     return null;
 }
 
+/** IPv4-mapped v6 in ANY form → the plain dotted quad: both the dotted
+ *  `::ffff:1.2.3.4` and the HEX form `::ffff:102:304` the WHATWG URL parser
+ *  canonicalizes hostnames to (`new URL("http://[::ffff:127.0.0.1]/")` yields
+ *  `[::ffff:7f00:1]`), which otherwise sails past every dotted-only matcher.
+ *  Range classification and self-membership then see one shape. */
+export function normalizeIpLiteral(ip: string): string {
+    const t = ip.trim().toLowerCase();
+    if (!t.startsWith("::ffff:")) return t;
+    const dotted = t.match(/^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/);
+    if (dotted) return dotted[1];
+    const hex = t.match(/^::ffff:0*([0-9a-f]{1,4}):0*([0-9a-f]{1,4})$/);
+    if (hex) {
+        const hi = parseInt(hex[1], 16);
+        const lo = parseInt(hex[2], 16);
+        return `${(hi >> 8) & 255}.${hi & 255}.${(lo >> 8) & 255}.${lo & 255}`;
+    }
+    return t;
+}
+
 export function classifyIp(ip: string): IpClass {
-    const lit = parseIpLiteral(ip);
+    const lit = normalizeIpLiteral(parseIpLiteral(ip) ?? "");
     if (!lit) return "public";
-    // v6 (incl. ::ffff:a.b.c.d mapped — normalize BEFORE the v4 branch, which
-    // would otherwise split on the dots of a mapped literal and NaN out).
     if (lit.includes(":")) {
         if (lit === "::1" || lit === "::") return "loopback";
-        const mapped = lit.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);
-        if (mapped) return classifyIp(mapped[1]);
         if (lit.startsWith("fe8") || lit.startsWith("fe9") || lit.startsWith("fea") || lit.startsWith("feb")) return "linkLocal";
         if (lit.startsWith("fc") || lit.startsWith("fd")) return "private"; // fc00::/7 ULA
         return "public";
@@ -122,7 +137,7 @@ export async function checkTunnelDestination(origin: string, ctx: TunnelCheckCon
     let ips: string[];
     const literal = parseIpLiteral(host);
     if (literal) {
-        ips = [literal];
+        ips = [normalizeIpLiteral(literal)];
     } else {
         try {
             ips = await (ctx.resolveHost ?? dnsResolveHost)(host);
@@ -132,10 +147,12 @@ export async function checkTunnelDestination(origin: string, ctx: TunnelCheckCon
         if (ips.length === 0) return { ok: false, code: "unresolvable", message: `no addresses for tunnel destination ${host}` };
     }
     // Layer 1: the proxy itself — the /__bili/ management plane must never be
-    // reachable through the tunnel, from any client.
+    // reachable through the tunnel, from any client. 0.0.0.0/:: as a
+    // destination routes to the local host, so our own port through them is
+    // a self-loop even though neither literal sits in the interface set.
     if (ctx.selfPort !== undefined && port === ctx.selfPort) {
         const mine = (ctx.localIps ?? localMachineIps)();
-        if (ips.some((ip) => mine.has(ip.toLowerCase()) || mine.has(`::ffff:${ip.toLowerCase()}`))) {
+        if (ips.some((ip) => ip === "0.0.0.0" || ip === "::" || mine.has(ip.toLowerCase()) || mine.has(`::ffff:${ip.toLowerCase()}`))) {
             return { ok: false, code: "self", message: "the bili tunnel may not target the proxy itself" };
         }
     }

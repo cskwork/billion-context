@@ -10,7 +10,7 @@ import { startServer } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
-import { classifyIp, checkTunnelDestination, tunnelAllowlistFromEnv, parseIpLiteral, type ResolveHost } from "../src/tunnel-guard.ts";
+import { classifyIp, checkTunnelDestination, tunnelAllowlistFromEnv, parseIpLiteral, normalizeIpLiteral, type ResolveHost } from "../src/tunnel-guard.ts";
 
 /** #409: the /bili/<absolute-url> tunnel must not reach the proxy's own
  *  management plane, link-local metadata, or (for remote clients) any
@@ -23,6 +23,17 @@ test("parseIpLiteral: quads, v6, mapped; names are not literals", () => {
     assert.equal(parseIpLiteral("::ffff:192.168.0.1"), "::ffff:192.168.0.1");
     assert.equal(parseIpLiteral("metadata.google.internal"), null);
     assert.equal(parseIpLiteral("localhost"), null);
+});
+
+test("normalizeIpLiteral: WHATWG-hex mapped forms fold to dotted quads", () => {
+    assert.equal(normalizeIpLiteral("::ffff:192.168.0.1"), "192.168.0.1", "dotted mapped passes through");
+    assert.equal(normalizeIpLiteral("::ffff:7f00:1"), "127.0.0.1", "hex loopback (what new URL canonicalizes [::ffff:127.0.0.1] to)");
+    assert.equal(normalizeIpLiteral("::FFFF:A9FE:A9FE"), "169.254.169.254", "hex metadata");
+    assert.equal(normalizeIpLiteral("::ffff:0a00:0001"), "10.0.0.1", "leading zeros tolerated");
+    assert.equal(normalizeIpLiteral("::ffff:808:808"), "8.8.8.8", "hex public");
+    assert.equal(normalizeIpLiteral("::ffff:not:a-quad"), "::ffff:not:a-quad", "non-mapped ::ffff: left alone");
+    assert.equal(normalizeIpLiteral("fe80::1"), "fe80::1", "plain v6 untouched");
+    assert.equal(new URL("http://[::ffff:127.0.0.1]:8787/").hostname, "[::ffff:7f00:1]", "precondition: WHATWG URL really emits the hex form");
 });
 
 test("classifyIp: range matrix", () => {
@@ -40,6 +51,11 @@ test("classifyIp: range matrix", () => {
     assert.equal(classifyIp("::ffff:10.0.0.1"), "private");
     assert.equal(classifyIp("8.8.8.8"), "public");
     assert.equal(classifyIp("2606:4700::1111"), "public");
+    // WHATWG-canonicalized hex mapped forms must classify like their v4 twin.
+    assert.equal(classifyIp("::ffff:7f00:1"), "loopback", "hex-mapped loopback is not public");
+    assert.equal(classifyIp("::ffff:a9fe:a9fe"), "linkLocal", "hex-mapped metadata is not public");
+    assert.equal(classifyIp("::ffff:a00:1"), "private", "hex-mapped RFC1918 is not public");
+    assert.equal(classifyIp("::ffff:808:808"), "public", "hex-mapped public stays public");
 });
 
 const localIps = () => new Set(["127.0.0.1", "::1", "192.168.1.5", "127.0.0.2"]);
@@ -56,6 +72,18 @@ test("checkTunnelDestination: self always denied, any client", async () => {
     }
     const otherPort = await checkTunnelDestination("http://127.0.0.1:8199", { selfPort: 8787, clientLoopback: true, allowlist: [], localIps });
     assert.equal(otherPort.ok, true, "loopback client reaching a DIFFERENT local service is the self-hosted upstream case");
+    // Hex-mapped self (WHATWG URL canonicalizes [::ffff:127.0.0.1] to the hex
+    // form) and the unspecified-address forms must land in the self layer too.
+    for (const clientLoopback of [true, false]) {
+        const hex = await checkTunnelDestination("http://[::ffff:127.0.0.1]:8787", { selfPort: 8787, clientLoopback, allowlist: [], localIps });
+        assert.equal(hex.ok, false);
+        assert.equal(hex.code, "self", "hex-mapped loopback on the serving port is self");
+        const unspec = await checkTunnelDestination("http://0.0.0.0:8787", { selfPort: 8787, clientLoopback, allowlist: [], localIps });
+        assert.equal(unspec.ok, false);
+        assert.equal(unspec.code, "self", "0.0.0.0 routes to the local host: our own port is a self-loop");
+    }
+    const unspecOther = await checkTunnelDestination("http://0.0.0.0:8199", { selfPort: 8787, clientLoopback: true, allowlist: [], localIps });
+    assert.equal(unspecOther.ok, true, "0.0.0.0 on a different port is still the local self-hosted case for local clients");
 });
 
 test("checkTunnelDestination: link-local/metadata always denied, incl. via DNS names", async () => {
@@ -88,6 +116,16 @@ test("checkTunnelDestination: private destinations — local allow, remote needs
     assert.equal(allowHost.ok, true, "bare-host allowlist entry matches any port on that host");
     const wrongPort = await checkTunnelDestination("http://127.0.0.1:9000/v1", { selfPort: 8787, clientLoopback: false, allowlist: ["127.0.0.1:8199"], localIps });
     assert.equal(wrongPort.ok, false, "host:port entry must not unlock other ports");
+    // Hex-mapped private (what [::ffff:10.0.0.1] canonicalizes to): remote
+    // clients denied, local clients allowed — same verdict as the dotted twin.
+    const hexRemote = await checkTunnelDestination("http://[::ffff:10.0.0.1]:9999/v1", { selfPort: 8787, clientLoopback: false, allowlist: [], localIps });
+    assert.equal(hexRemote.ok, false);
+    assert.equal(hexRemote.code, "privateRemote", "hex-mapped RFC1918 denied for remote clients");
+    const hexLocal = await checkTunnelDestination("http://[::ffff:10.0.0.1]:9999/v1", { selfPort: 8787, clientLoopback: true, allowlist: [], localIps });
+    assert.equal(hexLocal.ok, true, "hex-mapped private is fine for local clients (self-hosted upstream)");
+    const hexMeta = await checkTunnelDestination("http://[::ffff:169.254.169.254]/latest/meta-data/", { selfPort: 8787, clientLoopback: true, allowlist: [], localIps });
+    assert.equal(hexMeta.ok, false);
+    assert.equal(hexMeta.code, "linkLocal", "hex-mapped metadata denied even for local clients");
 });
 
 test("checkTunnelDestination: public destinations pass for any client; unresolvable denied", async () => {
