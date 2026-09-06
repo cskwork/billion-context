@@ -11,6 +11,7 @@ import { loadRoutes, type ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { applyCompatRoles, applyCompatRolesJson, detectRoleRejection, parseCompatRoles, resolveCompatRoles } from "../src/compat-roles.ts";
+import { _liveUpstreamTimersForTest } from "../src/fetch-util.ts";
 
 function close(server: http.Server): Promise<void> {
     return new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
@@ -354,9 +355,19 @@ test("e2e #552 F: retry that still fails passes the original 400 through verbati
         const text = await res.text();
         assert.ok(text.includes("Invalid role: developer"), `original error body preserved verbatim, got: ${text}`);
         assert.equal(hits.length, 2, "exactly one retry, no loop");
+        await waitFor(() => _liveUpstreamTimersForTest() === 0);
+        assert.equal(_liveUpstreamTimersForTest(), 0, "abandoned retry body must not re-arm the idle timer after clearTimer");
     } finally {
         await harness.stop();
         harness.cleanup();
         await close(upstream);
     }
 });
+
+async function waitFor(probe: () => boolean, deadlineMs = 3000): Promise<void> {
+    const start = Date.now();
+    while (!probe()) {
+        if (Date.now() - start > deadlineMs) return;
+        await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+}

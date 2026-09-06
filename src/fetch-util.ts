@@ -52,6 +52,7 @@ export async function fetchWithTimeout(
     externalSignal?: AbortSignal,
 ): Promise<{ response: Response; clearTimer: () => void }> {
     const controller = new AbortController();
+    let cleared = false;
     const armTimer = () => {
         const t = setTimeout(() => {
             liveUpstreamTimers.delete(t);
@@ -62,6 +63,11 @@ export async function fetchWithTimeout(
     };
     let timer = armTimer();
     const rearm = () => {
+        // A late body chunk can resolve after the consumer already called
+        // clearTimer (abandoned response — e.g. a failed retry whose body is
+        // never read, or a client abort). Re-arming after cleanup would leak
+        // a fresh 10-minute timer and pin the event loop (#552 e2e hang).
+        if (cleared) return;
         clearTimeout(timer);
         liveUpstreamTimers.delete(timer);
         timer = armTimer();
@@ -75,6 +81,7 @@ export async function fetchWithTimeout(
         }
     }
     const cleanup = () => {
+        cleared = true;
         clearTimeout(timer);
         liveUpstreamTimers.delete(timer);
         if (onExternalAbort && externalSignal) externalSignal.removeEventListener("abort", onExternalAbort);
