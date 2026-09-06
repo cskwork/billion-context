@@ -355,7 +355,7 @@ export type PluginToolDeps = {
 
 /** Context-level visibility for plugin UIs (status bars / slash commands):
  *  the same usage the nudge decision sees, keyed by conversation id. */
-export function handlePluginStatus(conversationId: string, res: import("node:http").ServerResponse, fallbackLatest = false): void {
+export function handlePluginStatus(conversationId: string, res: import("node:http").ServerResponse, deps: PluginToolDeps, fallbackLatest = false): void {
     let entry = conversations.get(conversationId);
     let session = entry ? peekSession(entry.sessionId) : undefined;
     let viaFallback = false;
@@ -385,6 +385,28 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
     const limit = session.metadata.effectiveContextLimit;
     const mem = remembered.get(session.id);
     const modelContextLimit = typeof limit === "number" && limit > 0 ? limit : 0;
+    // #387: the remembered nudge is a prepare-time snapshot. A compress tool
+    // executed after the last model request mutates state without re-running
+    // prepare, so that snapshot would list already-compressed refs as
+    // compressible next to the new blocks (stale ranges + live blocks in one
+    // panel). Recompute from live state on every status read — same pattern
+    // as acp_status; on failure omit the nudge/ranges sections instead of
+    // serving the stale snapshot.
+    let nudge: NudgeDecision | undefined;
+    try {
+        const messages = mem ? (mem.processed.length > 0 ? mem.processed : mem.original) : [];
+        if (messages.length > 0) {
+            nudge = deps.core.processTurn({
+                messages,
+                state: session.state,
+                config: deps.config,
+                tokenCount: session.stats.lastInputTokens,
+                renderTags: "none",
+            }).nudge;
+        }
+    } catch {
+        nudge = undefined;
+    }
     let panel: string | undefined;
     try {
         panel = buildStatusPanel({
@@ -392,7 +414,7 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
             tokenCount: session.stats.lastInputTokens,
             systemPromptTokens: 0,
             state: session.state,
-            nudge: mem?.nudge,
+            nudge,
             modelContextLimit,
             unprunedTokens: mem && mem.original.length > 0
                 ? mem.original.reduce((sum, m) => sum + defaultCountTokens(m.text ?? ""), 0)
@@ -471,7 +493,6 @@ export async function handlePluginTool(
                 messages,
                 session,
                 log: (m) => deps.log("info", `[${session.id}] [plugin] ${m}`),
-                nudge: mem?.nudge,
             }, callId);
         });
     } catch (err) {
