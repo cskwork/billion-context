@@ -19,7 +19,7 @@ import { proxyDispatcher } from "../upstream-proxy.js";
 import { noteWeakOverflow } from "../weak-overflow.js";
 import { warnCacheCollapse } from "../cache-warn.js";
 import { log as loggerLog } from "../logger.js";
-import type { WireProtocol } from "../util.js";
+import { promptInputTotal, type WireProtocol } from "../util.js";
 
 export const MAX_LOOP_ROUNDS = 10;
 
@@ -166,21 +166,15 @@ function recordUsage(
     const prompt = usage.inputTokens;
     const cached = usage.cachedTokens;
     const out = usage.outputTokens;
-    // Adapters emit `inputTokens` in protocol-native units: Anthropic's
-    // `input_tokens` is the NEW (uncached) portion only (cached reported
-    // separately), while OpenAI/Responses report the TOTAL (cached already
-    // included). Add `cached` back in ONLY when it is not already part of
-    // `prompt` — otherwise the cached portion is double-counted, inflating the
-    // context size (→ premature compression) and deflating the hit rate.
-    const includesCached = ctx.protocol === "openai" || ctx.protocol === "responses";
-    const total =
-        (typeof prompt === "number" ? prompt : 0) +
-        (!includesCached && typeof cached === "number" ? cached : 0);
+    const total = promptInputTotal(ctx.protocol, prompt, cached);
     if (total > 0) ctx.session.stats.inputTokens += total;
     // Net out this turn's compress credit: the post-compress re-request
     // re-sends the unfolded history, so its usage report over-reports the
     // context the NEXT request will actually carry (see stream.ts applyRanges).
     ctx.session.stats.lastInputTokens = Math.max(0, total - (ctx.session.stats.compressCreditTokens ?? 0));
+    // #408: remember the input-side total reported to the host AFTER the
+    // prepare-time fold backfill (uncompressed baseline), for the /acp panel.
+    ctx.session.hostContextTokens = total + (ctx.session.hostCreditTokens ?? 0);
     if (typeof cached === "number") {
         ctx.session.stats.cachedTokens += cached;
         ctx.session.stats.cacheSamples += 1;
@@ -360,6 +354,15 @@ export async function* runCompressLoop(
                 usage.cachedTokens !== undefined
             ) {
                 recordUsage(ctx, usage, round);
+            }
+            // #408: the provider measured the FOLDED (post-compress) view; add
+            // the prepare-time credit back so the completion event the host
+            // anchors on reports the uncompressed baseline. recordUsage above
+            // already ran on the un-backfilled numbers (internal ledger stays
+            // post-fold).
+            const hostCredit = ctx.session.hostCreditTokens ?? 0;
+            if (hostCredit > 0 && typeof usage.inputTokens === "number") {
+                usage.inputTokens += hostCredit;
             }
 
             let resolvedText = assistantText;

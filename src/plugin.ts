@@ -11,7 +11,7 @@ import { containsRenderTagText, createTagEchoFilter, mayStartRenderTag, stripAnt
 import { log as loggerLog } from "./logger.js";
 import { noteWeakOverflow } from "./weak-overflow.js";
 import { warnCacheCollapse } from "./cache-warn.js";
-import type { WireProtocol } from "./util.js";
+import { backfillHostUsage, promptInputTotal, type WireProtocol } from "./util.js";
 import { stateDir } from "./paths.js";
 
 // The proxy's own version, read from package.json at runtime (works in both dev
@@ -411,7 +411,7 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
     try {
         panel = buildStatusPanel({
             version: `billion-context@${PROXY_VERSION}`,
-            tokenCount: session.stats.lastInputTokens,
+            tokenCount: session.hostContextTokens ?? session.stats.lastInputTokens,
             systemPromptTokens: 0,
             state: session.state,
             nudge,
@@ -431,7 +431,8 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
         label: session.meta.label ?? null,
         pluginAgent: session.metadata.pluginAgent ?? null,
         contextLimit: typeof limit === "number" ? limit : null,
-        contextTokens: session.stats.lastInputTokens,
+        contextTokens: session.hostContextTokens ?? session.stats.lastInputTokens,
+        hostCredit: session.hostCreditTokens ?? 0,
         inputTokens: session.stats.inputTokens,
         outputTokens: session.stats.outputTokens,
         cachedTokens: session.stats.cachedTokens,
@@ -558,21 +559,22 @@ function usageFromSseEvent(obj: Record<string, unknown>): UsageSample | undefine
 function applyUsageSample(session: Session, sample: UsageSample, protocol?: WireProtocol): void {
     // inputTokens is protocol-native: Anthropic reports it NEW-only (cached
     // separate); OpenAI/Responses report the TOTAL (cached already included).
-    // Add cached back in only when it is not already part of inputTokens.
-    const includesCached = protocol === "openai" || protocol === "responses";
+    // promptInputTotal adds the cached segment back when it is not part of
+    // inputTokens — including the #408 split-semantics violation on OpenAI
+    // wires (prompt_tokens < cached_tokens → cached is NOT included).
     if (sample.cachedTokens !== undefined) {
         session.stats.cachedTokens += sample.cachedTokens;
         session.stats.cacheSamples += 1;
     }
     if (sample.inputTokens !== undefined) {
-        const total =
-            sample.inputTokens +
-            (!includesCached && sample.cachedTokens !== undefined ? sample.cachedTokens : 0);
+        const total = promptInputTotal(protocol, sample.inputTokens, sample.cachedTokens);
         session.stats.inputTokens += total;
         // Net out pending compress savings (see stream.ts applyRanges): plugin
         // compress tool results shrink the next request, not this report.
         session.stats.lastInputTokens = Math.max(0, total - (session.stats.compressCreditTokens ?? 0));
         warnCacheCollapse(session, total, sample.cachedTokens ?? 0);
+        // #408: host-facing baseline = this report + prepare-time fold credit.
+        session.hostContextTokens = total + (session.hostCreditTokens ?? 0);
     }
     if (sample.outputTokens !== undefined) session.stats.outputTokens += sample.outputTokens;
 }
@@ -613,6 +615,7 @@ export async function pipePluginChatWithStrip(
     const decoder = new TextDecoder("utf-8");
     let buf = "";
     const acc: UsageSample = {};
+    const credit = session?.hostCreditTokens ?? 0;
     const onDrop = (snippet: string) => {
         loggerLog("warn", `[tag-echo] stripped model-emitted render tag (plugin passthrough): ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
         log?.(`[tag-echo] stripped model-emitted render tag from plugin passthrough text`);
@@ -778,14 +781,38 @@ export async function pipePluginChatWithStrip(
                     if (ev["type"] === "message_stop") sawTerminal = true;
                     const sample = usageFromSseEvent(ev);
                     if (sample) mergeUsageSample(acc, sample);
+                    // #408: backfill the input-side usage so the host anchors on
+                    // the uncompressed baseline. Patch `ev` BEFORE the tag-echo
+                    // processors run and only rebuild when they return the event
+                    // verbatim — otherwise their render-tag stripping is lost.
+                    // message_delta input_tokens is normally absent (or a 0 echo)
+                    // — only patch a real echo.
+                    let backfilled = false;
+                    if (credit > 0 && protocol) {
+                        const usage =
+                            ev["type"] === "message_start"
+                                ? ((ev["message"] as Record<string, unknown> | undefined)?.["usage"] as Record<string, unknown> | undefined)
+                                : (ev["usage"] as Record<string, unknown> | undefined);
+                        const deltaEcho = ev["type"] === "message_delta" && (num(usage?.["input_tokens"]) ?? 0) <= 0;
+                        if (usage && !deltaEcho && backfillHostUsage(protocol, usage, credit)) backfilled = true;
+                    }
                     const out = protocol === "anthropic" ? processAnthropic(ev, rawEvent) : processOpenai(ev, rawEvent);
-                    if (out.length > 0) await write(out);
+                    if (backfilled && out === rawEvent + "\n\n") {
+                        await write(rebuildEvent(rawEvent, ev));
+                    } else if (out.length > 0) {
+                        await write(out);
+                    }
                 }
             }
             if (res.destroyed || res.writableEnded) break;
         }
+        if (buf.length > 0 && !res.destroyed && !res.writableEnded) await write(buf);
         const rest = flushTails();
         if (rest.length > 0 && !res.destroyed && !res.writableEnded) await write(rest);
+        // Settle BEFORE res.end() in the finally below: the client can issue
+        // its next request (e.g. /__bili/plugin/status, or the follow-up turn
+        // that reads lastInputTokens for the nudge decision) the moment the
+        // stream completes, and those must already see this usage.
         settleUsage();
         maybeNoteTruncated();
     } catch (e) {
@@ -846,10 +873,11 @@ export async function pipePluginResponsesWithStrip(
         loggerLog("warn", `[tag-echo] stripped model-emitted render tag (plugin passthrough): ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
         log?.(`[tag-echo] stripped model-emitted render tag from plugin passthrough text`);
     });
-    const write = (s: string) => {
+    const write = (s: string): Promise<void> => {
         if (!res.write(Buffer.from(s, "utf8"))) {
             return new Promise<void>((r) => res.once("drain", () => r()));
         }
+        return Promise.resolve();
     };
     // #411: keep the usage sniffed before an abort (see
     // pipePluginChatWithStrip).
@@ -917,7 +945,21 @@ export async function pipePluginResponsesWithStrip(
                     ) {
                         if (type === "response.completed" || type === "response.failed" || type === "response.incomplete") sawTerminal = true;
                         // done-family events also carry full text payloads — strip those too.
-                        const out = containsRenderTagText(jsonStr) ? rebuildEvent(rawEvent, stripResponsesText(ev)) : rawEvent + "\n\n";
+                        let evOut = ev;
+                        let rebuild = containsRenderTagText(jsonStr);
+                        if (rebuild) evOut = stripResponsesText(ev);
+                        if (type === "response.completed") {
+                            // #408: acc already holds the pre-backfill sample
+                            // (usageFromSseEvent ran above) — the internal
+                            // ledger stays post-fold, the host gets the
+                            // uncompressed baseline.
+                            const credit = session?.hostCreditTokens ?? 0;
+                            const usage = (evOut["response"] as Record<string, unknown> | undefined)?.["usage"] as Record<string, unknown> | undefined;
+                            if (credit > 0 && usage && backfillHostUsage("responses", usage, credit)) {
+                                rebuild = true;
+                            }
+                        }
+                        const out = rebuild ? rebuildEvent(rawEvent, evOut) : rawEvent + "\n\n";
                         await write(flushTail(out));
                         continue;
                     }
@@ -1013,8 +1055,10 @@ export async function pipePluginJson(
     }
     reader.releaseLock();
     const text = Buffer.concat(chunks).toString("utf8");
+    let json: Record<string, unknown> | undefined;
+    let mutated = false;
     try {
-        const json = JSON.parse(text) as Record<string, unknown>;
+        json = JSON.parse(text) as Record<string, unknown>;
         const usage = json["usage"] as Record<string, unknown> | undefined;
         if (session && usage) {
             const input = num(usage["prompt_tokens"]) ?? num(usage["input_tokens"]);
@@ -1028,19 +1072,26 @@ export async function pipePluginJson(
                         num(usage["cache_read_input_tokens"]),
                 }, protocol);
                 markDirty(session);
+                // #408: backfill mutates json.usage in place — reserialize below.
+                const credit = session.hostCreditTokens ?? 0;
+                if (credit > 0 && protocol && backfillHostUsage(protocol, usage, credit)) {
+                    mutated = true;
+                }
             }
         }
     } catch { /* non-JSON body — forward verbatim */ }
-    if (containsRenderTagText(text)) {
+    if (json && containsRenderTagText(text)) {
         // #206 parity for the non-streaming plugin path: the compress loop's
         // JSON branch strips render tags from every round; a verbatim plugin
-        // JSON response would re-feed the model's tag echoes.
-        try {
-            const json = JSON.parse(text) as Record<string, unknown>;
-            const stripped = protocol === "responses" ? stripResponsesText(json) : protocol === "anthropic" ? stripAnthropicText(json) : stripOpenaiChatText(json);
-            res.end(Buffer.from(JSON.stringify(stripped), "utf8"));
-            return;
-        } catch { /* fall through to verbatim */ }
+        // JSON response would re-feed the model's tag echoes. Strips mutate in
+        // place, so this composes with the #408 usage backfill above — one
+        // parse, one reserialize.
+        json = protocol === "responses" ? stripResponsesText(json) : protocol === "anthropic" ? stripAnthropicText(json) : stripOpenaiChatText(json);
+        mutated = true;
+    }
+    if (mutated && json) {
+        res.end(Buffer.from(JSON.stringify(json), "utf8"));
+        return;
     }
     res.end(text);
 }

@@ -78,9 +78,11 @@ export function usageTotals(
         };
     }
     if (protocol === "openai") {
+        const prompt = num(usage["prompt_tokens"]);
+        const cached = num((usage["prompt_tokens_details"] as Record<string, unknown> | undefined)?.["cached_tokens"]);
         return {
-            total: num(usage["prompt_tokens"]),
-            cached: num((usage["prompt_tokens_details"] as Record<string, unknown> | undefined)?.["cached_tokens"]),
+            total: prompt !== undefined ? promptInputTotal("openai", prompt, cached) : undefined,
+            cached,
         };
     }
     // responses
@@ -88,6 +90,53 @@ export function usageTotals(
         total: num(usage["input_tokens"]),
         cached: num((usage["input_tokens_details"] as Record<string, unknown> | undefined)?.["cached_tokens"]),
     };
+}
+
+/** #408: input-side total from a protocol-native input/cached pair.
+ *  OpenAI/Responses report the TOTAL (cached already included); Anthropic
+ *  reports fresh-only. Some OpenAI-wire upstreams violate that and report
+ *  Anthropic-style split semantics (prompt_tokens = fresh-only, cached
+ *  separate) — under true OpenAI semantics prompt_tokens >= cached_tokens
+ *  always holds, so a violation proves the cached segment is NOT part of
+ *  prompt_tokens and must be added back (e.g. {prompt_tokens:6,
+ *  cached_tokens:26278} is a real ~26284-token prompt, not 6). */
+export function promptInputTotal(
+    protocol: WireProtocol | undefined,
+    input: number | undefined,
+    cached: number | undefined,
+): number {
+    if (input === undefined) return 0;
+    const includesCached = protocol === "openai" || protocol === "responses";
+    const splitSemantics = !includesCached || (typeof cached === "number" && input < cached);
+    return input + (splitSemantics && typeof cached === "number" ? cached : 0);
+}
+
+/** #408: add the prepare-time fold credit back into a usage object's
+ *  input-side fields, in place, so the host's usage anchor reports the
+ *  uncompressed baseline instead of the post-fold value the provider measured.
+ *  Field names per protocol: Anthropic/Responses `input_tokens` (TOTAL there),
+ *  OpenAI `prompt_tokens` (+ `total_tokens` to keep the sum consistent).
+ *  Returns true when anything was patched. */
+export function backfillHostUsage(
+    protocol: WireProtocol,
+    usage: Record<string, unknown>,
+    credit: number,
+): boolean {
+    if (!Number.isFinite(credit) || credit <= 0) return false;
+    let patched = false;
+    const add = (key: string): void => {
+        if (typeof usage[key] === "number" && Number.isFinite(usage[key])) {
+            usage[key] = (usage[key] as number) + credit;
+            patched = true;
+        }
+    };
+    if (protocol === "openai") {
+        add("prompt_tokens");
+        add("total_tokens");
+    } else {
+        add("input_tokens");
+    }
+    return patched;
 }
 
 /** Result of inspecting an upstream response for a "context too long" error. */
