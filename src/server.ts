@@ -296,17 +296,23 @@ export function resolveUpstream(_opts: ProxyOptions, reqUrl: string, req?: http.
     // sent this request in absolute form (`GET http://host/path HTTP/1.1`) —
     // exactly what httpx emits for plain-http base URLs through a proxy. Route
     // it like the /bili/ embedded form: the absolute URL IS the upstream, same
-    // tunnel semantics. A target equal to this request's own Host header means
-    // the client is asking the proxy to fetch ITSELF — forwarding that would
-    // loop the request straight back into handle(), so fall through (own-API
-    // routing) instead.
+    // tunnel semantics.
+    //
+    // #562: do NOT decide "is this the proxy itself?" from the client-provided
+    // Host header. In a real forward proxy the client sets Host to the UPSTREAM
+    // (== the URL authority), so comparing u.host against req.headers.host
+    // misclassified every legitimate forward-proxy request as a self-request
+    // and dropped it to `undefined` — losing the per-upstream context-window
+    // config (route?.rewrittenUrl undefined) while the fallback forward still
+    // reached the upstream (chat kept working, the window silently didn't).
+    // Self-targeting is decided by the ACTUAL listening endpoint instead: mark
+    // this a tunnel and let checkTunnelDestination's self-layer (destination
+    // port == our bound port AND a local-machine IP) 403 a genuine self-forward
+    // before any forwarding — no silent fall-through to the fallback path.
     if (reqUrl.startsWith("http://") || reqUrl.startsWith("https://")) {
         try {
             const u = new URL(reqUrl);
-            const ownHost = (req?.headers.host ?? "").toLowerCase();
-            if (u.host.toLowerCase() !== ownHost) {
-                return { upstream: `${u.protocol}//${u.host}`, rewrittenUrl: reqUrl, tunnel: true };
-            }
+            return { upstream: `${u.protocol}//${u.host}`, rewrittenUrl: reqUrl, tunnel: true };
         } catch {
             // malformed absolute URL
         }

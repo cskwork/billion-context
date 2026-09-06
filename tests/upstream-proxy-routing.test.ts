@@ -4,7 +4,7 @@ import http from "node:http";
 import net from "node:net";
 import { once } from "node:events";
 import { defaultConfig } from "acp-kernel";
-import { loadOptions, type ProxyOptions } from "../src/config.ts";
+import { loadOptions, resolveConfiguredContextLimit, type ProxyOptions, type ProviderRoutes } from "../src/config.ts";
 import { resolveUpstream, startServer } from "../src/server.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
@@ -57,7 +57,7 @@ test("/bili/ resolves upstream host and full path from embedded URL", () => {
     assert.equal(resolveUpstream(opts, "/bili-not-owned/responses"), undefined);
 });
 
-test("#535: absolute-form request URLs route as forward-proxy targets (self-host guard)", () => {
+test("#535/#562: absolute-form request URLs route as forward-proxy targets", () => {
     const opts = loadOptions({ ACP_PORT: "8787" });
     // httpx through an http_proxy emits absolute form for plain-http base URLs
     assert.deepEqual(resolveUpstream(opts, "http://127.0.0.1:8199/v1/chat/completions", { headers: { host: "127.0.0.1:8787" } } as never), {
@@ -70,15 +70,40 @@ test("#535: absolute-form request URLs route as forward-proxy targets (self-host
         rewrittenUrl: "https://relay.example/v1/responses?x=1",
         tunnel: true,
     });
-    // a target equal to the request's own Host header is the proxy itself —
-    // forwarding would loop the request back into handle(); fall through.
-    assert.equal(
-        resolveUpstream(opts, "http://127.0.0.1:8787/v1/chat/completions", { headers: { host: "127.0.0.1:8787" } } as never),
-        undefined,
-        "self-target falls through to own-API routing",
-    );
+    // #562: the real transport form — every genuine forward-proxy request has
+    // Host == the URL authority (the client points Host at the UPSTREAM, not the
+    // proxy). These MUST route as tunnels; previously they were dropped to
+    // undefined (misread as self), silently losing per-upstream window config.
+    assert.deepEqual(resolveUpstream(opts, "http://model-server.example.invalid:8080/v1/responses", { headers: { host: "model-server.example.invalid:8080" } } as never), {
+        upstream: "http://model-server.example.invalid:8080",
+        rewrittenUrl: "http://model-server.example.invalid:8080/v1/responses",
+        tunnel: true,
+    });
+    // A target pointing back at the proxy's own listen endpoint is still marked
+    // a tunnel here — the client Host header cannot distinguish it from a real
+    // upstream in a forward proxy. It is rejected downstream by
+    // checkTunnelDestination's self-layer (bound port + local IP) before any
+    // forwarding; see the forward-absolute-url self-target integration test.
+    assert.deepEqual(resolveUpstream(opts, "http://127.0.0.1:8787/v1/chat/completions", { headers: { host: "127.0.0.1:8787" } } as never), {
+        upstream: "http://127.0.0.1:8787",
+        rewrittenUrl: "http://127.0.0.1:8787/v1/chat/completions",
+        tunnel: true,
+    });
     assert.equal(resolveUpstream(opts, "http://127.0.0.1:8787:bad/v1"), undefined, "malformed absolute URL falls through");
     assert.equal(resolveUpstream(opts, "/v1/chat/completions", { headers: { host: "127.0.0.1:8787" } } as never), undefined, "origin-form stays own-API");
+});
+
+test("#562: forward-proxy and /bili/ forms of the same upstream resolve the same model window", () => {
+    const opts = loadOptions({ ACP_PORT: "8787" });
+    const fwd = resolveUpstream(opts, "http://model-server.example.invalid:8080/v1/responses", { headers: { host: "model-server.example.invalid:8080" } } as never);
+    const bili = resolveUpstream(opts, "/bili/http://model-server.example.invalid:8080/v1/responses");
+    assert.ok(fwd && bili, "both access modes must produce a route");
+    assert.equal(fwd.rewrittenUrl, bili.rewrittenUrl, "forward-proxy and /bili/ must share one target resolution");
+    const routes: ProviderRoutes = {
+        "http://model-server.example.invalid:8080": { models: { "example-model": { context: 120_000 } } },
+    };
+    assert.equal(resolveConfiguredContextLimit(routes, fwd.rewrittenUrl, "example-model"), 120_000, "forward-proxy hits the per-upstream window, not the global default");
+    assert.equal(resolveConfiguredContextLimit(routes, bili.rewrittenUrl, "example-model"), 120_000);
 });
 
 test("/bili/ integration preserves query, subscription, account and thread headers", async () => {
