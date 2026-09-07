@@ -11,6 +11,7 @@ export function buildVisibilityMarker(toolName: string, result: string): string 
         decompress: "📤",
         search_context: "🔍",
         acp_status: "📊",
+        absorb: "🫧",
     };
     const icon = failed ? "❌" : (icons[toolName] ?? "📦");
 

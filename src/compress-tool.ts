@@ -10,7 +10,7 @@
  *    and adds the #603 quote-salvage fallback (single→double quote repair)
  *    for the one malformation class the kernel ladder does not cover.
  */
-import { parseCompressArgs } from "acp-kernel";
+import { parseCompressArgs, ABSORB_TOOL_OPENAI } from "acp-kernel";
 import { log as loggerLog } from "./logger.js";
 import { maxShrinkPerCompress } from "./fetch-util.js";
 
@@ -46,9 +46,23 @@ export {
     buildCompressSystemPrompt,
     buildCompressTextSystemPrompt,
     buildCompressHybridSystemPrompt,
+    ABSORB_TOOL_NAME,
+    ABSORB_TOOL,
+    ABSORB_TOOL_OPENAI,
+    buildAbsorbSystemPrompt,
 } from "acp-kernel";
-export type { ParsedRange } from "acp-kernel";
+export type { ParsedRange, AbsorbConfig } from "acp-kernel";
 export { ACP_TOOL_NAMES as PROXY_TOOL_NAMES, ACP_MUTATING_TOOLS as MUTATING_PROXY_TOOLS, ACP_READONLY_TOOLS as READONLY_PROXY_TOOLS } from "acp-kernel";
+
+// The kernel ships no Responses-format absorb const (the four ACP tools have
+// *_RESPONSES variants; absorb is host-registered opt-in). Synthesize it in
+// the same flat shape as SEARCH_CONTEXT_TOOL_RESPONSES.
+export const ABSORB_TOOL_RESPONSES = {
+    type: "function",
+    name: ABSORB_TOOL_OPENAI.function.name,
+    description: ABSORB_TOOL_OPENAI.function.description,
+    parameters: ABSORB_TOOL_OPENAI.function.parameters,
+};
 
 export function parseCompressInput(input: unknown, callId?: string) {
     const first = parseCompressArgs(input, { callId });

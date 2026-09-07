@@ -203,11 +203,11 @@ test("plugin manifest serves the exact wire tool schemas, headers and version", 
         assert.equal(manifest.ok, true);
         assert.equal(manifest.protocolVersion, 1);
         assert.ok(/^\d+\.\d+\.\d+/.test(manifest.version), `version looks wrong: ${manifest.version}`);
-        assert.deepEqual([...manifest.toolNames].sort(), ["acp_status", "compress", "decompress", "search_context"]);
+        assert.deepEqual([...manifest.toolNames].sort(), ["absorb", "acp_status", "compress", "decompress", "search_context"]);
         const names = manifest.tools.anthropic!.map((t) => t.name).sort();
-        assert.deepEqual(names, ["acp_status", "compress", "decompress", "search_context"]);
-        assert.equal(manifest.tools.openai!.length, 4);
-        assert.equal(manifest.tools.responses!.length, 4);
+        assert.deepEqual(names, ["absorb", "acp_status", "compress", "decompress", "search_context"]);
+        assert.equal(manifest.tools.openai!.length, 5);
+        assert.equal(manifest.tools.responses!.length, 5);
         assert.equal(manifest.headers.agent, "x-bili-plugin");
         assert.equal(manifest.headers.conversation, "x-bili-plugin-conversation");
         assert.equal(manifest.toolEndpoint, "/__bili/plugin/tool");
@@ -388,10 +388,11 @@ test("plugin tool API error paths: bad JSON, unknown tool, unknown conversation"
         });
         assert.equal(badJson.status, 400);
 
+        const { raw } = await callPluginAnthropic(h, "err-conv", [{ role: "user", content: "hello" }]);
         const badTool = await fetch(`http://127.0.0.1:${h.proxyPort}/__bili/plugin/tool`, {
             method: "POST",
             headers: { "content-type": "application/json" },
-            body: JSON.stringify({ conversationId: "never-seen", tool: "rm-rf", args: {} }),
+            body: JSON.stringify({ conversationId: "err-conv", tool: "rm-rf", args: {} }),
         });
         assert.equal(badTool.status, 400);
 

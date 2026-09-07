@@ -136,7 +136,7 @@ function patchUsageChunk(eventStr: string, parsed: Record<string, unknown>, u: R
     return Buffer.from(eventStr + "\n\n", "utf8");
 }
 
-export function createOpenaiAdapter(requestBody: Record<string, unknown>, clientSystem?: string, hostCredit = 0): CompressLoopAdapter {
+export function createOpenaiAdapter(requestBody: Record<string, unknown>, clientSystem?: string, hostCredit = 0, absorbName?: string): CompressLoopAdapter {
     const model = (requestBody.model as string) ?? "unknown";
     let responseId = `chatcmpl-proxy-${Date.now()}`;
     let toolIndex = 0;
@@ -258,7 +258,9 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
             const settleToolCalls = function* (): Generator<ParsedStreamEvent> {
                 const realIndexes = new Set<number>();
                 for (const [idx, tc] of pending) {
-                    if (tc.name.length > 0 && !PROXY_TOOL_SET.has(tc.name)) realIndexes.add(idx);
+                    // absorb joins PROXY_TOOL_SET dynamically: its name is configurable per session,
+                    // and misclassifying it as real would raw-replay its chunks to the client.
+                    if (tc.name.length > 0 && !PROXY_TOOL_SET.has(tc.name) && tc.name !== absorbName) realIndexes.add(idx);
                 }
                 sawRealToolCall = realIndexes.size > 0;
                 if (!sawRealToolCall) {

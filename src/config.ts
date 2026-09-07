@@ -124,6 +124,32 @@ export type CompressSettings = {
     /** Must be true for `prompts` overrides to take effect. Acknowledges the
      *  summary-quality risk documented on `prompts`. */
     acknowledgePromptsRisk?: boolean;
+    /** Instant tool-result absorption (kernel absorb API, acp-kernel >= 0.0.54).
+     *  When `enabled`, eligible large tool results carry a forced [ACP absorb]
+     *  instruction and the model distills them via the injected `absorb` tool;
+     *  the original output is then hidden from every wire view until the next
+     *  fold round (and its token cost is netted out of usage credits, like
+     *  compress). Maps to kernel `Config.absorb`. Off unless explicitly
+     *  enabled at some level. NOT supported on Responses marker/text-protocol
+     *  routes (no native tool surface there). */
+    absorb?: {
+        /** Enable absorb for this scope. Absent/false = off (kernel semantics). */
+        enabled?: boolean;
+        /** Tool results smaller than this many tokens never get the absorb
+         *  instruction (kernel default 1000). */
+        minToolTokens?: number;
+        /** Only emit instructions once context usage reaches this fraction of
+         *  the model window (kernel `contextThresholdPct`). Accepts a ratio
+         *  (0.5) or percent string ("50%"); 0 = size gate alone (kernel
+         *  default). */
+        contextThresholdPct?: number | string;
+        /** Tool names whose results are never absorbable (glob-suffix
+         *  patterns, e.g. "read"). Kernel default: none. */
+        excludeTools?: string[];
+        /** Rename the wire tool (default "absorb"). Must stay unique against
+         *  the client's own tool names or the agent will call its own tool. */
+        toolName?: string;
+    };
 };
 export type PromptCacheRouting = "auto" | "enabled" | "disabled";
 export type UpstreamProxyMode = "auto" | "manual" | "direct";
@@ -573,6 +599,36 @@ export function parseCompressSettings(v: unknown): (CompressSettings & { injectT
     if ("acknowledgePromptsRisk" in obj) {
         if (typeof obj.acknowledgePromptsRisk !== "boolean") ok = false;
         else out.acknowledgePromptsRisk = obj.acknowledgePromptsRisk;
+    }
+    if ("absorb" in obj && obj.absorb !== undefined) {
+        const a = obj.absorb;
+        if (!a || typeof a !== "object" || Array.isArray(a)) {
+            ok = false;
+        } else {
+            const ao = a as Record<string, unknown>;
+            const cleaned: NonNullable<CompressSettings["absorb"]> = {};
+            for (const key of ["enabled", "minToolTokens", "contextThresholdPct", "excludeTools", "toolName"] as const) {
+                if (!(key in ao)) continue;
+                const v = ao[key];
+                if (key === "enabled") {
+                    if (typeof v !== "boolean") { ok = false; continue; }
+                    cleaned.enabled = v;
+                } else if (key === "minToolTokens") {
+                    if (typeof v !== "number" || !Number.isFinite(v)) { ok = false; continue; }
+                    cleaned.minToolTokens = v;
+                } else if (key === "contextThresholdPct") {
+                    if (!numberOrPercent(v)) { ok = false; continue; }
+                    cleaned.contextThresholdPct = typeof v === "string" ? v.trim() : v;
+                } else if (key === "excludeTools") {
+                    if (!Array.isArray(v) || v.some((x) => typeof x !== "string")) { ok = false; continue; }
+                    cleaned.excludeTools = [...v] as string[];
+                } else {
+                    if (typeof v !== "string" || v.trim().length === 0) { ok = false; continue; }
+                    cleaned.toolName = v.trim();
+                }
+            }
+            if (ok) out.absorb = cleaned;
+        }
     }
     if ("prompts" in obj && obj.prompts !== undefined) {
         const prompts = obj.prompts;

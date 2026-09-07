@@ -1,7 +1,7 @@
 // MCP stdio thin shell for launcher mode (#162): a single "bili" MCP server
 // the hosts load via --mcp-config / -c mcp_servers.bili. It fetches the
 // proxy's plugin manifest (single source of truth — zero schema drift),
-// exposes the 4 ACP tools over stdio JSON-RPC, and forwards executes to
+// exposes the manifest's ACP tools over stdio JSON-RPC, and forwards executes to
 // POST /__bili/plugin/tool. Claude Code passes its session id via the MCP
 // initialize request's _meta.ui.sessionId (documented SessionStart context);
 // we also accept BILI_CONVERSATION_ID env (codex spawn-time registration).
