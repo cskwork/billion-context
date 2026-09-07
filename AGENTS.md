@@ -101,9 +101,9 @@ misattributes on decompress. Consequences for this repo:
   the highest-numbered (newest) messages stay resident so the cursor does not
   drop, but this is a theoretical re-issue window — drop the map-prune once
   the kernel's ref-space widening (post-#191 direction) makes it unnecessary.
-- Do not bump `acp-kernel` to ≥0.0.48/0.0.49 (contain ref-slot reclamation,
-  reverted in kernel #191); resume bumping at the release that lands the
-  revert.
+- Historical note: kernel 0.0.48/0.0.49 briefly contained ref-slot
+  reclamation (reverted in kernel #191, see `persist/store.ts`). The guard
+  "do not bump past 0.0.47" is obsolete — master pins 0.0.56.
 
 ## 3. Development Standards
 
