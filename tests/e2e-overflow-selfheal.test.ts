@@ -10,13 +10,14 @@ import { startServer, type ProxyOptions } from "../src/server.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { listSessions, type Session } from "../src/session.ts";
+import { noteWeakOverflow } from "../src/weak-overflow.ts";
 
 // The configured window here is deliberately LARGE (400k) so it plays the role
 // of a wrong/mis-detected window (the 200k-fallback footgun for an unknown
 // model on a relay). The upstream truthfully reports its real window (128000)
 // via a context-overflow 400. The proxy must:
 //   1. detect the overflow and pass the 400 + body through verbatim;
-//   2. learn the real window (128000) into session.metadata.learnedContextLimits,
+//   2. learn the real window (128000) into session.metadata.confirmedContextLimits,
 //      keyed by the model that overflowed;
 //   3. arm an emergency shrink (lastInputTokens >= window);
 //   4. let the NEXT request recover (self-healed window, upstream 200);
@@ -109,10 +110,10 @@ test("e2e: upstream context overflow → learn window + arm shrink + pass throug
         assert.ok(r1text.includes("prompt is too long"), "error body must pass through");
 
         // The session learned the real window (per model) and armed the emergency shrink.
-        const s = listSessions().find((x) => (x.metadata.learnedContextLimits as Record<string, number> | undefined)?.["claude-test"] === 128000);
+        const s = listSessions().find((x) => (x.metadata.confirmedContextLimits as Record<string, number> | undefined)?.["claude-test"] === 128000);
         assert.ok(s, "a session learned the real window from the overflow (keyed by model)");
-        assert.equal(s!.metadata.learnedContextLimit, undefined, "no legacy scalar when the model is known");
-        assert.ok(s!.stats.lastInputTokens >= 128000, "emergency shrink armed (lastInputTokens >= window)");
+        assert.equal(s!.metadata.confirmedContextLimit, undefined, "no legacy scalar when the model is known");
+        assert.equal(s!.stats.lastInputTokens, 128000, "emergency shrink armed at exactly the parsed window (#570 guard)");
 
         // The prepare phase marks the session dirty once per request; the
         // overflow error path must add its OWN save for the learned window +
@@ -145,7 +146,7 @@ test("e2e: upstream context overflow → learn window + arm shrink + pass throug
         assert.equal(r3.status, 200);
         await r3.text(); // drain
         const s3 = listSessions().find((x) => x.id === s!.id);
-        const limits = s3?.metadata.learnedContextLimits as Record<string, number> | undefined;
+        const limits = s3?.metadata.confirmedContextLimits as Record<string, number> | undefined;
         assert.equal(limits?.["claude-big"], undefined, "no learned limit for the other model");
         assert.deepEqual(Object.keys(limits ?? {}), ["claude-test"], "only the overflowing model is scoped");
     } finally {
@@ -270,10 +271,10 @@ test("e2e #280: Codex overflow without window number → learn conservative wind
         // The proxy recognized the overflow and learned a conservative window
         // from the rejected payload's size (~13k tokens, NOT the configured 400k).
         const s = listSessions().find(
-            (x) => (x.metadata.learnedContextLimits as Record<string, number> | undefined)?.["claude-test"] !== undefined,
+            (x) => (x.metadata.confirmedContextLimits as Record<string, number> | undefined)?.["claude-test"] !== undefined,
         );
         assert.ok(s, "session learned a conservative window from the rejected payload");
-        const learned = (s!.metadata.learnedContextLimits as Record<string, number>)["claude-test"];
+        const learned = (s!.metadata.confirmedContextLimits as Record<string, number>)["claude-test"];
         assert.ok(learned >= 1000 && learned < 20_000, `conservative window ≈ rejected payload size (got ${learned})`);
         assert.ok(s!.stats.lastInputTokens >= learned, "emergency shrink armed (lastInputTokens >= learned window)");
 
@@ -302,6 +303,96 @@ test("e2e #280: Codex overflow without window number → learn conservative wind
         // through the proxy, so it lands no usage on this session.)
         const s2 = listSessions().find((x) => x.id === s!.id);
         assert.equal(s2?.stats.lastInputTokens, 5000);
+    } finally {
+        proxy.close();
+        await once(proxy, "close");
+        upstream.close();
+        await once(upstream, "close");
+    }
+});
+
+// #570 review guard: three KV-pressure-style mid-stream deaths ABOVE the true
+// window inflate lastInputTokens via noteWeakOverflow. When the genuine
+// overflow then parses the real window, the armed value must be reset to
+// EXACTLY it — otherwise the next request's retraction check reads the
+// failures' size as "a later success" and deletes the just-learned confirmed
+// window, contradicting the fix's own invariant (a true overflow cannot be
+// contradicted by a success, because one cannot happen above the real window).
+test("e2e #570: failed-turn arms above the true window do not retract the learned window", async () => {
+    let call = 0;
+    const upstream = http.createServer((req, res) => {
+        req.on("data", () => {});
+        req.on("end", () => {
+            // call 0: warmup success; call 1: genuine overflow 400; rest: 200.
+            if (call === 1) {
+                res.writeHead(400, { "content-type": "application/json" });
+                res.end(OVERFLOW_BODY);
+            } else {
+                res.writeHead(200, { "content-type": "text/event-stream" });
+                res.end(okSse());
+            }
+            call += 1;
+        });
+    });
+    upstream.listen(0, "127.0.0.1");
+    await once(upstream, "listening");
+    const upstreamPort = upstream.address().port;
+
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    setRegistryForTest({});
+    const proxy = await startServer({
+        port: 0,
+        host: "127.0.0.1",
+        upstream: "http://127.0.0.1",
+        routes: { [`http://127.0.0.1:${upstreamPort}`]: { models: { "claude-test": { context: 400_000 } } } },
+        modelContextLimit: 400_000,
+        kernelConfig: defaultConfig(400_000),
+        compress: { injectTool: true, injectNudge: true },
+        promptCache: { routing: "auto" },
+        sessionHeader: "x-acp-session",
+        log: false,
+        debug: false,
+        passthrough: false,
+        autoUpdate: false,
+        mitm: { enabled: false, domains: [] },
+    } as ProxyOptions);
+    await once(proxy, "listening");
+    const proxyPort = proxy.address().port;
+
+    try {
+        const url = `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/messages`;
+        const body = JSON.stringify({ model: "claude-test", max_tokens: 1024, stream: true, messages: [{ role: "user", content: "hello" }] });
+        const headers = { "content-type": "application/json", "x-acp-session": "retract-sess" };
+
+        const before = new Set(listSessions().map((x) => x.id));
+        const r0 = await fetch(url, { method: "POST", headers, body });
+        assert.equal(r0.status, 200);
+        await r0.text();
+        const sess = listSessions().find((x) => !before.has(x.id));
+        assert.ok(sess, "warmup request created the session");
+
+        // Three high-usage mid-stream deaths at 370k — above the true window
+        // (128000), >= 90% of the configured 400k: the #570 KV-pressure pattern.
+        for (const r of ["r1", "r2", "r3"]) {
+            noteWeakOverflow(sess!, { inputTokens: 370_000, model: "claude-test", reason: r });
+        }
+        assert.equal(sess!.stats.lastInputTokens, 370_000, "failure arms inflated the high-water mark above the true window");
+
+        // The genuine overflow learns the real window.
+        const r1 = await fetch(url, { method: "POST", headers, body });
+        assert.equal(r1.status, 400);
+        await r1.text();
+        const s1 = listSessions().find((x) => x.id === sess!.id);
+        assert.equal((s1!.metadata.confirmedContextLimits as Record<string, number>)["claude-test"], 128000, "real window learned from the overflow body");
+        assert.equal(s1!.stats.lastInputTokens, 128000, "#570 guard: armed at exactly the parsed window, not the failures' 370k");
+
+        // Next request: retraction runs BEFORE resolution — the capped arm must
+        // not delete the just-learned window.
+        const r2 = await fetch(url, { method: "POST", headers, body });
+        assert.equal(r2.status, 200, "recovery request succeeds");
+        await r2.text();
+        const s2 = listSessions().find((x) => x.id === sess!.id);
+        assert.equal((s2!.metadata.confirmedContextLimits as Record<string, number>)["claude-test"], 128000, "learned window survived the next request's retraction check");
     } finally {
         proxy.close();
         await once(proxy, "close");

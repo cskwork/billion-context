@@ -183,7 +183,7 @@ test("#393: self-heal raises a too-small fallback window when a turn exceeded it
         await r2.text();
         sess = listSessions().find((s) => s.id === "selfheal-sess")!;
         assert.equal(sess.metadata.effectiveContextLimit, 300_000, "window raised to the observed input");
-        assert.equal((sess.metadata.learnedContextLimits as Record<string, number>)["claude-unknown"], 300_000, "learned window persisted per model");
+        assert.equal((sess.metadata.confirmedContextLimits as Record<string, number>)["claude-unknown"], 300_000, "learned window persisted per model");
     } finally {
         await closeRig(rig);
     }
