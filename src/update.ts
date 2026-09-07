@@ -28,6 +28,8 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { cacheDir } from "./paths.js";
 import { log as loggerLog } from "./logger.js";
+import { proxyDispatcher } from "./upstream-proxy.js";
+import type { FetchOptions } from "./fetch-util.js";
 
 const REGISTRY_BASE = "https://registry.npmjs.org";
 const CHECK_INTERVAL_MS = 3 * 60 * 1000;
@@ -331,7 +333,26 @@ export type UpdateOptions = {
     currentVersion: string;
     /** Enable auto-install when a newer version is found. */
     autoUpdate: boolean;
+    /** Egress proxy resolver for the registry/tarball hosts (#609) — the CLI
+     *  wires in bili's upstream-proxy decision chain so updater fetches honor
+     *  the same routing (incl. NO_PROXY) as model traffic. Absent = direct. */
+    resolveProxy?: (url: string) => string | undefined;
 };
+
+/** Fetch dispatcher for updater egress (#609). undici's global fetch ignores
+ *  HTTP(S)_PROXY env vars, so without an explicit dispatcher the registry
+ *  check and tarball download always went direct even when model traffic is
+ *  routed through a configured proxy. undefined result = direct connection. */
+export function egressDispatcher(opts: Pick<UpdateOptions, "resolveProxy">, url: string): object | undefined {
+    return proxyDispatcher(opts.resolveProxy?.(url));
+}
+
+// @types/node types RequestInit.dispatcher as its internal Dispatcher
+// interface, which structurally conflicts with undici's ProxyAgent; at runtime
+// they're the same thing. Cast once here (no `as any`), as fetch-util does.
+function fetchWithEgress(url: string, init: FetchOptions): Promise<Response> {
+    return fetch(url, init as RequestInit);
+}
 
 /** Run a single check (throttled unless `force`). Safe to call frequently. */
 export async function checkForUpdate(opts: UpdateOptions, force = false): Promise<void> {
@@ -364,9 +385,11 @@ export async function checkForUpdate(opts: UpdateOptions, force = false): Promis
         loggerLog("info", `[update] checking npm registry for ${opts.packageName}${sinceLastSec < 0 ? " (startup check)" : sinceLastSec === 0 ? "" : ` (last check ${sinceLastSec}s ago)`}\u2026`);
 
         const url = `${REGISTRY_BASE}/${opts.packageName}/latest`;
-        const res = await fetch(url, {
+        const registryDispatcher = egressDispatcher(opts, url);
+        const res = await fetchWithEgress(url, {
             signal: AbortSignal.timeout(5000),
             headers: { Accept: "application/json" },
+            ...(registryDispatcher ? { dispatcher: registryDispatcher } : {}),
         });
         if (!res.ok) {
             loggerLog("warn", `[update] registry returned ${res.status} ${res.statusText}, skipping`);
@@ -413,7 +436,7 @@ export async function checkForUpdate(opts: UpdateOptions, force = false): Promis
             return;
         }
         try {
-            const result = await installViaTarball(latest, tarballUrl, installDir, integrity, shasum);
+            const result = await installViaTarball(latest, tarballUrl, installDir, integrity, shasum, egressDispatcher(opts, tarballUrl));
             if (result.ok) {
                 loggerLog("info", `[update] installed ${currentVersion} \u2192 ${latest}. Restart to finish.`);
             } else {
@@ -458,7 +481,8 @@ export function verifyTarballIntegrity(buf: Buffer, integrity?: string, shasum?:
 }
 
 /** Download the npm tarball, extract to a temp staging dir, verify, then copy
- *  over the install directory. */
+ *  over the install directory. `dispatcher` (optional) routes the download
+ *  through a proxy (#609); omitted = direct connection. */
 
 export async function installViaTarball(
     version: string,
@@ -466,6 +490,7 @@ export async function installViaTarball(
     installDir: string | undefined,
     integrity?: string,
     shasum?: string,
+    dispatcher?: object,
 ): Promise<{ ok: boolean; error?: string }> {
     if (!installDir) {
         return { ok: false, error: "cannot determine install directory (package.json not found walking up from running binary)" };
@@ -491,7 +516,10 @@ export async function installViaTarball(
     const MAX_TARBALL_BYTES = 100 * 1024 * 1024;
     let tgzBuffer: Buffer;
     try {
-        const tgzRes = await fetch(tarballUrl, { signal: AbortSignal.timeout(60_000) });
+        const tgzRes = await fetchWithEgress(tarballUrl, {
+            signal: AbortSignal.timeout(60_000),
+            ...(dispatcher ? { dispatcher } : {}),
+        });
         if (!tgzRes.ok) {
             return { ok: false, error: `tarball download failed: HTTP ${tgzRes.status} ${tgzRes.statusText}` };
         }

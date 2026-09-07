@@ -344,6 +344,9 @@ Rules:
 - Both outbound paths are covered: `/bili/` path-mode (fetch) AND MITM CONNECT
   tunnels (the proxy's connection to the real upstream goes through the HTTP
   CONNECT proxy).
+- The auto-updater's own egress (npm registry check + tarball download) uses
+  the same decision for its hosts, so `bili update` and auto-update work on
+  hosts where npm is only reachable through the proxy (#609).
 
 Env override: `BILI_UPSTREAM_PROXY=http://127.0.0.1:20172` (higher priority than
 the config file). On Windows, common Clash/Mihomo static system proxies are
