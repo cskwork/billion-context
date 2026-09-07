@@ -362,8 +362,10 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             failure = ABORTED_FAILURE;
             break;
         }
-        // Re-run the pipeline each round: every successful compress renumbers
-        // the surviving refs, so the previous round's range refs are stale.
+        // Re-run the pipeline each round: a successful compress hides its
+        // range behind a new block, changing the visible view; refs stay
+        // stable per-session snapshots (#387), but which ranges are
+        // compressible under them does not.
         const turn = deps.core.processTurn({
             messages,
             state: deps.session.state,
