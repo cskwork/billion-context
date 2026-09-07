@@ -391,6 +391,7 @@
 | `ACP_UPSTREAM` | 覆盖默认上游 base URL。 |
 | `ACP_LOG` | 设为 `0` 关闭请求日志。 |
 | `ACP_AUTO_UPDATE` | 设为 `0` 禁用自动更新检查。 |
+| `ACP_UPDATE_TAG` | 自动更新跟随的 dist-tag 通道（默认 `latest`，如 `dev`）。文件配置键：`updateTag`。`pr-N` 预览 tag 仅在显式配置时才会被跟随。 |
 | `ACP_PROVIDERS` | 指向外部 `providers.json` 的路径（旧版 / 共享文件）。 |
 | `BILI_REPLAY_RETRY_BASE_MS` | acp-loop 回放重试的基础退避延迟（毫秒）：上游瞬时拒绝后重试（默认 `1500`；设 `0` 关闭延迟）。见 #189。 |
 | `BILI_REPLAY_RETRY_MAX` | acp-loop 回放重试的总次数（默认 `3`；设 `1` 彻底关闭重试 —— 旧版 fail-fast 行为）。见 #189。 |
