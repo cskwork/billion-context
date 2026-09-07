@@ -216,15 +216,63 @@ function splitChunks(
     return chunks;
 }
 
-function summaryPayload(protocol: PreflightProtocol, model: string, system: string, content: string): Record<string, unknown> {
+function summaryPayload(protocol: PreflightProtocol, model: string, system: string, content: string, stream: boolean): Record<string, unknown> {
     if (protocol === "anthropic") {
-        return { model, max_tokens: MAX_SUMMARY_OUTPUT_TOKENS, system, messages: [{ role: "user", content }], stream: false };
+        return { model, max_tokens: MAX_SUMMARY_OUTPUT_TOKENS, system, messages: [{ role: "user", content }], stream };
     }
     if (protocol === "openai") {
-        return { model, max_tokens: MAX_SUMMARY_OUTPUT_TOKENS, messages: [{ role: "system", content: system }, { role: "user", content }], stream: false };
+        return { model, max_tokens: MAX_SUMMARY_OUTPUT_TOKENS, messages: [{ role: "system", content: system }, { role: "user", content }], stream };
     }
     // #488: codex relays reject Responses calls without store:false ("Store must be set to false").
-    return { model, max_output_tokens: MAX_SUMMARY_OUTPUT_TOKENS, instructions: system, input: [{ role: "user", content }], stream: false, store: false };
+    return { model, max_output_tokens: MAX_SUMMARY_OUTPUT_TOKENS, instructions: system, input: [{ role: "user", content }], stream, store: false };
+}
+
+// #626: some upstreams (ChatGPT-login codex backend) reject non-stream calls
+// outright with 400 "Stream must be set to true". Match the rejection broadly
+// enough to cover phrasing variants, narrowly enough that an unrelated 400
+// mentioning neither word never triggers a pointless stream retry.
+const STREAM_REQUIRED_RE = /\bstream\b[^\n]{0,60}\btrue\b/i;
+
+// Extract the summary text from a buffered SSE body (the streaming twin of
+// extractSummaryText). For Responses, prefer the response.completed event's
+// full response object (reuses the JSON extractor); otherwise accumulate
+// output_text deltas. Non-conforming upstreams that return plain JSON despite
+// stream:true are handled by the caller's JSON fallback.
+function extractSummaryFromSse(protocol: PreflightProtocol, text: string): string {
+    let out = "";
+    for (const line of text.split("\n")) {
+        if (!line.startsWith("data:")) continue;
+        const payload = line.slice(5).trim();
+        if (!payload || payload === "[DONE]") continue;
+        let obj: unknown;
+        try {
+            obj = JSON.parse(payload);
+        } catch {
+            continue;
+        }
+        if (!obj || typeof obj !== "object") continue;
+        const o = obj as Record<string, unknown>;
+        if (protocol === "anthropic") {
+            if (o.type === "content_block_delta") {
+                const d = o.delta as Record<string, unknown> | undefined;
+                if (d && d.type === "text_delta" && typeof d.text === "string") out += d.text;
+            }
+        } else if (protocol === "openai") {
+            const choices = o.choices;
+            if (Array.isArray(choices) && choices.length > 0) {
+                const delta = (choices[0] as Record<string, unknown>).delta as Record<string, unknown> | undefined;
+                if (delta && typeof delta.content === "string") out += delta.content;
+            }
+        } else {
+            if (o.type === "response.output_text.delta" && typeof o.delta === "string") {
+                out += o.delta;
+            } else if (o.type === "response.completed" && o.response && typeof o.response === "object") {
+                const full = extractSummaryText(protocol, o.response as Record<string, unknown>);
+                if (full) return full;
+            }
+        }
+    }
+    return out;
 }
 
 function extractSummaryText(protocol: PreflightProtocol, json: Record<string, unknown>): string {
@@ -262,12 +310,29 @@ async function summarizeRange(deps: PreflightDeps, content: string, startRef: st
     const system =
         buildCompressSystemPrompt(deps.prompts) +
         `\n\nTASK: The conversation segment below (messages ${startRef}–${endRef}) must be compressed because the session context exceeds the current model's window. Write a tier-1 compression summary of the segment following every rule above. Output ONLY the summary text — no preamble, no closing remarks, no tool calls.`;
+    // #626: the session remembers upstreams that require stream:true, so the
+    // extra 400 round-trip is paid at most once per session (persisted with
+    // the session metadata).
+    const learned = deps.session.metadata.preflightStreamSummary === true;
+    try {
+        return await requestSummary(deps, system, content, learned);
+    } catch (err) {
+        if (err instanceof UpstreamHttpError && err.status === 400 && !learned && STREAM_REQUIRED_RE.test(err.body)) {
+            deps.session.metadata.preflightStreamSummary = true;
+            deps.log("info", "[preflight] upstream requires stream for summaries; retrying with SSE (learned for this session)");
+            return await requestSummary(deps, system, content, true);
+        }
+        throw err;
+    }
+}
+
+async function requestSummary(deps: PreflightDeps, system: string, content: string, stream: boolean): Promise<string | null> {
     const { response, clearTimer } = await fetchWithRetry(
         deps.url,
         {
             method: "POST",
             headers: { "content-type": "application/json", ...deps.headers },
-            body: JSON.stringify(summaryPayload(deps.protocol, deps.model, system, content)),
+            body: JSON.stringify(summaryPayload(deps.protocol, deps.model, system, content, stream)),
             dispatcher: proxyDispatcher(deps.proxyUrl),
         },
         undefined,
@@ -283,11 +348,18 @@ async function summarizeRange(deps: PreflightDeps, content: string, startRef: st
         try {
             json = JSON.parse(text);
         } catch {
-            deps.log("warn", `[preflight] summary response was not JSON: ${text.slice(0, 200)}`);
-            return null;
+            json = null;
         }
-        if (!json || typeof json !== "object") return null;
-        const summary = extractSummaryText(deps.protocol, json as Record<string, unknown>).trim();
+        // Streaming bodies are SSE, but a non-conforming upstream may answer a
+        // stream:true call with plain JSON — accept either shape.
+        const summary = (json && typeof json === "object"
+            ? extractSummaryText(deps.protocol, json as Record<string, unknown>)
+            : stream
+                ? extractSummaryFromSse(deps.protocol, text)
+                : "").trim();
+        if (!json && !stream) {
+            deps.log("warn", `[preflight] summary response was not JSON: ${text.slice(0, 200)}`);
+        }
         if (summary.length < MIN_SUMMARY_CHARS) {
             deps.log("warn", `[preflight] summary too short (${summary.length} chars); skipping range`);
             return null;
