@@ -36,22 +36,22 @@ export const ERROR_DELIVERY: Record<WireExitId, ExitCell> = {
     "proxy-openai-sse": {
         implementer: [emitStreamError, emitPreflightError, startServer],
         contract: "mid-stream upstream failure → inline `error` delta + finish + [DONE]; late (early-committed) preflight failure → top-level error object + [DONE] in-band",
-        coveredBy: ["tests/proxy-stream-error.test.ts", "tests/wire-exit-matrix.test.ts"],
+        coveredBy: ["tests/proxy-stream-error.test.ts", "tests/wire-exit-matrix.test.ts", "tests/wire-exit-gap-cells.test.ts"],
     },
     "proxy-anthropic-sse": {
         implementer: [emitStreamError, emitPreflightError, startServer],
         contract: "mid-stream failure → content_block_delta error + message_stop; late preflight failure → event: error payload in-band",
-        coveredBy: ["tests/proxy-stream-error.test.ts", "tests/preflight-hold.test.ts"],
+        coveredBy: ["tests/proxy-stream-error.test.ts", "tests/preflight-hold.test.ts", "tests/wire-exit-gap-cells.test.ts"],
     },
     "proxy-responses-sse": {
         implementer: [emitStreamError, emitPreflightError, startServer],
         contract: "mid-stream failure → full item lifecycle (added → delta → done) + response.failed; late preflight failure → event: error in-band",
-        coveredBy: ["tests/proxy-stream-error.test.ts", "tests/preflight-hold.test.ts"],
+        coveredBy: ["tests/proxy-stream-error.test.ts", "tests/preflight-hold.test.ts", "tests/wire-exit-gap-cells.test.ts"],
     },
     "proxy-json": {
         implementer: [emitPreflightError, startServer],
         contract: "pre-headers failure → 4xx/5xx `{error}` JSON; post-early-commit failure → identical `{error}` JSON body on the already-committed 200",
-        coveredBy: ["tests/preflight-hold.test.ts", "tests/preflight-fail-fast.test.ts"],
+        coveredBy: ["tests/preflight-hold.test.ts", "tests/preflight-fail-fast.test.ts", "tests/wire-exit-gap-cells.test.ts"],
     },
     "plugin-chat-sse": {
         implementer: [pipePluginChatWithStrip],
@@ -74,7 +74,7 @@ export const ABORT_PROPAGATION: Record<WireExitId, ExitCell> = {
     "proxy-openai-sse": {
         implementer: [startServer],
         contract: "client disconnects mid-stream → the in-flight upstream request is destroyed (no orphaned summarization/forward), session lock released",
-        coveredBy: ["tests/wire-exit-matrix.test.ts"],
+        coveredBy: ["tests/wire-exit-matrix.test.ts", "tests/wire-exit-gap-cells.test.ts"],
     },
     "proxy-anthropic-sse": {
         implementer: [startServer],
