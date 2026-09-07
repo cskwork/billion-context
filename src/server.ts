@@ -76,7 +76,7 @@ import { backfillHostUsage, isLoopbackAddress, inspectContextOverflow, reserveOu
 import { resolveConfirmedLimit, resolveLearnedLimit, resolveSpeculativeLimit, retractStaleLearnedLimits } from "./weak-overflow.js";
 import { BILI_TUNNEL_HEADER, checkTunnelDestination, tunnelAllowlistFromEnv } from "./tunnel-guard.js";
 
-import { decodeRequestBody } from "./content-encoding.js";
+import { decodeRequestBody, DecompressedTooLargeError } from "./content-encoding.js";
 import { applyCompatRoles, applyCompatRolesJson, detectRoleRejection, detectSystemPlacementError, resolveCompatRoles, type CompatRoles } from "./compat-roles.js";
 
 // Body dumps (dumps/req-*.json, raw/*-REQ.txt, raw/*-RES.txt, raw/*-INCOMING.txt,
@@ -991,18 +991,29 @@ async function handle(
         // Issue #99: decode body only for known protocols — passthrough requests
         // (e.g. GET /models) must forward raw bytes without content-encoding decode.
         if (protocol !== null && bodyBuffer.length > 0) {
-            const decoded = await decodeRequestBody(headerValue(req, "content-encoding"), bodyBuffer, MAX_REQUEST_BYTES);
-            bodyBuffer = decoded.body;
-            if (decoded.decoded) delete req.headers["content-encoding"];
+            try {
+                const decoded = await decodeRequestBody(headerValue(req, "content-encoding"), bodyBuffer, MAX_REQUEST_BYTES);
+                bodyBuffer = decoded.body;
+                if (decoded.decoded) delete req.headers["content-encoding"];
+            } catch (decErr) {
+                if (decErr instanceof DecompressedTooLargeError) throw decErr;
+                // #619: bili can't decode this content-encoding -> don't 400. Drop
+                // protocol so the request falls to the verbatim passthrough below,
+                // relaying the ORIGINAL still-encoded bytes (the reassignment never
+                // ran and the content-encoding header stays intact) so the upstream
+                // applies its own decode - mirroring the JSON.parse path.
+                protocol = null;
+                log("warn", `decode body failed (${String(decErr)}) - forwarding raw body verbatim to ${upstreamOrigin}`);
+            }
         }
     } catch (err) {
-        if (err instanceof BodyTooLargeError) {
+        if (err instanceof BodyTooLargeError || err instanceof DecompressedTooLargeError) {
             log("warn", `413: request body exceeds ${err.limit} bytes`);
             res.writeHead(413, { "content-type": "application/json" });
             res.end(JSON.stringify({ error: { type: "request_too_large", message: err.message } }));
             return;
         }
-        log("warn", `read/decode body failed: ${String(err)}`);
+        log("warn", `failed to prepare inbound request (${String(err)}) - 400`);
         res.writeHead(400, { "content-type": "application/json" });
         res.end(JSON.stringify({ error: { type: "invalid_request", message: String(err) } }));
         return;
