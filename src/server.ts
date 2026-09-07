@@ -3029,6 +3029,41 @@ async function preflightCompressIfNeeded(
     return failFast(status, f?.detail ?? "the payload still exceeds the window after preflight compression", status === 503);
 }
 
+/** #604: arm the emergency shrink after an upstream failure that will never
+ *  report usage (relay/gateway 5xx, network-level failure). A failed turn
+ *  produces no usage report, so session.stats.lastInputTokens — the input to
+ *  every usage-driven trigger (preflight floor, nudge bands, the kernel's
+ *  emergency nudge + tool-result truncate at truncate.threshold) — stays
+ *  frozen at the last SUCCESSFUL turn's value. A client that retries verbatim
+ *  therefore re-sends the identical payload into the identical rejection
+ *  forever (the relay-5xx deadlock). Raising lastInputTokens to a local
+ *  estimate of the wire body we just sent breaks the loop: the next prepare()
+ *  lands in the kernel's emergency band and truncates large tool results
+ *  server-side without model cooperation; the next successful usage report
+ *  overwrites the armed value.
+ *
+ *  Deliberate exception to the "tokenCount must be real usage" invariant: the
+ *  estimate RAISES the value only (a lower bound → compress earlier, never
+ *  later), the kernel no-ops below its thresholds, and real usage overwrites
+ *  it on success. markDirty is required because both call sites return before
+ *  forward()'s trailing save — without it the arm is lost on restart. */
+function armFailureShrink(prepared: Prepared, log: (level: string, msg: string) => void, reason: string): void {
+    const s = prepared.session;
+    let est: number;
+    try {
+        const text = typeof prepared.body === "string" ? prepared.body : prepared.body.toString("utf8");
+        est = estimateTokensFast(text);
+    } catch {
+        return; // non-text body — nothing to estimate
+    }
+    if (!Number.isFinite(est) || est <= 0) return;
+    if (est > s.stats.lastInputTokens) {
+        s.stats.lastInputTokens = est;
+        markDirty(s);
+        log("warn", `[${s.id}] ${reason} with no usage report — armed emergency shrink with local estimate ${est} tokens`);
+    }
+}
+
 async function forward(
     req: http.IncomingMessage,
     res: http.ServerResponse,
@@ -3215,6 +3250,9 @@ async function forward(
         recordUpstreamConnection(upstreamUrl, proxyUrl);
     } catch (error) {
         recordUpstreamConnection(upstreamUrl, proxyUrl, error);
+        // #604: a network-level failure (socket reset, timeout abort) also never
+        // reports usage — arm the emergency shrink like the 5xx branch below.
+        if (prepared && req.method !== "GET" && req.method !== "HEAD") armFailureShrink(prepared, log, "network failure");
         throw new Error(`upstream request failed: ${formatUpstreamError(error, upstreamUrl, proxyUrl)}`, { cause: error });
     }
     // #552 learn-on-failure: a converting upstream that rejects a role (codex
@@ -3433,6 +3471,16 @@ async function forward(
                 // lost on restart and the next overflow must be re-learned.
                 markDirty(s);
             }
+        }
+        // #604: relay/gateway 5xx — no usage report will arrive, so arm the
+        // emergency shrink with a local estimate of the wire body we just sent
+        // (see armFailureShrink for the deadlock this breaks). Generic relay
+        // errors (new_api_error etc.) are not overflow signatures and carry no
+        // window number, so this is the only self-heal path for them;
+        // inspectContextOverflow never matches 5xx (400/413 only), so the
+        // overflow path above could not have handled this response.
+        if (prepared?.session && upstream.status >= 500) {
+            armFailureShrink(prepared, log, `upstream ${upstream.status}`);
         }
         // #174: always log a non-2xx upstream response (status + request-id +
         // body snippet) — a 4xx/5xx with zero log trace is a diagnostic
