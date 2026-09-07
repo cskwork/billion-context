@@ -24,6 +24,7 @@ import { loadOptions, ensureConfigTemplate } from "./config.js";
 import { startServer } from "./server.js";
 import { configFile as defaultConfigFile } from "./paths.js";
 import { checkForUpdate, startAutoUpdate } from "./update.js";
+import { resolveProxy } from "./upstream-proxy.js";
 import { runMcpStdio } from "./mcp.js";
 import { PLUGIN_AGENTS, isPluginAgent, pluginInstall, pluginRemove, pluginStatusAll, type PluginAgent } from "./plugin-install.js";
 import { runLaunch, runTestPi, isLaunchClient, type ClientName } from "./launcher.js";
@@ -374,8 +375,24 @@ export async function main(): Promise<void> {
         return;
     }
     if (command === "update") {
-        // Manual one-shot update — bypasses the throttle.
-        await checkForUpdate({ packageName: PACKAGE_NAME, currentVersion: VERSION, autoUpdate: true }, true);
+        // Manual one-shot update — bypasses the throttle. Apply flag
+        // overrides first so `-F <proxy>` reaches loadOptions; the registry
+        // and tarball egress then honor the same upstream-proxy decision as
+        // model traffic (#609).
+        for (const [k, v] of Object.entries(overrides)) {
+            if (v !== undefined) process.env[k] = v;
+        }
+        let updaterResolveProxy: ((url: string) => string | undefined) | undefined;
+        try {
+            const o = loadOptions();
+            updaterResolveProxy = (url) => resolveProxy(o.routes, o.proxy, url, o.proxyFallback);
+        } catch (e) {
+            console.error(`bili update: config load failed (${String(e)}); updater egress goes direct`);
+        }
+        await checkForUpdate(
+            { packageName: PACKAGE_NAME, currentVersion: VERSION, autoUpdate: true, resolveProxy: updaterResolveProxy },
+            true,
+        );
         return;
     }
     if (command === "test") {
@@ -406,6 +423,13 @@ export async function main(): Promise<void> {
     // Start background auto-update after the server is listening so a slow
     // registry check never delays startup or races the listen socket.
     if (opts.autoUpdate) {
-        startAutoUpdate({ packageName: PACKAGE_NAME, currentVersion: VERSION, autoUpdate: true });
+        // Resolver reads opts fields per call, so web-UI hot-reload of proxy
+        // settings (server.ts mutates opts in place) is picked up live (#609).
+        startAutoUpdate({
+            packageName: PACKAGE_NAME,
+            currentVersion: VERSION,
+            autoUpdate: true,
+            resolveProxy: (url) => resolveProxy(opts.routes, opts.proxy, url, opts.proxyFallback),
+        });
     }
 }
