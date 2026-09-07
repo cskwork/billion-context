@@ -7,6 +7,7 @@ import {
     type Prompts,
 } from "acp-kernel";
 import { buildCompressSystemPrompt, parseCompressInput } from "./compress-tool.js";
+import { applyAbsorbView } from "./absorb.js";
 import { applyRanges, type RewriteCtx } from "./stream.js";
 import { fetchWithRetry, UpstreamHttpError } from "./fetch-util.js";
 import { proxyDispatcher } from "./upstream-proxy.js";
@@ -374,6 +375,9 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             renderTags: "text-only",
         });
         deps.session.state = turn.state;
+        // Absorbed pairs are hidden on the wire, so the fit check must see the
+        // same reduced payload prepare* will actually forward.
+        turn.messages = applyAbsorbView(turn.messages, turn.state, activeConfig, currentTokens);
         // Floor on the session's measured input baseline: the upstream's
         // input_tokens also covers the system prompt + tool definitions, which
         // are not in turn.messages, so the direct estimate can undershoot.

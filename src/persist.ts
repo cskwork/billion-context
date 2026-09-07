@@ -136,6 +136,9 @@ function mergeState(parsed: CompressionState): CompressionState {
         nextBlockId: parsed.nextBlockId ?? fresh.nextBlockId,
         nextRunId: parsed.nextRunId ?? fresh.nextRunId,
         tokenSnapshot: parsed.tokenSnapshot ?? fresh.tokenSnapshot,
+        // Without this, a restart re-exposes absorbed tool outputs: state
+        // resurrects with absorbed=[] and hideAbsorbedMessages has nothing to hide.
+        absorbed: parsed.absorbed ?? fresh.absorbed,
     };
 }
 

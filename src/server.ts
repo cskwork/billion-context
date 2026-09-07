@@ -42,7 +42,8 @@ import {
     subagentNamespace,
 } from "acp-kernel/wire";
 import { getSession, listSessions, type Session, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight, withSessionLock, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, snapshotMessages, applyCompactionArchive } from "./session.js";
-import { COMPRESS_TOOL, ACP_TOOLS_ANTHROPIC, ACP_TOOLS_OPENAI, ACP_TOOLS_RESPONSES, ACP_READONLY_TOOLS_RESPONSES, COMPRESS_TOOL_NAME, buildCompressSystemPrompt, buildCompressHybridSystemPrompt, withStagedCompressGuidance } from "./compress-tool.js";
+import { ABSORB_TOOL, ABSORB_TOOL_OPENAI, ABSORB_TOOL_RESPONSES, COMPRESS_TOOL, ACP_TOOLS_ANTHROPIC, ACP_TOOLS_OPENAI, ACP_TOOLS_RESPONSES, ACP_READONLY_TOOLS_RESPONSES, COMPRESS_TOOL_NAME, buildAbsorbSystemPrompt, buildCompressSystemPrompt, buildCompressHybridSystemPrompt, withStagedCompressGuidance } from "./compress-tool.js";
+import { applyAbsorbView, absorbEnabled, absorbToolName, storeEffectiveAbsorb } from "./absorb.js";
 import { rewriteJsonResponse, type RewriteCtx } from "./stream.js";
 import { applyRanges } from "./stream.js";
 import { preflightCompress, estimateCoreMessages, estimateRawBodyTokens, estimateCoreMessagesUpper, type PreflightResult } from "./preflight.js";
@@ -1872,11 +1873,20 @@ function prepareAnthropic(
         // compression trigger fires until overflow. See effectiveTokenCount.
         const tokenCount = effectiveTokenCount(session, msgs);
         const activeBefore = new Set(session.state.blocks.filter((b) => b.active).map((b) => b.blockId));
-        const turn = core.processTurn({ messages: msgs, state: session.state, config, tokenCount, renderTags: "text-only" });
+        // Absorb markers are injected by the kernel's processTurn from
+        // config.absorb. With no channel to call the tool (injection off),
+        // strip absorb from the loop config so the REQUIRED instruction never
+        // reaches the wire. Hiding recorded absorptions is unaffected
+        // (applyAbsorbView hides regardless of enablement).
+        const absorbActive = absorbEnabled(config) && opts.compress.injectTool;
+        const loopConfig = absorbActive ? config : { ...config, absorb: undefined };
+        const turn = core.processTurn({ messages: msgs, state: session.state, config: loopConfig, tokenCount, renderTags: "text-only" });
         session.state = turn.state;
         // The fold from last turn's compress has now materialized in state —
         // future usage reports are post-fold reality, drop the credit.
         session.stats.compressCreditTokens = 0;
+        storeEffectiveAbsorb(session, loopConfig);
+        turn.messages = applyAbsorbView(turn.messages, session.state, loopConfig, tokenCount);
         // Drop sub-viability fragments before any consumer sees them: a tiny
         // range in the list makes batched compress attempts fail atomically
         // (kernel validates the whole batch). Mirrors billion-context-pi.
@@ -1895,9 +1905,9 @@ function prepareAnthropic(
         reapOrphanBlocks(session, msgs, deactivateBlock);
         rebuiltMessages = coreToAnthropic(processedMessages as BiliMessage[], cacheControls);
 
-        systemOut = injectSystem(parsed, opts, prompts);
+        systemOut = injectSystem(parsed, opts, prompts, loopConfig);
         if (injectTools) {
-            toolsOut = injectTool(parsed.tools);
+            toolsOut = injectTool(parsed.tools, absorbActive ? ABSORB_TOOL : undefined);
         }
         // Nudge as a separate trailing user message (cache-friendly): the
         // system block stays byte-stable so the prefix cache survives.
@@ -2096,11 +2106,18 @@ function prepareOpenai(
         // (see anthropic branch comment + its #553-follow-up exception).
         const tokenCount = effectiveTokenCount(session, msgs);
         const activeBefore = new Set(session.state.blocks.filter((b) => b.active).map((b) => b.blockId));
-        const turn = core.processTurn({ messages: msgs, state: session.state, config, tokenCount, renderTags: "text-only" });
+        // Absorb markers ride in the kernel's processTurn output (gated by
+        // config.absorb). Title-gen requests skip ALL injection for
+        // prefix-cache stability, so strip absorb from the loop config there.
+        const absorbActive = absorbEnabled(config) && shouldInject;
+        const loopConfig = absorbActive ? config : { ...config, absorb: undefined };
+        const turn = core.processTurn({ messages: msgs, state: session.state, config: loopConfig, tokenCount, renderTags: "text-only" });
         session.state = turn.state;
         // The fold from last turn's compress has now materialized in state —
         // future usage reports are post-fold reality, drop the credit.
         session.stats.compressCreditTokens = 0;
+        storeEffectiveAbsorb(session, loopConfig);
+        turn.messages = applyAbsorbView(turn.messages, session.state, loopConfig, tokenCount);
         // Drop sub-viability fragments before any consumer sees them: a tiny
         // range in the list makes batched compress attempts fail atomically
         // (kernel validates the whole batch). Mirrors billion-context-pi.
@@ -2128,6 +2145,7 @@ function prepareOpenai(
         const sysParts: string[] = [];
         if (systemText) sysParts.push(systemText);
         if (shouldInject) sysParts.push(buildCompressSystemPrompt(prompts));
+        if (absorbActive) sysParts.push(buildAbsorbSystemPrompt(absorbToolName(config)));
         rebuiltMessages = injectOpenaiSystem(rebuiltMessages, sysParts);
         // #532: capture what bili injects outside the fold space (client system
         // + compress prompt). A head system message already in the rebuilt view
@@ -2135,7 +2153,7 @@ function prepareOpenai(
         // avoids double-counting it.
         openaiOutboundSystem = sysParts.join("\n\n");
         if (injectTools) {
-            toolsOut = injectOpenaiTool(parsed.tools);
+            toolsOut = injectOpenaiTool(parsed.tools, absorbActive ? ABSORB_TOOL_OPENAI : undefined);
         }
         // Nudge as a separate trailing user message (cache-friendly). Injected
         // in BOTH modes (#451): plugin agents supply the ACP tools but have no
@@ -2277,11 +2295,18 @@ function prepareResponses(
             log("info", `[${sessionId}] input items: ${Array.isArray(parsed.input) ? parsed.input.map((i: ResponseInputItem) => i.type).join(",") : "(string)"}`);
         }
         const tokenCount = effectiveTokenCount(session, msgs);
-        const turn = core.processTurn({ messages: msgs, state: session.state, config, tokenCount, renderTags });
+        // Absorb markers ride in the kernel's processTurn output (gated by
+        // config.absorb). The marker/text protocol has no native tool channel,
+        // so strip absorb from the loop config there (both modes).
+        const absorbActive = absorbEnabled(config) && shouldInject && !isCompactionTrigger && !responsesTextProtocol;
+        const loopConfig = absorbActive ? config : { ...config, absorb: undefined };
+        const turn = core.processTurn({ messages: msgs, state: session.state, config: loopConfig, tokenCount, renderTags });
         session.state = turn.state;
         // The fold from last turn's compress has now materialized in state —
         // future usage reports are post-fold reality, drop the credit.
         session.stats.compressCreditTokens = 0;
+        storeEffectiveAbsorb(session, loopConfig);
+        turn.messages = applyAbsorbView(turn.messages, session.state, loopConfig, tokenCount);
         // Drop sub-viability fragments before any consumer sees them: a tiny
         // range in the list makes batched compress attempts fail atomically
         // (kernel validates the whole batch). Mirrors billion-context-pi.
@@ -2309,13 +2334,15 @@ function prepareResponses(
             : (session.metadata.codexForgedSummaries as string[] | undefined) ?? [];
         if (shouldInject && !isCompactionTrigger && !process.env.ACP_NO_COMPRESS_PROMPT) {
             const prompt = responsesTextProtocol ? buildCompressHybridSystemPrompt(prompts) : buildCompressSystemPrompt(prompts);
-            const devContent = [...projection.systemParts, ...forgedSummaries, prompt].join("\n\n---\n\n");
+            const devParts = [...projection.systemParts, ...forgedSummaries, prompt];
+            if (absorbActive) devParts.push(buildAbsorbSystemPrompt(absorbToolName(config)));
+            const devContent = devParts.join("\n\n---\n\n");
             responsesDevContent = devContent;
             rebuiltInput = injectResponsesDeveloperMessage(rebuiltInput, devContent);
             if (!process.env.ACP_NO_INJECT_TOOL && injectTools) {
                 toolsOut = responsesTextProtocol
                     ? injectResponsesTool(parsed.tools, ACP_READONLY_TOOLS_RESPONSES)
-                    : injectResponsesTool(parsed.tools);
+                    : injectResponsesTool(parsed.tools, absorbActive ? [...ACP_TOOLS_RESPONSES, ABSORB_TOOL_RESPONSES] : ACP_TOOLS_RESPONSES);
             }
         } else if (projection.systemParts.length > 0 || forgedSummaries.length > 0) {
             const devContent = [...projection.systemParts, ...forgedSummaries].join("\n\n---\n\n");
@@ -2545,14 +2572,19 @@ function prepareResponsesCompact(
     let transformOk = false;
     try {
         const projection = responsesToCore(forgeBody);
-        const turn = core.processTurn({ messages: projection.msgs, state: session.state, config, tokenCount: session.stats.lastInputTokens, renderTags: process.env.ACP_RENDER_NONE ? "none" : "text-only" });
+        // The forged handoff is one-shot with no tool channel: strip absorb so
+        // no [ACP absorb] instruction bakes into the forged history, and run
+        // the absorb view so absorbed pairs stay hidden in it (wire parity).
+        const compactConfig = { ...config, absorb: undefined };
+        const turn = core.processTurn({ messages: projection.msgs, state: session.state, config: compactConfig, tokenCount: session.stats.lastInputTokens, renderTags: process.env.ACP_RENDER_NONE ? "none" : "text-only" });
         session.state = turn.state;
         transformOk = true;
         if (!codexCompactGate(session, config.modelContextLimit, transformOk)) {
             session.state = prevState;
             return base;
         }
-        const processed = repairResponsesAssistantOrdering(stripKernelSummaries(turn.messages, turn.state), projection.msgs);
+        const viewed = applyAbsorbView(turn.messages, turn.state, compactConfig, session.stats.lastInputTokens);
+        const processed = repairResponsesAssistantOrdering(stripKernelSummaries(viewed, turn.state), projection.msgs);
         const output = patchResponsesInput(projection, processed);
         if (typeof output === "string") {
             session.state = prevState;
@@ -2627,6 +2659,7 @@ function injectSystem(
     parsed: AnthropicRequestBody,
     opts: ProxyOptions,
     prompts: Prompts = defaultPrompts,
+    config: Config,
 ): string | AnthropicRequestBody["system"] {
     // ONLY the static compress prompt goes into the system block — it is the
     // prefix-cache anchor and must stay byte-stable across turns. The nudge
@@ -2635,27 +2668,32 @@ function injectSystem(
     const baseText = extractSystem(parsed.system);
     const parts: string[] = [];
     if (opts.compress.injectTool) parts.push(buildCompressSystemPrompt(prompts));
+    if (opts.compress.injectTool && absorbEnabled(config)) parts.push(buildAbsorbSystemPrompt(absorbToolName(config)));
     if (parts.length === 0) return parsed.system;
     const full = baseText ? `${baseText}\n\n---\n\n${parts.join("\n\n")}` : parts.join("\n\n");
     return buildSystem(full, parsed.system);
 }
 
-function injectTool(tools: unknown[] | undefined): unknown[] {
-    if (!Array.isArray(tools)) return [...ACP_TOOLS_ANTHROPIC];
+function injectTool(tools: unknown[] | undefined, extra?: { name: string }): unknown[] {
+    if (!Array.isArray(tools)) return extra ? [...ACP_TOOLS_ANTHROPIC, extra] : [...ACP_TOOLS_ANTHROPIC];
     const names = new Set(tools.map((t) => (t as { name?: string })?.name));
     const missing = ACP_TOOLS_ANTHROPIC.filter((t) => !names.has(t.name));
-    return missing.length === 0 ? tools : [...tools, ...missing];
+    const extraMissing = extra && !names.has(extra.name);
+    if (missing.length === 0 && !extraMissing) return tools;
+    return [...tools, ...missing, ...(extraMissing ? [extra] : [])];
 }
 
-function injectOpenaiTool(tools: OpenAITool[] | undefined): OpenAITool[] {
-    if (!Array.isArray(tools)) return [...ACP_TOOLS_OPENAI] as OpenAITool[];
+function injectOpenaiTool(tools: OpenAITool[] | undefined, extra?: OpenAITool): OpenAITool[] {
+    if (!Array.isArray(tools)) return extra ? [...ACP_TOOLS_OPENAI, extra] as OpenAITool[] : ([...ACP_TOOLS_OPENAI] as OpenAITool[]);
     const present = new Set(
         tools
             .map((t) => t?.function?.name)
             .filter((n): n is string => typeof n === "string"),
     );
     const additions = ACP_TOOLS_OPENAI.filter((t) => !present.has(t.function.name));
-    return [...tools, ...(additions as OpenAITool[])];
+    const out = [...tools, ...(additions as OpenAITool[])];
+    if (extra && !out.some((t) => t?.function?.name === extra.function?.name)) out.push(extra);
+    return out;
 }
 
 /** When true, the Responses path teaches compression via a text trigger
@@ -3679,8 +3717,16 @@ async function forward(
             const parsedReq = JSON.parse(typeof body === "string" ? body : body.toString("utf8"));
             const reqHeaders = buildForwardHeaders(headers);
             const textProtocol = prepared.protocol === "responses" && !!prepared.responsesTextProtocol;
-            const systemPrompt = textProtocol ? buildCompressHybridSystemPrompt(prepared.prompts ?? defaultPrompts) : buildCompressSystemPrompt(prepared.prompts ?? defaultPrompts);
-            const adapter = pickAdapter(prepared.protocol, parsedReq, textProtocol, prepared.responsesProjection, prepared.anthropicSystem, prepared.openaiSystemText, prepared.session.hostCreditTokens ?? 0);
+            // Same absorb gate as prepare*: the section only exists where the
+            // tool is callable, keeping loop re-requests byte-consistent with
+            // the first request (prefix-cache anchor).
+            const absorbActive = absorbEnabled(config) && opts.compress.injectTool && !textProtocol;
+            const loopConfig = absorbActive ? config : { ...config, absorb: undefined };
+            const absorbSection = absorbActive
+                ? `\n\n---\n\n${buildAbsorbSystemPrompt(absorbToolName(loopConfig))}`
+                : "";
+            const systemPrompt = (textProtocol ? buildCompressHybridSystemPrompt(prepared.prompts ?? defaultPrompts) : buildCompressSystemPrompt(prepared.prompts ?? defaultPrompts)) + absorbSection;
+            const adapter = pickAdapter(prepared.protocol, parsedReq, textProtocol, prepared.responsesProjection, prepared.anthropicSystem, prepared.openaiSystemText, prepared.session.hostCreditTokens ?? 0, absorbActive ? absorbToolName(loopConfig) : undefined);
             const refreshFolded = (current: CoreMessage[]): CoreMessage[] => {
                 // #422: mirror the prepare's fold with the post-compress state so
                 // the re-request shows the compression the model just performed.
@@ -3689,13 +3735,14 @@ async function forward(
                 const turn = core.processTurn({
                     messages: prepared.originalMessages,
                     state: prepared.session.state,
-                    config,
+                    config: loopConfig,
                     tokenCount: prepared.session.stats.lastInputTokens,
                     renderTags: prepared.renderTags ?? "text-only",
                 });
                 prepared.session.state = turn.state;
+                const viewed = applyAbsorbView(turn.messages, turn.state, loopConfig, prepared.session.stats.lastInputTokens);
                 const records = current.filter((m) => typeof m.id === "string" && m.id.startsWith("acp_loop_"));
-                return repairResponsesAssistantOrdering(stripKernelSummaries([...turn.messages, ...records] as BiliMessage[], turn.state), prepared.originalMessages);
+                return repairResponsesAssistantOrdering(stripKernelSummaries([...viewed, ...records] as BiliMessage[], turn.state), prepared.originalMessages);
             };
             const loop = runCompressLoop(
                 streamToRead,

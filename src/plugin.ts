@@ -4,7 +4,8 @@ import { fileURLToPath } from "node:url";
 import fs from "node:fs";
 import path from "node:path";
 import { acquireInFlight, listSessions, markCompactionBoundary, markDirty, peekSession, releaseInFlight, withSessionLock, type Session } from "./session.js";
-import { ACP_TOOLS_ANTHROPIC, ACP_TOOLS_OPENAI, ACP_TOOLS_RESPONSES, PROXY_TOOL_NAMES } from "./compress-tool.js";
+import { ABSORB_TOOL, ABSORB_TOOL_NAME, ABSORB_TOOL_OPENAI, ABSORB_TOOL_RESPONSES, ACP_TOOLS_ANTHROPIC, ACP_TOOLS_OPENAI, ACP_TOOLS_RESPONSES, PROXY_TOOL_NAMES } from "./compress-tool.js";
+import { effectiveAbsorbConfig, isProxyToolFor } from "./absorb.js";
 import { executeProxyTool } from "./loop/core.js";
 import { normalizeSseLineEndings } from "./sse-util.js";
 import { containsRenderTagText, createTagEchoFilter, mayStartRenderTag, stripAnthropicText, stripOpenaiChatText, stripResponsesText, type TagEchoFilter } from "./loop/tag-echo-filter.js";
@@ -335,11 +336,16 @@ export function handlePluginManifest(res: import("node:http").ServerResponse): v
         protocolVersion: PLUGIN_PROTOCOL_VERSION,
         proxy: "billion-context",
         version: VERSION,
-        toolNames: [...PROXY_TOOL_NAMES],
+        // Absorb is advertised alongside the four ACP tools. It is host-
+        // registered opt-in (not in the kernel's ACP_TOOL_NAMES), so the
+        // manifest must list it explicitly. Per-session enablement is enforced
+        // at execution (isProxyToolFor / executeProxyTool), not here — the
+        // manifest has no request context to know which route will win.
+        toolNames: [...PROXY_TOOL_NAMES, ABSORB_TOOL_NAME],
         tools: {
-            anthropic: ACP_TOOLS_ANTHROPIC,
-            openai: ACP_TOOLS_OPENAI,
-            responses: ACP_TOOLS_RESPONSES,
+            anthropic: [...ACP_TOOLS_ANTHROPIC, ABSORB_TOOL],
+            openai: [...ACP_TOOLS_OPENAI, ABSORB_TOOL_OPENAI],
+            responses: [...ACP_TOOLS_RESPONSES, ABSORB_TOOL_RESPONSES],
         },
         headers: { agent: PLUGIN_AGENT_HEADER, conversation: PLUGIN_CONVERSATION_HEADER, contextWindow: PLUGIN_CONTEXT_WINDOW_HEADER },
         toolEndpoint: "/__bili/plugin/tool",
@@ -472,16 +478,21 @@ export async function handlePluginTool(
         res.end(JSON.stringify({ ok: false, error: `conversationId is required (send the same value as the ${PLUGIN_CONVERSATION_HEADER} header)` }));
         return;
     }
-    if (!PROXY_TOOL_NAMES.has(tool)) {
-        res.writeHead(400, { "content-type": "application/json" });
-        res.end(JSON.stringify({ ok: false, error: `unknown tool "${tool}" (expected one of: ${[...PROXY_TOOL_NAMES].join(", ")})` }));
-        return;
-    }
     const entry = conversations.get(conversationId);
     const session = entry ? peekSession(entry.sessionId) : undefined;
     if (!entry || !session) {
         res.writeHead(404, { "content-type": "application/json" });
         res.end(JSON.stringify({ ok: false, error: "unknown plugin conversation (no model request has arrived with this conversation id yet)" }));
+        return;
+    }
+    // Absorb enablement is per-session (last resolved config), so the gate
+    // needs the session — it runs after the lookup above.
+    if (!isProxyToolFor(tool, session, deps.config)) {
+        const allowed = [...PROXY_TOOL_NAMES];
+        const absorb = effectiveAbsorbConfig(session, deps.config);
+        if (absorb?.enabled === true) allowed.push(absorb.toolName ?? ABSORB_TOOL_NAME);
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: `unknown tool "${tool}" (expected one of: ${allowed.join(", ")})` }));
         return;
     }
     entry.lastSeen = Date.now();

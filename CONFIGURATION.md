@@ -278,6 +278,19 @@ For each request, the proxy resolves the settings by longest-URL-prefix match (t
 - **Status:** ACTIVE
 - **Description:** Must be `true` for `prompts` overrides to take effect. Setting it acknowledges the summary-quality risk documented above.
 
+#### `absorb`
+
+- **Type:** `object` (`{ enabled?, minToolTokens?, contextThresholdPct?, excludeTools?, toolName? }`)
+- **Default:** *(disabled — the feature is off unless you set `enabled: true`)*
+- **Status:** ACTIVE
+- **Description:** Opt-in **instant tool-result compression** (issue #605, via the `acp-kernel` absorb API). When enabled, large tool results get a forced `[ACP absorb]` instruction at result time; the model distills the result into a compact summary via the `absorb` tool, and the original tool-call/tool-result pair is hidden from the wire from the next turn on — keeping mid-session pressure lower between fold rounds. Sub-fields (merged deepest-wins like every other CompressSettings field):
+  - `enabled: boolean` — master switch; anything other than `true` keeps the feature fully off (no tool, no prompt, no markers).
+  - `minToolTokens: number` — only results at or above this many tokens are prompted (kernel default 1000).
+  - `contextThresholdPct: number|percent-string` — only prompt once usage reaches this fraction of `modelContextLimit` (`0` = size gate alone; `"75%"` is accepted).
+  - `excludeTools: string[]` — tool-name patterns never absorbed. **Known limitation:** a no-op on tool *results* until [ranxianglei/acp-kernel#213](https://github.com/ranxianglei/acp-kernel/issues/213) ships (wire projections don't carry `toolName` on results, so the kernel's name guard can't fire).
+  - `toolName: string` — rename the injected tool (default `"absorb"`); the schema, system-prompt section and per-session adjudication all follow the name.
+  Injection follows the wire's native-tool surface: proxy mode injects the tool + a static system-prompt section on the anthropic/openai/responses native-tools wires, plugin mode advertises it in the plugin manifest (the MCP shell picks it up for free). Responses **marker/text-protocol** routes are not supported (no native tool surface — the REQUIRED absorb instruction would be unsatisfiable), and title-generation requests (`max_tokens ≤ 200`) skip injection like the compress prompt does. Absorbed pairs stay hidden across restarts (persisted in the session state).
+
 ### Injection toggles (global only)
 
 These two toggles are honoured only at the **global** level. Setting them inside a per-provider or per-model `compress` block has no effect.

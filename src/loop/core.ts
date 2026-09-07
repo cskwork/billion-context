@@ -9,8 +9,9 @@ import { lastCompressSuffix, type Session } from "../session.js";
 import type { BiliMessage } from "acp-kernel/wire";
 import {
     parseCompressInput,
-    PROXY_TOOL_NAMES,
+    ABSORB_TOOL_NAME,
 } from "../compress-tool.js";
+import { effectiveAbsorbConfig, executeAbsorb, isProxyToolFor } from "../absorb.js";
 import { applyRanges } from "../stream.js";
 import { resolveDecompress } from "../decompress-shared.js";
 import { buildVisibilityMarker } from "../compress-loop.js";
@@ -154,6 +155,10 @@ export function executeProxyTool(
     }
     if (toolName === "acp_status") {
         return handleAcpStatus(args, ctx);
+    }
+    const absorb = effectiveAbsorbConfig(ctx.session, ctx.config);
+    if (absorb?.enabled === true && toolName === (absorb.toolName ?? ABSORB_TOOL_NAME)) {
+        return executeAbsorb(args, callId, absorb, ctx);
     }
     return `[Unknown proxy tool: ${toolName}]`;
 }
@@ -383,7 +388,7 @@ export async function* runCompressLoop(
             const proxyResults: { name: string; callId: string; result: string; arguments: string }[] = [];
 
             for (const call of allCalls) {
-                if (PROXY_TOOL_NAMES.has(call.name)) {
+                if (isProxyToolFor(call.name, ctx.session, ctx.config)) {
                     let parsedArgs: Record<string, unknown>;
                     try {
                         parsedArgs = call.arguments.length > 0 ? JSON.parse(call.arguments) : {};
@@ -487,12 +492,20 @@ export async function* runCompressLoop(
                     }
                 }
                 // #422: a successful compress changed the session state — refresh
-                // the fold so the re-request shows the post-compress view. Falls
-                // back to the pre-compress view (previous behavior) if the host
-                // hook is absent or throws.
+                // the fold so the re-request shows the post-compress view. A
+                // successful absorb does the same (state.absorbed grew; the
+                // refresh's processTurn + hideAbsorbedView drop the pair). A
+                // no-op re-absorb ("already absorbed") also passes this check —
+                // its refresh is a harmless identical-view re-fold. Falls back
+                // to the pre-compress view (previous behavior) if the host hook
+                // is absent or throws.
+                const absorbName = (() => {
+                    const a = effectiveAbsorbConfig(ctx.session, ctx.config);
+                    return a?.enabled === true ? a.toolName ?? ABSORB_TOOL_NAME : undefined;
+                })();
                 if (
                     ctx.refreshFolded &&
-                    proxyResults.some((pr) => pr.name === "compress" && !pr.result.includes("FAILED"))
+                    proxyResults.some((pr) => (pr.name === "compress" || pr.name === absorbName) && !pr.result.includes("FAILED"))
                 ) {
                     try {
                         const refreshed = ctx.refreshFolded(coreMessages);

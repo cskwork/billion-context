@@ -247,7 +247,7 @@ function buildCompleted(responseObj: Record<string, unknown> | null): Buffer {
     );
 }
 
-export function createResponsesAdapter(textProtocol?: boolean, projection?: ResponsesProjection): CompressLoopAdapter {
+export function createResponsesAdapter(textProtocol?: boolean, projection?: ResponsesProjection, absorbName?: string): CompressLoopAdapter {
     const suppressTextLifecycle = !!textProtocol;
     let outputIndex = 0;
     let responseObj: Record<string, unknown> | null = null;
@@ -348,7 +348,9 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
                     const item = obj.item as Record<string, unknown> | undefined;
                     if (item?.type === "function_call") {
                         const fcName = typeof item.name === "string" ? item.name : "";
-                        if (PROXY_TOOL_NAMES.has(fcName)) {
+                        // absorb is deliberately outside PROXY_TOOL_NAMES (kernel ACP_TOOL_NAMES);
+                        // without absorbName it would be raw-replayed as a real call and never executed.
+                        if (PROXY_TOOL_NAMES.has(fcName) || fcName === absorbName) {
                             const itemId = typeof item.id === "string" ? item.id : "";
                             pending.set(itemId, {
                                 itemId,

@@ -1,4 +1,4 @@
-import { defaultPrompts, resolvePrompts, type Config, type Prompts } from "acp-kernel";
+import { DEFAULT_ABSORB_CONFIG, defaultPrompts, resolvePrompts, type AbsorbConfig, type Config, type Prompts } from "acp-kernel";
 import { findRoute, type CompressSettings, type ProviderRoutes } from "./config.js";
 import { log as loggerLog } from "./logger.js";
 
@@ -47,6 +47,10 @@ export function mergeCompress(
     // value still beats a global-level new-name value. The merged output
     // always carries the canonical name only.
     const rangeOf = (s?: CompressSettings): number | undefined => s?.minCompressRangeChars ?? s?.minCompressRange;
+    // `absorb` is a second nested-object field, merged sub-field-wise exactly
+    // like `prompts`: a model-level minToolTokens must not discard a
+    // provider-level excludeTools.
+    const absorbLevels = [global?.absorb, provider?.absorb, model?.absorb].filter(Boolean) as NonNullable<CompressSettings["absorb"]>[];
     return {
         modelContextLimit: pick("modelContextLimit"),
         maxContextLimit: pick("maxContextLimit"),
@@ -58,6 +62,7 @@ export function mergeCompress(
         tiers: pick("tiers"),
         prompts: promptLevels.length > 0 ? Object.assign({}, ...promptLevels) : undefined,
         acknowledgePromptsRisk: pick("acknowledgePromptsRisk"),
+        absorb: absorbLevels.length > 0 ? Object.assign({}, ...absorbLevels) : undefined,
     };
 }
 
@@ -116,9 +121,13 @@ export function hasCompressSettings(s: CompressSettings): boolean {
  *  - `nudgeGrowthTokens` → flattens the adaptive band to a fixed step
  *    (sets both `nudge.growthFloor` and `nudge.growthCap`).
  *  - `preserveRecentMessages` / `preserveRecentTokens` → top-level Config.
- *  - `minCompressRangeChars` (deprecated alias: `minCompressRange`) →
- *    `compress.minCompressRange`. The unit is characters.
- *  - `tiers` → `tiers.enabled`. */
+  *  - `minCompressRangeChars` (deprecated alias: `minCompressRange`) →
+  *    `compress.minCompressRange`. The unit is characters.
+  *  - `tiers` → `tiers.enabled`.
+  *  - `absorb` → `absorb` (kernel AbsorbConfig; unset fields inherit the
+  *    kernel DEFAULT_ABSORB_CONFIG, so a partial user block still resolves
+  *    fully). Absent `s.absorb` leaves `base.absorb` untouched — the feature
+  *    stays off unless some level enables it. */
 export function applyCompressSettings(base: Config, limit: number, s: CompressSettings): Config {
     const nudge = { ...base.nudge };
     const truncate = { ...base.truncate };
@@ -134,6 +143,17 @@ export function applyCompressSettings(base: Config, limit: number, s: CompressSe
     }
     const tiers = { ...base.tiers };
     if (s.tiers !== undefined) tiers.enabled = s.tiers;
+    let absorb: AbsorbConfig | undefined;
+    if (s.absorb !== undefined) {
+        const d = DEFAULT_ABSORB_CONFIG;
+        absorb = {
+            enabled: s.absorb.enabled === true,
+            toolName: s.absorb.toolName ?? d.toolName,
+            minToolTokens: s.absorb.minToolTokens ?? d.minToolTokens,
+            contextThresholdPct: s.absorb.contextThresholdPct !== undefined ? parsePercent(s.absorb.contextThresholdPct) : d.contextThresholdPct,
+            excludeTools: s.absorb.excludeTools ?? [...d.excludeTools],
+        };
+    }
     return {
         ...base,
         modelContextLimit: limit,
@@ -146,6 +166,7 @@ export function applyCompressSettings(base: Config, limit: number, s: CompressSe
             ...base.compress,
             minCompressRange: s.minCompressRangeChars ?? s.minCompressRange ?? base.compress.minCompressRange,
         },
+        ...(absorb !== undefined ? { absorb } : {}),
     };
 }
 

@@ -409,6 +409,53 @@ test("F2: responses custom_tool_call meta events have firstRoundOnly=false (pass
     }
 });
 
+const absorbFcStream = () => mockStream(
+    sseLf("response.output_item.added", {
+        type: "response.output_item.added",
+        output_index: 0,
+        item: { type: "function_call", id: "fc_1", call_id: "call_a1", name: "absorb", arguments: "" },
+    }),
+    sseLf("response.function_call_arguments.delta", {
+        type: "response.function_call_arguments.delta",
+        item_id: "fc_1",
+        output_index: 0,
+        delta: '{"ref":"m00003"',
+    }),
+    sseLf("response.function_call_arguments.done", {
+        type: "response.function_call_arguments.done",
+        item_id: "fc_1",
+        output_index: 0,
+        arguments: '{"ref":"m00003","summary":"s"}',
+    }),
+    sseLf("response.output_item.done", {
+        type: "response.output_item.done",
+        output_index: 0,
+        item: { type: "function_call", id: "fc_1", call_id: "call_a1", name: "absorb", arguments: '{"ref":"m00003","summary":"s"}' },
+    }),
+);
+
+test("absorb: responses adapter buffers absorb function_call when absorbName is set (PR #615 fix)", async () => {
+    const events = await collectParseEvents(createResponsesAdapter(false, undefined, "absorb"), absorbFcStream(), 1);
+    const toolCall = events.find((e) => e.kind === "tool_call");
+    assert.ok(toolCall, "absorb call surfaced as a structured tool_call event for loop execution");
+    if (toolCall && toolCall.kind === "tool_call") {
+        assert.equal(toolCall.name, "absorb");
+        assert.equal(toolCall.callId, "call_a1");
+        assert.equal(toolCall.arguments, '{"ref":"m00003","summary":"s"}');
+        assert.ok(!toolCall.passthrough, "buffered proxy call, not a passthrough");
+    }
+    const rawReplay = events.some((e) => e.kind === "meta" && e.firstRoundOnly === false);
+    assert.ok(!rawReplay, "no absorb SSE event raw-replayed to the client");
+});
+
+test("absorb: without absorbName the same call is raw-replayed + passthrough (documents pre-fix behavior)", async () => {
+    const events = await collectParseEvents(createResponsesAdapter(), absorbFcStream(), 1);
+    const toolCall = events.find((e) => e.kind === "tool_call");
+    assert.ok(toolCall?.kind === "tool_call" && toolCall.passthrough, "no absorbName → passthrough tool_call (loop skips execution)");
+    const rawReplay = events.filter((e) => e.kind === "meta" && e.firstRoundOnly === false);
+    assert.ok(rawReplay.length >= 3, "added/delta/done events raw-replayed to the client pre-fix");
+});
+
 test("F3: anthropic remaps forwarded block indices to be strictly sequential when tool_use is suppressed", async () => {
     const stream = mockStream(
         sseLf("message_start", { type: "message_start", message: { id: "msg_1", usage: { input_tokens: 3 } } }),

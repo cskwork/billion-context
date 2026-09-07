@@ -1,7 +1,8 @@
 import { collectBlockContent, type CompressionCore, type Config, type CoreMessage, type CompressionState } from "acp-kernel";
 import { handleAcpStatus } from "./acp-status.js";
 import { type Session, cacheBlockContent } from "./session.js";
-import { COMPRESS_TOOL_NAME, parseCompressInput, PROXY_TOOL_NAMES } from "./compress-tool.js";
+import { COMPRESS_TOOL_NAME, parseCompressInput, ABSORB_TOOL_NAME } from "./compress-tool.js";
+import { effectiveAbsorbConfig, executeAbsorb, isProxyToolFor } from "./absorb.js";
 import { resolveDecompress } from "./decompress-shared.js";
 import { containsRenderTagText, stripAcpTags } from "./loop/tag-echo-filter.js";
 import { maxShrinkPerCompress } from "./fetch-util.js";
@@ -45,6 +46,10 @@ function executeAnthropicProxyTool(toolName: string, args: Record<string, unknow
     }
     if (toolName === "acp_status") {
         return handleAcpStatus(args, ctx);
+    }
+    const absorb = effectiveAbsorbConfig(ctx.session, ctx.config);
+    if (absorb?.enabled === true && toolName === (absorb.toolName ?? ABSORB_TOOL_NAME)) {
+        return executeAbsorb(args, undefined, absorb, ctx);
     }
     return `[Unknown proxy tool: ${toolName}]`;
 }
@@ -153,7 +158,7 @@ export function rewriteJsonResponse(body: unknown, ctx: RewriteCtx): unknown {
     const newContent: unknown[] = [];
     for (const block of b.content) {
         const blk = block as { type?: string; name?: string; input?: unknown };
-        if (blk.type === "tool_use" && typeof blk.name === "string" && PROXY_TOOL_NAMES.has(blk.name)) {
+        if (blk.type === "tool_use" && typeof blk.name === "string" && isProxyToolFor(blk.name, ctx.session, ctx.config)) {
             converted = true;
             const args = (blk.input && typeof blk.input === "object" ? blk.input : {}) as Record<string, unknown>;
             newContent.push({ type: "text", text: executeAnthropicProxyTool(blk.name, args, ctx) });
