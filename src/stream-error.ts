@@ -70,3 +70,35 @@ export function emitStreamError(res: http.ServerResponse, protocol: Protocol, me
         }
     }
 }
+
+/**
+ * #568: deliver a preflight fail-fast error IN-BAND, after the proxy already
+ * committed `200` early to hold the client through a long compression (see
+ * beginPreflightHold in server.ts). The status line can no longer change, so
+ * the failure rides on a protocol-native error event:
+ *  - openai:    top-level `error` in a data frame, then `[DONE]`.
+ *  - anthropic: `event: error` (the SDK's standard API-error channel).
+ *  - responses: `event: error` (Responses SSE spec).
+ * Never throws.
+ */
+export function emitPreflightError(res: http.ServerResponse, protocol: Protocol, error: { message: string; retryable: boolean }, log?: (msg: string) => void): void {
+    const err = { type: "server_error", code: "preflight_compress_failed", message: error.message, retryable: error.retryable };
+    log?.(`[acp-proxy: preflight failed after early response commit — delivering in-band: ${error.message}]`);
+    try {
+        if (protocol === "openai") {
+            safeWrite(res, `data: ${JSON.stringify({ error: err })}\n\ndata: [DONE]\n\n`);
+        } else if (protocol === "responses") {
+            safeWrite(res, `event: error\ndata: ${JSON.stringify({ type: "error", code: err.code, message: err.message })}\n\n`);
+        } else {
+            safeWrite(res, `event: error\ndata: ${JSON.stringify({ type: "error", error: { type: "server_error", code: err.code, message: err.message } })}\n\n`);
+        }
+    } catch {
+        /* best-effort */
+    } finally {
+        try {
+            res.end();
+        } catch {
+            /* already closed */
+        }
+    }
+}

@@ -45,7 +45,7 @@ import { getSession, listSessions, type Session, initSessions, markDirty, flushA
 import { COMPRESS_TOOL, ACP_TOOLS_ANTHROPIC, ACP_TOOLS_OPENAI, ACP_TOOLS_RESPONSES, ACP_READONLY_TOOLS_RESPONSES, COMPRESS_TOOL_NAME, buildCompressSystemPrompt, buildCompressHybridSystemPrompt, withStagedCompressGuidance } from "./compress-tool.js";
 import { rewriteJsonResponse, type RewriteCtx } from "./stream.js";
 import { applyRanges } from "./stream.js";
-import { preflightCompress, estimateCoreMessages, estimateRawBodyTokens, estimateCoreMessagesUpper } from "./preflight.js";
+import { preflightCompress, estimateCoreMessages, estimateRawBodyTokens, estimateCoreMessagesUpper, type PreflightResult } from "./preflight.js";
 import { imageTokensInRawBody, imageTokensInParsedBody } from "./image-tokens.js";
 import { renderUI, handleConfigGet, handleConfigPut } from "./web/index.js";
 import { reapOrphanBlocks } from "./orphan-gc.js";
@@ -63,7 +63,7 @@ import { stripAcpPanelMessages, stripAcpPanelResponsesInput } from "./acp-panel.
 import { rewriteOpenaiJsonResponse } from "./stream-openai.js";
 import { rewriteResponsesJsonResponse } from "./stream-responses.js";
 import { observeResponsesTerminalState } from "./stream-terminal.js";
-import { emitStreamError } from "./stream-error.js";
+import { emitPreflightError, emitStreamError } from "./stream-error.js";
 import { affinityToken, clientConversationHeader, codexTurnIdentity, preferPromptCacheKeyIdentity, type ConversationIdentity } from "./session-id.js";
 import { prefixAffinity, type AnonymousAffinity } from "./prefix-affinity.js";
 import { flushPrefixAffinity, hydratePrefixAffinity, scheduleAffinityPersist } from "./affinity-persist.js";
@@ -1581,22 +1581,43 @@ async function handle(
                         // #301: the payload still overflows the window and
                         // preflight could not fix it — answer with a
                         // structured error instead of forwarding.
-                        if (outcome.respond && !res.headersSent && !res.destroyed) {
-                            // Retry-After on the 503 (rate-limited) path: gives
-                            // well-behaved clients a backoff signal instead of
-                            // hammering the rate-limited upstream (#301).
-                            res.writeHead(outcome.status, {
-                                "content-type": "application/json",
-                                ...(outcome.status === 503 ? { "retry-after": "30" } : {}),
-                            });
-                            res.end(JSON.stringify({
-                                error: {
-                                    type: "server_error",
-                                    code: "preflight_compress_failed",
-                                    message: outcome.message,
-                                    retryable: outcome.retryable,
-                                },
-                            }));
+                        if (outcome.respond && !res.destroyed) {
+                            if (res.headersSent) {
+                                // #568: the hold already committed 200 early — the status
+                                // can no longer change, so deliver the same error in-band
+                                // (protocol error event for SSE, identical JSON body for
+                                // non-stream) instead of a status code we lost.
+                                if (prepared!.stream) {
+                                    emitPreflightError(res, prepared!.protocol, { message: outcome.message, retryable: outcome.retryable }, (m) => log("warn", m));
+                                } else {
+                                    try {
+                                        res.end(JSON.stringify({
+                                            error: {
+                                                type: "server_error",
+                                                code: "preflight_compress_failed",
+                                                message: outcome.message,
+                                                retryable: outcome.retryable,
+                                            },
+                                        }));
+                                    } catch { /* client gone */ }
+                                }
+                            } else {
+                                // Retry-After on the 503 (rate-limited) path: gives
+                                // well-behaved clients a backoff signal instead of
+                                // hammering the rate-limited upstream (#301).
+                                res.writeHead(outcome.status, {
+                                    "content-type": "application/json",
+                                    ...(outcome.status === 503 ? { "retry-after": "30" } : {}),
+                                });
+                                res.end(JSON.stringify({
+                                    error: {
+                                        type: "server_error",
+                                        code: "preflight_compress_failed",
+                                        message: outcome.message,
+                                        retryable: outcome.retryable,
+                                    },
+                                }));
+                            }
                         }
                         return;
                     }
@@ -2753,6 +2774,65 @@ function isPreflightFailFast(outcome: Prepared | PreflightFailFast): outcome is 
     return "failFast" in outcome;
 }
 
+// #568: preflight compression sends ZERO bytes to the client while it runs, so
+// undici's default headersTimeout (300s) kills any multi-round compression that
+// crosses it — the proxy then aborts on the detected disconnect and the client
+// retries into the same wall (5-minute death loop). Once the work outlives this
+// grace period the response is committed early (200 + protocol framing) and the
+// client is held with periodic keep-alive bytes until the real response exists.
+// 30s protects every client whose header deadline exceeds 30s (undici's 300s
+// default included); shorter preflights keep full status-code fidelity.
+const PREFLIGHT_HOLD_GRACE_DEFAULT_MS = 30_000;
+const PREFLIGHT_KEEPALIVE_MS = 15_000;
+
+function preflightHoldGraceMs(): number {
+    const raw = process.env.BILI_PREFLIGHT_HOLD_MS;
+    if (!raw) return PREFLIGHT_HOLD_GRACE_DEFAULT_MS;
+    const v = Number(raw);
+    return Number.isFinite(v) && v >= 0 ? Math.floor(v) : PREFLIGHT_HOLD_GRACE_DEFAULT_MS;
+}
+
+/** #568: commit the response early so a long preflight cannot lose the client
+ *  to its header timeout. Streaming clients get an SSE stream with keep-alive
+ *  comment lines (`: bili-preflight` — a spec-mandated no-op for every SSE
+ *  consumer, same pattern as OpenAI's SSE pings); non-streaming clients get
+ *  chunked JSON padded with whitespace (valid JSON padding). Each byte resets
+ *  undici's bodyTimeout (inactivity-based), holding the client for the whole
+ *  compression. Returns a stop() ending the keep-alive, or undefined when
+ *  nothing could be committed (headers already sent / socket gone — the
+ *  existing res "close" abort then handles cancellation). */
+function beginPreflightHold(res: http.ServerResponse, prepared: Prepared, log: (level: string, msg: string) => void): (() => void) | undefined {
+    if (res.headersSent || res.destroyed || res.writableEnded) return undefined;
+    const sid = prepared.session.id;
+    const keepAlive = prepared.stream ? ": bili-preflight\n\n" : " ";
+    try {
+        if (prepared.stream) {
+            res.writeHead(200, {
+                "content-type": "text/event-stream",
+                "cache-control": "no-cache",
+                "x-accel-buffering": "no",
+                "x-bili-preflight": "compressing",
+            });
+        } else {
+            res.writeHead(200, { "content-type": "application/json", "x-bili-preflight": "compressing" });
+        }
+    } catch {
+        return undefined;
+    }
+    log("info", `[${sid}] preflight still running after ${preflightHoldGraceMs()}ms grace — committed early ${prepared.stream ? "SSE" : "JSON"} headers + keep-alive to hold the client (#568)`);
+    try {
+        res.write(keepAlive);
+    } catch { /* client gone */ }
+    const iv = setInterval(() => {
+        try {
+            res.write(keepAlive);
+        } catch {
+            clearInterval(iv);
+        }
+    }, PREFLIGHT_KEEPALIVE_MS);
+    return () => clearInterval(iv);
+}
+
 async function preflightCompressIfNeeded(
     prepared: Prepared,
     runPrepare: () => Prepared,
@@ -2868,25 +2948,36 @@ async function preflightCompressIfNeeded(
         if (!res.writableEnded) clientAbort.abort();
     });
     const started = Date.now();
-    const result = await preflightCompress(
-        {
-            core,
-            session,
-            config,
-            prompts: prepared.prompts ?? defaultPrompts,
-            protocol: prepared.protocol,
-            url: upstreamUrl,
-            headers,
-            model,
-            proxyUrl,
-            signal: clientAbort.signal,
-            log,
-            imageFloor: imageTokens,
-            wireOverhead: overheadEstimate,
-            unknownBaseline,
-        },
-        prepared.originalMessages,
-    );
+    let stopHold: (() => void) | undefined;
+    const holdTimer = setTimeout(() => {
+        stopHold = beginPreflightHold(res, prepared, log);
+    }, preflightHoldGraceMs());
+    holdTimer.unref();
+    let result: PreflightResult;
+    try {
+        result = await preflightCompress(
+            {
+                core,
+                session,
+                config,
+                prompts: prepared.prompts ?? defaultPrompts,
+                protocol: prepared.protocol,
+                url: upstreamUrl,
+                headers,
+                model,
+                proxyUrl,
+                signal: clientAbort.signal,
+                log,
+                imageFloor: imageTokens,
+                wireOverhead: overheadEstimate,
+                unknownBaseline,
+            },
+            prepared.originalMessages,
+        );
+    } finally {
+        clearTimeout(holdTimer);
+        stopHold?.();
+    }
     // #330: decide forward/fail on the payload actually forwarded, not
     // result.payloadEstimate — the preflight's relaxed-zone processTurn trims
     // that estimate more than the normal-config prepare does, which can turn a
@@ -2939,7 +3030,7 @@ async function forward(
     // forged success response — serve it without contacting upstream.
     if (prepared?.codexForge) {
         log("info", `[${prepared.session.id}] codex compact served locally (${prepared.codexForge.kind}); upstream not contacted`);
-        res.writeHead(200, { "content-type": prepared.codexForge.contentType });
+        if (!res.headersSent) res.writeHead(200, { "content-type": prepared.codexForge.contentType });
         res.end(prepared.codexForge.body);
         return;
     }
@@ -3328,6 +3419,18 @@ async function forward(
         if (bodyText.length > 600) snippet += " …";
         if (!snippet) snippet = "(no body)";
         loggerLog("warn", `[${errSid}] ← upstream ${upstream.status}${reqIdText}: ${snippet}`);
+        if (res.headersSent) {
+            // #568: the preflight hold already committed 200 early — the status can no
+            // longer change, so deliver the upstream failure in-band (protocol error
+            // event for streams; verbatim error body under 200 otherwise).
+            if (prepared?.stream) {
+                emitStreamError(res, prepared.protocol, `upstream HTTP ${upstream.status}: ${snippet}`, (m) => loggerLog("info", m));
+            } else {
+                try { res.end(errBody ?? undefined); } catch { /* client gone */ }
+            }
+            clearUpstreamTimer();
+            return;
+        }
         const errHeaders: Record<string, string> = { ...respHeaders };
         // Drop the upstream framing headers unconditionally: when errBody is
         // present a fixed-length write replaces them, and when errBody is
@@ -3342,7 +3445,9 @@ async function forward(
         return;
     }
     // 2xx path: now safe to commit the status + headers, then stream the body.
-    res.writeHead(upstream.status, respHeaders);
+    // When the #568 hold already committed an early 200, the upstream's own
+    // headers (x-request-id etc.) are dropped — informational only.
+    if (!res.headersSent) res.writeHead(upstream.status, respHeaders);
     if (!upstream.body) {
         res.end();
         clearUpstreamTimer();
