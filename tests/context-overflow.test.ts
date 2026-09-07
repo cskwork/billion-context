@@ -53,6 +53,18 @@ test("sglang: 'input (N tokens) is longer than the model's context length (M tok
     assert.equal(info2.window, 262144);
 });
 
+test("llama.cpp: 'exceed_context_size_error (N / M > W)' → overflow + window W (#570)", () => {
+    // Captured shape from a real llama-server rejection. The window must be W
+    // (the limit AFTER '>'), not N or M — learning either of those would
+    // self-heal to a window far above the real one.
+    const body = JSON.stringify({
+        error: { message: "exceed_context_size_error (198,277 / 198,661 > 150,528)", type: "invalid_request_error", code: 400 },
+    });
+    const info = inspectContextOverflow(400, body);
+    assert.equal(info.isOverflow, true);
+    assert.equal(info.window, 150528);
+});
+
 test("Anthropic: 'prompt is too long: X tokens > Y maximum' → window is Y", () => {    const body = JSON.stringify({
         type: "error",
         error: { type: "invalid_request_error", message: "prompt is too long: 130000 tokens > 128000 maximum" },

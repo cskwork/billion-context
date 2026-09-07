@@ -45,7 +45,7 @@ import { getSession, listSessions, type Session, initSessions, markDirty, flushA
 import { COMPRESS_TOOL, ACP_TOOLS_ANTHROPIC, ACP_TOOLS_OPENAI, ACP_TOOLS_RESPONSES, ACP_READONLY_TOOLS_RESPONSES, COMPRESS_TOOL_NAME, buildCompressSystemPrompt, buildCompressHybridSystemPrompt, withStagedCompressGuidance } from "./compress-tool.js";
 import { rewriteJsonResponse, type RewriteCtx } from "./stream.js";
 import { applyRanges } from "./stream.js";
-import { preflightCompress, estimateCoreMessages, estimateRawBodyTokens } from "./preflight.js";
+import { preflightCompress, estimateCoreMessages, estimateRawBodyTokens, estimateCoreMessagesUpper, type PreflightResult } from "./preflight.js";
 import { imageTokensInRawBody, imageTokensInParsedBody } from "./image-tokens.js";
 import { renderUI, handleConfigGet, handleConfigPut } from "./web/index.js";
 import { reapOrphanBlocks } from "./orphan-gc.js";
@@ -63,7 +63,7 @@ import { stripAcpPanelMessages, stripAcpPanelResponsesInput } from "./acp-panel.
 import { rewriteOpenaiJsonResponse } from "./stream-openai.js";
 import { rewriteResponsesJsonResponse } from "./stream-responses.js";
 import { observeResponsesTerminalState } from "./stream-terminal.js";
-import { emitStreamError } from "./stream-error.js";
+import { emitPreflightError, emitStreamError } from "./stream-error.js";
 import { affinityToken, clientConversationHeader, codexTurnIdentity, preferPromptCacheKeyIdentity, type ConversationIdentity } from "./session-id.js";
 import { prefixAffinity, type AnonymousAffinity } from "./prefix-affinity.js";
 import { flushPrefixAffinity, hydratePrefixAffinity, scheduleAffinityPersist } from "./affinity-persist.js";
@@ -71,10 +71,11 @@ import { consumePluginRegisterFor, flushConversations, handlePluginCompact, hand
 import { setupMitm, readMitmUpstream } from "./mitm.js";
 import type { BiliMessage } from "acp-kernel/wire";
 import { backfillHostUsage, isLoopbackAddress, inspectContextOverflow, reserveOutputHeadroom, shouldReserveOutputHeadroom, systemToUser, usageTotals, type WireProtocol } from "./util.js";
+import { resolveConfirmedLimit, resolveLearnedLimit, resolveSpeculativeLimit, retractStaleLearnedLimits } from "./weak-overflow.js";
 import { BILI_TUNNEL_HEADER, checkTunnelDestination, tunnelAllowlistFromEnv } from "./tunnel-guard.js";
 
 import { decodeRequestBody } from "./content-encoding.js";
-import { applyCompatRoles, applyCompatRolesJson, detectRoleRejection, resolveCompatRoles, type CompatRoles } from "./compat-roles.js";
+import { applyCompatRoles, applyCompatRolesJson, detectRoleRejection, detectSystemPlacementError, resolveCompatRoles, type CompatRoles } from "./compat-roles.js";
 
 // Body dumps (dumps/req-*.json, raw/*-REQ.txt, raw/*-RES.txt, raw/*-INCOMING.txt,
 // req-*-REREQUEST.json) write the full plaintext request body and are off by
@@ -1390,10 +1391,10 @@ async function handle(
             // hammering the upstream). Gate on the raw body estimate and fail
             // fast locally instead of forwarding (#301 precedent).
             const reqModel = (parsed as { model?: string }).model;
-            const learnedMap = session.metadata.learnedContextLimits as Record<string, number> | undefined;
-            const learnedLimit =
-                (reqModel && learnedMap ? learnedMap[reqModel] : undefined) ??
-                (session.metadata.learnedContextLimit as number | undefined);
+            // #572-merge: read through the resolver (confirmed → speculative, per-model
+            // then scalar) — the learner now writes the confirmed channel, so the
+            // legacy direct map read would miss windows learned from real 400s.
+            const learnedLimit = resolveLearnedLimit(session, reqModel);
             const guard = sideRequestGuard(parsed, protocol, reqConfig.modelContextLimit, learnedLimit);
             if (guard.blocked) {
                 log("warn", `[${session.id}] side request (~${guard.estimate} tokens) ≥ effective window ${guard.limit} (model=${reqModel ?? "?"}) — NOT forwarded: guaranteed upstream 400 (side requests bypass preflight by design, #388)`);
@@ -1426,26 +1427,32 @@ async function handle(
         }
         // Self-heal the context window: a prior upstream overflow may have
         // taught us the real window (forward()'s overflow detection persists it
-        // to metadata.learnedContextLimits, keyed by model, or the legacy scalar
-        // metadata.learnedContextLimit). If it is smaller than what we resolved this
-        // turn (e.g. the 200k fallback for an unknown model on a relay), re-center
-        // the kernel on it so the nudge/truncate bands sit below the real limit
-        // instead of above it. A limit learned for a DIFFERENT model does not
-        // apply — the user can switch models mid-conversation (same session),
-        // and a stale smaller window would cap the bigger model prematurely.
-        // Spread into a new object — never mutate the shared global config.
+        // to metadata.confirmedContextLimits, keyed by model, or the legacy
+        // scalar metadata.confirmedContextLimit; the weak-overflow heuristic
+        // keeps its hypotheses in metadata.learnedContextLimits / scalar). If
+        // it is smaller than what we resolved this turn (e.g. the 200k fallback
+        // for an unknown model on a relay), re-center the kernel on it so the
+        // nudge/truncate bands sit below the real limit instead of above it.
+        // A limit learned for a DIFFERENT model does not apply — the user can
+        // switch models mid-conversation (same session), and a stale smaller
+        // window would cap the bigger model prematurely. Spread into a new
+        // object — never mutate the shared global config.
         const reqModel = (parsed as { model?: string }).model;
-        const learnedMap = session.metadata.learnedContextLimits as Record<string, number> | undefined;
-        const learnedLimit =
-            (reqModel && learnedMap ? learnedMap[reqModel] : undefined) ??
-            (session.metadata.learnedContextLimit as number | undefined);
+        // #570: a learned window is a hypothesis — if a later turn SUCCEEDED
+        // with reported input above it, it is stale (KV-pressure false
+        // positive, resized server, ...) and must not keep throttling this
+        // session. Runs before the resolution below so this request already
+        // sees the corrected window.
+        retractStaleLearnedLimits(session, reqModel);
+        const confirmedLimit = resolveConfirmedLimit(session, reqModel);
+        const learnedLimit = confirmedLimit ?? resolveSpeculativeLimit(session, reqModel);
         if (learnedLimit && learnedLimit > 0 && learnedLimit < reqConfig.modelContextLimit) {
             const resolved = reqConfig.modelContextLimit;
             reqConfig = { ...reqConfig, modelContextLimit: learnedLimit };
             // A learned limit is ground truth from a real overflow — it must
             // not be floored back up (that would undo the self-heal).
             nativeFromFallback = false;
-            log("info", `[${session.id}] self-healed context window: ${resolved} → ${learnedLimit} (learned from an upstream overflow)`);
+            log("info", `[${session.id}] self-healed context window: ${resolved} → ${learnedLimit} (${confirmedLimit !== undefined ? "confirmed by an upstream overflow error" : "weak-overflow heuristic"})`);
         } else if (nativeFromFallback && reqModel) {
             // Self-heal UPWARD — complement of the overflow self-heal above. An
             // overflow only proves the window is SMALLER; a too-small fallback
@@ -1462,11 +1469,14 @@ async function handle(
             const prevWindow = session.metadata.lastTurnWindow as number | undefined;
             const resolved = reqConfig.modelContextLimit;
             if (prevWindow !== undefined && prevInput > prevWindow && prevInput > resolved && prevInput >= 1000) {
-                const map = (session.metadata.learnedContextLimits as Record<string, number> | undefined) ?? {};
+                // #570: a successful turn's reported input is grounded evidence
+                // (the upstream accepted it), so it lands in the CONFIRMED
+                // fields — a later weak-overflow heuristic must not clobber it.
+                const map = (session.metadata.confirmedContextLimits as Record<string, number> | undefined) ?? {};
                 const prev = map[reqModel];
                 if (prev === undefined || prevInput > prev) {
                     map[reqModel] = prevInput;
-                    session.metadata.learnedContextLimits = map;
+                    session.metadata.confirmedContextLimits = map;
                     markDirty(session);
                 }
                 reqConfig = { ...reqConfig, modelContextLimit: prevInput };
@@ -1573,6 +1583,7 @@ async function handle(
                         (parsed as { model?: string }).model,
                         route,
                         affinity,
+                        anonAffinity !== null,
                         log,
                         instanceId,
                     );
@@ -1580,22 +1591,43 @@ async function handle(
                         // #301: the payload still overflows the window and
                         // preflight could not fix it — answer with a
                         // structured error instead of forwarding.
-                        if (outcome.respond && !res.headersSent && !res.destroyed) {
-                            // Retry-After on the 503 (rate-limited) path: gives
-                            // well-behaved clients a backoff signal instead of
-                            // hammering the rate-limited upstream (#301).
-                            res.writeHead(outcome.status, {
-                                "content-type": "application/json",
-                                ...(outcome.status === 503 ? { "retry-after": "30" } : {}),
-                            });
-                            res.end(JSON.stringify({
-                                error: {
-                                    type: "server_error",
-                                    code: "preflight_compress_failed",
-                                    message: outcome.message,
-                                    retryable: outcome.retryable,
-                                },
-                            }));
+                        if (outcome.respond && !res.destroyed) {
+                            if (res.headersSent) {
+                                // #568: the hold already committed 200 early — the status
+                                // can no longer change, so deliver the same error in-band
+                                // (protocol error event for SSE, identical JSON body for
+                                // non-stream) instead of a status code we lost.
+                                if (prepared!.stream) {
+                                    emitPreflightError(res, prepared!.protocol, { message: outcome.message, retryable: outcome.retryable }, (m) => log("warn", m));
+                                } else {
+                                    try {
+                                        res.end(JSON.stringify({
+                                            error: {
+                                                type: "server_error",
+                                                code: "preflight_compress_failed",
+                                                message: outcome.message,
+                                                retryable: outcome.retryable,
+                                            },
+                                        }));
+                                    } catch { /* client gone */ }
+                                }
+                            } else {
+                                // Retry-After on the 503 (rate-limited) path: gives
+                                // well-behaved clients a backoff signal instead of
+                                // hammering the rate-limited upstream (#301).
+                                res.writeHead(outcome.status, {
+                                    "content-type": "application/json",
+                                    ...(outcome.status === 503 ? { "retry-after": "30" } : {}),
+                                });
+                                res.end(JSON.stringify({
+                                    error: {
+                                        type: "server_error",
+                                        code: "preflight_compress_failed",
+                                        message: outcome.message,
+                                        retryable: outcome.retryable,
+                                    },
+                                }));
+                            }
                         }
                         return;
                     }
@@ -1764,6 +1796,19 @@ function armHostUsageCredit(
     }
 }
 
+// Zero-baseline sessions are judged conservatively ONLY when they arrived
+// anonymously (prefix-affinity forks/reloads, #553): they carry the full raw
+// history but no measurement yet, so feeding 0 blinds the nudge (usage 0%,
+// growth ref 0) and no compression trigger fires until overflow. Explicit-
+// identity zero-baseline sessions stay at 0 — first-turn or post-native-
+// compaction payloads that are small by construction and self-heal via the
+// next measured usage report.
+function effectiveTokenCount(session: Session, msgs: CoreMessage[]): number {
+    if (session.stats.lastInputTokens > 0) return session.stats.lastInputTokens;
+    if (!session.metadata.anonymousPrefixAffinity) return 0;
+    return estimateCoreMessagesUpper(msgs);
+}
+
 function prepareAnthropic(
     parsed: AnthropicRequestBody,
     req: http.IncomingMessage,
@@ -1812,7 +1857,11 @@ function prepareAnthropic(
         // the fallback path below if we ever need it, but we no longer feed
         // estimates to the kernel.
         extractSystem(parsed.system);
-        const tokenCount = session.stats.lastInputTokens;
+        // #553-follow-up exception to the "never estimates" rule above: anonymous
+        // zero-baseline forks replay their FULL raw history with no measurement,
+        // so feeding 0 blinds the nudge (usage 0%, growth ref 0) and no
+        // compression trigger fires until overflow. See effectiveTokenCount.
+        const tokenCount = effectiveTokenCount(session, msgs);
         const activeBefore = new Set(session.state.blocks.filter((b) => b.active).map((b) => b.blockId));
         const turn = core.processTurn({ messages: msgs, state: session.state, config, tokenCount, renderTags: "text-only" });
         session.state = turn.state;
@@ -2034,8 +2083,9 @@ function prepareOpenai(
         openaiSystemText = systemText;
         originalMessages = msgs;
         // tokenCount = upstream's real input_tokens from the previous turn
-        // (see anthropic branch comment). Never an estimate.
-        const tokenCount = session.stats.lastInputTokens;
+        // tokenCount = upstream's real input_tokens from the previous turn
+        // (see anthropic branch comment + its #553-follow-up exception).
+        const tokenCount = effectiveTokenCount(session, msgs);
         const activeBefore = new Set(session.state.blocks.filter((b) => b.active).map((b) => b.blockId));
         const turn = core.processTurn({ messages: msgs, state: session.state, config, tokenCount, renderTags: "text-only" });
         session.state = turn.state;
@@ -2217,7 +2267,7 @@ function prepareResponses(
         if (process.env.ACP_DEBUG) {
             log("info", `[${sessionId}] input items: ${Array.isArray(parsed.input) ? parsed.input.map((i: ResponseInputItem) => i.type).join(",") : "(string)"}`);
         }
-        const tokenCount = session.stats.lastInputTokens;
+        const tokenCount = effectiveTokenCount(session, msgs);
         const turn = core.processTurn({ messages: msgs, state: session.state, config, tokenCount, renderTags });
         session.state = turn.state;
         // The fold from last turn's compress has now materialized in state —
@@ -2734,6 +2784,65 @@ function isPreflightFailFast(outcome: Prepared | PreflightFailFast): outcome is 
     return "failFast" in outcome;
 }
 
+// #568: preflight compression sends ZERO bytes to the client while it runs, so
+// undici's default headersTimeout (300s) kills any multi-round compression that
+// crosses it — the proxy then aborts on the detected disconnect and the client
+// retries into the same wall (5-minute death loop). Once the work outlives this
+// grace period the response is committed early (200 + protocol framing) and the
+// client is held with periodic keep-alive bytes until the real response exists.
+// 30s protects every client whose header deadline exceeds 30s (undici's 300s
+// default included); shorter preflights keep full status-code fidelity.
+const PREFLIGHT_HOLD_GRACE_DEFAULT_MS = 30_000;
+const PREFLIGHT_KEEPALIVE_MS = 15_000;
+
+function preflightHoldGraceMs(): number {
+    const raw = process.env.BILI_PREFLIGHT_HOLD_MS;
+    if (!raw) return PREFLIGHT_HOLD_GRACE_DEFAULT_MS;
+    const v = Number(raw);
+    return Number.isFinite(v) && v >= 0 ? Math.floor(v) : PREFLIGHT_HOLD_GRACE_DEFAULT_MS;
+}
+
+/** #568: commit the response early so a long preflight cannot lose the client
+ *  to its header timeout. Streaming clients get an SSE stream with keep-alive
+ *  comment lines (`: bili-preflight` — a spec-mandated no-op for every SSE
+ *  consumer, same pattern as OpenAI's SSE pings); non-streaming clients get
+ *  chunked JSON padded with whitespace (valid JSON padding). Each byte resets
+ *  undici's bodyTimeout (inactivity-based), holding the client for the whole
+ *  compression. Returns a stop() ending the keep-alive, or undefined when
+ *  nothing could be committed (headers already sent / socket gone — the
+ *  existing res "close" abort then handles cancellation). */
+function beginPreflightHold(res: http.ServerResponse, prepared: Prepared, log: (level: string, msg: string) => void): (() => void) | undefined {
+    if (res.headersSent || res.destroyed || res.writableEnded) return undefined;
+    const sid = prepared.session.id;
+    const keepAlive = prepared.stream ? ": bili-preflight\n\n" : " ";
+    try {
+        if (prepared.stream) {
+            res.writeHead(200, {
+                "content-type": "text/event-stream",
+                "cache-control": "no-cache",
+                "x-accel-buffering": "no",
+                "x-bili-preflight": "compressing",
+            });
+        } else {
+            res.writeHead(200, { "content-type": "application/json", "x-bili-preflight": "compressing" });
+        }
+    } catch {
+        return undefined;
+    }
+    log("info", `[${sid}] preflight still running after ${preflightHoldGraceMs()}ms grace — committed early ${prepared.stream ? "SSE" : "JSON"} headers + keep-alive to hold the client (#568)`);
+    try {
+        res.write(keepAlive);
+    } catch { /* client gone */ }
+    const iv = setInterval(() => {
+        try {
+            res.write(keepAlive);
+        } catch {
+            clearInterval(iv);
+        }
+    }, PREFLIGHT_KEEPALIVE_MS);
+    return () => clearInterval(iv);
+}
+
 async function preflightCompressIfNeeded(
     prepared: Prepared,
     runPrepare: () => Prepared,
@@ -2745,6 +2854,7 @@ async function preflightCompressIfNeeded(
     model: string | undefined,
     route: ReturnType<typeof resolveUpstream>,
     affinity: string | undefined,
+    anonymous: boolean,
     log: (level: string, msg: string) => void,
     instanceId: string,
 ): Promise<Prepared | PreflightFailFast> {
@@ -2762,7 +2872,21 @@ async function preflightCompressIfNeeded(
     // under the window while the billed input already overflows it).
     const overheadEstimate = estimateWireOverhead(prepared.protocol, prepared.body);
     const payloadEstimate = textEstimate + overheadEstimate + imageTokens;
-    const tokenCount = Math.max(session.stats.lastInputTokens, payloadEstimate);
+    // #553: anonymous requests resolve their session by prefix affinity. After
+    // an ACP compression breaks the chain hash, the client's replay mints a NEW
+    // session id (a fork) whose lastInputTokens is 0 — yet it carries the full
+    // raw history. Judging that on the optimistic chars/4 estimate undercounts
+    // code/JSON replays by up to ~4x, so an over-window payload triggers
+    // nothing and is forwarded raw (upstream 400 / long-prefill timeout). Judge
+    // exactly those sessions by the char-count upper bound (never undershoots;
+    // the image/wire floors still apply — #488/#470 postdate the fork).
+    // Sessions with a client-provided identity keep the optimistic path: their
+    // 0-baseline means a genuinely new conversation or a post-native-compaction
+    // replay, both small enough to self-heal via the learned-window path.
+    const unknownBaseline = anonymous && session.stats.lastInputTokens <= 0;
+    const tokenCount = unknownBaseline
+        ? estimateCoreMessagesUpper(prepared.processedMessages) + overheadEstimate + imageTokens
+        : Math.max(session.stats.lastInputTokens, payloadEstimate);
     if (limit <= 0 || !model || tokenCount < limit) return prepared;
     // #496 forward-once-then-learn: the default image cost (base64/4) matches byte
     // relays (#488) but overestimates pixel-tile upstreams (a 400KB JPEG ≈ 1.6K real
@@ -2774,10 +2898,7 @@ async function preflightCompressIfNeeded(
     // (it counts rejected image tokens) → later requests fail-fast. #488's 400 loop stays
     // broken (exactly one rejected forward). With either evidence signal present we trust
     // the estimate and fall through to fold / fail-fast below.
-    const learnedMap = session.metadata.learnedContextLimits as Record<string, number> | undefined;
-    const learnedLimit =
-        (model ? learnedMap?.[model] : undefined) ??
-        (session.metadata.learnedContextLimit as number | undefined);
+    const learnedLimit = resolveLearnedLimit(session, model);
     const noOverflowEvidence = session.stats.lastInputTokens < limit && learnedLimit === undefined;
     if (imageTokens > 0 && textEstimate < limit && noOverflowEvidence) {
         log("warn", `[${session.id}] image-dominated payload (~${textEstimate} text + ~${imageTokens} image tokens) exceeds window ${limit} by estimate only, no upstream overflow evidence — forwarding once so the upstream arbitrates billing (#496)`);
@@ -2800,11 +2921,23 @@ async function preflightCompressIfNeeded(
         log("error", `[${session.id}] preflight fail-fast ${status} (retryable=${retryable}): ${message}`);
         return { failFast: true, status, message, retryable, respond: !res.writableEnded };
     };
-    if ((prepared.nudge?.compressibleRanges ?? []).length === 0 && payloadEstimate < limit) {
+    if ((prepared.nudge?.compressibleRanges ?? []).length === 0) {
         // #300: the trigger fired on a stale baseline (lastInputTokens) but the
         // payload's own estimate fits the window — forwarding as-is is safe.
-        log("warn", `[${session.id}] preflight trigger fired on a stale baseline (~${tokenCount}) but the payload fits (~${payloadEstimate}/${limit}); forwarding as-is`);
-        return prepared;
+        // #553: only a trusted optimistic fit may clear a raw forward; an
+        // unknown-baseline session's true size is unmeasured, so fail fast
+        // instead of gambling a raw forward past the window.
+        if (!unknownBaseline && payloadEstimate < limit) {
+            log("warn", `[${session.id}] preflight trigger fired on a stale baseline (~${tokenCount}) but the payload fits (~${payloadEstimate}/${limit}); forwarding as-is`);
+            return prepared;
+        }
+        if (unknownBaseline) {
+            return failFast(502, "no part of the conversation is compressible (nothing left to fold)", false);
+        }
+        // Known-baseline over-window: fall through to preflightCompress — its
+        // relax path (#330) folds the soft-protected recent zone when that is
+        // the only foldable content, and its exhaustion detail carries the
+        // operator remedy wording.
     }
     // #330: the payload overflows the window (or nothing is foldable in the
     // normal pass but it doesn't fit). Let preflightCompress try to fold it —
@@ -2822,38 +2955,57 @@ async function preflightCompressIfNeeded(
         if (!res.writableEnded) clientAbort.abort();
     });
     const started = Date.now();
-    const result = await preflightCompress(
-        {
-            core,
-            session,
-            config,
-            prompts: prepared.prompts ?? defaultPrompts,
-            protocol: prepared.protocol,
-            url: upstreamUrl,
-            headers,
-            model,
-            proxyUrl,
-            signal: clientAbort.signal,
-            log,
-            imageFloor: imageTokens,
-            wireOverhead: overheadEstimate,
-        },
-        prepared.originalMessages,
-    );
+    let stopHold: (() => void) | undefined;
+    const holdTimer = setTimeout(() => {
+        stopHold = beginPreflightHold(res, prepared, log);
+    }, preflightHoldGraceMs());
+    holdTimer.unref();
+    let result: PreflightResult;
+    try {
+        result = await preflightCompress(
+            {
+                core,
+                session,
+                config,
+                prompts: prepared.prompts ?? defaultPrompts,
+                protocol: prepared.protocol,
+                url: upstreamUrl,
+                headers,
+                model,
+                proxyUrl,
+                signal: clientAbort.signal,
+                log,
+                imageFloor: imageTokens,
+                wireOverhead: overheadEstimate,
+                unknownBaseline,
+            },
+            prepared.originalMessages,
+        );
+    } finally {
+        clearTimeout(holdTimer);
+        stopHold?.();
+    }
     // #330: decide forward/fail on the payload actually forwarded, not
     // result.payloadEstimate — the preflight's relaxed-zone processTurn trims
     // that estimate more than the normal-config prepare does, which can turn a
     // guaranteed-400 forward into a false "fits". Images ride the payload
     // verbatim (#488): add their cost back or #496's image-dominated payload
-    // would look "fitting" on its text estimate alone.
+    // would look "fitting" on its text estimate alone. Unknown-baseline
+    // sessions keep the loop's own upper-bound judgment (result.fitsWindow,
+    // #553) — the optimistic re-estimate is exactly what that regime distrusts.
     if (result.compressedRanges > 0) {
         log("info", `[${session.id}] preflight compressed ${result.compressedRanges} range(s), ~${result.savedTokens} tokens saved (${tokenCount} → ${session.stats.lastInputTokens}) in ${Date.now() - started}ms; rebuilding payload`);
         const rebuilt = runPrepare();
         // runPrepare re-incremented stats.requests; the rebuild is internal
         // to this single client request.
         session.stats.requests -= 1;
-        if (estimateCoreMessages(rebuilt.processedMessages) + overheadEstimate + imageTokens < limit) return rebuilt;
-    } else if (estimateCoreMessages(prepared.processedMessages) + overheadEstimate + imageTokens < limit) {
+        const fits = unknownBaseline
+            ? result.fitsWindow
+            : estimateCoreMessages(rebuilt.processedMessages) + overheadEstimate + imageTokens < limit;
+        if (fits) return rebuilt;
+    } else if (unknownBaseline
+        ? result.fitsWindow
+        : estimateCoreMessages(prepared.processedMessages) + overheadEstimate + imageTokens < limit) {
         log("warn", `[${session.id}] preflight made no progress but the payload fits; forwarding as-is`);
         return prepared;
     }
@@ -2885,7 +3037,7 @@ async function forward(
     // forged success response — serve it without contacting upstream.
     if (prepared?.codexForge) {
         log("info", `[${prepared.session.id}] codex compact served locally (${prepared.codexForge.kind}); upstream not contacted`);
-        res.writeHead(200, { "content-type": prepared.codexForge.contentType });
+        if (!res.headersSent) res.writeHead(200, { "content-type": prepared.codexForge.contentType });
         res.end(prepared.codexForge.body);
         return;
     }
@@ -3089,32 +3241,58 @@ async function forward(
             };
             const rejection = detectRoleRejection(upstreamResult.response.status, roleErrText);
             if (rejection && rejection.role !== "system") {
-                const fixed = applyCompatRoles(wireBody, compatProtocol, { [rejection.role]: "system" });
-                if (fixed.rewritten > 0) {
-                    try {
-                        const retry = await fetchWithTimeout(upstreamUrl, { ...init, body: fixed.body }, undefined, clientAbort.signal);
-                        if (retry.response.ok) {
-                            upstreamResult.clearTimer();
-                            const s = prepared?.session;
-                            if (s) {
-                                const prev = (s.metadata.learnedCompatRoles as CompatRoles | undefined) ?? {};
-                                s.metadata.learnedCompatRoles = { ...prev, [rejection.role]: "system" };
-                                markDirty(s);
-                            }
-                            // Same-request re-sends (compress-retry loops) must
-                            // carry the rewrite too — wireTransform reads this
-                            // variable at call time.
-                            compatRoles = { ...compatRoles, [rejection.role]: "system" };
-                            const providerKey = new URL(upstreamUrl).origin;
-                            log("info", `[${prepared?.session.id ?? "passthrough"}] [compat] upstream rejected role "${rejection.role}" — auto-rewrote ${fixed.rewritten} message role(s) to "system", retry OK (remembered for this session only). To make permanent, add: {"providers":{"${providerKey}":{"compat":{"roles":{"${rejection.role}":"system"}}}}`);
-                            upstreamResult = retry;
-                        } else {
-                            retry.clearTimer();
-                        }
-                    } catch {
-                        // retry transport failure — keep the original 400
+                // Learn-on-failure ladder — primary hop (#552: offending role →
+                // "system") plus a SECOND-CHANCE hop (#583: → "user") fired only
+                // when the system hop 400'd with a #377-class system-PLACEMENT
+                // error (backend accepts the role name but forbids system off
+                // index 0, so a mid-list developer→system still 400s). Each hop
+                // rewrites the one offending role to a single target and forwards
+                // exactly once; the sequence is fixed (never a loop), hard-capped
+                // at original + 2 retries. Any other failure stops the ladder and
+                // the original 400 passes through verbatim.
+                const cp = compatProtocol;
+                const wb = wireBody;
+                const remember = (target: string, rewritten: number): void => {
+                    const s = prepared?.session;
+                    if (s) {
+                        const prev = (s.metadata.learnedCompatRoles as CompatRoles | undefined) ?? {};
+                        s.metadata.learnedCompatRoles = { ...prev, [rejection.role]: target };
+                        markDirty(s);
                     }
-                }
+                    // Same-request re-sends (compress-retry loops) carry the
+                    // rewrite too — wireTransform reads compatRoles at call time.
+                    compatRoles = { ...compatRoles, [rejection.role]: target };
+                    const providerKey = new URL(upstreamUrl).origin;
+                    log("info", `[${prepared?.session.id ?? "passthrough"}] [compat] upstream rejected role "${rejection.role}" — auto-rewrote ${rewritten} message role(s) to "${target}", retry OK (remembered for this session only). To make permanent, add: {"providers":{"${providerKey}":{"compat":{"roles":{"${rejection.role}":"${target}"}}}}`);
+                };
+                type HopOutcome = "ok" | "placement-400" | "other";
+                const hop = async (target: string): Promise<HopOutcome> => {
+                    const fixed = applyCompatRoles(wb, cp, { [rejection.role]: target });
+                    if (fixed.rewritten === 0) return "other";
+                    let r: Awaited<ReturnType<typeof fetchWithTimeout>>;
+                    try {
+                        r = await fetchWithTimeout(upstreamUrl, { ...init, body: fixed.body }, undefined, clientAbort.signal);
+                    } catch {
+                        return "other"; // transport failure — keep the original 400
+                    }
+                    if (r.response.ok) {
+                        upstreamResult.clearTimer();
+                        remember(target, fixed.rewritten);
+                        upstreamResult = r;
+                        return "ok";
+                    }
+                    let errText: string | null = null;
+                    if (r.response.body) {
+                        try {
+                            errText = (await readStreamToBuffer(r.response.body)).toString("utf8");
+                        } catch {
+                            errText = null;
+                        }
+                    }
+                    r.clearTimer();
+                    return errText !== null && detectSystemPlacementError(r.response.status, errText) ? "placement-400" : "other";
+                };
+                if ((await hop("system")) === "placement-400") await hop("user");
             }
         }
     }
@@ -3185,15 +3363,19 @@ async function forward(
                 } catch {
                     reqModel = undefined; // non-JSON body — fall back to the legacy scalar
                 }
-                const learnedMap = (s.metadata.learnedContextLimits as Record<string, number> | undefined) ?? {};
+                // #570 provenance: an actual non-2xx overflow rejection is
+                // STRONG evidence — it lands in the CONFIRMED fields, which
+                // take precedence over the weak-overflow heuristic's guesses
+                // and are never clobbered by them.
+                const confirmedMap = (s.metadata.confirmedContextLimits as Record<string, number> | undefined) ?? {};
                 if (info.window) {
-                    const prev = (reqModel ? learnedMap[reqModel] : undefined) ?? (s.metadata.learnedContextLimit as number | undefined);
+                    const prev = (reqModel ? confirmedMap[reqModel] : undefined) ?? (s.metadata.confirmedContextLimit as number | undefined);
                     // Persist the real window to a STABLE field (effectiveContextLimit
                     // is re-resolved every turn in plugin mode and would be overwritten);
                     // handle() reads it (per model) to re-center the kernel next turn.
-                    if (reqModel) learnedMap[reqModel] = info.window;
-                    else s.metadata.learnedContextLimit = info.window;
-                    s.metadata.learnedContextLimits = learnedMap;
+                    if (reqModel) confirmedMap[reqModel] = info.window;
+                    else s.metadata.confirmedContextLimit = info.window;
+                    s.metadata.confirmedContextLimits = confirmedMap;
                     log("warn", `[${s.id}] upstream context overflow — learned real window ${info.window} for ${reqModel ?? "(unknown model)"} (was ${prev ?? "unset"}); arming emergency shrink`);
                 } else {
                     // No window number in the body (e.g. Codex's
@@ -3207,11 +3389,11 @@ async function forward(
                     const payloadEstimate = (prepared.processedMessages.length > 0
                         ? estimateCoreMessages(prepared.processedMessages)
                         : estimateRawBodyTokens(parsedBody)) + rejectedImageTokens;
-                    const prev = (reqModel ? learnedMap[reqModel] : undefined) ?? (s.metadata.learnedContextLimit as number | undefined);
+                    const prev = (reqModel ? confirmedMap[reqModel] : undefined) ?? (s.metadata.confirmedContextLimit as number | undefined);
                     if (payloadEstimate >= 1000 && (prev === undefined || payloadEstimate < prev)) {
-                        if (reqModel) learnedMap[reqModel] = payloadEstimate;
-                        else s.metadata.learnedContextLimit = payloadEstimate;
-                        s.metadata.learnedContextLimits = learnedMap;
+                        if (reqModel) confirmedMap[reqModel] = payloadEstimate;
+                        else s.metadata.confirmedContextLimit = payloadEstimate;
+                        s.metadata.confirmedContextLimits = confirmedMap;
                         log("warn", `[${s.id}] upstream context overflow (window not parseable) — learned conservative window ${payloadEstimate} for ${reqModel ?? "(unknown model)"} from rejected payload size (was ${prev ?? "unset"}); arming emergency shrink`);
                     } else {
                         log("warn", `[${s.id}] upstream context overflow (window not parseable): ${info.message}`);
@@ -3219,16 +3401,22 @@ async function forward(
                 }
                 // Arm the emergency shrink: force the next turn's usage to >=100%
                 // so the kernel's emergency nudge + tool-result truncate fire.
-                // lastInputTokens is a lower bound here (the context overflowed,
-                // so it is at least the window); a real usage report from the
-                // next successful turn overwrites it.
-                const floor =
-                    info.window ??
-                    (reqModel ? learnedMap[reqModel] : undefined) ??
-                    (s.metadata.learnedContextLimit as number | undefined) ??
-                    (s.metadata.effectiveContextLimit as number | undefined) ??
-                    0;
-                if (floor > 0) s.stats.lastInputTokens = Math.max(s.stats.lastInputTokens, floor);
+                // With a parsed window, arm at EXACTLY it: a turn cannot succeed
+                // above the real window, so any higher armed value came from an
+                // earlier FAILED turn, and #570's retraction must not mistake
+                // that failure's size for a success and delete the window we
+                // just learned. Without one, keep the max-floor (a real usage
+                // report from the next successful turn overwrites either way).
+                if (info.window) {
+                    s.stats.lastInputTokens = info.window;
+                } else {
+                    const floor =
+                        (reqModel ? confirmedMap[reqModel] : undefined) ??
+                        (s.metadata.confirmedContextLimit as number | undefined) ??
+                        (s.metadata.effectiveContextLimit as number | undefined) ??
+                        0;
+                    if (floor > 0) s.stats.lastInputTokens = Math.max(s.stats.lastInputTokens, floor);
+                }
                 // The learned window (metadata) and the armed emergency
                 // (lastInputTokens) live in memory only until scheduled —
                 // the error path returns before forward()'s trailing
@@ -3248,6 +3436,18 @@ async function forward(
         if (bodyText.length > 600) snippet += " …";
         if (!snippet) snippet = "(no body)";
         loggerLog("warn", `[${errSid}] ← upstream ${upstream.status}${reqIdText}: ${snippet}`);
+        if (res.headersSent) {
+            // #568: the preflight hold already committed 200 early — the status can no
+            // longer change, so deliver the upstream failure in-band (protocol error
+            // event for streams; verbatim error body under 200 otherwise).
+            if (prepared?.stream) {
+                emitStreamError(res, prepared.protocol, `upstream HTTP ${upstream.status}: ${snippet}`, (m) => loggerLog("info", m));
+            } else {
+                try { res.end(errBody ?? undefined); } catch { /* client gone */ }
+            }
+            clearUpstreamTimer();
+            return;
+        }
         const errHeaders: Record<string, string> = { ...respHeaders };
         // Drop the upstream framing headers unconditionally: when errBody is
         // present a fixed-length write replaces them, and when errBody is
@@ -3262,7 +3462,9 @@ async function forward(
         return;
     }
     // 2xx path: now safe to commit the status + headers, then stream the body.
-    res.writeHead(upstream.status, respHeaders);
+    // When the #568 hold already committed an early 200, the upstream's own
+    // headers (x-request-id etc.) are dropped — informational only.
+    if (!res.headersSent) res.writeHead(upstream.status, respHeaders);
     if (!upstream.body) {
         res.end();
         clearUpstreamTimer();
