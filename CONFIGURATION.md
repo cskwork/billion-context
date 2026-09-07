@@ -291,6 +291,20 @@ For each request, the proxy resolves the settings by longest-URL-prefix match (t
   - `toolName: string` — rename the injected tool (default `"absorb"`); the schema, system-prompt section and per-session adjudication all follow the name.
   Injection follows the wire's native-tool surface: proxy mode injects the tool + a static system-prompt section on the anthropic/openai/responses native-tools wires, plugin mode advertises it in the plugin manifest (the MCP shell picks it up for free). Responses **marker/text-protocol** routes are not supported (no native tool surface — the REQUIRED absorb instruction would be unsatisfiable), and title-generation requests (`max_tokens ≤ 200`) skip injection like the compress prompt does. Absorbed pairs stay hidden across restarts (persisted in the session state).
 
+#### `stripImages`
+
+- **Type:** `boolean`
+- **Default:** `false`
+- **Status:** ACTIVE
+- **Description:** Opt-in removal of historical image payloads. When `true`, every message **except** the most recent `stripImagesKeepRecent` has its image parts dropped before the wire rebuild; an image-only message collapses to a single `[image]` text placeholder (mixed text+image messages keep their text). Recent-N images are forwarded verbatim, and a freshly-sent image always falls inside that window on the turn it arrives. Off by default — while off, the #488 image-token floor and its overflow `502` stay the opt-in signal for image-heavy payloads. Applies to both compression modes (in plugin mode the agent's own history is untouched; only the upstream-bound wire is slimmed). See issue #617.
+
+#### `stripImagesKeepRecent`
+
+- **Type:** `number`
+- **Default:** `5`
+- **Status:** ACTIVE
+- **Description:** With `stripImages: true`, how many trailing messages keep their images verbatim. Ignored unless `stripImages` is enabled.
+
 ### Injection toggles (global only)
 
 These two toggles are honoured only at the **global** level. Setting them inside a per-provider or per-model `compress` block has no effect.
