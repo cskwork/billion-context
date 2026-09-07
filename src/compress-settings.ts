@@ -63,6 +63,9 @@ export function mergeCompress(
         prompts: promptLevels.length > 0 ? Object.assign({}, ...promptLevels) : undefined,
         acknowledgePromptsRisk: pick("acknowledgePromptsRisk"),
         absorb: absorbLevels.length > 0 ? Object.assign({}, ...absorbLevels) : undefined,
+
+stripImages: pick("stripImages"),
+        stripImagesKeepRecent: pick("stripImagesKeepRecent"),
     };
 }
 

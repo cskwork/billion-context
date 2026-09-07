@@ -150,6 +150,16 @@ export type CompressSettings = {
          *  the client's own tool names or the agent will call its own tool. */
         toolName?: string;
     };
+
+/** Opt-in removal of historical image payloads (src/strip-images.ts). When
+     *  true, every message except the most recent {@link stripImagesKeepRecent}
+     *  has its image parts dropped before the wire rebuild (image-only content
+     *  collapses to an "[image]" placeholder). Off by default — the #488 image
+     *  floor / overflow 502 stays the opt-in signal until this is enabled. */
+    stripImages?: boolean;
+    /** With {@link stripImages}, how many trailing messages keep their images
+     *  verbatim (default 5). Ignored unless stripImages is true. */
+    stripImagesKeepRecent?: number;
 };
 export type PromptCacheRouting = "auto" | "enabled" | "disabled";
 export type UpstreamProxyMode = "auto" | "manual" | "direct";
@@ -579,12 +589,16 @@ export function parseCompressSettings(v: unknown): (CompressSettings & { injectT
         if (!numberOrPercent(obj[key])) { ok = false; continue; }
         (out as Record<string, unknown>)[key] = typeof obj[key] === "string" ? (obj[key] as string).trim() : obj[key];
     }
-    for (const key of ["nudgeGrowthTokens", "preserveRecentMessages", "preserveRecentTokens", "minCompressRange", "minCompressRangeChars"] as const) {
+    for (const key of ["nudgeGrowthTokens", "preserveRecentMessages", "preserveRecentTokens", "minCompressRange", "minCompressRangeChars", "stripImagesKeepRecent"] as const) {
         takeNumber(key);
     }
     if ("tiers" in obj) {
         if (typeof obj.tiers !== "boolean") ok = false;
         else out.tiers = obj.tiers;
+    }
+    if ("stripImages" in obj) {
+        if (typeof obj.stripImages !== "boolean") ok = false;
+        else out.stripImages = obj.stripImages;
     }
     // Injection toggles are file-level fields (FileConfig.compress) honored by
     // loadOptions via `=== false`; the web UI shows them from the raw file

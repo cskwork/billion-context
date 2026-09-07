@@ -3,6 +3,7 @@ import fs from "node:fs";
 import { randomUUID } from "node:crypto";
 import { createCore, type CompressionCore, type CompressionState, type Config, type CoreMessage, type NudgeDecision, type Prompts, defaultPrompts, defaultCountTokens, estimateTokensFast, renderNudgeText, deactivateBlock, viableRanges } from "acp-kernel";
 import { resolveCompress, resolveCompressPrompts, resolveRequestConfig } from "./compress-settings.js";
+import { DEFAULT_STRIP_IMAGES_KEEP_RECENT, stripHistoricalImages } from "./strip-images.js";
 import type { ProxyOptions } from "./config.js";
 import { loadOptions, loadRoutes } from "./config.js";
 import { resetProxyCache } from "./upstream-proxy.js";
@@ -1544,16 +1545,30 @@ async function handle(
             // (stream rewriter mutates state via compress/decompress) must not
             // interleave across concurrent requests on the same session.
             await withSessionLock(session, async () => {
-                const runPrepare = (): Prepared =>
-                    countTokens
-                        ? prepareCountTokens(parsed as AnthropicRequestBody, core, reqConfig, log, session)
+                const runPrepare = (): Prepared => {
+                    const cs = resolveCompress(opts.routes, route?.rewrittenUrl, (parsed as { model?: string }).model, opts.compress);
+                    const keepRecent = cs.stripImagesKeepRecent ?? DEFAULT_STRIP_IMAGES_KEEP_RECENT;
+                    const stripped = cs.stripImages
+                        ? stripHistoricalImages(parsed, protocol, keepRecent)
+                        : { body: parsed, removed: 0 };
+                    if (opts.debug && stripped.removed > 0) {
+                        log("info", `[debug] strip-images: dropped ${stripped.removed} historical image part(s), kept last ${keepRecent} (session=${session.id})`);
+                    }
+                    const work = stripped.body;
+                    return countTokens
+                        ? prepareCountTokens(work as AnthropicRequestBody, core, reqConfig, log, session)
                         : protocol === "anthropic"
-                          ? prepareAnthropic(parsed as AnthropicRequestBody, req, opts, core, reqConfig, reqPrompts, log, session, pluginMode)
+                          ? prepareAnthropic(work as AnthropicRequestBody, req, opts, core, reqConfig, reqPrompts, log, session, pluginMode)
                           : protocol === "openai"
-                             ? prepareOpenai(parsed as OpenAIRequestBody, req, opts, core, reqConfig, reqPrompts, log, session, pluginMode, nativeWindow)
-                            : responsesCompact
-                               ? prepareResponsesCompact(bodyBuffer, parsed as ResponsesRequestBody, session, req, core, reqConfig, log)
-                               : prepareResponses(parsed as ResponsesRequestBody, req, opts, core, reqConfig, reqPrompts, log, session, responsesIdentity!, pluginMode, upstreamOrigin, nativeWindow);
+                             ? prepareOpenai(work as OpenAIRequestBody, req, opts, core, reqConfig, reqPrompts, log, session, pluginMode, nativeWindow)
+                             : responsesCompact
+                                // #618 review nit: when no bili compaction item is present,
+                                // prepareResponsesCompact falls back to the raw bodyBuffer — forward
+                                // the re-serialized post-strip work instead so dropped images don't
+                                // ride along. Unchanged bodies keep the original buffer byte-identical.
+                                ? prepareResponsesCompact(stripped.removed > 0 ? Buffer.from(JSON.stringify(work)) : bodyBuffer, work as ResponsesRequestBody, session, req, core, reqConfig, log)
+                               : prepareResponses(work as ResponsesRequestBody, req, opts, core, reqConfig, reqPrompts, log, session, responsesIdentity!, pluginMode, upstreamOrigin, nativeWindow);
+                };
                 // #332: codex's native remote-compaction request (trigger form)
                 // is dispatched BEFORE prepare/preflight. When it is not
                 // intercepted, the upstream must receive exactly what codex
