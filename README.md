@@ -112,24 +112,6 @@ turn is a semantic mismatch the model tolerates (it is clearly marked
   summaries (their tool call isn't in the agent's history and the agent's view
   skips `acp_summary`) — but that needs the id match above, which doesn't occur.
 
-### Preflight hold (#568)
-
-Preflight compression runs **before** the proxy sends any response bytes, and on
-big sessions it takes minutes (summarization round-trips to the same upstream).
-That exceeds client-side header timeouts (undici's default is 300s): the client
-aborts, the proxy drops the in-flight compression and never forwards — a
-repeating death loop every few minutes.
-
-So when preflight outlives a grace period (default **30s**, override with
-`BILI_PREFLIGHT_HOLD_MS`), the proxy commits the response early: streams get
-`200` + `text/event-stream` + SSE comment keep-alives (`: bili-preflight`, every
-15s); non-stream requests get `200` + `application/json` + whitespace padding.
-Early commits carry an `x-bili-preflight: compressing` header. Once the status
-is committed, late failures can no longer change it, so they are delivered
-**in-band** instead: a protocol error event (`preflight_compress_failed`) for
-streams, the identical structured error body under the already-sent 200 for
-JSON. Fast paths (preflight finishes within the grace) are unchanged and keep
-full status-code fidelity.
 
 ## Which do I need?
 
