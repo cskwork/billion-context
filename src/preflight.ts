@@ -49,6 +49,14 @@ export interface PreflightDeps {
     imageFloor?: number;
     /** Constant wire overhead for this request (system prompt + tool definitions, #470). Folding never removes it, so every fit decision must add it — otherwise the loop stops with "text fits" while the billed input still overflows. */
     wireOverhead?: number;
+    /** #553: the caller knows this session's input size is unmeasured AND its
+     *  raw history is untrusted (anonymous prefix-affinity session with
+     *  lastInputTokens == 0 — a fork minted when an ACP compression broke the
+     *  chain hash). Size judgments then use the char-count upper bound
+     *  (estimateCoreMessagesUpper / char-based chunking) instead of the
+     *  optimistic chars/4 estimator, which undercounts code/JSON replays by up
+     *  to ~4x and would let an over-window payload slip through uncompressed. */
+    unknownBaseline?: boolean;
 }
 
 export type PreflightFailureKind = "upstream" | "exhausted" | "aborted";
@@ -69,6 +77,13 @@ export interface PreflightResult {
      *  stale (e.g. a double-counted usage report, #300). The caller uses it
      *  to decide whether forwarding as-is is actually safe. */
     payloadEstimate: number;
+    /** Whether the final payload fits the window, judged with the same
+     *  measure the loop used: the optimistic token estimate for
+     *  measured-baseline sessions (#300 — a stale HIGH baseline must not
+     *  fail-fast a fitting payload), the char-count upper bound for
+     *  unknown-baseline ones (#553 — the optimistic figure can undershoot by
+     *  up to ~4x on dense replays, so only the upper bound proves a fit). */
+    fitsWindow: boolean;
     /** Why the loop stopped while the payload still overflows the window.
      *  Undefined when the payload fits. */
     failure?: PreflightFailure;
@@ -129,6 +144,20 @@ export function estimateRawBodyTokens(parsed: unknown): number {
     return tokens;
 }
 
+// #553: upper-bound variant of estimateCoreMessages — every character counts
+// as one token. A BPE token covers >=1 char (Latin/code) and CJK is already
+// ~1 token/char, so this never undershoots the real count, unlike
+// defaultCountTokens' 4-chars-per-token for non-CJK. Used only for anonymous
+// prefix-affinity sessions without a measured baseline (a fork mints a new
+// session id with lastInputTokens == 0 after an ACP compression breaks the
+// chain hash), where an undershoot lets an over-window payload slip past the
+// trigger and the fit checks and get forwarded raw.
+export function estimateCoreMessagesUpper(messages: CoreMessage[]): number {
+    let chars = 0;
+    for (const m of messages) chars += (m.text ?? "").length;
+    return chars;
+}
+
 function rangeChars(messages: CoreMessage[], startIdx: number, endIdx: number): number {
     let chars = 0;
     for (let i = startIdx; i <= endIdx && i < messages.length; i++) {
@@ -156,16 +185,28 @@ function renderRange(messages: CoreMessage[], startIdx: number, endIdx: number):
     return parts.join("\n\n");
 }
 
-function splitChunks(messages: CoreMessage[], startIdx: number, endIdx: number, budgetTokens: number): Array<[number, number]> {
+// minUnits: never close a chunk below this many countText units while more
+// messages remain — a chunk under config.compress.minCompressRange chars is
+// rejected by applyCompression, so such a chunk would waste a whole round.
+// (The char-count regime needs this because its budget can be far smaller
+// than minCompressRange on small windows.)
+function splitChunks(
+    messages: CoreMessage[],
+    startIdx: number,
+    endIdx: number,
+    budget: number,
+    minUnits: number,
+    countText: (text: string) => number = defaultCountTokens,
+): Array<[number, number]> {
     const chunks: Array<[number, number]> = [];
     let cur = startIdx;
     while (cur <= endIdx) {
-        let tokens = 0;
+        let total = 0;
         let last = cur;
         for (let i = cur; i <= endIdx; i++) {
-            const t = defaultCountTokens(messages[i].text ?? "");
-            if (tokens + t > budgetTokens && i > cur) break;
-            tokens += t;
+            const t = countText(messages[i].text ?? "");
+            if (total + t > budget && i > cur && (minUnits <= 0 || total >= minUnits)) break;
+            total += t;
             last = i;
         }
         chunks.push([cur, last]);
@@ -281,17 +322,25 @@ function noEmergencyTruncate(config: Config): Config {
 
 export async function preflightCompress(deps: PreflightDeps, messages: CoreMessage[]): Promise<PreflightResult> {
     const limit = deps.config.modelContextLimit;
-    const result: PreflightResult = { compressedRanges: 0, savedTokens: 0, payloadEstimate: estimateCoreMessages(messages) + (deps.imageFloor ?? 0) + (deps.wireOverhead ?? 0) };
+    const result: PreflightResult = { compressedRanges: 0, savedTokens: 0, payloadEstimate: estimateCoreMessages(messages) + (deps.imageFloor ?? 0) + (deps.wireOverhead ?? 0), fitsWindow: true };
     if (limit <= 0) return result;
     const budget = Math.max(MIN_CHUNK_TOKENS, Math.floor(limit * CHUNK_FRACTION));
     // applyCompression rejects ranges below config.compress.minCompressRange
     // chars, so never spend a summarization call on a chunk that can't apply.
     const minChars = deps.config.compress.minCompressRange;
     // The fit check runs on the real post-fold payload size, not on
-    // stats.lastInputTokens: a fresh session (its id rotated, e.g. after a
-    // model switch) starts at 0 while still carrying a full raw history that
-    // overflows the smaller window.
-    let currentTokens = deps.session.stats.lastInputTokens;
+    // stats.lastInputTokens: a session without a measured baseline
+    // (lastInputTokens == 0 — fresh, or forked/reloaded after an ACP
+    // compression broke prefix affinity, #553) starts at 0 while still
+    // carrying a full raw history that may overflow the window.
+    // #553: for an unknown-baseline session the optimistic chars/4 estimate can
+    // be off by up to ~4x on code/JSON replays, so judge those by the char-count
+    // upper bound (never undershoots). The regime is caller-decided and fixed
+    // for the whole loop — lastInputTokens mutates mid-loop and must not flip it.
+    const baselineKnown = deps.unknownBaseline !== true;
+    const countText = baselineKnown ? defaultCountTokens : (text: string): number => text.length;
+    let currentTokens = baselineKnown ? deps.session.stats.lastInputTokens : estimateCoreMessagesUpper(messages);
+    let finalUpper = baselineKnown ? 0 : estimateCoreMessagesUpper(messages);
     let startTokens = -1;
     let failure: PreflightFailure | undefined;
     let activeConfig = deps.config;
@@ -327,6 +376,13 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
         // input_tokens also covers the system prompt + tool definitions, which
         // are not in turn.messages, so the direct estimate can undershoot.
         currentTokens = Math.max(deps.session.stats.lastInputTokens, estimateCoreMessages(turn.messages) + (deps.imageFloor ?? 0) + (deps.wireOverhead ?? 0));
+        if (!baselineKnown) {
+            // #558-merge: the upper-bound regime also carries the image/wire
+            // floors — they are real billed costs the fold can never remove
+            // (#470/#488 postdate this PR's fork point).
+            finalUpper = estimateCoreMessagesUpper(turn.messages) + (deps.imageFloor ?? 0) + (deps.wireOverhead ?? 0);
+            currentTokens = Math.max(currentTokens, finalUpper);
+        }
         // The caller's forward/fail-fast gate uses the payload's own estimate
         // (the floor can be stale — see PreflightResult.payloadEstimate).
         result.payloadEstimate = estimateCoreMessages(turn.messages) + (deps.imageFloor ?? 0) + (deps.wireOverhead ?? 0);
@@ -374,7 +430,10 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                 continue;
             }
             rangesTried += 1;
-            for (const [cs, ce] of splitChunks(messages, startIdx, endIdx, budget)) {
+            // minUnits only in the char regime: with the optimistic token budget a
+            // sub-minimum chunk is already rare, and keeping minUnits = 0 there
+            // preserves the historical packing exactly.
+            for (const [cs, ce] of splitChunks(messages, startIdx, endIdx, budget, baselineKnown ? 0 : minChars, countText)) {
                 if (currentTokens < limit) break;
                 if (deps.signal?.aborted) {
                     failure = ABORTED_FAILURE;
@@ -435,9 +494,12 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                     break;
                 }
                 // The summary itself re-enters the payload; net its cost against
-                // both the folded size and the session's input baseline.
+                // both the folded size and the session's input baseline. Without a
+                // baseline currentTokens is char-based, so net the folded span's
+                // char count against it instead of the token-based credit.
                 const compressed = deps.session.stats.compressCreditTokens - creditBefore;
-                currentTokens = Math.max(0, currentTokens - compressed + defaultCountTokens(summary));
+                const folded = baselineKnown ? compressed : rangeChars(messages, cs, ce);
+                currentTokens = Math.max(0, currentTokens - folded + countText(summary));
                 deps.session.stats.lastInputTokens += defaultCountTokens(summary);
                 appliedThisRound += 1;
                 result.compressedRanges += 1;
@@ -462,5 +524,6 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
     if (result.compressedRanges > 0) deps.session.stats.lastInputTokens = currentTokens;
     result.savedTokens = Math.max(0, startTokens - currentTokens);
     if (currentTokens >= limit) result.failure = failure;
+    result.fitsWindow = baselineKnown ? result.payloadEstimate < limit : finalUpper < limit;
     return result;
 }

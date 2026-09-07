@@ -45,7 +45,7 @@ import { getSession, listSessions, type Session, initSessions, markDirty, flushA
 import { COMPRESS_TOOL, ACP_TOOLS_ANTHROPIC, ACP_TOOLS_OPENAI, ACP_TOOLS_RESPONSES, ACP_READONLY_TOOLS_RESPONSES, COMPRESS_TOOL_NAME, buildCompressSystemPrompt, buildCompressHybridSystemPrompt, withStagedCompressGuidance } from "./compress-tool.js";
 import { rewriteJsonResponse, type RewriteCtx } from "./stream.js";
 import { applyRanges } from "./stream.js";
-import { preflightCompress, estimateCoreMessages, estimateRawBodyTokens } from "./preflight.js";
+import { preflightCompress, estimateCoreMessages, estimateRawBodyTokens, estimateCoreMessagesUpper } from "./preflight.js";
 import { imageTokensInRawBody, imageTokensInParsedBody } from "./image-tokens.js";
 import { renderUI, handleConfigGet, handleConfigPut } from "./web/index.js";
 import { reapOrphanBlocks } from "./orphan-gc.js";
@@ -1573,6 +1573,7 @@ async function handle(
                         (parsed as { model?: string }).model,
                         route,
                         affinity,
+                        anonAffinity !== null,
                         log,
                         instanceId,
                     );
@@ -1764,6 +1765,19 @@ function armHostUsageCredit(
     }
 }
 
+// Zero-baseline sessions are judged conservatively ONLY when they arrived
+// anonymously (prefix-affinity forks/reloads, #553): they carry the full raw
+// history but no measurement yet, so feeding 0 blinds the nudge (usage 0%,
+// growth ref 0) and no compression trigger fires until overflow. Explicit-
+// identity zero-baseline sessions stay at 0 — first-turn or post-native-
+// compaction payloads that are small by construction and self-heal via the
+// next measured usage report.
+function effectiveTokenCount(session: Session, msgs: CoreMessage[]): number {
+    if (session.stats.lastInputTokens > 0) return session.stats.lastInputTokens;
+    if (!session.metadata.anonymousPrefixAffinity) return 0;
+    return estimateCoreMessagesUpper(msgs);
+}
+
 function prepareAnthropic(
     parsed: AnthropicRequestBody,
     req: http.IncomingMessage,
@@ -1812,7 +1826,11 @@ function prepareAnthropic(
         // the fallback path below if we ever need it, but we no longer feed
         // estimates to the kernel.
         extractSystem(parsed.system);
-        const tokenCount = session.stats.lastInputTokens;
+        // #553-follow-up exception to the "never estimates" rule above: anonymous
+        // zero-baseline forks replay their FULL raw history with no measurement,
+        // so feeding 0 blinds the nudge (usage 0%, growth ref 0) and no
+        // compression trigger fires until overflow. See effectiveTokenCount.
+        const tokenCount = effectiveTokenCount(session, msgs);
         const activeBefore = new Set(session.state.blocks.filter((b) => b.active).map((b) => b.blockId));
         const turn = core.processTurn({ messages: msgs, state: session.state, config, tokenCount, renderTags: "text-only" });
         session.state = turn.state;
@@ -2034,8 +2052,9 @@ function prepareOpenai(
         openaiSystemText = systemText;
         originalMessages = msgs;
         // tokenCount = upstream's real input_tokens from the previous turn
-        // (see anthropic branch comment). Never an estimate.
-        const tokenCount = session.stats.lastInputTokens;
+        // tokenCount = upstream's real input_tokens from the previous turn
+        // (see anthropic branch comment + its #553-follow-up exception).
+        const tokenCount = effectiveTokenCount(session, msgs);
         const activeBefore = new Set(session.state.blocks.filter((b) => b.active).map((b) => b.blockId));
         const turn = core.processTurn({ messages: msgs, state: session.state, config, tokenCount, renderTags: "text-only" });
         session.state = turn.state;
@@ -2217,7 +2236,7 @@ function prepareResponses(
         if (process.env.ACP_DEBUG) {
             log("info", `[${sessionId}] input items: ${Array.isArray(parsed.input) ? parsed.input.map((i: ResponseInputItem) => i.type).join(",") : "(string)"}`);
         }
-        const tokenCount = session.stats.lastInputTokens;
+        const tokenCount = effectiveTokenCount(session, msgs);
         const turn = core.processTurn({ messages: msgs, state: session.state, config, tokenCount, renderTags });
         session.state = turn.state;
         // The fold from last turn's compress has now materialized in state —
@@ -2745,6 +2764,7 @@ async function preflightCompressIfNeeded(
     model: string | undefined,
     route: ReturnType<typeof resolveUpstream>,
     affinity: string | undefined,
+    anonymous: boolean,
     log: (level: string, msg: string) => void,
     instanceId: string,
 ): Promise<Prepared | PreflightFailFast> {
@@ -2762,7 +2782,21 @@ async function preflightCompressIfNeeded(
     // under the window while the billed input already overflows it).
     const overheadEstimate = estimateWireOverhead(prepared.protocol, prepared.body);
     const payloadEstimate = textEstimate + overheadEstimate + imageTokens;
-    const tokenCount = Math.max(session.stats.lastInputTokens, payloadEstimate);
+    // #553: anonymous requests resolve their session by prefix affinity. After
+    // an ACP compression breaks the chain hash, the client's replay mints a NEW
+    // session id (a fork) whose lastInputTokens is 0 — yet it carries the full
+    // raw history. Judging that on the optimistic chars/4 estimate undercounts
+    // code/JSON replays by up to ~4x, so an over-window payload triggers
+    // nothing and is forwarded raw (upstream 400 / long-prefill timeout). Judge
+    // exactly those sessions by the char-count upper bound (never undershoots;
+    // the image/wire floors still apply — #488/#470 postdate the fork).
+    // Sessions with a client-provided identity keep the optimistic path: their
+    // 0-baseline means a genuinely new conversation or a post-native-compaction
+    // replay, both small enough to self-heal via the learned-window path.
+    const unknownBaseline = anonymous && session.stats.lastInputTokens <= 0;
+    const tokenCount = unknownBaseline
+        ? estimateCoreMessagesUpper(prepared.processedMessages) + overheadEstimate + imageTokens
+        : Math.max(session.stats.lastInputTokens, payloadEstimate);
     if (limit <= 0 || !model || tokenCount < limit) return prepared;
     // #496 forward-once-then-learn: the default image cost (base64/4) matches byte
     // relays (#488) but overestimates pixel-tile upstreams (a 400KB JPEG ≈ 1.6K real
@@ -2800,11 +2834,23 @@ async function preflightCompressIfNeeded(
         log("error", `[${session.id}] preflight fail-fast ${status} (retryable=${retryable}): ${message}`);
         return { failFast: true, status, message, retryable, respond: !res.writableEnded };
     };
-    if ((prepared.nudge?.compressibleRanges ?? []).length === 0 && payloadEstimate < limit) {
+    if ((prepared.nudge?.compressibleRanges ?? []).length === 0) {
         // #300: the trigger fired on a stale baseline (lastInputTokens) but the
         // payload's own estimate fits the window — forwarding as-is is safe.
-        log("warn", `[${session.id}] preflight trigger fired on a stale baseline (~${tokenCount}) but the payload fits (~${payloadEstimate}/${limit}); forwarding as-is`);
-        return prepared;
+        // #553: only a trusted optimistic fit may clear a raw forward; an
+        // unknown-baseline session's true size is unmeasured, so fail fast
+        // instead of gambling a raw forward past the window.
+        if (!unknownBaseline && payloadEstimate < limit) {
+            log("warn", `[${session.id}] preflight trigger fired on a stale baseline (~${tokenCount}) but the payload fits (~${payloadEstimate}/${limit}); forwarding as-is`);
+            return prepared;
+        }
+        if (unknownBaseline) {
+            return failFast(502, "no part of the conversation is compressible (nothing left to fold)", false);
+        }
+        // Known-baseline over-window: fall through to preflightCompress — its
+        // relax path (#330) folds the soft-protected recent zone when that is
+        // the only foldable content, and its exhaustion detail carries the
+        // operator remedy wording.
     }
     // #330: the payload overflows the window (or nothing is foldable in the
     // normal pass but it doesn't fit). Let preflightCompress try to fold it —
@@ -2837,6 +2883,7 @@ async function preflightCompressIfNeeded(
             log,
             imageFloor: imageTokens,
             wireOverhead: overheadEstimate,
+            unknownBaseline,
         },
         prepared.originalMessages,
     );
@@ -2845,15 +2892,22 @@ async function preflightCompressIfNeeded(
     // that estimate more than the normal-config prepare does, which can turn a
     // guaranteed-400 forward into a false "fits". Images ride the payload
     // verbatim (#488): add their cost back or #496's image-dominated payload
-    // would look "fitting" on its text estimate alone.
+    // would look "fitting" on its text estimate alone. Unknown-baseline
+    // sessions keep the loop's own upper-bound judgment (result.fitsWindow,
+    // #553) — the optimistic re-estimate is exactly what that regime distrusts.
     if (result.compressedRanges > 0) {
         log("info", `[${session.id}] preflight compressed ${result.compressedRanges} range(s), ~${result.savedTokens} tokens saved (${tokenCount} → ${session.stats.lastInputTokens}) in ${Date.now() - started}ms; rebuilding payload`);
         const rebuilt = runPrepare();
         // runPrepare re-incremented stats.requests; the rebuild is internal
         // to this single client request.
         session.stats.requests -= 1;
-        if (estimateCoreMessages(rebuilt.processedMessages) + overheadEstimate + imageTokens < limit) return rebuilt;
-    } else if (estimateCoreMessages(prepared.processedMessages) + overheadEstimate + imageTokens < limit) {
+        const fits = unknownBaseline
+            ? result.fitsWindow
+            : estimateCoreMessages(rebuilt.processedMessages) + overheadEstimate + imageTokens < limit;
+        if (fits) return rebuilt;
+    } else if (unknownBaseline
+        ? result.fitsWindow
+        : estimateCoreMessages(prepared.processedMessages) + overheadEstimate + imageTokens < limit) {
         log("warn", `[${session.id}] preflight made no progress but the payload fits; forwarding as-is`);
         return prepared;
     }
