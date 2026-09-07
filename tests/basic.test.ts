@@ -160,6 +160,57 @@ test("parseCompressInput accepts JSON-string content (non-strict providers strin
     assert.deepEqual(parseCompressInput({ content: "not-json" }).ranges, []);
 });
 
+test("parseCompressInput salvages single-quoted JSON args (#603)", () => {
+    const parsed = parseCompressInput(
+        `{'content':[{'startId':'m00010','endId':'m00020','summary':'first'},{'startId':'m00030','endId':'m00040','summary':'second','topic':'mid'}],'topic':'intro'}`,
+        "call-q",
+    ).ranges;
+    assert.equal(parsed.length, 2);
+    assert.equal(parsed[0]?.startRef, "m00010");
+    assert.equal(parsed[0]?.endRef, "m00020");
+    assert.equal(parsed[0]?.summary, "first");
+    assert.equal(parsed[0]?.topic, "intro");
+    assert.equal(parsed[0]?.compressCallId, "call-q");
+    assert.equal(parsed[1]?.startRef, "m00030");
+    assert.equal(parsed[1]?.topic, "mid");
+});
+
+test("parseCompressInput salvages mixed single/double quotes, keeps apostrophes in data (#603)", () => {
+    const parsed = parseCompressInput(`{'content': [{'startId': "m00001", 'endId': "m00009", 'summary': "it's done, really"}]}`).ranges;
+    assert.equal(parsed.length, 1);
+    assert.equal(parsed[0]?.startRef, "m00001");
+    assert.equal(parsed[0]?.endRef, "m00009");
+    assert.equal(parsed[0]?.summary, "it's done, really");
+});
+
+test("parseCompressInput salvages truncated single-quoted content array (#603)", () => {
+    const parsed = parseCompressInput(`{'content':[{'startId':'m00010','endId':'m00020','summary':'first'},{'startId':'m00030','endId':'m00040','summary':'secon`).ranges;
+    assert.equal(parsed.length, 1);
+    assert.equal(parsed[0]?.startRef, "m00010");
+    assert.equal(parsed[0]?.endRef, "m00020");
+    assert.equal(parsed[0]?.summary, "first");
+});
+
+test("parseCompressInput salvages object input whose content string is single-quoted (#603)", () => {
+    const parsed = parseCompressInput({ content: `[{'startId':'m00005','endId':'m00006','summary':'ok'}]` }).ranges;
+    assert.equal(parsed.length, 1);
+    assert.equal(parsed[0]?.startRef, "m00005");
+    assert.equal(parsed[0]?.endRef, "m00006");
+    assert.equal(parsed[0]?.summary, "ok");
+});
+
+test("parseCompressInput still rejects prose with apostrophes unchanged (#603)", () => {
+    const result = parseCompressInput("I couldn't believe {that} would 'work'");
+    assert.deepEqual(result.ranges, []);
+    assert.equal(result.diagnostics.ok, false);
+});
+
+test("parseCompressInput leaves valid double-quoted args untouched by salvage (#603)", () => {
+    const parsed = parseCompressInput(JSON.stringify({ content: [{ startId: "m00001", endId: "m00002", summary: "don't panic" }] })).ranges;
+    assert.equal(parsed.length, 1);
+    assert.equal(parsed[0]?.summary, "don't panic");
+});
+
 test("buildCompressSystemPrompt includes compression philosophy", () => {
     const prompt = buildCompressSystemPrompt();
     assert.ok(prompt.length > 100, "prompt should be substantial");
