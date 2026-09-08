@@ -148,6 +148,7 @@ async function withTempHome<T>(fn: (home: string, env: NodeJS.ProcessEnv) => Pro
             CODEX_HOME: path.join(tmp, ".codex"),
             ZCODE_DATA_BASE_DIR: path.join(tmp, ".zcode"),
             PI_CODING_AGENT_DIR: path.join(tmp, ".pi", "agent"),
+            CODEBUDDY_CONFIG_DIR: path.join(tmp, ".codebuddy"),
         };
         return await fn(tmp, env);
     } finally {
