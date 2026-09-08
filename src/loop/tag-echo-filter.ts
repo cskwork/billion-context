@@ -16,13 +16,13 @@ const LONE_CLOSE = /<\/acp(?=[\s>])[^<>]{0,32}>/;
 // A suffix of the buffer that could still grow into a render tag: either an
 // unterminated `\x3cacp …` opening (attrs so far, no `>` yet) or a short
 // ambiguous prefix like `<`, `<a`, `</ac`, …
-const PARTIAL_TAIL = /(\x3cacp\s[^<>]*|\x3c\/acp(?:\s[^<>]*)?|<\/?a?c?p?)$/;
+const PARTIAL_TAIL = /(\x3cacp\s[^<>]*|\x3c\/acp(?:\s[^<>]{0,32})?|<\/?a?c?p?)$/;
 // An unterminated render-tag opening at the end of a string: `<acp ` plus
 // attrs, no `>` — a truncated imitation, never prose (triggers use `<acp_`).
 const TRUNC_OPEN = /\x3cacp\s[^<>]*$/;
 // A truncated render-tag CLOSE at the end of a string: `` or `` —
 // a truncated imitation close, never prose. Mirrors TRUNC_OPEN on the close side.
-const TRUNC_CLOSE = /\x3c\/acp(?:\s[^<>]*)?$/;
+const TRUNC_CLOSE = /\x3c\/acp(?:\s[^<>]{0,32})?$/;
 const CLOSE_TAG = "\x3c/acp";
 const HOLD_LIMIT = 128;
 // Hold cap for a definite unterminated opening tail — far beyond any real tag
