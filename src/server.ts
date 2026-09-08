@@ -1830,24 +1830,31 @@ function diagNudge(turn: { nudge?: { shouldInject: boolean; reason: string; cont
     return `[${sessionId}] nudge ${inject}: usage=${pct} (${tokenCount}/${limit}), growth=${growth}/${floor} (ref=${ref}, interval=${interval}), pendingT1=${pendingT1}/${interval}${modelTag}, reason="${n.reason.slice(0, 120)}"`;
 }
 
-// #408/#590/#623/#648: hosts that get the #408 uncompressed-baseline usage
+// #408/#590/#623/#645/#648: hosts that get the #408 uncompressed-baseline usage
 // backfill. pi's AND omp's bili extensions cancel the host's NATIVE compaction
 // so ACP owns compression — pi cancels auto-compaction, omp cancels ALL
 // compaction (its session_before_compact event carries no reason field, so
-// manual /compact can't be preserved). With the host's compaction off, the
-// uncompressed baseline drives nothing on the host side; reporting it only puts
-// a >100% footer that mismatches the folded request actually forwarded
-// (#590 pi 302.7%, #623 omp 205%). Gate on pluginAgent so ONLY the
-// bili-launched extensions are exempted: plain proxy clients and codex
-// native-compact interception keep the #408 behavior (their native compaction
-// stays live and consumes the baseline). The `hostUsageCredit` config option
-// (#648) additionally lets a plain proxy client opt out entirely ("off") —
-// ZCode and similar plain anthropic clients otherwise show the cumulative,
-// drifting baseline as inflated context in their UI.
+// manual /compact can't be preserved). Codex is exempted the same way (#645):
+// the backfilled baseline is a virtual number the model never receives — it
+// drifts turn-to-turn (real post-fold usage + a character-based estimate of
+// the folded-out tokens, so the metric can decrement with no compress), it
+// exceeds the window (user saw 1315/950k = 138%), and it drives nothing in
+// codex: codex's auto-compact keys off total_tokens, which the backfill never
+// touches. Detected by UA (same signal as native-compact interception) because
+// bili-launched codex sessions carry pluginAgent "mcp" (shared with claude).
+// With the host's compaction off (pi/omp) or the backfill inert (codex),
+// reporting the baseline only puts a >100% footer that mismatches the folded
+// request actually forwarded (#590 pi 302.7%, #623 omp 205%, #645 codex 138%).
+// Plain proxy clients keep the #408 behavior by default (their native
+// compaction stays live and consumes the baseline); the `hostUsageCredit`
+// config option (#648) additionally lets such a client opt out entirely
+// ("off") — ZCode and similar plain anthropic clients otherwise show the
+// cumulative, drifting baseline as inflated context in their UI.
 function armHostUsageCredit(
     session: Session,
     originalMessages: CoreMessage[],
     processedMessages: CoreMessage[],
+    headers: http.IncomingHttpHeaders,
     hostUsageCredit: "auto" | "off",
     log: (level: string, msg: string) => void,
 ): void {
@@ -1858,6 +1865,7 @@ function armHostUsageCredit(
     // drifting baseline that overstates real context pressure.
     if (hostUsageCredit === "off") return;
     if (session.metadata.pluginAgent === "pi" || session.metadata.pluginAgent === "omp") return;
+    if (isCodexClient(headers)) return;
     // #408: tokens folded out of the forwarded view vs the host's own (unfolded)
     // view — added back into the usage reported to the host so its anchor
     // reflects the uncompressed baseline. Same estimator both sides, so
@@ -2007,7 +2015,7 @@ function prepareAnthropic(
     // identity chain (#268), not part of the Anthropic Messages API — strip it
     // so the real upstream never sees a field it doesn't know.
     delete (rebuilt as Record<string, unknown>).prompt_cache_key;
-    armHostUsageCredit(session, originalMessages, processedMessages, opts.hostUsageCredit, log);
+    armHostUsageCredit(session, originalMessages, processedMessages, req.headers, opts.hostUsageCredit, log);
     return { body: JSON.stringify(rebuilt), session, processedMessages, originalMessages, anthropicSystem: parsed.system, protocol: "anthropic", stream, compressInjected: injectTools, pluginMode, nudge, prompts, renderTags: "text-only" } as Prepared;
 }
 
@@ -2262,7 +2270,7 @@ function prepareOpenai(
     if (stream && (rebuilt as Record<string, unknown>).stream_options === undefined) {
         (rebuilt as Record<string, unknown>).stream_options = { include_usage: true };
     }
-    armHostUsageCredit(session, originalMessages, processedMessages, opts.hostUsageCredit, log);
+    armHostUsageCredit(session, originalMessages, processedMessages, req.headers, opts.hostUsageCredit, log);
     // #532: title-gen side requests carry their own tiny system and would
     // clobber the conversation's measured overhead — skip them.
     if (!isTitleGen && openaiOutboundSystem !== undefined) {
@@ -2518,7 +2526,7 @@ function prepareResponses(
         });
         log("info", `[${sessionId}] responses forward tools=[${fwdTools.join(",")}] injectTool=${injectTools}${pluginMode ? " (plugin mode: wire injection suppressed)" : ""} NO_INJECT_TOOL=${!!process.env.ACP_NO_INJECT_TOOL} NO_COMPRESS_PROMPT=${!!process.env.ACP_NO_COMPRESS_PROMPT}`);
     }
-    armHostUsageCredit(session, originalMessages, processedMessages, opts.hostUsageCredit, log);
+    armHostUsageCredit(session, originalMessages, processedMessages, req.headers, opts.hostUsageCredit, log);
     // #532: measure the outbound developer(system)+tools overhead for the panel.
     // On this wire the system rides the injected developer message outside the
     // fold space, so counting devContent + tools does not double-count the
