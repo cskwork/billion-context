@@ -3,7 +3,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { loadClientConfig, resolvePiHome, nonEmpty, type ClientConfig } from "./client-config.js";
+import { loadClientConfig, resolvePiHome, resolveCodebuddyHome, nonEmpty, type ClientConfig } from "./client-config.js";
 
 const TTL_MS = 2000;
 
@@ -43,6 +43,10 @@ export function extractHttpsHosts(config: ClientConfig): string[] {
     if (config.zcode) {
         for (const prov of Object.values(config.zcode.providers)) push(prov.baseURL);
     }
+    if (config.codebuddy) {
+        push(config.codebuddy.codebuddyBaseUrl);
+        for (const u of config.codebuddy.modelUrls ?? []) push(u);
+    }
     return out;
 }
 
@@ -50,12 +54,16 @@ function configFilePaths(env: NodeJS.ProcessEnv): string[] {
     const home = os.homedir();
     const codexHome = nonEmpty(env.CODEX_HOME) ? env.CODEX_HOME : path.join(home, ".codex");
     const zcodeHome = nonEmpty(env.ZCODE_DATA_BASE_DIR) ? env.ZCODE_DATA_BASE_DIR : path.join(home, ".zcode");
+    const codebuddyHome = resolveCodebuddyHome(env);
     return [
         path.join(home, ".claude", "settings.json"),
         path.join(process.cwd(), ".claude", "settings.json"),
         path.join(codexHome, "config.toml"),
         path.join(resolvePiHome(env), "models.json"),
         path.join(zcodeHome, "v2", "config.json"),
+        path.join(codebuddyHome, "settings.json"),
+        path.join(codebuddyHome, "models.json"),
+        path.join(process.cwd(), ".codebuddy", "models.json"),
     ];
 }
 

@@ -79,12 +79,16 @@ export {
     readOpencodeConfig,
     type OpencodeConfig,
     type OpencodeProvider,
+    type CodebuddyConfig,
+    readCodebuddyConfig,
+    parseCodebuddyModelsJson,
+    resolveCodebuddyHome,
 } from "./client-config.js";
 
 export const LAUNCHER_DEFAULT_HOST = "127.0.0.1";
-export const LAUNCH_CLIENTS = ["pi", "codex", "claude", "omp", "opencode", "hermes", "dsh", "pi-test"] as const;
+export const LAUNCH_CLIENTS = ["pi", "codex", "claude", "omp", "opencode", "hermes", "dsh", "codebuddy", "pi-test"] as const;
 export type ClientName = (typeof LAUNCH_CLIENTS)[number];
-export type BaseClientName = "claude" | "codex" | "pi" | "omp" | "opencode" | "hermes" | "dsh";
+export type BaseClientName = "claude" | "codex" | "pi" | "omp" | "opencode" | "hermes" | "dsh" | "codebuddy";
 
 const HEALTH_PATH = "/__bili/health";
 const HEALTH_POLL_INTERVAL_MS = 200;
@@ -279,6 +283,40 @@ export function discoverRoutes(client: ClientName, config: ClientConfig): Discov
         } catch {
             // Unparseable base URL: leave routes empty (proxy still runs; claude
             // falls back to its own default endpoint).
+        }
+    } else if (client === "codebuddy") {
+        // codebuddy (Tencent CodeBuddy Code CLI) honors CODEBUDDY_BASE_URL
+        // (Anthropic protocol) natively, so — like claude — every upstream is
+        // routed through the /bili/ URL form. The CN platform default endpoint
+        // is the verified fallback; other deployments (e.g. the international
+        // build, whose default endpoint is unconfirmed) must set
+        // CODEBUDDY_BASE_URL in settings.json or the shell. models.json
+        // per-model urls BYPASS CODEBUDDY_BASE_URL, so they are collected as
+        // MITM-whitelist inventory only, never rewritten (v1).
+        const raw = nonEmpty(config.codebuddy?.codebuddyBaseUrl) ? config.codebuddy!.codebuddyBaseUrl! : "https://tencent.sso.codebuddy.cn/v2";
+        const real = unwrapUpstream(raw);
+        try {
+            const url = new URL(real);
+            if ((url.protocol === "https:" || url.protocol === "http:") && !rewriteKeys.has("CODEBUDDY_BASE_URL")) {
+                rewriteKeys.add("CODEBUDDY_BASE_URL");
+                httpRewrites.push({ key: "CODEBUDDY_BASE_URL", realUpstream: real });
+            }
+        } catch {
+            // Unparseable base URL: leave routes empty (proxy still runs;
+            // codebuddy falls back to its own default endpoint).
+        }
+        for (const rawModelUrl of config.codebuddy?.modelUrls ?? []) {
+            try {
+                const url = new URL(unwrapUpstream(rawModelUrl));
+                if (url.protocol !== "https:") continue;
+                const host = url.hostname;
+                if (host && !httpsSeen.has(host.toLowerCase())) {
+                    httpsSeen.add(host.toLowerCase());
+                    httpsDomains.push(host);
+                }
+            } catch {
+                // Unparseable model url: skip.
+            }
         }
     } else if (client === "pi") {
         for (const [name, prov] of Object.entries(config.pi?.providers ?? {})) {
@@ -542,6 +580,41 @@ export function buildClaudeEnv(
     return env;
 }
 
+/** codebuddy budget alignment (#321 pattern, mirrors resolveClaudeBudgetEnv):
+ *  inject CODEBUDDY_AUTO_COMPACT_WINDOW so codebuddy's native auto-compact
+ *  threshold matches bili's compress budget. Returns {} (no injection) when:
+ *  no model resolvable, the user already set an explicit auto-compact window
+ *  (settings `autoCompactWindow` or a shell-exported
+ *  CODEBUDDY_AUTO_COMPACT_WINDOW), or bili resolves no window for the model. */
+export async function resolveCodebuddyBudgetEnv(opts: {
+    model: string | undefined;
+    userAutoCompactWindow: number | undefined;
+    shellAutoCompactWindow: string | undefined;
+    routes: ProviderRoutes;
+    upstreamUrl: string | undefined;
+}): Promise<NodeJS.ProcessEnv> {
+    const { model, userAutoCompactWindow, shellAutoCompactWindow, routes, upstreamUrl } = opts;
+    if (!model || userAutoCompactWindow !== undefined || nonEmpty(shellAutoCompactWindow)) return {};
+    const window = await resolveLauncherWindow(model, routes, upstreamUrl);
+    if (!window) return {};
+    return { CODEBUDDY_AUTO_COMPACT_WINDOW: String(window) };
+}
+
+export function buildCodebuddyEnv(
+    origin: string,
+    caPath: string,
+    httpRewrites: HttpRewrite[],
+    httpsRewrites: HttpRewrite[],
+    baseEnv: NodeJS.ProcessEnv,
+): NodeJS.ProcessEnv {
+    const env: NodeJS.ProcessEnv = { ...baseEnv, HTTPS_PROXY: origin, NODE_EXTRA_CA_CERTS: caPath, BILLION_CONTEXT_PROXY: origin };
+    const r = httpRewrites.find((rw) => rw.key === "CODEBUDDY_BASE_URL");
+    if (r) env.CODEBUDDY_BASE_URL = wrapUpstream(origin, r.realUpstream);
+    const hr = httpsRewrites.find((rw) => rw.key === "CODEBUDDY_BASE_URL");
+    if (hr) env.CODEBUDDY_BASE_URL = hr.realUpstream;
+    return env;
+}
+
 // --- Launcher plugin mode (#162): inject the MCP shell + session hooks as
 // spawn-time flags, never touching host config files on disk. ---
 
@@ -613,9 +686,13 @@ function isPrivateIPv4(host: string): boolean {
  *  fumbles for them. When the codex upstream is a local/private endpoint and
  *  the user has not chosen explicitly, wire mode (flat tools every server
  *  understands) is the sane default. `BILI_LAUNCHER_PLUGIN=1` forces plugin
- *  mode regardless of the upstream. */
+ *  mode regardless of the upstream.
+ *
+ *  codebuddy is always excluded too: its `--mcp-config` compatibility is not
+ *  yet verified against a real build, so v1 runs pure wire mode (the proxy
+ *  injects the context tools on the wire). */
 export function launcherInjectMcp(env: NodeJS.ProcessEnv, base: string, codexUpstream?: string): boolean {
-    if (base === "pi" || base === "omp" || base === "opencode" || base === "hermes" || base === "dsh") return false;
+    if (base === "pi" || base === "omp" || base === "opencode" || base === "hermes" || base === "dsh" || base === "codebuddy") return false;
     if (env.BILI_LAUNCHER_PLUGIN === "0") return false;
     if (base === "codex" && env.BILI_LAUNCHER_PLUGIN === undefined && codexUpstream !== undefined && isPrivateUpstreamHost(codexUpstream)) {
         return false;
@@ -1656,6 +1733,10 @@ export function resolveClientCommand(
         );
         return { command: process.execPath, prefixArgs: [cli] };
     }
+    if (client === "codebuddy") {
+        const resolved = resolveOnPath("codebuddy", env) ?? resolveOnPath("cbc", env);
+        return { command: resolved ?? "codebuddy", prefixArgs: [] };
+    }
     const resolved = resolveOnPath(client, env);
     return { command: resolved ?? client, prefixArgs: [] };
 }
@@ -1908,6 +1989,19 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
                 console.error(`bili: codex budget aligned — ${budgetArgs.slice(2).join(", ")} (model: ${config.codex?.model})`);
             }
             if (injectMcp && codexConversationId) clientArgs = [...buildCodexMcpArgs(origin, codexConversationId), ...clientArgs];
+        }
+    } else if (base === "codebuddy") {
+        env = buildCodebuddyEnv(origin, ca, routes.httpRewrites, routes.httpsRewrites, process.env);
+        const codebuddyBudget = await resolveCodebuddyBudgetEnv({
+            model: config.codebuddy?.model,
+            userAutoCompactWindow: config.codebuddy?.autoCompactWindow,
+            shellAutoCompactWindow: process.env.CODEBUDDY_AUTO_COMPACT_WINDOW,
+            routes: biliRoutes,
+            upstreamUrl: config.codebuddy?.codebuddyBaseUrl ?? "https://tencent.sso.codebuddy.cn/v2",
+        });
+        Object.assign(env, codebuddyBudget);
+        if (codebuddyBudget.CODEBUDDY_AUTO_COMPACT_WINDOW !== undefined) {
+            console.error(`bili: codebuddy budget aligned — CODEBUDDY_AUTO_COMPACT_WINDOW=${codebuddyBudget.CODEBUDDY_AUTO_COMPACT_WINDOW}`);
         }
     } else {
         env = directUrl

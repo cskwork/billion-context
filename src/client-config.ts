@@ -93,6 +93,24 @@ export interface DshConfig {
     baseUrls: string[];
 }
 
+export interface CodebuddyConfig {
+    /** Model endpoint (Anthropic protocol): settings `env.CODEBUDDY_BASE_URL`
+     *  ?? shell `CODEBUDDY_BASE_URL`. */
+    codebuddyBaseUrl?: string;
+    /** The model codebuddy runs: settings top-level `model`. */
+    model?: string;
+    /** The user's explicit auto-compact window (settings `autoCompactWindow`)
+     *  — when set, the launcher must NOT override it with its own budget
+     *  injection (#321 pattern). */
+    autoCompactWindow?: number;
+    /** Per-model context windows from the two-tier models.json
+     *  (`maxInputTokens`), project-level winning per model id. */
+    models?: ModelWindow[];
+    /** Per-model `url` values from the two-tier models.json (inventory; the
+     *  launcher does NOT rewrite these in v1 — they bypass CODEBUDDY_BASE_URL). */
+    modelUrls?: string[];
+}
+
 export interface ClientConfig {
     claude?: ClaudeSettings;
     codex?: CodexConfig;
@@ -102,6 +120,7 @@ export interface ClientConfig {
     opencode?: OpencodeConfig;
     hermes?: HermesConfig;
     dsh?: DshConfig;
+    codebuddy?: CodebuddyConfig;
 }
 
 export function nonEmpty(s: unknown): s is string {
@@ -148,6 +167,118 @@ export function resolveDshHome(env: NodeJS.ProcessEnv): string {
     const h = os.homedir();
     return nonEmpty(env.DSH_HOME) ? env.DSH_HOME!
         : path.join(h, ".dsh");
+}
+
+/** codebuddy (Tencent CodeBuddy Code CLI) keeps its config under
+ *  CODEBUDDY_CONFIG_DIR (default ~/.codebuddy). */
+export function resolveCodebuddyHome(env: NodeJS.ProcessEnv): string {
+    const h = os.homedir();
+    return nonEmpty(env.CODEBUDDY_CONFIG_DIR) ? env.CODEBUDDY_CONFIG_DIR!
+        : path.join(h, ".codebuddy");
+}
+
+/** codebuddy models.json: per-model `url` (OpenAI /chat/completions full
+ *  path) + `maxInputTokens` (context window). The container shape is
+ *  unverified in the wild, so this tolerates a top-level model map, a
+ *  `models` map, or a `models`/top-level array of {id|name, url,
+ *  maxInputTokens} entries. */
+export function parseCodebuddyModelsJson(obj: unknown): { models: ModelWindow[]; urls: string[] } {
+    const out: { models: ModelWindow[]; urls: string[] } = { models: [], urls: [] };
+    const seenUrl = new Set<string>();
+    const collect = (id: unknown, entry: unknown): void => {
+        if (!entry || typeof entry !== "object" || Array.isArray(entry)) return;
+        const e = entry as Record<string, unknown>;
+        const url = e.url;
+        if (typeof url === "string" && url.length > 0 && !seenUrl.has(url)) {
+            seenUrl.add(url);
+            out.urls.push(url);
+        }
+        const win = toModelWindow(id, e.maxInputTokens);
+        if (win) out.models.push(win);
+    };
+    if (!obj) return out;
+    if (Array.isArray(obj)) {
+        for (const item of obj) {
+            if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+            const it = item as Record<string, unknown>;
+            collect(it.id ?? it.name, it);
+        }
+        return out;
+    }
+    if (typeof obj !== "object") return out;
+    const root = obj as Record<string, unknown>;
+    const modelsField = root.models;
+    if (Array.isArray(modelsField)) {
+        for (const item of modelsField) {
+            if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+            const it = item as Record<string, unknown>;
+            collect(it.id ?? it.name, it);
+        }
+        return out;
+    }
+    if (modelsField && typeof modelsField === "object") {
+        for (const [id, val] of Object.entries(modelsField as Record<string, unknown>)) collect(id, val);
+        return out;
+    }
+    for (const [id, val] of Object.entries(root)) collect(id, val);
+    return out;
+}
+
+function readJsonFile(filePath: string): unknown {
+    try {
+        return JSON.parse(fs.readFileSync(filePath, "utf8"));
+    } catch {
+        return null;
+    }
+}
+
+/** codebuddy config discovery (read-only):
+ *  - <configDir>/settings.json: `env.CODEBUDDY_BASE_URL` (Anthropic-protocol
+ *    endpoint), top-level `model`, top-level `autoCompactWindow`;
+ *  - two-tier <configDir>/models.json + <cwd>/.codebuddy/models.json (project
+ *    level wins per model id): per-model `url` + `maxInputTokens`.
+ *  A shell-exported CODEBUDDY_BASE_URL (codebuddy's native override) is
+ *  honored when no settings value exists. */
+export function readCodebuddyConfig(codebuddyHome: string, cwd: string, env: NodeJS.ProcessEnv = process.env): CodebuddyConfig {
+    let codebuddyBaseUrl: string | undefined;
+    let model: string | undefined;
+    let autoCompactWindow: number | undefined;
+    const settings = readJsonObject(path.join(codebuddyHome, "settings.json"));
+    const settingsEnv = settings?.env;
+    if (settingsEnv && typeof settingsEnv === "object" && !Array.isArray(settingsEnv)) {
+        const e = settingsEnv as Record<string, unknown>;
+        const v = e.CODEBUDDY_BASE_URL;
+        if (nonEmpty(v)) codebuddyBaseUrl = v;
+    }
+    const tm = settings?.model;
+    if (nonEmpty(tm)) model = String(tm);
+    const tacw = Number(settings?.autoCompactWindow);
+    if (Number.isFinite(tacw) && tacw > 0) autoCompactWindow = tacw;
+    if (!codebuddyBaseUrl && nonEmpty(env.CODEBUDDY_BASE_URL)) codebuddyBaseUrl = env.CODEBUDDY_BASE_URL;
+
+    const windowByModel = new Map<string, number>();
+    const urls: string[] = [];
+    const seenUrl = new Set<string>();
+    for (const f of [
+        path.join(codebuddyHome, "models.json"),
+        path.join(cwd, ".codebuddy", "models.json"),
+    ]) {
+        const parsed = parseCodebuddyModelsJson(readJsonFile(f));
+        for (const w of parsed.models) windowByModel.set(w.id, w.contextWindow);
+        for (const u of parsed.urls) {
+            if (!seenUrl.has(u)) {
+                seenUrl.add(u);
+                urls.push(u);
+            }
+        }
+    }
+    return {
+        ...(codebuddyBaseUrl ? { codebuddyBaseUrl } : {}),
+        ...(model ? { model } : {}),
+        ...(autoCompactWindow ? { autoCompactWindow } : {}),
+        ...(windowByModel.size > 0 ? { models: [...windowByModel.entries()].map(([id, contextWindow]) => ({ id, contextWindow })) } : {}),
+        ...(urls.length > 0 ? { modelUrls: urls } : {}),
+    };
 }
 
 /** Line-based scanner for dsh settings.yaml: collects every http(s) URL that
@@ -570,6 +701,7 @@ export function loadClientConfig(env: NodeJS.ProcessEnv, cwd: string): ClientCon
     config.opencode = readOpencodeConfig(resolveOpencodeConfigFile(env));
     config.hermes = readHermesConfig(resolveHermesHome(env));
     config.dsh = readDshConfig(resolveDshHome(env));
+    config.codebuddy = readCodebuddyConfig(resolveCodebuddyHome(env), cwd, env);
     return config;
 }
 
@@ -577,7 +709,7 @@ export function loadClientConfig(env: NodeJS.ProcessEnv, cwd: string): ClientCon
  *  launched client's own declarations are authoritative (#436: launching
  *  `bili omp` with omp's models.yml declaring 131072 must not be overridden by
  *  another client's larger declaration for the same model id). */
-export type ModelWindowScope = "claude" | "codex" | "pi" | "omp" | "opencode" | "hermes" | "dsh";
+export type ModelWindowScope = "claude" | "codex" | "pi" | "omp" | "opencode" | "hermes" | "dsh" | "codebuddy";
 
 /** Collect per-model context windows from client configs the launcher can
  *  read (pi models.json, omp models.yml, opencode opencode.json, codex
@@ -599,11 +731,13 @@ export function collectModelWindows(config: ClientConfig, scope?: ModelWindowSco
         else if (scope === "pi") for (const p of Object.values(config.pi?.providers ?? {})) add(p.models);
         else if (scope === "omp") for (const p of Object.values(config.omp?.providers ?? {})) add(p.models);
         else if (scope === "opencode") for (const p of Object.values(config.opencode?.providers ?? {})) add(p.models);
+        else if (scope === "codebuddy") add(config.codebuddy?.models);
         return out;
     }
     for (const p of Object.values(config.pi?.providers ?? {})) add(p.models);
     for (const p of Object.values(config.omp?.providers ?? {})) add(p.models);
     for (const p of Object.values(config.opencode?.providers ?? {})) add(p.models);
     add(config.codex?.modelWindows);
+    add(config.codebuddy?.models);
     return out;
 }

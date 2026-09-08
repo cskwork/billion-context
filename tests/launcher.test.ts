@@ -51,8 +51,13 @@ import {
     resolveLauncherWindow,
     resolveCodexBudgetArgs,
     resolveClaudeBudgetEnv,
+    resolveCodebuddyBudgetEnv,
+    buildCodebuddyEnv,
     codexUpstreamUrl,
     readClaudeSettings,
+    readCodebuddyConfig,
+    parseCodebuddyModelsJson,
+    resolveCodebuddyHome,
     type SpawnChild,
     type SpawnFn,
     runLaunch,
@@ -2298,6 +2303,325 @@ test("runLaunch claude: CLAUDE_CODE_AUTO_COMPACT_WINDOW injected (built-in table
         else process.env.ANTHROPIC_MODEL = prevAnthropicModel;
         if (prevAutoCompact === undefined) delete process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW;
         else process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW = prevAutoCompact;
+        fs.rmSync(home, { recursive: true, force: true });
+    }
+});
+
+test("isLaunchClient: codebuddy true", () => {
+    assert.equal(isLaunchClient("codebuddy"), true);
+});
+
+test("resolveCodebuddyHome: CODEBUDDY_CONFIG_DIR > default ~/.codebuddy", () => {
+    const h = os.homedir();
+    assert.equal(resolveCodebuddyHome({ CODEBUDDY_CONFIG_DIR: "/custom/cb" }), "/custom/cb");
+    assert.equal(resolveCodebuddyHome({}), path.join(h, ".codebuddy"));
+    assert.equal(resolveCodebuddyHome({ CODEBUDDY_CONFIG_DIR: "  " }), path.join(h, ".codebuddy"));
+});
+
+test("parseCodebuddyModelsJson: top-level map / models map / array shapes", () => {
+    const topMap = parseCodebuddyModelsJson({
+        "model-a": { url: "https://a.example.com/v1/chat/completions", apiKey: "k", maxInputTokens: 100000 },
+        "model-b": { maxInputTokens: 200000 },
+        junk: "not-an-object",
+    });
+    assert.deepEqual(topMap.models, [
+        { id: "model-a", contextWindow: 100000 },
+        { id: "model-b", contextWindow: 200000 },
+    ]);
+    assert.deepEqual(topMap.urls, ["https://a.example.com/v1/chat/completions"]);
+
+    const modelsMap = parseCodebuddyModelsJson({
+        models: { "model-c": { url: "https://c.example.com/v1/chat/completions", maxInputTokens: 300000 } },
+    });
+    assert.deepEqual(modelsMap.models, [{ id: "model-c", contextWindow: 300000 }]);
+    assert.deepEqual(modelsMap.urls, ["https://c.example.com/v1/chat/completions"]);
+
+    const arr = parseCodebuddyModelsJson([
+        { id: "model-d", url: "https://d.example.com/v1/chat/completions", maxInputTokens: 400000 },
+        { name: "model-e", maxInputTokens: 500000 },
+        "junk",
+    ]);
+    assert.deepEqual(arr.models, [
+        { id: "model-d", contextWindow: 400000 },
+        { id: "model-e", contextWindow: 500000 },
+    ]);
+    assert.deepEqual(arr.urls, ["https://d.example.com/v1/chat/completions"]);
+
+    assert.deepEqual(parseCodebuddyModelsJson(null), { models: [], urls: [] });
+    assert.deepEqual(parseCodebuddyModelsJson("nope"), { models: [], urls: [] });
+    assert.deepEqual(parseCodebuddyModelsJson({ "model-x": { maxInputTokens: -1 } }), { models: [], urls: [] });
+});
+
+test("readCodebuddyConfig: settings env block / top-level model / autoCompactWindow / shell fallback", () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-codebuddy-settings-"));
+    try {
+        const cbDir = path.join(home, ".codebuddy");
+        fs.mkdirSync(cbDir, { recursive: true });
+        fs.writeFileSync(
+            path.join(cbDir, "settings.json"),
+            JSON.stringify({ model: "cb-model-1", autoCompactWindow: 300000, env: { CODEBUDDY_BASE_URL: "http://relay.local/cb" } }),
+        );
+        let cfg = readCodebuddyConfig(cbDir, os.tmpdir(), {});
+        assert.equal(cfg.codebuddyBaseUrl, "http://relay.local/cb");
+        assert.equal(cfg.model, "cb-model-1");
+        assert.equal(cfg.autoCompactWindow, 300000);
+
+        // shell-exported CODEBUDDY_BASE_URL fills in when settings has none
+        fs.writeFileSync(path.join(cbDir, "settings.json"), JSON.stringify({ model: "cb-model-1" }));
+        cfg = readCodebuddyConfig(cbDir, os.tmpdir(), { CODEBUDDY_BASE_URL: "https://shell.example.com/v2" });
+        assert.equal(cfg.codebuddyBaseUrl, "https://shell.example.com/v2");
+
+        // nothing set → empty object
+        fs.writeFileSync(path.join(cbDir, "settings.json"), JSON.stringify({}));
+        cfg = readCodebuddyConfig(cbDir, os.tmpdir(), {});
+        assert.deepEqual(cfg, {});
+    } finally {
+        fs.rmSync(home, { recursive: true, force: true });
+    }
+});
+
+test("readCodebuddyConfig: two-tier models.json, project level wins per model", () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-codebuddy-models-"));
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "bili-codebuddy-cwd-"));
+    try {
+        const cbDir = path.join(home, ".codebuddy");
+        fs.mkdirSync(cbDir, { recursive: true });
+        fs.writeFileSync(
+            path.join(cbDir, "models.json"),
+            JSON.stringify({
+                "shared-model": { url: "https://global.example.com/v1/chat/completions", maxInputTokens: 100000 },
+                "global-only": { url: "https://global.example.com/v1/chat/completions", maxInputTokens: 200000 },
+            }),
+        );
+        const projDir = path.join(cwd, ".codebuddy");
+        fs.mkdirSync(projDir, { recursive: true });
+        fs.writeFileSync(
+            path.join(projDir, "models.json"),
+            JSON.stringify({
+                "shared-model": { url: "https://project.example.com/v1/chat/completions", maxInputTokens: 999999 },
+            }),
+        );
+        const cfg = readCodebuddyConfig(cbDir, cwd, {});
+        assert.deepEqual(cfg.models, [
+            { id: "shared-model", contextWindow: 999999 },
+            { id: "global-only", contextWindow: 200000 },
+        ]);
+        assert.deepEqual(cfg.modelUrls, [
+            "https://global.example.com/v1/chat/completions",
+            "https://project.example.com/v1/chat/completions",
+        ]);
+    } finally {
+        fs.rmSync(home, { recursive: true, force: true });
+        fs.rmSync(cwd, { recursive: true, force: true });
+    }
+});
+
+test("buildCodebuddyEnv: CODEBUDDY_BASE_URL rewrite sets env + keeps HTTPS_PROXY/CA", () => {
+    const rewrites: HttpRewrite[] = [
+        { key: "CODEBUDDY_BASE_URL", realUpstream: "http://relay.local/cb" },
+    ];
+    const env = buildCodebuddyEnv("http://127.0.0.1:8787", "/tmp/ca.pem", rewrites, [], { PATH: "/usr/bin", CODEBUDDY_API_KEY: "cb-x" });
+    assert.equal(env.HTTPS_PROXY, "http://127.0.0.1:8787");
+    assert.equal(env.NODE_EXTRA_CA_CERTS, "/tmp/ca.pem");
+    assert.equal(env.BILLION_CONTEXT_PROXY, "http://127.0.0.1:8787");
+    assert.equal(env.CODEBUDDY_API_KEY, "cb-x");
+    assert.equal(env.CODEBUDDY_BASE_URL, "http://127.0.0.1:8787/bili/http://relay.local/cb");
+});
+
+test("buildCodebuddyEnv: no CODEBUDDY_BASE_URL rewrite → env.CODEBUDDY_BASE_URL unset", () => {
+    const env = buildCodebuddyEnv("http://127.0.0.1:8787", "/tmp/ca.pem", [], [], { PATH: "/usr/bin" });
+    assert.equal(env.CODEBUDDY_BASE_URL, undefined);
+    assert.equal(env.HTTPS_PROXY, "http://127.0.0.1:8787");
+});
+
+test("discoverRoutes: codebuddy default → CODEBUDDY_BASE_URL /bili/ rewrite (CN platform endpoint)", () => {
+    const routes = discoverRoutes("codebuddy", {});
+    assert.deepEqual(routes.httpsDomains, []);
+    assert.deepEqual(routes.httpsRewrites, []);
+    assert.deepEqual(routes.httpRewrites, [
+        { key: "CODEBUDDY_BASE_URL", realUpstream: "https://tencent.sso.codebuddy.cn/v2" },
+    ]);
+});
+
+test("discoverRoutes: codebuddy configured http base URL → httpRewrites entry, no https domains", () => {
+    const config: ClientConfig = {
+        codebuddy: { codebuddyBaseUrl: "http://relay.local/cb" },
+    };
+    const routes = discoverRoutes("codebuddy", config);
+    assert.deepEqual(routes.httpsDomains, []);
+    assert.deepEqual(routes.httpRewrites, [
+        { key: "CODEBUDDY_BASE_URL", realUpstream: "http://relay.local/cb" },
+    ]);
+});
+
+test("discoverRoutes: codebuddy /bili/-wrapped base_url unwraps to real upstream for re-wrap", () => {
+    const config: ClientConfig = {
+        codebuddy: { codebuddyBaseUrl: "http://127.0.0.1:8787/bili/https://relay.example.com/v2" },
+    };
+    const routes = discoverRoutes("codebuddy", config);
+    assert.deepEqual(routes.httpsDomains, []);
+    assert.deepEqual(routes.httpRewrites, [
+        { key: "CODEBUDDY_BASE_URL", realUpstream: "https://relay.example.com/v2" },
+    ]);
+});
+
+test("discoverRoutes: codebuddy models.json urls → httpsDomains inventory, never rewritten", () => {
+    const config: ClientConfig = {
+        codebuddy: {
+            modelUrls: [
+                "https://models.example.com/v1/chat/completions",
+                "http://local.example.com/v1/chat/completions",
+                "not-a-url",
+            ],
+        },
+    };
+    const routes = discoverRoutes("codebuddy", config);
+    assert.deepEqual(routes.httpsDomains, ["models.example.com"]);
+    assert.deepEqual(routes.httpRewrites, [
+        { key: "CODEBUDDY_BASE_URL", realUpstream: "https://tencent.sso.codebuddy.cn/v2" },
+    ]);
+});
+
+test("resolveCodebuddyBudgetEnv: injects CODEBUDDY_AUTO_COMPACT_WINDOW from bili's chain", async () => {
+    registrySetForTest({});
+    try {
+        assert.deepEqual(
+            await resolveCodebuddyBudgetEnv({ model: "claude-sonnet-4-5", userAutoCompactWindow: undefined, shellAutoCompactWindow: undefined, routes: {}, upstreamUrl: "https://tencent.sso.codebuddy.cn/v2" }),
+            { CODEBUDDY_AUTO_COMPACT_WINDOW: "200000" },
+        );
+        const routes = { "https://relay.example.com": { models: { "cb-x": { context: 123456 } } } };
+        assert.deepEqual(
+            await resolveCodebuddyBudgetEnv({ model: "cb-x", userAutoCompactWindow: undefined, shellAutoCompactWindow: undefined, routes, upstreamUrl: "https://relay.example.com" }),
+            { CODEBUDDY_AUTO_COMPACT_WINDOW: "123456" },
+        );
+        registrySetForTest({ "anthropic/bili-fallback-model": { limit: { context: 333333 } } });
+        assert.deepEqual(
+            await resolveCodebuddyBudgetEnv({ model: "bili-fallback-model", userAutoCompactWindow: undefined, shellAutoCompactWindow: undefined, routes: {}, upstreamUrl: "https://tencent.sso.codebuddy.cn/v2" }),
+            { CODEBUDDY_AUTO_COMPACT_WINDOW: "333333" },
+        );
+    } finally {
+        registryResetForTest();
+    }
+});
+
+test("resolveCodebuddyBudgetEnv: no injection when user self-aligned or unresolvable", async () => {
+    registrySetForTest({});
+    try {
+        assert.deepEqual(await resolveCodebuddyBudgetEnv({ model: "claude-sonnet-4-5", userAutoCompactWindow: 300000, shellAutoCompactWindow: undefined, routes: {}, upstreamUrl: "https://tencent.sso.codebuddy.cn/v2" }), {});
+        assert.deepEqual(await resolveCodebuddyBudgetEnv({ model: "claude-sonnet-4-5", userAutoCompactWindow: undefined, shellAutoCompactWindow: "250000", routes: {}, upstreamUrl: "https://tencent.sso.codebuddy.cn/v2" }), {});
+        assert.deepEqual(await resolveCodebuddyBudgetEnv({ model: undefined, userAutoCompactWindow: undefined, shellAutoCompactWindow: undefined, routes: {}, upstreamUrl: "https://tencent.sso.codebuddy.cn/v2" }), {});
+        assert.deepEqual(await resolveCodebuddyBudgetEnv({ model: "bili-nonexistent-model-xyz", userAutoCompactWindow: undefined, shellAutoCompactWindow: undefined, routes: {}, upstreamUrl: "https://tencent.sso.codebuddy.cn/v2" }), {});
+    } finally {
+        registryResetForTest();
+    }
+});
+
+test("resolveClientCommand: codebuddy resolves codebuddy, then cbc, then bare name", () => {
+    assert.deepEqual(resolveClientCommand("codebuddy", { PATH: "/nonexistent-dir-zzz" }), {
+        command: "codebuddy",
+        prefixArgs: [],
+    });
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "bili-path-"));
+    const cbcFile = path.join(tmp, "cbc");
+    fs.writeFileSync(cbcFile, "#!/bin/sh\necho cbc\n", { mode: 0o755 });
+    try {
+        assert.deepEqual(resolveClientCommand("codebuddy", { PATH: tmp }), {
+            command: cbcFile,
+            prefixArgs: [],
+        });
+    } finally {
+        fs.unlinkSync(cbcFile);
+        fs.rmdirSync(tmp);
+    }
+    const tmp2 = fs.mkdtempSync(path.join(os.tmpdir(), "bili-path-"));
+    const cbFile = path.join(tmp2, "codebuddy");
+    const cbFile2 = path.join(tmp2, "cbc");
+    fs.writeFileSync(cbFile, "#!/bin/sh\necho cb\n", { mode: 0o755 });
+    fs.writeFileSync(cbFile2, "#!/bin/sh\necho cbc\n", { mode: 0o755 });
+    try {
+        assert.deepEqual(resolveClientCommand("codebuddy", { PATH: tmp2 }), {
+            command: cbFile,
+            prefixArgs: [],
+        });
+    } finally {
+        fs.unlinkSync(cbFile);
+        fs.unlinkSync(cbFile2);
+        fs.rmdirSync(tmp2);
+    }
+});
+
+test("runLaunch codebuddy: CODEBUDDY_BASE_URL /bili/ rewrite + budget injected (built-in table window)", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-codebuddy-budget-"));
+    const prevHome = process.env.HOME;
+    const prevUserProfile = process.env.USERPROFILE;
+    const prevClientBin = process.env.BILI_CLIENT_BIN;
+    const prevBaseUrl = process.env.CODEBUDDY_BASE_URL;
+    const prevAutoCompact = process.env.CODEBUDDY_AUTO_COMPACT_WINDOW;
+    const prevConfigDir = process.env.CODEBUDDY_CONFIG_DIR;
+    process.env.HOME = home;
+    if (prevUserProfile !== undefined) process.env.USERPROFILE = home;
+    delete process.env.CODEBUDDY_BASE_URL;
+    delete process.env.CODEBUDDY_AUTO_COMPACT_WINDOW;
+    delete process.env.CODEBUDDY_CONFIG_DIR;
+    const fakeCodebuddy = path.join(home, "fake-codebuddy");
+    fs.writeFileSync(fakeCodebuddy, "");
+    process.env.BILI_CLIENT_BIN = fakeCodebuddy;
+    const cbDir = path.join(home, ".codebuddy");
+    fs.mkdirSync(cbDir, { recursive: true });
+    fs.writeFileSync(path.join(cbDir, "settings.json"), JSON.stringify({ model: "claude-sonnet-4-5" }));
+
+    const clientEnvs: (NodeJS.ProcessEnv | undefined)[] = [];
+    const spawnImpl: SpawnFn = (cmd, args, opts) => {
+        if (cmd === fakeCodebuddy) {
+            clientEnvs.push((opts as { env?: NodeJS.ProcessEnv } | undefined)?.env);
+            const child = makeFakeChild(0);
+            const orig = child.on.bind(child);
+            (child as { on: SpawnChild["on"] }).on = (event, listener) => {
+                orig(event, listener);
+                if (event === "exit") setTimeout(() => listener(0, null), 0);
+                return child;
+            };
+            return child;
+        }
+        return makeFakeChild(42422);
+    };
+    const fetchImpl = async () => ({ ok: true });
+    const prevExit = process.exit;
+    process.exit = (() => undefined) as typeof process.exit;
+
+    try {
+        await runLaunch(
+            { client: "codebuddy", clientArgs: [], overrides: {} },
+            { fetchImpl, spawnImpl, sleep: () => Promise.resolve() },
+        );
+        assert.equal(clientEnvs.length, 1);
+        assert.match(clientEnvs[0]?.CODEBUDDY_BASE_URL ?? "", /^http:\/\/127\.0\.0\.1:\d+\/bili\/https:\/\/tencent\.sso\.codebuddy\.cn\/v2$/);
+        assert.equal(clientEnvs[0]?.CODEBUDDY_AUTO_COMPACT_WINDOW, "200000");
+        assert.equal(clientEnvs[0]?.HTTPS_PROXY, clientEnvs[0]?.BILLION_CONTEXT_PROXY);
+
+        // user self-aligned (settings autoCompactWindow) → no budget injection
+        fs.writeFileSync(path.join(cbDir, "settings.json"), JSON.stringify({ model: "claude-sonnet-4-5", autoCompactWindow: 300000 }));
+        clientEnvs.length = 0;
+        await runLaunch(
+            { client: "codebuddy", clientArgs: [], overrides: {} },
+            { fetchImpl, spawnImpl, sleep: () => Promise.resolve() },
+        );
+        assert.equal(clientEnvs.length, 1);
+        assert.equal(clientEnvs[0]?.CODEBUDDY_AUTO_COMPACT_WINDOW, undefined);
+        assert.match(clientEnvs[0]?.CODEBUDDY_BASE_URL ?? "", /^http:\/\/127\.0\.0\.1:\d+\/bili\//);
+    } finally {
+        process.exit = prevExit;
+        process.env.HOME = prevHome;
+        if (prevUserProfile === undefined) delete process.env.USERPROFILE;
+        else process.env.USERPROFILE = prevUserProfile;
+        if (prevClientBin === undefined) delete process.env.BILI_CLIENT_BIN;
+        else process.env.BILI_CLIENT_BIN = prevClientBin;
+        if (prevBaseUrl === undefined) delete process.env.CODEBUDDY_BASE_URL;
+        else process.env.CODEBUDDY_BASE_URL = prevBaseUrl;
+        if (prevAutoCompact === undefined) delete process.env.CODEBUDDY_AUTO_COMPACT_WINDOW;
+        else process.env.CODEBUDDY_AUTO_COMPACT_WINDOW = prevAutoCompact;
+        if (prevConfigDir === undefined) delete process.env.CODEBUDDY_CONFIG_DIR;
+        else process.env.CODEBUDDY_CONFIG_DIR = prevConfigDir;
         fs.rmSync(home, { recursive: true, force: true });
     }
 });
