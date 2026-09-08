@@ -94,8 +94,8 @@ export interface DshConfig {
 }
 
 export interface CodebuddyConfig {
-    /** Model endpoint (Anthropic protocol): settings `env.CODEBUDDY_BASE_URL`
-     *  ?? shell `CODEBUDDY_BASE_URL`. */
+    /** Model endpoint (OpenAI chat completions wire): settings
+     *  `env.CODEBUDDY_BASE_URL` ?? shell `CODEBUDDY_BASE_URL`. */
     codebuddyBaseUrl?: string;
     /** The model codebuddy runs: settings top-level `model`. */
     model?: string;
@@ -233,8 +233,8 @@ function readJsonFile(filePath: string): unknown {
 }
 
 /** codebuddy config discovery (read-only):
- *  - <configDir>/settings.json: `env.CODEBUDDY_BASE_URL` (Anthropic-protocol
- *    endpoint), top-level `model`, top-level `autoCompactWindow`;
+ *  - <configDir>/settings.json: `env.CODEBUDDY_BASE_URL` (OpenAI chat
+ *    completions endpoint), top-level `model`, top-level `autoCompactWindow`;
  *  - two-tier <configDir>/models.json + <cwd>/.codebuddy/models.json (project
  *    level wins per model id): per-model `url` + `maxInputTokens`.
  *  A shell-exported CODEBUDDY_BASE_URL (codebuddy's native override) is

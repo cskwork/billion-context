@@ -286,13 +286,15 @@ export function discoverRoutes(client: ClientName, config: ClientConfig): Discov
         }
     } else if (client === "codebuddy") {
         // codebuddy (Tencent CodeBuddy Code CLI) honors CODEBUDDY_BASE_URL
-        // (Anthropic protocol) natively, so — like claude — every upstream is
-        // routed through the /bili/ URL form. The CN platform default endpoint
-        // is the verified fallback; other deployments (e.g. the international
-        // build, whose default endpoint is unconfirmed) must set
-        // CODEBUDDY_BASE_URL in settings.json or the shell. models.json
-        // per-model urls BYPASS CODEBUDDY_BASE_URL, so they are collected as
-        // MITM-whitelist inventory only, never rewritten (v1).
+        // natively; its ModelProvider is the OpenAI SDK, so model traffic is
+        // OpenAI chat completions (POST <base>/chat/completions) — bili routes
+        // it through the openai adapter by path. Every upstream is routed
+        // through the /bili/ URL form. The CN platform default endpoint is the
+        // verified fallback; the international build defaults to
+        // https://www.codebuddy.ai/v2 (product.json), so other deployments
+        // must set CODEBUDDY_BASE_URL in settings.json or the shell.
+        // models.json per-model urls BYPASS CODEBUDDY_BASE_URL, so they are
+        // collected as MITM-whitelist inventory only, never rewritten (v1).
         const raw = nonEmpty(config.codebuddy?.codebuddyBaseUrl) ? config.codebuddy!.codebuddyBaseUrl! : "https://tencent.sso.codebuddy.cn/v2";
         const real = unwrapUpstream(raw);
         try {
