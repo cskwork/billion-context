@@ -124,6 +124,30 @@ test("stripAcpTags: short truncated close at end is still dropped (#644 bound)",
     assert.equal(stripAcpTags(`ref m00001 ${LT}/acp tokens`), "ref m00001 ");
 });
 
+// The actual #644 incident shape: whitespace right after the malformed
+// close. The unbounded close-side tails consumed content only through the
+// \s[^<>]* group, so the no-whitespace variants above never triggered the
+// bug on their own — this is the shape that ate the real prose.
+test("stripAcpTags: malformed close with trailing space does not eat following content (#644 incident shape)", () => {
+    const content = "这是真实的正文内容，不应被过滤器吃掉。".repeat(12);
+    const malformed = `${LT}acp tokens="245" type="text">m01998${LT}/acp ` + content;
+    const out = stripAcpTags(malformed);
+    assert.ok(out.includes(content), "real content survives the malformed close (not eaten)");
+    assert.ok(out.includes("m01998"), "the ref is preserved");
+    assert.notEqual(out, "m01998", "not stripped to the bare ref");
+});
+
+test("streaming filter matches stripAcpTags for the incident-shape malformed close at every split position (#644)", () => {
+    const content = "这是真实的正文内容，不应被过滤器吃掉。".repeat(12);
+    const full = `${LT}acp tokens="245" type="text">m01998${LT}/acp ` + content;
+    const expected = stripAcpTags(full);
+    for (let split = 0; split <= full.length; split++) {
+        const f = createTagEchoFilter();
+        const out = f.push(full.slice(0, split)) + f.push(full.slice(split)) + f.flush();
+        assert.equal(out, expected, `split=${split}`);
+    }
+});
+
 test("streaming filter matches stripAcpTags for every split position", () => {
     const cases = [
         `answer ${TAG("m00155")}${TAG("m00155", 44)} done`,
