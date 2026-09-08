@@ -7,7 +7,7 @@ import http from "node:http";
 import { once } from "node:events";
 import type { Config, CoreMessage } from "acp-kernel";
 import { createCore, createInitialState, defaultConfig } from "acp-kernel";
-import type { Session } from "../src/session.ts";
+import { listSessions, _resetSessionsForTest, type Session } from "../src/session.ts";
 import { runCompressLoop, createResponsesAdapter, createOpenaiAdapter, createAnthropicAdapter } from "../src/loop/index.ts";
 import { backfillHostUsage, promptInputTotal, usageTotals } from "../src/util.ts";
 import { pipePluginChatWithStrip, pipePluginResponsesWithStrip, pipePluginJson, _resetPluginStateForTest } from "../src/plugin.ts";
@@ -747,4 +747,166 @@ test("#623: omp plugin mode reports folded usage — host backfill suppressed", 
         await new Promise<void>((resolve, reject) => proxy.close((e) => (e ? reject(e) : resolve())));
         await new Promise<void>((resolve, reject) => relay.close((e) => (e ? reject(e) : resolve())));
     }
+});
+
+// #648: ZCode — a plain proxy client on the anthropic wire (no x-bili-plugin
+// header, no special UA) — must be able to opt out of the #408
+// uncompressed-baseline backfill via hostUsageCredit: "off", reporting the
+// folded request's own usage (matching [acp-usage] input=). The control test
+// pins the other side of the gate: an identical plain client on the default
+// (hostUsageCredit: "auto") still gets the #408 backfill. The fold is real
+// (the relay emits a compress tool_use), not a vacuous pass.
+
+const ZCODE_CONV_648 = "zcode-usage-648";
+
+function zcodeSse(event: string, data: unknown): string {
+    return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+}
+
+function zcodeCompressToolUse(): string {
+    const args = JSON.stringify({
+        content: [{ startId: "m00001", endId: "m00002", topic: "setup", summary: "MAIN-SUMMARY-SETUP-CONTEXT-FOLDED-BY-COMPRESSION-LONG-ENOUGH-FOR-KERNEL-MIN-LENGTH-CHECK" }],
+    });
+    return [
+        zcodeSse("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "tool_use", id: "toolu_zcode_1", name: "compress", input: {} } }),
+        zcodeSse("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: args } }),
+        zcodeSse("content_block_stop", { type: "content_block_stop", index: 0 }),
+    ].join("");
+}
+
+function zcodeNormalCompletion(inputTokens: number): string {
+    return [
+        zcodeSse("message_start", { type: "message_start", message: { id: "msg_zcode", role: "assistant", usage: { input_tokens: inputTokens, output_tokens: 3 } } }),
+        zcodeSse("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } }),
+        zcodeSse("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "ok" } }),
+        zcodeSse("content_block_stop", { type: "content_block_stop", index: 0 }),
+        zcodeSse("message_delta", { type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { output_tokens: 3 } }),
+        zcodeSse("message_stop", { type: "message_stop" }),
+    ].join("");
+}
+
+// 10 messages with filler; the sentinel sits in m00002 (the assistant message
+// of the compressed head) so the fold is real and the post-fold upstream body
+// provably drops the head content.
+function zcodeConversation(): Array<{ role: string; content: string }> {
+    const headFiller = "lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. ".repeat(28);
+    const tailFiller = "enim ad minim veniam quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat duis aute irure dolor in reprehenderit in voluptate. ".repeat(28);
+    const history: Array<{ role: string; content: string }> = [];
+    for (let i = 1; i <= 2; i++) {
+        history.push({ role: "user", content: `turn-${i}-marker question: ${headFiller}` });
+        history.push({ role: "assistant", content: `turn-${i}-marker ${i === 1 ? "SENTINEL_FOLD_GONE " : ""}answer: ${headFiller}` });
+    }
+    for (let i = 3; i <= 5; i++) {
+        history.push({ role: "user", content: `turn-${i} padding question: ${tailFiller}` });
+        history.push({ role: "assistant", content: `turn-${i} padding answer: ${tailFiller}` });
+    }
+    return history;
+}
+
+async function withZCodeHarness(hostUsageCredit: "auto" | "off", fn: (h: { proxy: http.Server; upstream: http.Server; bodies: string[]; url: string }) => Promise<void>): Promise<void> {
+    const bodies: string[] = [];
+    const upstream = http.createServer((req, res) => {
+        const chunks: Buffer[] = [];
+        req.on("data", (c: Buffer) => chunks.push(c));
+        req.on("end", () => {
+            bodies.push(Buffer.concat(chunks).toString("utf8"));
+            res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
+            if (bodies.length === 1) {
+                res.write(zcodeSse("message_start", { type: "message_start", message: { id: "msg_zcode_1", role: "assistant", usage: { input_tokens: 1000, output_tokens: 3 } } }));
+                res.write(zcodeCompressToolUse());
+                res.write(zcodeSse("message_delta", { type: "message_delta", delta: { stop_reason: "tool_use", stop_sequence: null }, usage: { output_tokens: 3 } }));
+                res.write(zcodeSse("message_stop", { type: "message_stop" }));
+            } else {
+                res.write(zcodeNormalCompletion(1000));
+            }
+            res.end();
+        });
+    });
+    upstream.listen(0, "127.0.0.1");
+    await once(upstream, "listening");
+    const upstreamPort = (upstream.address() as { port: number }).port;
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    _resetSessionsForTest();
+    setRegistryForTest({});
+    const proxy = await startServer({
+        port: 0,
+        host: "127.0.0.1",
+        upstream: "http://127.0.0.1",
+        routes: { [`http://127.0.0.1:${upstreamPort}`]: { models: { "claude-test": { context: 100_000 } } } },
+        modelContextLimit: 100_000,
+        kernelConfig: defaultConfig(100_000),
+        compress: { injectTool: true, injectNudge: false },
+        promptCache: { routing: "auto" },
+        sessionHeader: "x-acp-session",
+        log: false,
+        debug: false,
+        passthrough: false,
+        autoUpdate: false,
+        hostUsageCredit,
+        mitm: { enabled: false, domains: [] },
+    } as ProxyOptions);
+    await once(proxy, "listening");
+    const proxyPort = (proxy.address() as { port: number }).port;
+    const h = { proxy, upstream, bodies, url: `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/messages` };
+    try {
+        await fn(h);
+    } finally {
+        proxy.close();
+        await once(proxy, "close");
+        upstream.close();
+        await once(upstream, "close");
+    }
+}
+
+function zcodeInputTokensOf(raw: string): number {
+    const m = raw.match(/"input_tokens":(\d+)/);
+    assert.ok(m, `message_start usage missing: ${raw.slice(0, 400)}`);
+    return Number(m[1]);
+}
+
+async function setupZCodeCompressedSession(h: { bodies: string[]; url: string }): Promise<number> {
+    const r1 = await fetch(h.url, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-acp-session": ZCODE_CONV_648 },
+        body: JSON.stringify({ model: "claude-test", max_tokens: 1024, stream: true, system: "You are a test assistant.", messages: zcodeConversation() }),
+    });
+    assert.equal(r1.status, 200);
+    await r1.text();
+    const s = listSessions().find((x) => x.meta.label === ZCODE_CONV_648);
+    assert.ok(s, "session exists");
+    assert.ok((s!.state.blocks ?? []).some((b) => b.active), "setup created an active block (real fold)");
+    assert.ok(h.bodies[0]!.includes("SENTINEL_FOLD_GONE"), "setup forwarded the unfolded head (sentinel present)");
+    return h.bodies.length;
+}
+
+test("#648: ZCode (anthropic wire, hostUsageCredit off) reports folded usage — host backfill suppressed", async () => {
+    await withZCodeHarness("off", async (h) => {
+        const afterSetup = await setupZCodeCompressedSession(h);
+        const r2 = await fetch(h.url, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-acp-session": ZCODE_CONV_648 },
+            body: JSON.stringify({ model: "claude-test", max_tokens: 1024, stream: true, system: "You are a test assistant.", messages: zcodeConversation() }),
+        });
+        assert.equal(r2.status, 200);
+        const raw = await r2.text();
+        assert.equal(h.bodies.length, afterSetup + 1, "post-fold turn forwarded to upstream exactly once");
+        assert.ok(!h.bodies[h.bodies.length - 1]!.includes("SENTINEL_FOLD_GONE"), "post-fold upstream body must not carry the folded head content");
+        assert.equal(zcodeInputTokensOf(raw), 1000, "hostUsageCredit off must report the folded request's own usage — no uncompressed-baseline backfill (#648)");
+    });
+});
+
+test("#648 control: plain client (anthropic wire, hostUsageCredit auto) still gets the #408 backfill", async () => {
+    await withZCodeHarness("auto", async (h) => {
+        const afterSetup = await setupZCodeCompressedSession(h);
+        const r2 = await fetch(h.url, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-acp-session": ZCODE_CONV_648 },
+            body: JSON.stringify({ model: "claude-test", max_tokens: 1024, stream: true, system: "You are a test assistant.", messages: zcodeConversation() }),
+        });
+        assert.equal(r2.status, 200);
+        const raw = await r2.text();
+        assert.equal(h.bodies.length, afterSetup + 1, "post-fold turn forwarded to upstream exactly once");
+        assert.ok(!h.bodies[h.bodies.length - 1]!.includes("SENTINEL_FOLD_GONE"), "post-fold upstream body must not carry the folded head content");
+        assert.ok(zcodeInputTokensOf(raw) > 1000, "plain proxy client with hostUsageCredit auto must still see the uncompressed baseline (#408)");
+    });
 });
