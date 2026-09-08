@@ -1061,15 +1061,42 @@ test("isOnPath: finds a known binary on PATH, misses bogus name", () => {
     assert.equal(isOnPath(nodeName, {}), false);
 });
 
-test("resolveClientCommand: codex/claude resolve to themselves", () => {
-    assert.deepEqual(resolveClientCommand("codex", { PATH: "/usr/bin" }), {
-        command: "codex",
-        prefixArgs: [],
-    });
-    assert.deepEqual(resolveClientCommand("claude", { PATH: "/usr/bin" }), {
-        command: "claude",
-        prefixArgs: [],
-    });
+test("resolveClientCommand: codex/claude not on PATH fall back to bare name", () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "bili-path-"));
+    try {
+        assert.deepEqual(resolveClientCommand("codex", { PATH: tmp }), {
+            command: "codex",
+            prefixArgs: [],
+        });
+        assert.deepEqual(resolveClientCommand("claude", { PATH: tmp }), {
+            command: "claude",
+            prefixArgs: [],
+        });
+    } finally {
+        fs.rmdirSync(tmp);
+    }
+});
+
+test("resolveClientCommand: codex/claude on PATH resolve to full path", () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "bili-path-"));
+    const codexFile = path.join(tmp, "codex");
+    const claudeFile = path.join(tmp, "claude");
+    fs.writeFileSync(codexFile, "#!/bin/sh\necho codex\n", { mode: 0o755 });
+    fs.writeFileSync(claudeFile, "#!/bin/sh\necho claude\n", { mode: 0o755 });
+    try {
+        assert.deepEqual(resolveClientCommand("codex", { PATH: tmp }), {
+            command: codexFile,
+            prefixArgs: [],
+        });
+        assert.deepEqual(resolveClientCommand("claude", { PATH: tmp }), {
+            command: claudeFile,
+            prefixArgs: [],
+        });
+    } finally {
+        fs.unlinkSync(codexFile);
+        fs.unlinkSync(claudeFile);
+        fs.rmdirSync(tmp);
+    }
 });
 
 test("resolveClientCommand: pi prefers PI_BIN env", () => {
