@@ -91,6 +91,39 @@ test("stripAcpTags: long paired content keeps content, strips tags", () => {
     assert.equal(stripAcpTags(`${OPEN}t="1">${long}${CLOSE}`), long);
 });
 
+// #644: a malformed render-tag close (the echoed `</acp` is missing its closing
+// `>`) used to make the close-side tail regexes (TRUNC_CLOSE, PARTIAL_TAIL)
+// swallow the ENTIRE following real content — they were unbounded, so `</acp`
+// + 300 chars of prose was held/dropped and only the bare ref survived. Bounding
+// the close-side tail to {0,32} (aligned with LONE_CLOSE) releases an over-long
+// tail as content instead of holding/dropping it.
+test("stripAcpTags: malformed close (missing >) does not eat following content (#644)", () => {
+    const content = "这是真实的正文内容，不应被过滤器吃掉。".repeat(12);
+    const malformed = `${LT}acp tokens="245" type="text">m01998${LT}/acp` + content;
+    const out = stripAcpTags(malformed);
+    assert.ok(out.includes(content), "real content survives the malformed close (not eaten)");
+    assert.ok(out.includes("m01998"), "the ref is preserved");
+    assert.notEqual(out, "m01998", "not stripped to the bare ref");
+});
+
+test("streaming filter matches stripAcpTags for a malformed close at every split position (#644)", () => {
+    const content = "这是真实的正文内容，不应被过滤器吃掉。".repeat(12);
+    const full = `${LT}acp tokens="245" type="text">m01998${LT}/acp` + content;
+    const expected = stripAcpTags(full);
+    for (let split = 0; split <= full.length; split++) {
+        const f = createTagEchoFilter();
+        const out = f.push(full.slice(0, split)) + f.push(full.slice(split)) + f.flush();
+        assert.equal(out, expected, `split=${split}`);
+    }
+});
+
+// A genuinely short truncated close at end-of-stream (<= 32 chars) is still a
+// truncated imitation and is dropped — the bound must not over-release.
+test("stripAcpTags: short truncated close at end is still dropped (#644 bound)", () => {
+    assert.equal(stripAcpTags(`ref m00001 ${LT}/acp`), "ref m00001 ");
+    assert.equal(stripAcpTags(`ref m00001 ${LT}/acp tokens`), "ref m00001 ");
+});
+
 test("streaming filter matches stripAcpTags for every split position", () => {
     const cases = [
         `answer ${TAG("m00155")}${TAG("m00155", 44)} done`,
