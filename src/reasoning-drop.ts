@@ -1,17 +1,20 @@
 import type { BiliMessage } from "acp-kernel/wire";
 
-/** [#651] Drop oversized reasoning (thinking) from closed-turn `compress`
+/** [#651] Drop oversized reasoning (thinking) from closed-round `compress`
  *  tool calls at request time — the billion-context twin of
- *  billion-context-pi #336/#339, aligned with opencode-acp #377.
+ *  billion-context-pi #336/#339/#348, aligned with opencode-acp #377.
  *  `compress` tool messages are hard-exempt from compression (their tool
  *  results are the anchors that keep block summaries addressable), so the
  *  reasoning attached to those turns rides along EVERY forwarded request as
  *  an unreclaimable context floor — measured at ~83.5% of the never-covered
  *  residual on real long sessions, growing ~9 KB per compression round.
  *  This pass removes those reasoning messages from the OUTBOUND view only
- *  (persisted history and kernel state are never modified) once the turn is
- *  closed and the reasoning run exceeds the size gate. The active round
- *  (from the last genuine user message onward) is never touched. */
+ *  (persisted history and kernel state are never modified) once the round is
+ *  closed and the reasoning run exceeds the size gate. A round is closed on
+ *  ROUND EVIDENCE, not on user messages: the compress tool result must have
+ *  arrived and at least one message must exist after it. The in-flight round
+ *  (result still missing or still the last message) is never touched [#348
+ *  twin]. */
 export interface CompressReasoningConfig {
     /** Master switch. Default: true. `drop: false` disables the pass entirely
      *  (kill-switch — set it per-provider for models whose reasoning items
@@ -39,9 +42,13 @@ export function resolveReasoningDrop(cfg?: CompressReasoningConfig): Required<Co
 
 /** Request-time pass: remove reasoning messages attached to a `compress`
  *  tool call only when ALL gates hold —
- *  1. closed turn: the compress call sits strictly before the last genuine
- *     user message (`role: "user"` + `contentType: "text"`; tool results are
- *     not genuine users). With no user message at all, nothing is dropped;
+ *  1. closed round [#348 twin]: the compress call has its tool-result
+ *     message (`contentType: "tool-result"`, matching `toolCallId`) at a
+ *     LATER index, and at least one message exists after that result (the
+ *     round has demonstrably moved on). No user message is required, so
+ *     long agentic sessions do close rounds; a call without a result, or
+ *     whose result is still the last message, is in flight and never
+ *     touched;
  *  2. selector: `contentType: "tool-call"` with `toolName === "compress"`
  *     (other protected tools would need their own explicit config);
  *  3. size: the run of reasoning messages immediately preceding the call
@@ -53,16 +60,20 @@ export function dropCompressReasoning(messages: BiliMessage[], cfg?: CompressRea
     const { drop, threshold } = resolveReasoningDrop(cfg);
     if (!drop || messages.length === 0) return messages;
     try {
-        let lastUser = -1;
-        for (let i = 0; i < messages.length; i++) {
+        const last = messages.length - 1;
+        const resultAt = new Map<string, number>();
+        for (let i = 0; i <= last; i++) {
             const m = messages[i]!;
-            if (m.role === "user" && m.contentType === "text") lastUser = i;
+            if (m.contentType === "tool-result" && typeof m.toolCallId === "string" && !resultAt.has(m.toolCallId)) {
+                resultAt.set(m.toolCallId, i);
+            }
         }
-        if (lastUser < 0) return messages;
         const dropIdx = new Set<number>();
-        for (let i = 0; i < lastUser; i++) {
+        for (let i = 0; i <= last; i++) {
             const m = messages[i]!;
             if (m.contentType !== "tool-call" || m.toolName !== "compress") continue;
+            const ri = typeof m.toolCallId === "string" ? resultAt.get(m.toolCallId) : undefined;
+            if (ri === undefined || ri <= i || ri >= last) continue;
             let total = 0;
             let j = i - 1;
             while (j >= 0 && messages[j]!.contentType === "reasoning") {

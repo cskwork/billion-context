@@ -5,9 +5,10 @@ import { mergeCompress } from "../src/compress-settings.ts";
 import type { BiliMessage } from "acp-kernel/wire";
 
 const R = (text: string, id = "r"): BiliMessage => ({ id, role: "assistant", contentType: "reasoning", text });
-const CALL = (toolName = "compress", id = "c"): BiliMessage => ({ id, role: "assistant", contentType: "tool-call", toolName, toolCallId: "t1", text: "{}" });
-const RESULT = (toolName = "compress"): BiliMessage => ({ id: "res", role: "user", contentType: "tool-result", toolName, toolCallId: "t1", text: "ok" });
+const CALL = (toolName = "compress", toolCallId = "t1"): BiliMessage => ({ id: "c", role: "assistant", contentType: "tool-call", toolName, toolCallId, text: "{}" });
+const RESULT = (toolCallId = "t1"): BiliMessage => ({ id: "res", role: "user", contentType: "tool-result", toolName: "compress", toolCallId, text: "ok" });
 const USER = (text = "hi"): BiliMessage => ({ id: "u", role: "user", contentType: "text", text });
+const TEXT = (text = "hm"): BiliMessage => ({ id: "txt", role: "assistant", contentType: "text", text });
 
 test("default: drops oversized reasoning run before a closed compress call", () => {
     const msgs = [R("x".repeat(3000)), CALL(), RESULT(), USER("next")];
@@ -15,6 +16,33 @@ test("default: drops oversized reasoning run before a closed compress call", () 
     assert.equal(out.length, 3);
     assert.ok(!out.some((m) => m.contentType === "reasoning"));
     assert.ok(out.some((m) => m.contentType === "tool-call" && m.toolName === "compress"));
+});
+
+test("#348 twin: closes WITHOUT any user message — assistant continuation is round evidence", () => {
+    const msgs = [R("x".repeat(3000)), CALL(), RESULT(), TEXT("carrying on"), CALL("bash", "t2")];
+    const out = dropCompressReasoning(msgs);
+    assert.equal(out.length, 4);
+    assert.ok(!out.some((m) => m.contentType === "reasoning"));
+});
+
+test("in flight: result still the last message → never touched", () => {
+    const msgs = [USER("q"), R("x".repeat(3000)), CALL(), RESULT()];
+    assert.equal(dropCompressReasoning(msgs).length, 4);
+});
+
+test("result pending (call without any result) → never touched", () => {
+    const msgs = [R("x".repeat(3000)), CALL(), TEXT("next round already started")];
+    assert.equal(dropCompressReasoning(msgs).length, 3);
+});
+
+test("result for a different toolCallId does not close the round", () => {
+    const msgs = [R("x".repeat(3000)), CALL("compress", "a"), RESULT("b"), USER("next")];
+    assert.equal(dropCompressReasoning(msgs).length, 4);
+});
+
+test("result BEFORE the call does not close the round", () => {
+    const msgs = [RESULT(), R("x".repeat(3000)), CALL("compress", "t1"), USER("next")];
+    assert.equal(dropCompressReasoning(msgs).length, 4);
 });
 
 test("small reasoning survives the default threshold", () => {
@@ -27,23 +55,8 @@ test("exactly-threshold reasoning is kept (strictly-greater gate)", () => {
     assert.equal(dropCompressReasoning(msgs).length, 4);
 });
 
-test("active round is never touched (compress call after the last user message)", () => {
-    const msgs = [USER("q"), R("x".repeat(3000)), CALL(), RESULT()];
-    assert.equal(dropCompressReasoning(msgs).length, 4);
-});
-
-test("no genuine user message means no drop", () => {
-    const msgs = [R("x".repeat(3000)), CALL(), RESULT()];
-    assert.equal(dropCompressReasoning(msgs).length, 3);
-});
-
-test("tool-result messages are not genuine users", () => {
-    const msgs = [R("x".repeat(3000)), CALL("read"), RESULT("read"), USER("next")];
-    assert.equal(dropCompressReasoning(msgs).length, 4);
-});
-
 test("only compress calls select the drop — other tool calls keep their reasoning", () => {
-    const msgs = [R("x".repeat(3000)), CALL("read"), RESULT("read"), USER("next")];
+    const msgs = [R("x".repeat(3000)), CALL("read", "t1"), RESULT("t1"), USER("next")];
     assert.ok(dropCompressReasoning(msgs).some((m) => m.contentType === "reasoning"));
 });
 
@@ -55,8 +68,7 @@ test("multi-message reasoning run is summed before the gate", () => {
 });
 
 test("non-contiguous reasoning is not attributed to the compress call", () => {
-    const interlude: BiliMessage = { id: "txt", role: "assistant", contentType: "text", text: "hm" };
-    const msgs = [R("x".repeat(1200)), interlude, R("y".repeat(1200)), CALL(), RESULT(), USER("next")];
+    const msgs = [R("x".repeat(1200)), TEXT(), R("y".repeat(1200)), CALL(), RESULT(), USER("next")];
     const out = dropCompressReasoning(msgs);
     assert.equal(out.length, 6);
 });
@@ -92,11 +104,22 @@ test("resolveReasoningDrop: defaults, validation, and passthrough", () => {
     assert.deepEqual(resolveReasoningDrop({ threshold: 512.9 }), { drop: true, threshold: 512 });
 });
 
-test("multiple closed compress turns all get stripped", () => {
+test("multiple closed compress rounds all get stripped (distinct toolCallIds)", () => {
     const msgs = [
-        R("a".repeat(3000), "r1"), CALL("compress", "c1"), RESULT(),
-        R("b".repeat(3000), "r2"), CALL("compress", "c2"), RESULT(),
+        R("a".repeat(3000), "r1"), CALL("compress", "c1"), RESULT("c1"),
+        R("b".repeat(3000), "r2"), CALL("compress", "c2"), RESULT("c2"),
         USER("next"),
+    ];
+    const out = dropCompressReasoning(msgs);
+    assert.equal(out.length, 5);
+    assert.ok(!out.some((m) => m.contentType === "reasoning"));
+});
+
+test("multiple agentic compress rounds close without any user message", () => {
+    const msgs = [
+        R("a".repeat(3000), "r1"), CALL("compress", "c1"), RESULT("c1"),
+        R("b".repeat(3000), "r2"), CALL("compress", "c2"), RESULT("c2"),
+        CALL("bash", "t9"),
     ];
     const out = dropCompressReasoning(msgs);
     assert.equal(out.length, 5);
