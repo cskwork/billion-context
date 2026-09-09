@@ -297,7 +297,10 @@ For each request, the proxy resolves the settings by longest-URL-prefix match (t
 - **Default:** `drop: true`, `threshold: 2048` — on
 - **Status:** ACTIVE
 - **Description:** **Compress-reasoning hygiene** (issue #651, the proxy-side twin of `billion-context-pi` #339 / `opencode-acp` #377). Models that keep their `reasoning`/`thinking` traces on the wire accumulate a permanent uncompressible floor: the anchor of a fold is a `compress` call, and any reasoning messages sitting *before* that call survive every fold as part of the protected prefix — they can never be re-summarized, only stripped. In the storm sessions this floor reached ~50% of the visible context. When on, the proxy removes the reasoning run that immediately precedes a **closed** `compress` call — i.e. one that already has its tool result and is followed by a genuine user message — when that run exceeds `threshold` characters. Safety gates: the *active* round (compress still in flight, no user message after it yet) is never touched; runs of ordinary tool calls (`read`, `bash`, …) keep their reasoning; a run is judged by its summed length so a 2×1200-char run still trips a 2048 gate; non-contiguous reasoning (text between the fragments) is left alone. Sub-fields (merged deepest-wins like every other CompressSettings field):
-  - `drop: boolean` — kill-switch; `false` restores the old wire verbatim.
+  - `drop: boolean` — kill-switch; `false` restores the old wire verbatim. Required per-provider for thinking models that mandate `reasoning` round-trip while the request carries `tools` — DeepSeek, GLM thinking and Qwen-QwQ return HTTP 400 when a prior `reasoning_content` is not echoed back:
+    ```jsonc
+    "providers": { "https://api.deepseek.com": { "compress": { "reasoning": { "drop": false } } } }
+    ```
   - `threshold: number` — character gate; runs **strictly greater** than this are dropped (`0` = drop any non-empty run). Invalid values fall back to the default instead of throwing.
 
 #### `stripImages`
