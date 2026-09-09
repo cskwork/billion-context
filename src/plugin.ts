@@ -359,12 +359,31 @@ export type PluginToolDeps = {
     log: (level: string, msg: string) => void;
 };
 
+/** Reverse-lookup the conversation id bound to a session id. #656: the
+ *  status endpoint's fallback branch picks the latest active SESSION, but a
+ *  caller that needs to ADOPT it (an MCP shim whose captured conversation id
+ *  went stale after the host resumed) must be told the session's conversation
+ *  id, not have its own stale id echoed back. Most-recently-seen binding wins
+ *  when several conversations share one session. */
+function conversationIdForSession(sessionId: string): string | undefined {
+    let bestId: string | undefined;
+    let bestSeen = -Infinity;
+    for (const [cid, entry] of conversations) {
+        if (entry.sessionId === sessionId && entry.lastSeen > bestSeen) {
+            bestId = cid;
+            bestSeen = entry.lastSeen;
+        }
+    }
+    return bestId;
+}
+
 /** Context-level visibility for plugin UIs (status bars / slash commands):
  *  the same usage the nudge decision sees, keyed by conversation id. */
 export function handlePluginStatus(conversationId: string, res: import("node:http").ServerResponse, deps: PluginToolDeps, fallbackLatest = false): void {
     let entry = conversations.get(conversationId);
     let session = entry ? peekSession(entry.sessionId) : undefined;
     let viaFallback = false;
+    let resolvedConversationId = conversationId;
     if ((!entry || !session) && fallbackLatest) {
         // #404: only sessions with real activity in THIS process qualify.
         // Before the fix every boot-restored session carried lastSeen =
@@ -376,6 +395,9 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
         if (latest) {
             session = latest;
             viaFallback = true;
+            // #656: name the conversation that was actually resolved — the
+            // caller asked with a stale id and must learn the real one.
+            resolvedConversationId = conversationIdForSession(latest.id) ?? conversationId;
         } else {
             res.writeHead(404, { "content-type": "application/json" });
             res.end(JSON.stringify({ ok: false, error: "no session with activity since boot — issue a model request or pass the conversation id" }));
@@ -441,7 +463,7 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({
         ok: true,
-        conversationId,
+        conversationId: resolvedConversationId,
         fallback: viaFallback || undefined,
         label: session.meta.label ?? null,
         pluginAgent: session.metadata.pluginAgent ?? null,
@@ -481,8 +503,18 @@ export async function handlePluginTool(
     const entry = conversations.get(conversationId);
     const session = entry ? peekSession(entry.sessionId) : undefined;
     if (!entry || !session) {
+        // #656: two distinct failures shared one message before. An id that was
+        // NEVER registered is the classic stale-shim-id case (host resumed its
+        // session after the MCP shim captured CLAUDE_CODE_SESSION_ID) — say so,
+        // and log it: these 404s used to be invisible in bili.log.
+        deps.log("warn", `[plugin] tool "${tool}" rejected for conversation ${conversationId}: ${entry ? "id registered but session not resident in this proxy instance" : "id never registered (stale shim session id after host resume?)"}`);
         res.writeHead(404, { "content-type": "application/json" });
-        res.end(JSON.stringify({ ok: false, error: "unknown plugin conversation (no model request has arrived with this conversation id yet)" }));
+        res.end(JSON.stringify({
+            ok: false,
+            error: !entry
+                ? "unknown plugin conversation (no model request has arrived with this conversation id yet)"
+                : "unknown plugin conversation (id registered but its session is not resident in this proxy instance — a fresh model request re-binds it)",
+        }));
         return;
     }
     // Absorb enablement is per-session (last resolved config), so the gate
