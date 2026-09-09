@@ -267,6 +267,25 @@ function rememberNoMaxOutputTokens(deps: PreflightDeps): void {
     deps.session.metadata.preflightNoMaxOutputTokens = map;
 }
 
+// #663: request-shape-specific headers that must NOT ride the independently
+// constructed summary call. The main Codex request carries
+// x-openai-internal-codex-responses-lite, which the backend only accepts when
+// the body has reasoning.context: all_turns. The summary body is built
+// independently (no reasoning field), so carrying the header over makes the
+// backend reject it (400 "…requires `reasoning.context` to be `all_turns`").
+// The original model request keeps the header and its reasoning fields; only
+// the side summary call drops it. Auth/routing headers are preserved.
+const SUMMARY_STRIP_HEADERS = new Set(["x-openai-internal-codex-responses-lite"]);
+
+function summaryHeaders(deps: PreflightDeps): Record<string, string> {
+    const headers: Record<string, string> = {};
+    for (const [k, v] of Object.entries(deps.headers)) {
+        if (SUMMARY_STRIP_HEADERS.has(k.toLowerCase())) continue;
+        headers[k] = v;
+    }
+    return headers;
+}
+
 // Extract the summary text from a buffered SSE body (the streaming twin of
 // extractSummaryText). For Responses, prefer the response.completed event's
 // full response object (reuses the JSON extractor); otherwise accumulate
@@ -382,7 +401,7 @@ async function requestSummary(deps: PreflightDeps, system: string, content: stri
         deps.url,
         {
             method: "POST",
-            headers: { "content-type": "application/json", ...deps.headers },
+            headers: { "content-type": "application/json", ...summaryHeaders(deps) },
             body: JSON.stringify(summaryPayload(deps.protocol, deps.model, system, content, stream, includeMaxOutputTokens)),
             dispatcher: proxyDispatcher(deps.proxyUrl),
         },
