@@ -160,6 +160,20 @@ export type CompressSettings = {
     /** With {@link stripImages}, how many trailing messages keep their images
      *  verbatim (default 5). Ignored unless stripImages is true. */
     stripImagesKeepRecent?: number;
+    /** [#651] Drop oversized reasoning (thinking) from closed-turn `compress`
+     *  tool calls at request time (src/reasoning-drop.ts, aligned with
+     *  billion-context-pi #336/#339 and opencode-acp #377). Compress turns
+     *  are hard-exempt from compression, so their reasoning is otherwise an
+     *  unreclaimable context floor. Merged sub-field-wise across the three
+     *  config levels like `absorb`. */
+    reasoning?: {
+        /** Master switch (default true). Set `drop: false` per-provider for
+         *  models whose reasoning must round-trip unmodified. */
+        drop?: boolean;
+        /** A closed turn's reasoning run must exceed this many chars to be
+         *  dropped (default 2048). */
+        threshold?: number;
+    };
 };
 export type PromptCacheRouting = "auto" | "enabled" | "disabled";
 export type UpstreamProxyMode = "auto" | "manual" | "direct";

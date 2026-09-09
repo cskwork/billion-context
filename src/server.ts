@@ -3,6 +3,7 @@ import fs from "node:fs";
 import { randomUUID } from "node:crypto";
 import { createCore, type CompressionCore, type CompressionState, type Config, type CoreMessage, type NudgeDecision, type Prompts, defaultPrompts, defaultCountTokens, estimateTokensFast, renderNudgeText, deactivateBlock, viableRanges } from "acp-kernel";
 import { resolveCompress, resolveCompressPrompts, resolveRequestConfig } from "./compress-settings.js";
+import { dropCompressReasoning, type CompressReasoningConfig } from "./reasoning-drop.js";
 import { DEFAULT_STRIP_IMAGES_KEEP_RECENT, stripHistoricalImages } from "./strip-images.js";
 import type { ProxyOptions } from "./config.js";
 import { loadOptions, loadRoutes } from "./config.js";
@@ -1558,6 +1559,7 @@ async function handle(
             await withSessionLock(session, async () => {
                 const runPrepare = (): Prepared => {
                     const cs = resolveCompress(opts.routes, route?.rewrittenUrl, (parsed as { model?: string }).model, opts.compress);
+                    const reasoningCfg = cs.reasoning;
                     const keepRecent = cs.stripImagesKeepRecent ?? DEFAULT_STRIP_IMAGES_KEEP_RECENT;
                     const stripped = cs.stripImages
                         ? stripHistoricalImages(parsed, protocol, keepRecent)
@@ -1569,16 +1571,16 @@ async function handle(
                     return countTokens
                         ? prepareCountTokens(work as AnthropicRequestBody, core, reqConfig, log, session)
                         : protocol === "anthropic"
-                          ? prepareAnthropic(work as AnthropicRequestBody, req, opts, core, reqConfig, reqPrompts, log, session, pluginMode)
+                          ? prepareAnthropic(work as AnthropicRequestBody, req, opts, core, reqConfig, reqPrompts, log, session, pluginMode, reasoningCfg)
                           : protocol === "openai"
-                             ? prepareOpenai(work as OpenAIRequestBody, req, opts, core, reqConfig, reqPrompts, log, session, pluginMode, nativeWindow)
+                             ? prepareOpenai(work as OpenAIRequestBody, req, opts, core, reqConfig, reqPrompts, log, session, pluginMode, nativeWindow, reasoningCfg)
                              : responsesCompact
                                 // #618 review nit: when no bili compaction item is present,
                                 // prepareResponsesCompact falls back to the raw bodyBuffer — forward
                                 // the re-serialized post-strip work instead so dropped images don't
                                 // ride along. Unchanged bodies keep the original buffer byte-identical.
                                 ? prepareResponsesCompact(stripped.removed > 0 ? Buffer.from(JSON.stringify(work)) : bodyBuffer, work as ResponsesRequestBody, session, req, core, reqConfig, log)
-                               : prepareResponses(work as ResponsesRequestBody, req, opts, core, reqConfig, reqPrompts, log, session, responsesIdentity!, pluginMode, upstreamOrigin, nativeWindow);
+                               : prepareResponses(work as ResponsesRequestBody, req, opts, core, reqConfig, reqPrompts, log, session, responsesIdentity!, pluginMode, upstreamOrigin, nativeWindow, reasoningCfg);
                 };
                 // #332: codex's native remote-compaction request (trigger form)
                 // is dispatched BEFORE prepare/preflight. When it is not
@@ -1706,6 +1708,21 @@ const ACP_TAG_MARK = "\x3cacp ";
 // nonexistent (preflight), so acp_summary survives as the carrier and
 // systemToUser later re-voices the survivors as USER messages (leaving them at
 // their anchors) for strict backends (#377).
+/** [#651] Strip oversized reasoning from closed compress turns (see
+ *  src/reasoning-drop.ts) with an ops log line when anything was dropped. */
+function withReasoningDrop(
+    msgs: BiliMessage[],
+    reasoning: CompressReasoningConfig | undefined,
+    log: (level: string, msg: string) => void,
+    sessionId: string,
+): BiliMessage[] {
+    const out = dropCompressReasoning(msgs, reasoning);
+    if (out.length !== msgs.length) {
+        log("info", `[${sessionId}] compress-reasoning: dropped ${msgs.length - out.length} reasoning message(s) from closed compress turns (#651)`);
+    }
+    return out;
+}
+
 export function stripKernelSummaries(messages: BiliMessage[], state: CompressionState): BiliMessage[] {
     const carried = new Set<string>();
     for (const b of state.blocks) {
@@ -1859,12 +1876,14 @@ function prepareAnthropic(
     log: (level: string, msg: string) => void,
     session: Session,
     pluginMode: boolean,
+    reasoning: CompressReasoningConfig | undefined,
 ): Prepared {
     const sessionId = session.id;
     const stream = parsed.stream === true;
     ++session.stats.requests;
     session.hostCreditTokens = 0;
     const injectTools = opts.compress.injectTool && !pluginMode;
+    const stripReasoning = (msgs: BiliMessage[]): BiliMessage[] => withReasoningDrop(msgs, reasoning, log, sessionId);
 
     if (isAutoModeClassifier(parsed)) {
         log("info", `[${sessionId}] auto-mode classifier passthrough (skipping compress injection)`);
@@ -1930,7 +1949,7 @@ function prepareAnthropic(
         log("info", diagTagSummary(turn.messages, sessionId, "text-only"));
         const willInjectNudge = opts.compress.injectNudge && !!turn.nudge && (turn.nudge.shouldInject || emergencyNudge(turn.nudge));
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, parsed.model, willInjectNudge));
-        processedMessages = stripKernelSummaries(turn.messages, turn.state);
+        processedMessages = stripReasoning(stripKernelSummaries(turn.messages, turn.state));
         applyCompactionArchive(session, activeBefore, new Set(msgs.map((m) => m.id)), log);
         reapOrphanBlocks(session, msgs, deactivateBlock);
         rebuiltMessages = coreToAnthropic(processedMessages as BiliMessage[], cacheControls);
@@ -2094,12 +2113,14 @@ function prepareOpenai(
     session: Session,
     pluginMode: boolean,
     nativeWindow: number,
+    reasoning: CompressReasoningConfig | undefined,
 ): Prepared {
     const sessionId = session.id;
     const stream = parsed.stream === true;
     ++session.stats.requests;
     session.hostCreditTokens = 0;
     let openaiSystemText = "";
+    const stripReasoning = (msgs: BiliMessage[]): BiliMessage[] => withReasoningDrop(msgs, reasoning, log, sessionId);
     let openaiOutboundSystem: string | undefined;
     let processedMessages: CoreMessage[] = [];
     let originalMessages: CoreMessage[] = [];
@@ -2161,7 +2182,7 @@ function prepareOpenai(
         log("info", diagTagSummary(turn.messages, sessionId, "text-only"));
         const willInjectNudge = opts.compress.injectNudge && !!turn.nudge && shouldInject && (turn.nudge.shouldInject || emergencyNudge(turn.nudge));
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, parsed.model, willInjectNudge));
-        processedMessages = stripKernelSummaries(turn.messages, turn.state);
+        processedMessages = stripReasoning(stripKernelSummaries(turn.messages, turn.state));
         applyCompactionArchive(session, activeBefore, new Set(msgs.map((m) => m.id)), log);
         reapOrphanBlocks(session, msgs, deactivateBlock);
         rebuiltMessages = systemToUser(coreToOpenai(processedMessages as BiliMessage[]));
@@ -2248,11 +2269,13 @@ function prepareResponses(
     pluginMode: boolean,
     upstreamOrigin: string,
     nativeWindow: number,
+    reasoning: CompressReasoningConfig | undefined,
 ): Prepared {
     const sessionId = session.id;
     const stream = parsed.stream === true;
     ++session.stats.requests;
     session.hostCreditTokens = 0;
+    const stripReasoning = (msgs: BiliMessage[]): BiliMessage[] => withReasoningDrop(msgs, reasoning, log, sessionId);
     if (reconcileNativeCompactionBoundary(session)) {
         log("info", `[${sessionId}] reconciled ACP state after native Responses compact boundary`);
     }
@@ -2350,7 +2373,7 @@ function prepareResponses(
         log("info", diagTagSummary(turn.messages, sessionId, "text-only"));
         const willInjectNudge = opts.compress.injectNudge && !!turn.nudge && shouldInject && !isCompactionTrigger && (turn.nudge.shouldInject || emergencyNudge(turn.nudge));
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, parsed.model, willInjectNudge));
-        processedMessages = repairResponsesAssistantOrdering(stripKernelSummaries(turn.messages, turn.state), originalMessages);
+        processedMessages = repairResponsesAssistantOrdering(stripReasoning(stripKernelSummaries(turn.messages, turn.state)), originalMessages);
         reapOrphanBlocks(session, msgs, deactivateBlock);
         rebuiltInput = patchResponsesInput(projection, processedMessages);
         // Fallback path: when the echo did NOT come back this turn (client
