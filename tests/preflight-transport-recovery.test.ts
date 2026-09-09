@@ -82,7 +82,9 @@ test("preflight retries a 200 summary body socket reset, applying only the compl
         const f = fixture(url);
         const result = await preflightCompress(f.deps, f.messages);
         assert.equal(result.fitsWindow, true, result.failure?.detail);
-        assert.equal(attempts(), 2);
+        // 3, not 2: #668 bounds every summary input to the chunk budget, so the
+        // over-budget fixture message splits into two chunks — one request per chunk.
+        assert.equal(attempts(), 3);
         assert.equal(result.compressedRanges, 1);
         const blocks = JSON.stringify(f.session.state.blocks);
         assert.ok(blocks.includes(SUMMARY));
@@ -96,7 +98,8 @@ test("preflight retries a socket reset before summary headers", async () => {
         const f = fixture(url);
         const result = await preflightCompress(f.deps, f.messages);
         assert.equal(result.fitsWindow, true, result.failure?.detail);
-        assert.equal(attempts(), 2);
+        // 3, not 2: see the bounded-chunk note in the body-reset test above.
+        assert.equal(attempts(), 3);
         assert.match(f.logs.join("\n"), /request.*UND_ERR_SOCKET/);
     });
 });

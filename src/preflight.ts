@@ -201,14 +201,6 @@ export function estimateCoreMessagesUpper(messages: CoreMessage[]): number {
     return chars;
 }
 
-function rangeChars(messages: CoreMessage[], startIdx: number, endIdx: number): number {
-    let chars = 0;
-    for (let i = startIdx; i <= endIdx && i < messages.length; i++) {
-        chars += (messages[i].text ?? "").length;
-    }
-    return chars;
-}
-
 function spanUnitsOf(messages: CoreMessage[], startIdx: number, endIdx: number, countText: (text: string) => number): number {
     let units = 0;
     for (let i = startIdx; i <= endIdx && i < messages.length; i++) {
@@ -217,32 +209,24 @@ function spanUnitsOf(messages: CoreMessage[], startIdx: number, endIdx: number, 
     return units;
 }
 
-function renderRange(messages: CoreMessage[], startIdx: number, endIdx: number): string {
-    const parts: string[] = [];
-    for (let i = startIdx; i <= endIdx && i < messages.length; i++) {
-        const m = messages[i];
-        let text = (m.text ?? "").trim();
-        // #781: images live in BiliMessage sidecars, invisible to m.text — emit
-        // one explicit placeholder each so summaries record them instead of
-        // losing them silently. Replaces the codec's bare "[image]" literal
-        // (anthropic) with the richer media-type/dimension note.
-        const notes = imagePlaceholders(m);
-        if (notes.length > 0) {
-            const note = notes.join(" ");
-            text = text === IMAGE_PLACEHOLDER ? note : text ? `${text}\n${note}` : note;
+// Message-level splitChunks cannot shrink a span dominated by one huge
+// message (e.g. a megabyte tool result); split its rendered content into
+// token-budgeted slices so every summarization call stays inside the window.
+function splitSummaryContent(content: string, budget: number, countTokens: (text: string) => number): string[] {
+    const chunks: string[] = [];
+    let offset = 0;
+    while (offset < content.length) {
+        let low = offset + 1;
+        let high = content.length;
+        while (low < high) {
+            const mid = Math.ceil((low + high) / 2);
+            if (countTokens(content.slice(offset, mid)) <= budget) low = mid;
+            else high = mid - 1;
         }
-        if (!text) continue;
-        const label =
-            m.contentType === "tool-call"
-                ? `assistant tool-call ${m.toolName ?? "?"}`
-                : m.contentType === "tool-result"
-                  ? `tool result ${m.toolName ?? "?"}`
-                  : m.contentType === "reasoning"
-                    ? "assistant reasoning"
-                    : m.role;
-        parts.push(`[${label}]\n${text}`);
+        chunks.push(content.slice(offset, low));
+        offset = low;
     }
-    return parts.join("\n\n");
+    return chunks;
 }
 
 // minUnits: never close a chunk below this many countText units while more
@@ -797,7 +781,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             // estimate (not currentTokens, which is floored by a possibly-stale
             // lastInputTokens from a prior model): if the real payload already
             // fits, stop instead of folding protected content.
-            if (!relaxed && result.payloadEstimate >= limit) {
+            if (!relaxed && (baselineKnown ? result.payloadEstimate : finalUpper) >= limit) {
                 activeConfig = relaxedConfig(deps.config);
                 relaxed = true;
                 target = limit;
@@ -856,17 +840,80 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                 const startRef = maps.idxToRef.get(cs);
                 const endRef = maps.idxToRef.get(ce);
                 if (!startRef || !endRef) continue;
-                if (rangeChars(messages, cs, ce) < minChars) continue;
-                const content = renderRange(messages, cs, ce);
-                if (content.length === 0) continue;
-                if (summaryCalls >= MAX_SUMMARY_CALLS_PER_PREFLIGHT) {
-                    budgetHit = true;
-                    break;
+                const preview = deps.core.applyCompression({
+                    messages,
+                    state: deps.session.state,
+                    config: activeConfig,
+                    ranges: [{ startRef, endRef, summary: "x".repeat(Math.max(MIN_SUMMARY_CHARS, activeConfig.compress.minSummaryLength)) }],
+                });
+                const previousBlockIds = new Set(deps.session.state.blocks.map((block) => block.blockId));
+                const planned = preview.state.blocks.find((block) => !previousBlockIds.has(block.blockId));
+                if (!planned) continue;
+                // Direct raw messages render host-side: #781 image notes live in BiliMessage
+                // sidecars the kernel never sees. Consumed child blocks render through the
+                // kernel from the original state so they stay summaries.
+                const idxById = new Map(messages.map((m, i) => [m.id, i]));
+                const parts: string[] = [];
+                for (const id of planned.directMessageIds) {
+                    const i = idxById.get(id);
+                    if (i === undefined) continue;
+                    const m = messages[i];
+                    let text = m.text ?? "";
+                    const notes = imagePlaceholders(m);
+                    if (notes.length > 0) {
+                        const note = notes.join(" ");
+                        text = text === IMAGE_PLACEHOLDER ? note : text ? `${text}\n${note}` : note;
+                    }
+                    if (!text) continue;
+                    const label =
+                        m.contentType === "tool-call"
+                            ? `assistant tool-call ${m.toolName ?? "?"}`
+                            : m.contentType === "tool-result"
+                              ? `tool result ${m.toolName ?? "?"}`
+                              : m.contentType === "reasoning"
+                                ? "assistant reasoning"
+                                : m.role;
+                    parts.push(`[${label}]\n${text}`);
                 }
-                summaryCalls += 1;
-                let outcome: SummaryOutcome;
+                for (const nid of planned.directBlockIds) {
+                    const nb = deps.session.state.blocks.find((b) => b.blockId === nid);
+                    // The child stays a summary: its raw text is already condensed, and
+                    // re-expanding it would defeat the compression this fold performs.
+                    if (!nb) continue;
+                    const label = nb.topic ? `${nb.blockId}: ${nb.topic}` : nb.blockId;
+                    parts.push(`[summarized ${label}]\n${nb.summary}`);
+                }
+                const content = parts.join("\n\n");
+                if (content.length === 0) continue;
+                let summary: string | null = null;
+                let outcome: SummaryOutcome | undefined;
                 try {
-                    outcome = await summarizeRange(deps, content, startRef, endRef);
+                    const parts: string[] = [];
+                    const chunks = splitSummaryContent(content, budget, countText);
+                    for (const chunk of chunks) {
+                        if (summaryCalls >= MAX_SUMMARY_CALLS_PER_PREFLIGHT) {
+                            budgetHit = true;
+                            break;
+                        }
+                        summaryCalls += 1;
+                        const part = await summarizeRange(deps, chunk, startRef, endRef);
+                        if ("unusable" in part) {
+                            outcome = part;
+                            break;
+                        }
+                        parts.push(part.summary);
+                    }
+                    if (!budgetHit && !outcome && parts.length === chunks.length) {
+                        const candidate = parts.join("\n\n");
+                        // #861: a summary the kernel would reject on length wastes the apply
+                        // attempt and its failure log — route it through the same
+                        // halving/skip path as any unusable output.
+                        if (activeConfig.compress.maxSummaryLength <= 0 || candidate.length <= activeConfig.compress.maxSummaryLength) {
+                            summary = candidate;
+                        } else {
+                            outcome = { unusable: `assembled summary (${candidate.length} chars) exceeds maxSummaryLength (${activeConfig.compress.maxSummaryLength})` };
+                        }
+                    }
                 } catch (err) {
                     if (err instanceof UpstreamHttpError) {
                         failure = {
@@ -890,21 +937,21 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                     }
                     break;
                 }
-                if ("unusable" in outcome) {
-                    lastUnusableDetail = outcome.unusable;
+                if (summary === null) {
+                    const unusableDetail = outcome && "unusable" in outcome ? outcome.unusable : "unknown";
+                    if (outcome) lastUnusableDetail = unusableDetail;
                     const floorUnits = baselineKnown ? 2 * MIN_CHUNK_TOKENS : 2 * minChars;
                     if (ce > cs && spanUnitsOf(messages, cs, ce, countText) >= floorUnits) {
-                        deps.log("warn", `[preflight] chunk ${startRef}:${endRef} produced no usable summary (${outcome.unusable}); retrying with smaller chunks`);
+                        deps.log("warn", `[preflight] chunk ${startRef}:${endRef} produced no usable summary (${unusableDetail}); retrying with smaller chunks`);
                         const mid = Math.floor((cs + ce) / 2);
                         spans.push([mid + 1, ce]);
                         spans.push([cs, mid]);
                         continue;
                     }
-                    deps.log("warn", `[preflight] range ${skipKey} produced no usable summary even at minimum size (${outcome.unusable}); skipping it`);
+                    deps.log("warn", `[preflight] range ${skipKey} produced no usable summary even at minimum size (${unusableDetail}); skipping it`);
                     skipSet.add(skipKey);
                     break;
                 }
-                const summary = outcome.summary;
                 const ctx: RewriteCtx = {
                     core: deps.core,
                     config: activeConfig,
@@ -924,7 +971,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                 // baseline currentTokens is char-based, so net the folded span's
                 // char count against it instead of the token-based credit.
                 const compressed = deps.session.stats.compressCreditTokens - creditBefore;
-                const folded = baselineKnown ? compressed : rangeChars(messages, cs, ce);
+                const folded = baselineKnown ? compressed : messages.filter((message) => planned.effectiveMessageIds.includes(message.id)).reduce((total, message) => total + (message.text ?? "").length, 0);
                 currentTokens = Math.max(0, currentTokens - folded + countText(summary));
                 deps.session.stats.lastInputTokens += defaultCountTokens(summary);
                 appliedThisRound += 1;
@@ -934,7 +981,17 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             if (appliedThisRound > 0) break;
             if (failure || budgetHit) break;
         }
-        if (appliedThisRound === 0) break;
+        if (appliedThisRound === 0) {
+            if (!failure && !budgetHit && !relaxed && (baselineKnown ? result.payloadEstimate : finalUpper) >= limit) {
+                activeConfig = relaxedConfig(deps.config);
+                relaxed = true;
+                summaryCalls = 0;
+                budgetHit = false;
+                deps.log("warn", "[preflight] no usable ranges outside the protected recent zone; relaxing soft protection (preserveRecentMessages/Tokens -> 0) and retrying");
+                continue;
+            }
+            break;
+        }
     }
     if (currentTokens >= limit && !failure) {
         // #726: carry the most recent unusable-summary diagnosis into the
