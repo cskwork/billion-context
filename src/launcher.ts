@@ -43,7 +43,7 @@ import { selfPackageRoot, isBiliPiEntry, ompPluginLoadedFrom } from "./plugin-in
 function selfDistFile(name: string): string {
     return path.join(selfPackageRoot(), "dist", name);
 }
-import { nonEmpty, resolvePiHome, resolveOmpHome, resolveDshHome, loadClientConfig, collectModelWindows, type ClientConfig, type CodexConfig, resolveOpencodeConfigFile, type OpencodeConfig, type OpencodeProvider, type HermesConfig, type HermesProvider } from "./client-config.js";
+import { nonEmpty, resolvePiHome, resolveOmpHome, resolveDshHome, resolveTraeHome, readTraeConfig, TRAE_DEFAULT_MODEL_HOSTS, type TraeConfig, loadClientConfig, collectModelWindows, type ClientConfig, type CodexConfig, resolveOpencodeConfigFile, type OpencodeConfig, type OpencodeProvider, type HermesConfig, type HermesProvider } from "./client-config.js";
 import { loadRoutes, resolveConfiguredContextLimit, lookupContextLimit, type ProviderRoutes } from "./config.js";
 import { contextFromRegistry } from "./registry.js";
 
@@ -75,6 +75,10 @@ export {
     readDshConfig,
     parseDshSettingsYaml,
     resolveDshHome,
+    resolveTraeHome,
+    readTraeConfig,
+    TRAE_DEFAULT_MODEL_HOSTS,
+    type TraeConfig,
     resolveOpencodeConfigFile,
     readOpencodeConfig,
     type OpencodeConfig,
@@ -82,9 +86,9 @@ export {
 } from "./client-config.js";
 
 export const LAUNCHER_DEFAULT_HOST = "127.0.0.1";
-export const LAUNCH_CLIENTS = ["pi", "codex", "claude", "omp", "opencode", "hermes", "dsh", "pi-test"] as const;
+export const LAUNCH_CLIENTS = ["pi", "codex", "claude", "omp", "opencode", "hermes", "dsh", "trae", "pi-test"] as const;
 export type ClientName = (typeof LAUNCH_CLIENTS)[number];
-export type BaseClientName = "claude" | "codex" | "pi" | "omp" | "opencode" | "hermes" | "dsh";
+export type BaseClientName = "claude" | "codex" | "pi" | "omp" | "opencode" | "hermes" | "dsh" | "trae";
 
 const HEALTH_PATH = "/__bili/health";
 const HEALTH_POLL_INTERVAL_MS = 200;
@@ -358,6 +362,22 @@ export function discoverRoutes(client: ClientName, config: ClientConfig): Discov
                 // Unparseable endpoint: skip.
             }
         }
+    } else if (client === "trae") {
+        // #655: Trae CLI is a closed Go binary (no base-URL override) that
+        // honors HTTPS_PROXY; the model API host is TRAE_CLI_API_HOST or the
+        // default enterprise gateway. Whitelist the host(s) for cert-MITM so
+        // the proxy can compress the model traffic. No /bili/ rewrite (the
+        // scheme is hardcoded https).
+        const hosts = nonEmpty(config.trae?.modelApiHost)
+            ? [config.trae!.modelApiHost!]
+            : TRAE_DEFAULT_MODEL_HOSTS;
+        for (const h of hosts) {
+            const host = h.toLowerCase();
+            if (host && !httpsSeen.has(host)) {
+                httpsSeen.add(host);
+                httpsDomains.push(host);
+            }
+        }
     } else {
         for (const [name, prov] of Object.entries(config.codex?.providers ?? {})) {
             classify(prov.baseUrl, `model_providers.${name}.base_url`);
@@ -405,6 +425,12 @@ export function buildPiEnv(
 }
 
 export function buildCodexEnv(origin: string, caPath: string, baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+    return { ...baseEnv, HTTPS_PROXY: origin, SSL_CERT_FILE: caPath, BILLION_CONTEXT_PROXY: origin };
+}
+
+export function buildTraeEnv(origin: string, caPath: string, baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+    // #655: trae is a Go binary like codex — the CA rides SSL_CERT_FILE (the
+    // combined bundle, since it replaces Go's system trust store).
     return { ...baseEnv, HTTPS_PROXY: origin, SSL_CERT_FILE: caPath, BILLION_CONTEXT_PROXY: origin };
 }
 
@@ -615,7 +641,7 @@ function isPrivateIPv4(host: string): boolean {
  *  understands) is the sane default. `BILI_LAUNCHER_PLUGIN=1` forces plugin
  *  mode regardless of the upstream. */
 export function launcherInjectMcp(env: NodeJS.ProcessEnv, base: string, codexUpstream?: string): boolean {
-    if (base === "pi" || base === "omp" || base === "opencode" || base === "hermes" || base === "dsh") return false;
+    if (base === "pi" || base === "omp" || base === "opencode" || base === "hermes" || base === "dsh" || base === "trae") return false;
     if (env.BILI_LAUNCHER_PLUGIN === "0") return false;
     if (base === "codex" && env.BILI_LAUNCHER_PLUGIN === undefined && codexUpstream !== undefined && isPrivateUpstreamHost(codexUpstream)) {
         return false;
@@ -1656,6 +1682,12 @@ export function resolveClientCommand(
         );
         return { command: process.execPath, prefixArgs: [cli] };
     }
+    if (client === "trae") {
+        const traeBin = resolveOnPath("traecli", env)
+            ?? resolveOnPath("trae-cli", env)
+            ?? resolveOnPath("trae", env);
+        return { command: traeBin ?? "traecli", prefixArgs: [] };
+    }
     const resolved = resolveOnPath(client, env);
     return { command: resolved ?? client, prefixArgs: [] };
 }
@@ -1886,6 +1918,13 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         // settings rewrite above), so it exists on every profile dsh boots.
         const dshAcpPatch = writeDshAcpPatch(dshHomeDir);
         if (dshAcpPatch) clientArgs = dshArgsWithPatch(clientArgs, dshAcpPatch);
+    } else if (base === "trae") {
+        // #655: cert-MITM like codex/qoder (Go binary honors HTTPS_PROXY; CA
+        // via SSL_CERT_FILE combined bundle). No budget env (the CLI manages
+        // its own context window) and no transport forcing — the wire is the
+        // proprietary /api/ide/v2/llm_raw_chat, recognized as OpenAI by the
+        // proxy.
+        env = buildTraeEnv(origin, resolveCombinedCaPath(process.env), stripInheritedProxy(process.env));
     } else if (base === "codex") {
         // Per-spawn conversation id for the MCP shell's headless
         // self-registration (codex provides no session id of its own).

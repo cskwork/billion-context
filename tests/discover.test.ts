@@ -11,6 +11,7 @@ import {
 import {
     parseZcodeConfig,
     readZcodeConfig,
+    TRAE_DEFAULT_MODEL_HOSTS,
     type ClientConfig,
 } from "../src/client-config.ts";
 
@@ -117,6 +118,11 @@ test("extractHttpsHosts: dedupes, lowercases, drops http, unwraps /bili/", () =>
 
 test("extractHttpsHosts: empty config → []", () => {
     assert.deepEqual(extractHttpsHosts({}), []);
+});
+
+test("extractHttpsHosts: trae → default model hosts; modelApiHost replaces them (#655)", () => {
+    assert.deepEqual(extractHttpsHosts({ trae: {} }), TRAE_DEFAULT_MODEL_HOSTS);
+    assert.deepEqual(extractHttpsHosts({ trae: { modelApiHost: "my-relay.example.com" } }), ["my-relay.example.com"]);
 });
 
 async function withTempHome<T>(fn: (home: string, env: NodeJS.ProcessEnv) => Promise<T>): Promise<T> {
