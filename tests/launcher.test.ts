@@ -2345,6 +2345,12 @@ test("discoverRoutes: trae modelApiHost replaces the default map", () => {
     assert.deepEqual(routes.httpsDomains, ["my-relay.example.com"]);
 });
 
+test("discoverRoutes: trae modelApiHost with :port → hostname only (MITM is SNI-based, #655)", () => {
+    const config: ClientConfig = { trae: { modelApiHost: "my-relay.example.com:8443" } };
+    const routes = discoverRoutes("trae", config);
+    assert.deepEqual(routes.httpsDomains, ["my-relay.example.com"]);
+});
+
 test("buildTraeEnv: HTTPS_PROXY + SSL_CERT_FILE + BILLION_CONTEXT_PROXY, baseEnv preserved", () => {
     const env = buildTraeEnv("http://127.0.0.1:8787", "/tmp/ca.pem", { FOO: "bar" });
     assert.equal(env.HTTPS_PROXY, "http://127.0.0.1:8787");

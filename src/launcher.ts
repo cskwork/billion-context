@@ -372,7 +372,9 @@ export function discoverRoutes(client: ClientName, config: ClientConfig): Discov
             ? [config.trae!.modelApiHost!]
             : TRAE_DEFAULT_MODEL_HOSTS;
         for (const h of hosts) {
-            const host = h.toLowerCase();
+            // MITM whitelist matches the port-less SNI hostname (isMitmHost), so
+            // reduce host:port to its host or the entry never matches.
+            const host = h.split(":", 2)[0]!.toLowerCase();
             if (host && !httpsSeen.has(host)) {
                 httpsSeen.add(host);
                 httpsDomains.push(host);
