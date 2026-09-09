@@ -405,6 +405,40 @@ test("plugin tool API error paths: bad JSON, unknown tool, unknown conversation"
         const errJson = (await unknownConv.json()) as { ok: boolean; error: string };
         assert.equal(errJson.ok, false);
         assert.match(errJson.error, /unknown plugin conversation/i);
+        // #656: a never-registered id must say so explicitly (stale shim id
+        // after host resume) — not the generic wording.
+        assert.match(errJson.error, /no model request has arrived/);
+    } finally {
+        await h.close();
+    }
+});
+
+test("#656: status fallback=latest resolves the active conversation for a stale shim id, and the adopted id then works for tool calls", async () => {
+    const h = await startHarness([textScript()]);
+    try {
+        const conv = "plug-conv-after-resume";
+        // The host resumed and now sends traffic under a NEW id; the shim
+        // still holds the pre-resume one ("stale-shim-id").
+        await callPluginAnthropic(h, conv, [{ role: "user", content: "hello after resume" }]);
+
+        // Shim adoption step 1: status asked with the stale id falls back to
+        // the latest active conversation and reports the adoption.
+        const statusResp = await fetch(`http://127.0.0.1:${h.proxyPort}/__bili/plugin/status?conversationId=stale-shim-id&fallback=latest`);
+        assert.equal(statusResp.status, 200);
+        const status = (await statusResp.json()) as { ok: boolean; conversationId: string; fallback?: boolean };
+        assert.equal(status.ok, true);
+        assert.equal(status.fallback, true);
+        assert.equal(status.conversationId, conv);
+
+        // Shim adoption step 2: the retry with the adopted id succeeds.
+        const adopted = await fetch(`http://127.0.0.1:${h.proxyPort}/__bili/plugin/tool`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ conversationId: conv, tool: "acp_status", args: {} }),
+        });
+        assert.equal(adopted.status, 200);
+        const adoptedJson = (await adopted.json()) as { ok: boolean };
+        assert.equal(adoptedJson.ok, true);
     } finally {
         await h.close();
     }
