@@ -49,6 +49,13 @@ export type ProviderRoute = {
      *  client-sent roles and bili's own injected prompt alike (#552). Wins
      *  per key over the global `compat` block. */
     compat?: { roles?: Record<string, string> };
+    /** Route-scoped passthrough (#661): same semantics as the global
+     *  `passthrough` flag, but only for requests whose upstream URL matches
+     *  this route — request body forwarded byte-for-byte (no kernel
+     *  round-trip, no render tags, no re-serialization), response piped
+     *  verbatim, no session state. For upstreams whose anti-cheat fingerprints
+     *  the request body (e.g. ZCode 405/3012). */
+    passthrough?: boolean;
 };
 export type ProviderRoutes = Record<string, ProviderRoute>; // key = upstream URL prefix (the /bili/<this> string)
 
@@ -579,13 +586,14 @@ export function parseRouteEntry(v: unknown): ProviderRoute | undefined {
     // is the KEY in the providers map (identical to the /bili/<url> string),
     // so it is NOT repeated inside the value.
     if (v && typeof v === "object" && !Array.isArray(v)) {
-        const obj = v as { models?: Record<string, ModelEntry>; proxy?: string; compressProtocol?: string; compress?: CompressSettings; compat?: { roles?: unknown } };
+        const obj = v as { models?: Record<string, ModelEntry>; proxy?: string; compressProtocol?: string; compress?: CompressSettings; compat?: { roles?: unknown }; passthrough?: boolean };
         const route: ProviderRoute = { models: obj.models };
         if (typeof obj.proxy === "string") route.proxy = obj.proxy;
         if (obj.compressProtocol === "marker" || obj.compressProtocol === "tools") route.compressProtocol = obj.compressProtocol;
         if (obj.compress) route.compress = obj.compress;
         const compatRoles = parseCompatRoles(obj.compat?.roles);
         if (compatRoles) route.compat = { roles: compatRoles };
+        if (typeof obj.passthrough === "boolean") route.passthrough = obj.passthrough;
         return route;
     }
     // A bare value (e.g. null) means "this upstream exists, no overrides".
