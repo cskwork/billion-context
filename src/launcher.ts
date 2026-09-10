@@ -103,7 +103,7 @@ export interface SpawnChild {
 export type SpawnFn = (
     command: string,
     args: readonly string[],
-    options: { detached?: boolean; stdio?: StdioOptions; env?: NodeJS.ProcessEnv; shell?: boolean },
+    options: { detached?: boolean; stdio?: StdioOptions; env?: NodeJS.ProcessEnv; shell?: boolean; windowsVerbatimArguments?: boolean },
 ) => SpawnChild;
 
 export interface LaunchOptions {
@@ -1597,15 +1597,62 @@ export function stopProxy(handle: ProxyHandle): void {
     } catch {}
 }
 
+/** #679: quote one token for cmd.exe's line parser. Only whitespace-bearing
+ *  tokens get wrapped in double quotes, so a space-free launch produces a
+ *  byte-identical line to the old shell:true form. A token containing an
+ *  embedded double quote stays bare: cmd.exe has no escape mechanism for
+ *  quotes, so wrapping would only change how it is mangled (today's behavior
+ *  preserved). */
+export function quoteWinToken(token: string): string {
+    if (!/\s/.test(token) || token.includes('"')) return token;
+    return `"${token}"`;
+}
+
+/** #679: full command line for `comspec /d /s /c <line>` — tokens quoted as
+ *  needed, wrapped in one extra outer pair that cmd's /s strips before
+ *  parsing the inner tokens with their own quoting intact (the documented /s
+ *  form; same trick cross-spawn uses). */
+export function buildWindowsCommandLine(cmd: string, args: readonly string[]): string {
+    return `"${[cmd, ...args].map(quoteWinToken).join(" ")}"`;
+}
+
+/** #679: which spawn form a resolved client needs on Windows. Only .cmd/.bat
+ *  shims and unresolved bare names need cmd.exe — CreateProcess cannot
+ *  execute a batch file, and an extensionless name needs cmd's PATHEXT
+ *  resolution. Everything else (.exe, node, an existing path with an
+ *  extension) spawns directly and the OS quotes the executable and argv
+ *  itself, spaces included. shell:true is never used anymore: no DEP0190, no
+ *  cmd.exe re-splitting of spaced paths at their first space (which truncated
+ *  both the command and its args). */
+export function planClientSpawn(
+    cmd: string,
+    args: readonly string[],
+    env: NodeJS.ProcessEnv,
+    platform: NodeJS.Platform = process.platform,
+): { command: string; args: string[]; windowsVerbatimArguments?: boolean } {
+    if (platform !== "win32") return { command: cmd, args: [...args] };
+    const lower = cmd.toLowerCase();
+    const base = cmd.slice(Math.max(cmd.lastIndexOf("/"), cmd.lastIndexOf("\\")) + 1);
+    const needsCmd = lower.endsWith(".cmd") || lower.endsWith(".bat") || !path.extname(base);
+    if (!needsCmd) return { command: cmd, args: [...args] };
+    const comspec = nonEmpty(env.COMSPEC) ? env.COMSPEC : "cmd.exe";
+    return {
+        command: comspec,
+        args: ["/d", "/s", "/c", buildWindowsCommandLine(cmd, args)],
+        windowsVerbatimArguments: true,
+    };
+}
+
 export function runClient(
     cmd: string,
     args: string[],
     env: NodeJS.ProcessEnv,
-    deps?: { spawnImpl?: SpawnFn },
+    deps?: { spawnImpl?: SpawnFn; platform?: NodeJS.Platform },
 ): Promise<number> {
     const spawnImpl = deps?.spawnImpl ?? (spawn as SpawnFn);
+    const plan = planClientSpawn(cmd, args, env, deps?.platform);
     return new Promise((resolve, reject) => {
-        const child = spawnImpl(cmd, args, { stdio: "inherit", env, shell: process.platform === "win32" });
+        const child = spawnImpl(plan.command, plan.args, { stdio: "inherit", env, windowsVerbatimArguments: plan.windowsVerbatimArguments });
         child.on?.("error", (...rest: unknown[]) => reject(rest[0]));
         child.on?.("exit", (...rest: unknown[]) => {
             const code = rest[0];
