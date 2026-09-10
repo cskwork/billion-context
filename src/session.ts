@@ -84,6 +84,10 @@ export type Session = {
          *  lastInputTokens; the next prepare() — where the fold actually
          *  happens — clears it. In-memory only. */
         compressCreditTokens: number;
+        /** True from compress execution until the next upstream usage report
+         *  lands — marks THE request whose prompt first materialized the fold
+         *  (the one whose prefix-cache hit is expected to cliff). #695. */
+        pendingFoldUsage?: boolean;
         /** Current in-context (uncompressed) token count at last processTurn. */
         contextTokens: number;
     };

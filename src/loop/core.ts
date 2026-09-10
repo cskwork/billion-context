@@ -188,8 +188,10 @@ function recordUsage(
     const hitPct =
         typeof cached === "number" && total > 0 ? Math.round((cached / total) * 100) : 0;
     warnCacheCollapse(ctx.session, total, cached ?? 0);
+    const foldNew = ctx.session.stats.pendingFoldUsage === true;
+    if (foldNew) ctx.session.stats.pendingFoldUsage = false;
     ctx.log(
-        `[acp-usage] round ${round} input=${total} cached=${cached ?? 0} (cache hit ${hitPct}%)`,
+        `[acp-usage] round ${round} input=${total} cached=${cached ?? 0} (cache hit ${hitPct}%)${foldNew ? " fold=new" : ""}`,
     );
 }
 

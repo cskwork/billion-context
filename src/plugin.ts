@@ -609,7 +609,7 @@ function usageFromSseEvent(obj: Record<string, unknown>): UsageSample | undefine
     return undefined;
 }
 
-function applyUsageSample(session: Session, sample: UsageSample, protocol?: WireProtocol): void {
+export function applyUsageSample(session: Session, sample: UsageSample, protocol?: WireProtocol): void {
     // inputTokens is protocol-native: Anthropic reports it NEW-only (cached
     // separate); OpenAI/Responses report the TOTAL (cached already included).
     // promptInputTotal adds the cached segment back when it is not part of
@@ -628,6 +628,12 @@ function applyUsageSample(session: Session, sample: UsageSample, protocol?: Wire
         warnCacheCollapse(session, total, sample.cachedTokens ?? 0);
         // #408: host-facing baseline = this report + prepare-time fold credit.
         session.hostContextTokens = total + (session.hostCreditTokens ?? 0);
+        // #695: per-request parity with the wire path's [acp-usage] — without
+        // this, post-fold cache cliffs cannot be attributed from logs.
+        const hit = sample.cachedTokens === undefined || total <= 0 ? undefined : Math.round((100 * (sample.cachedTokens ?? 0)) / total);
+        const foldNew = session.stats.pendingFoldUsage === true;
+        if (foldNew) session.stats.pendingFoldUsage = false;
+        loggerLog("info", `[${session.id}] [plugin] [acp-usage] input=${total} cached=${sample.cachedTokens ?? "n/a"}${hit === undefined ? "" : ` (cache hit ${hit}%)`} ctx=${session.hostContextTokens}${foldNew ? " fold=new" : ""}`);
     }
     if (sample.outputTokens !== undefined) session.stats.outputTokens += sample.outputTokens;
 }
