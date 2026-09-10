@@ -1649,6 +1649,9 @@ export function runClient(
     env: NodeJS.ProcessEnv,
     deps?: { spawnImpl?: SpawnFn; platform?: NodeJS.Platform },
 ): Promise<number> {
+    // #679: never shell:true — besides DEP0190, cmd.exe re-splits the unquoted
+    // line on whitespace and truncated spaced client/-e paths at their first
+    // space; planClientSpawn picks the direct-vs-comspec form instead.
     const spawnImpl = deps?.spawnImpl ?? (spawn as SpawnFn);
     const plan = planClientSpawn(cmd, args, env, deps?.platform);
     return new Promise((resolve, reject) => {
