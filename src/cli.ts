@@ -88,7 +88,7 @@ Launcher (bili pi / bili codex / bili claude / bili omp / bili opencode / bili h
   Brings up a proxy on an independent port (a fresh instance every launch), then runs the client pointed at it via HTTPS_PROXY + the proxy's
   MITM CA — no config-file edits. Discovered HTTPS upstream domains are
   auto-whitelisted for MITM so the proxy TLS-terminates exactly the hosts the
-   the CA via NODE_EXTRA_CA_CERTS, codex via SSL_CERT_FILE. Proxy killed on
+  client uses; HTTP / localhost providers go direct. pi/claude/qoder trust the CA
   via NODE_EXTRA_CA_CERTS, codex/trae via SSL_CERT_FILE. Proxy killed on client exit.
   bili flags (-F, --mitm-domain, --port, ...) must precede the client name;
   everything after the client name is passed through to the client.

@@ -464,6 +464,8 @@ Full command surface (`bili --help` prints an abridged version). Precedence ever
 | `bili opencode [opts --] [args]` | Proxy + **opencode** |
 | `bili hermes [opts --] [args]` | Proxy + **hermes-agent** (`/bili/` rewrite) |
 | `bili dsh [opts --] [args]` | Proxy + **deepseek-harness** (non-loopback upstreams via proxy envs, loopback via `/bili/` rewrite — #535; args like `--profile web "task"` pass through) |
+| `bili codebuddy [opts --] [args]` | Proxy + **codebuddy** (Tencent CodeBuddy Code CLI) — `CODEBUDDY_BASE_URL` `/bili/` rewrite, OpenAI chat-completions wire; budget via `CODEBUDDY_AUTO_COMPACT_WINDOW` (#640) |
+| `bili qoder [opts --] [args]` | Proxy + **qoder** — cert-MITM via `HTTPS_PROXY` + `NODE_EXTRA_CA_CERTS`; model endpoint hardcoded https so no `/bili/` rewrite (default host map whitelisted) (#653) |
 | `bili trae [opts --] [args]` | Proxy + **Trae CLI** (ByteDance, closed Go binary) — cert-MITM via `HTTPS_PROXY` + `SSL_CERT_FILE`; model host from `TRAE_CLI_API_HOST` or the default enterprise gateway (#655) |
 | `bili test pi` | Non-polluting end-to-end smoke test of the pi path |
 | `bili export [session] [--full] [--output FILE]` | List persisted sessions / export one as a Markdown handoff — see [Sessions & Migration](#sessions--migration) |
