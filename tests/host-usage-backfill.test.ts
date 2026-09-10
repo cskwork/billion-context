@@ -910,3 +910,157 @@ test("#648 control: plain client (anthropic wire, hostUsageCredit auto) still ge
         assert.ok(zcodeInputTokensOf(raw) > 1000, "plain proxy client with hostUsageCredit auto must still see the uncompressed baseline (#408)");
     });
 });
+
+// #645: codex — a plain proxy client on the responses wire identified by UA —
+// must report the folded request's own usage; the #408 uncompressed-baseline
+// backfill is suppressed (virtual number the model never receives, drifts
+// turn-to-turn, exceeds the window: 1315/950k). The control test pins the
+// other side of the gate: an identical non-codex client still gets the
+// backfill. Harness mirrors codex-compact-e2e.test.ts (real fold, not a
+// vacuous pass).
+
+const CODEX_UA_645 = "codex_cli_rs/0.1.0 (linux x86_64)";
+const CODEX_CONV_645 = "codex-usage-645";
+
+function sseFrame(type: string, data: unknown): string {
+    return `event: ${type}\ndata: ${JSON.stringify(data)}\n\n`;
+}
+
+function completedFrame(inputTokens: number): string {
+    return sseFrame("response.completed", {
+        response: { id: "resp_done", status: "completed", output: [], usage: { input_tokens: inputTokens, output_tokens: 5, total_tokens: inputTokens + 5 } },
+    });
+}
+
+function compressFcEvents(callId: string): string {
+    const args = JSON.stringify({
+        content: [{ startId: "m00001", endId: "m00002", topic: "setup", summary: "MAIN-SUMMARY-SETUP-CONTEXT-FOLDED-BY-COMPRESSION-LONG-ENOUGH-FOR-KERNEL-MIN-LENGTH-CHECK" }],
+    });
+    return [
+        sseFrame("response.output_item.added", { item: { type: "function_call", id: `fc_${callId}`, call_id: callId, name: "compress" }, output_index: 0 }),
+        sseFrame("response.function_call_arguments.delta", { item_id: `fc_${callId}`, delta: args }),
+        sseFrame("response.output_item.done", { item: { type: "function_call", id: `fc_${callId}`, call_id: callId, name: "compress", arguments: args }, output_index: 0 }),
+    ].join("");
+}
+
+// 7 messages × ~3800 chars (~6.7k tokens). Below the 10k window so preflight
+// never fires. The sentinel sits in m00002 — the assistant message of the
+// compressed head — because the kernel keeps the block's user anchor (m00001)
+// resident and folds the assistant (same placement as the #590 pi test).
+function codexConversation(): Array<{ type: string; role: string; content: string }> {
+    const input: Array<{ type: string; role: string; content: string }> = [];
+    for (let i = 0; i < 7; i++) {
+        input.push({ type: "message", role: i % 2 === 0 ? "user" : "assistant", content: `Message ${i} of the working session. ${i === 1 ? "SENTINEL_FOLD_GONE " : ""}` + `WORK_${i}_content_`.repeat(290) });
+    }
+    return input;
+}
+
+function completedUsageOf(raw: string): { input_tokens: number; total_tokens: number } {
+    const m = raw.match(/event: response\.completed\ndata: (\{[\s\S]*?\})\n\n/);
+    assert.ok(m, `response.completed frame missing: ${raw.slice(0, 400)}`);
+    const frame = JSON.parse(m[1]!) as { response: { usage: { input_tokens: number; total_tokens: number } } };
+    return frame.response.usage;
+}
+
+async function withCodexHarness(fn: (h: { proxy: http.Server; upstream: http.Server; bodies: string[]; url: string }) => Promise<void>): Promise<void> {
+    const bodies: string[] = [];
+    const upstream = http.createServer((req, res) => {
+        const chunks: Buffer[] = [];
+        req.on("data", (c: Buffer) => chunks.push(c));
+        req.on("end", () => {
+            bodies.push(Buffer.concat(chunks).toString("utf8"));
+            res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
+            if (bodies.length === 1) {
+                res.write(compressFcEvents("call_645"));
+            }
+            res.write(completedFrame(1000));
+            res.end();
+        });
+    });
+    upstream.listen(0, "127.0.0.1");
+    await once(upstream, "listening");
+    const upstreamPort = (upstream.address() as { port: number }).port;
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    _resetSessionsForTest();
+    setRegistryForTest({});
+    const proxy = await startServer({
+        port: 0,
+        host: "127.0.0.1",
+        upstream: "http://127.0.0.1",
+        routes: { [`http://127.0.0.1:${upstreamPort}`]: { models: { "gpt-resp": { context: 10_000 } } } },
+        modelContextLimit: 10_000,
+        kernelConfig: defaultConfig(10_000),
+        compress: { injectTool: true, injectNudge: false },
+        promptCache: { routing: "auto" },
+        sessionHeader: "x-acp-session",
+        log: false,
+        debug: false,
+        passthrough: false,
+        autoUpdate: false,
+        mitm: { enabled: false, domains: [] },
+    } as ProxyOptions);
+    await once(proxy, "listening");
+    const proxyPort = (proxy.address() as { port: number }).port;
+    const h = { proxy, upstream, bodies, url: `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/responses` };
+    try {
+        await fn(h);
+    } finally {
+        proxy.close();
+        await once(proxy, "close");
+        upstream.close();
+        await once(upstream, "close");
+    }
+}
+
+// Returns the upstream-request count after setup (the compress execution
+// triggers a re-ask, so setup is more than one upstream call — same shape as
+// codex-compact-e2e's setupCompressedSession).
+async function setupCodexCompressedSession(h: { bodies: string[]; url: string }, ua?: string): Promise<number> {
+    const headers: Record<string, string> = { "content-type": "application/json" };
+    if (ua) headers["user-agent"] = ua;
+    const r1 = await fetch(h.url, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ model: "gpt-resp", stream: true, session_id: CODEX_CONV_645, instructions: "You are the test coding agent.", input: codexConversation() }),
+    });
+    assert.equal(r1.status, 200);
+    const raw = await r1.text();
+    assert.equal(completedUsageOf(raw).input_tokens, 1000, "pre-fold turn must pass the raw usage through");
+    const s = listSessions().find((x) => x.meta.label === CODEX_CONV_645);
+    assert.ok(s, "session exists");
+    assert.ok((s!.state.blocks ?? []).some((b) => b.active), "setup created an active block");
+    assert.ok(h.bodies[0]!.includes("SENTINEL_FOLD_GONE"), "setup forwarded the unfolded head (sentinel present)");
+    return h.bodies.length;
+}
+
+test("#645: codex (responses wire, UA) reports folded usage — host backfill suppressed", async () => {
+    await withCodexHarness(async (h) => {
+        const afterSetup = await setupCodexCompressedSession(h, CODEX_UA_645);
+        const r2 = await fetch(h.url, {
+            method: "POST",
+            headers: { "content-type": "application/json", "user-agent": CODEX_UA_645 },
+            body: JSON.stringify({ model: "gpt-resp", stream: true, session_id: CODEX_CONV_645, instructions: "You are the test coding agent.", input: codexConversation() }),
+        });
+        assert.equal(r2.status, 200);
+        const raw = await r2.text();
+        assert.equal(h.bodies.length, afterSetup + 1, "post-fold turn forwarded to upstream exactly once");
+        assert.ok(!h.bodies[h.bodies.length - 1]!.includes("SENTINEL_FOLD_GONE"), "post-fold upstream body must not carry the folded head content");
+        assert.equal(completedUsageOf(raw).input_tokens, 1000, "codex must report the folded request's own usage — no uncompressed-baseline backfill (#645)");
+    });
+});
+
+test("#645 control: non-codex plain client (responses wire) still gets the #408 backfill", async () => {
+    await withCodexHarness(async (h) => {
+        const afterSetup = await setupCodexCompressedSession(h);
+        const r2 = await fetch(h.url, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ model: "gpt-resp", stream: true, session_id: CODEX_CONV_645, instructions: "You are the test coding agent.", input: codexConversation() }),
+        });
+        assert.equal(r2.status, 200);
+        const raw = await r2.text();
+        assert.equal(h.bodies.length, afterSetup + 1, "post-fold turn forwarded to upstream exactly once");
+        assert.ok(!h.bodies[h.bodies.length - 1]!.includes("SENTINEL_FOLD_GONE"), "post-fold upstream body must not carry the folded head content");
+        assert.ok(completedUsageOf(raw).input_tokens > 1000, "plain proxy client must still see the uncompressed baseline (#408)");
+    });
+});
