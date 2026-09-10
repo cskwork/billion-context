@@ -10,6 +10,7 @@ import {
 } from "../src/discover.ts";
 import {
     parseZcodeConfig,
+    TRAE_DEFAULT_MODEL_HOSTS,
     readZcodeConfig,
     QODER_DEFAULT_MODEL_HOSTS,
     type ClientConfig,
@@ -141,6 +142,11 @@ test("extractHttpsHosts: codebuddy base URL + models.json urls (https only, unwr
 test("extractHttpsHosts: qoder → default model hosts; modelServerHost replaces them (#653)", () => {
     assert.deepEqual(extractHttpsHosts({ qoder: {} }), QODER_DEFAULT_MODEL_HOSTS);
     assert.deepEqual(extractHttpsHosts({ qoder: { modelServerHost: "my-relay.example.com" } }), ["my-relay.example.com"]);
+});
+
+test("extractHttpsHosts: trae → default model hosts; modelApiHost replaces them (#655)", () => {
+    assert.deepEqual(extractHttpsHosts({ trae: {} }), TRAE_DEFAULT_MODEL_HOSTS);
+    assert.deepEqual(extractHttpsHosts({ trae: { modelApiHost: "my-relay.example.com" } }), ["my-relay.example.com"]);
 });
 
 async function withTempHome<T>(fn: (home: string, env: NodeJS.ProcessEnv) => Promise<T>): Promise<T> {

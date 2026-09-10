@@ -43,7 +43,7 @@ import { selfPackageRoot, isBiliPiEntry, ompPluginLoadedFrom } from "./plugin-in
 function selfDistFile(name: string): string {
     return path.join(selfPackageRoot(), "dist", name);
 }
-import { nonEmpty, resolvePiHome, resolveOmpHome, resolveDshHome, resolveCodexHome, loadClientConfig, collectModelWindows, type ClientConfig, type CodexConfig, resolveOpencodeConfigFile, type OpencodeConfig, type OpencodeProvider, type HermesConfig, type HermesProvider, qoderIsCnSite, QODER_DEFAULT_MODEL_HOSTS } from "./client-config.js";
+import { nonEmpty, resolvePiHome, resolveOmpHome, resolveDshHome, resolveCodexHome, loadClientConfig, collectModelWindows, type ClientConfig, type CodexConfig, resolveOpencodeConfigFile, type OpencodeConfig, type OpencodeProvider, type HermesConfig, type HermesProvider, qoderIsCnSite, QODER_DEFAULT_MODEL_HOSTS, resolveTraeHome, readTraeConfig, TRAE_DEFAULT_MODEL_HOSTS, type TraeConfig } from "./client-config.js";
 import { loadRoutes, resolveConfiguredContextLimit, lookupContextLimit, type ProviderRoutes } from "./config.js";
 import { contextFromRegistry } from "./registry.js";
 
@@ -76,6 +76,10 @@ export {
     parseDshSettingsYaml,
     resolveDshHome,
     resolveCodexHome,
+    resolveTraeHome,
+    readTraeConfig,
+    TRAE_DEFAULT_MODEL_HOSTS,
+    type TraeConfig,
     resolveOpencodeConfigFile,
     readOpencodeConfig,
     type OpencodeConfig,
@@ -92,9 +96,9 @@ export {
 } from "./client-config.js";
 
 export const LAUNCHER_DEFAULT_HOST = "127.0.0.1";
-export const LAUNCH_CLIENTS = ["pi", "codex", "claude", "omp", "opencode", "hermes", "dsh", "codebuddy", "qoder", "pi-test"] as const;
+export const LAUNCH_CLIENTS = ["pi", "codex", "claude", "omp", "opencode", "hermes", "dsh", "codebuddy", "qoder", "trae", "pi-test"] as const;
 export type ClientName = (typeof LAUNCH_CLIENTS)[number];
-export type BaseClientName = "claude" | "codex" | "pi" | "omp" | "opencode" | "hermes" | "dsh" | "codebuddy" | "qoder";
+export type BaseClientName = "claude" | "codex" | "pi" | "omp" | "opencode" | "hermes" | "dsh" | "codebuddy" | "qoder" | "trae";
 
 const HEALTH_PATH = "/__bili/health";
 const HEALTH_POLL_INTERVAL_MS = 200;
@@ -419,6 +423,24 @@ export function discoverRoutes(client: ClientName, config: ClientConfig): Discov
                 httpsDomains.push(h);
             }
         }
+    } else if (client === "trae") {
+        // #655: Trae CLI is a closed Go binary (no base-URL override) that
+        // honors HTTPS_PROXY; the model API host is TRAE_CLI_API_HOST or the
+        // default enterprise gateway. Whitelist the host(s) for cert-MITM so
+        // the proxy can compress the model traffic. No /bili/ rewrite (the
+        // scheme is hardcoded https).
+        const hosts = nonEmpty(config.trae?.modelApiHost)
+            ? [config.trae!.modelApiHost!]
+            : TRAE_DEFAULT_MODEL_HOSTS;
+        for (const h of hosts) {
+            // MITM whitelist matches the port-less SNI hostname (isMitmHost), so
+            // reduce host:port to its host or the entry never matches.
+            const host = h.split(":", 2)[0]!.toLowerCase();
+            if (host && !httpsSeen.has(host)) {
+                httpsSeen.add(host);
+                httpsDomains.push(host);
+            }
+        }
     } else {
         for (const [name, prov] of Object.entries(config.codex?.providers ?? {})) {
             classify(prov.baseUrl, `model_providers.${name}.base_url`);
@@ -466,6 +488,12 @@ export function buildPiEnv(
 }
 
 export function buildCodexEnv(origin: string, caPath: string, baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+    return { ...baseEnv, HTTPS_PROXY: origin, SSL_CERT_FILE: caPath, BILLION_CONTEXT_PROXY: origin };
+}
+
+export function buildTraeEnv(origin: string, caPath: string, baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+    // #655: trae is a Go binary like codex — the CA rides SSL_CERT_FILE (the
+    // combined bundle, since it replaces Go's system trust store).
     return { ...baseEnv, HTTPS_PROXY: origin, SSL_CERT_FILE: caPath, BILLION_CONTEXT_PROXY: origin };
 }
 
@@ -751,7 +779,7 @@ function isPrivateIPv4(host: string): boolean {
  *  yet verified against a real build, so v1 runs pure wire mode (the proxy
  *  injects the context tools on the wire). */
 export function launcherInjectMcp(env: NodeJS.ProcessEnv, base: string, codexUpstream?: string): boolean {
-    if (base === "pi" || base === "omp" || base === "opencode" || base === "hermes" || base === "dsh" || base === "codebuddy" || base === "qoder") return false;
+    if (base === "pi" || base === "omp" || base === "opencode" || base === "hermes" || base === "dsh" || base === "codebuddy" || base === "qoder" || base === "trae") return false;
     if (env.BILI_LAUNCHER_PLUGIN === "0") return false;
     if (base === "codex" && env.BILI_LAUNCHER_PLUGIN === undefined && codexUpstream !== undefined && isPrivateUpstreamHost(codexUpstream)) {
         return false;
@@ -1932,6 +1960,12 @@ export function resolveClientCommand(
         const resolved = resolveOnPath("qoder", env) ?? resolveOnPath("qodercli", env);
         return { command: resolved ?? "qoder", prefixArgs: [] };
     }
+    if (client === "trae") {
+        const traeBin = resolveOnPath("traecli", env)
+            ?? resolveOnPath("trae-cli", env)
+            ?? resolveOnPath("trae", env);
+        return { command: traeBin ?? "traecli", prefixArgs: [] };
+    }
     const resolved = resolveOnPath(client, env);
     return { command: resolved ?? client, prefixArgs: [] };
 }
@@ -2190,6 +2224,13 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         if (qoderBudget[`${qoderPrefix}_AUTOCOMPACT_WINDOW`] !== undefined) {
             console.error(`bili: qoder budget aligned — ${qoderPrefix}_AUTOCOMPACT_WINDOW=${qoderBudget[`${qoderPrefix}_AUTOCOMPACT_WINDOW`]}`);
         }
+    } else if (base === "trae") {
+        // #655: cert-MITM like codex/qoder (Go binary honors HTTPS_PROXY; CA
+        // via SSL_CERT_FILE combined bundle). No budget env (the CLI manages
+        // its own context window) and no transport forcing — the wire is the
+        // proprietary /api/ide/v2/llm_raw_chat, recognized as OpenAI by the
+        // proxy.
+        env = buildTraeEnv(origin, resolveCombinedCaPath(process.env), stripInheritedProxy(process.env));
     } else if (base === "codex") {
         // Per-spawn conversation id for the MCP shell's headless
         // self-registration (codex provides no session id of its own).

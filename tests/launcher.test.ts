@@ -39,6 +39,10 @@ import {
     resolveHermesHome,
     parseDshSettingsYaml,
     readDshConfig,
+    resolveTraeHome,
+    readTraeConfig,
+    buildTraeEnv,
+    TRAE_DEFAULT_MODEL_HOSTS,
     resolveDshHome,
     prepareDshHome,
     writeDshAcpPatch,
@@ -84,6 +88,7 @@ test("isLaunchClient: pi/claude/codex/omp/opencode/pi-test true, others false", 
     assert.equal(isLaunchClient("opencode"), true);
     assert.equal(isLaunchClient("hermes"), true);
     assert.equal(isLaunchClient("dsh"), true);
+    assert.equal(isLaunchClient("trae"), true);
     assert.equal(isLaunchClient("qoder"), true);
     assert.equal(isLaunchClient("pi-test"), true);
     assert.equal(isLaunchClient("start"), false);
@@ -3018,6 +3023,141 @@ test("runLaunch qoder: cert-MITM envs, transport forced, budget aligned, default
         else process.env.QODER_AUTOCOMPACT_WINDOW = prevWindow;
         if (prevTransport === undefined) delete process.env.QODER_MODEL_TRANSPORT;
         else process.env.QODER_MODEL_TRANSPORT = prevTransport;
+        if (prevNoProxy === undefined) delete process.env.NO_PROXY;
+        else process.env.NO_PROXY = prevNoProxy;
+        fs.rmSync(home, { recursive: true, force: true });
+    }
+});
+
+test("resolveTraeHome: TRAE_CONFIG_DIR override > ~/.trae", () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-trae-home-"));
+    const prevHome = process.env.HOME;
+    const prevUserProfile = process.env.USERPROFILE;
+    process.env.HOME = home;
+    if (prevUserProfile !== undefined) process.env.USERPROFILE = home;
+    try {
+        assert.equal(resolveTraeHome({ TRAE_CONFIG_DIR: "/tmp/trae-cfg" }), "/tmp/trae-cfg");
+        assert.equal(resolveTraeHome({}), path.join(home, ".trae"));
+    } finally {
+        process.env.HOME = prevHome;
+        if (prevUserProfile === undefined) delete process.env.USERPROFILE;
+        else process.env.USERPROFILE = prevUserProfile;
+        fs.rmSync(home, { recursive: true, force: true });
+    }
+});
+
+test("readTraeConfig: TRAE_CLI_API_HOST (scheme + trailing slash stripped)", () => {
+    assert.deepEqual(readTraeConfig({}), {});
+    assert.deepEqual(readTraeConfig({ TRAE_CLI_API_HOST: "https://my-relay.example.com:8443/" }), { modelApiHost: "my-relay.example.com:8443" });
+    assert.deepEqual(readTraeConfig({ TRAE_CLI_API_HOST: "my-relay.example.com" }), { modelApiHost: "my-relay.example.com" });
+    assert.deepEqual(readTraeConfig({ TRAE_CLI_API_HOST: "   " }), {});
+});
+
+test("discoverRoutes: trae → default MITM hosts, no rewrites (#655)", () => {
+    const routes = discoverRoutes("trae", {});
+    assert.deepEqual(routes.httpsDomains, TRAE_DEFAULT_MODEL_HOSTS);
+    assert.deepEqual(routes.httpRewrites, []);
+    assert.deepEqual(routes.httpsRewrites, []);
+    assert.deepEqual(routes.httpEnvRoutes, []);
+});
+
+test("discoverRoutes: trae modelApiHost replaces the default map", () => {
+    const config: ClientConfig = { trae: { modelApiHost: "my-relay.example.com" } };
+    const routes = discoverRoutes("trae", config);
+    assert.deepEqual(routes.httpsDomains, ["my-relay.example.com"]);
+});
+
+test("discoverRoutes: trae modelApiHost with :port → hostname only (MITM is SNI-based, #655)", () => {
+    const config: ClientConfig = { trae: { modelApiHost: "my-relay.example.com:8443" } };
+    const routes = discoverRoutes("trae", config);
+    assert.deepEqual(routes.httpsDomains, ["my-relay.example.com"]);
+});
+
+test("buildTraeEnv: HTTPS_PROXY + SSL_CERT_FILE + BILLION_CONTEXT_PROXY, baseEnv preserved", () => {
+    const env = buildTraeEnv("http://127.0.0.1:8787", "/tmp/ca.pem", { FOO: "bar" });
+    assert.equal(env.HTTPS_PROXY, "http://127.0.0.1:8787");
+    assert.equal(env.SSL_CERT_FILE, "/tmp/ca.pem");
+    assert.equal(env.BILLION_CONTEXT_PROXY, "http://127.0.0.1:8787");
+    assert.equal(env.FOO, "bar");
+});
+
+test("resolveClientCommand: trae resolves `traecli`, falls back to `trae-cli` then `trae`", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-trae-bin-"));
+    try {
+        const env: NodeJS.ProcessEnv = { PATH: dir };
+        assert.deepEqual(resolveClientCommand("trae", env), { command: "traecli", prefixArgs: [] });
+        fs.writeFileSync(path.join(dir, "trae"), "");
+        assert.deepEqual(resolveClientCommand("trae", env), { command: path.join(dir, "trae"), prefixArgs: [] });
+        fs.writeFileSync(path.join(dir, "trae-cli"), "");
+        assert.deepEqual(resolveClientCommand("trae", env), { command: path.join(dir, "trae-cli"), prefixArgs: [] });
+        fs.writeFileSync(path.join(dir, "traecli"), "");
+        assert.deepEqual(resolveClientCommand("trae", env), { command: path.join(dir, "traecli"), prefixArgs: [] });
+    } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("runLaunch trae: cert-MITM envs (SSL_CERT_FILE combined bundle), no budget/transport, default MITM whitelist (#655)", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-trae-launch-"));
+    const prevHome = process.env.HOME;
+    const prevUserProfile = process.env.USERPROFILE;
+    const prevBin = process.env.BILI_CLIENT_BIN;
+    const prevNoProxy = process.env.NO_PROXY;
+    process.env.HOME = home;
+    if (prevUserProfile !== undefined) process.env.USERPROFILE = home;
+    const fakeTrae = path.join(home, "fake-traecli");
+    fs.writeFileSync(fakeTrae, "");
+    process.env.BILI_CLIENT_BIN = fakeTrae;
+    process.env.NO_PROXY = "localhost,.corp";
+
+    const clientEnvs: (NodeJS.ProcessEnv | undefined)[] = [];
+    const proxyEnvs: (NodeJS.ProcessEnv | undefined)[] = [];
+    const spawnImpl: SpawnFn = (cmd, args, opts) => {
+        const env = (opts as { env?: NodeJS.ProcessEnv } | undefined)?.env;
+        if (cmd === fakeTrae) {
+            clientEnvs.push(env);
+            const child = makeFakeChild(0);
+            const orig = child.on.bind(child);
+            (child as { on: SpawnChild["on"] }).on = (event, listener) => {
+                orig(event, listener);
+                if (event === "exit") setTimeout(() => listener(0, null), 0);
+                return child;
+            };
+            return child;
+        }
+        proxyEnvs.push(env);
+        return makeFakeChild(42424);
+    };
+    const fetchImpl = async () => ({ ok: true });
+    const prevExit = process.exit;
+    process.exit = (() => undefined) as typeof process.exit;
+
+    try {
+        await runLaunch(
+            { client: "trae", clientArgs: [], overrides: {} },
+            { fetchImpl, spawnImpl, sleep: () => Promise.resolve() },
+        );
+        assert.equal(clientEnvs.length, 1);
+        const seenEnv = clientEnvs[0]!;
+        const origin = seenEnv.BILLION_CONTEXT_PROXY;
+        assert.ok(/^http:\/\/127\.0\.0\.1:\d+$/.test(String(origin)), `origin: ${origin}`);
+        assert.equal(seenEnv.HTTPS_PROXY, origin);
+        assert.ok(String(seenEnv.SSL_CERT_FILE).endsWith(path.join("billion-context", "ca", "combined-ca.pem")), String(seenEnv.SSL_CERT_FILE));
+        assert.equal(seenEnv.NODE_EXTRA_CA_CERTS, undefined, "trae uses SSL_CERT_FILE, not NODE_EXTRA_CA_CERTS");
+        assert.equal(seenEnv.HTTP_PROXY, undefined, "inherited HTTP_PROXY stripped");
+        assert.equal(seenEnv.NO_PROXY, undefined, "inherited NO_PROXY stripped");
+        assert.ok(proxyEnvs.length > 0, "proxy child spawned");
+        const mitm = String(proxyEnvs[0]!.BILI_MITM_DOMAINS).split(",");
+        for (const h of TRAE_DEFAULT_MODEL_HOSTS) {
+            assert.ok(mitm.includes(h), `whitelist has ${h}: ${mitm.join(",")}`);
+        }
+    } finally {
+        process.exit = prevExit;
+        process.env.HOME = prevHome;
+        if (prevUserProfile === undefined) delete process.env.USERPROFILE;
+        else process.env.USERPROFILE = prevUserProfile;
+        if (prevBin === undefined) delete process.env.BILI_CLIENT_BIN;
+        else process.env.BILI_CLIENT_BIN = prevBin;
         if (prevNoProxy === undefined) delete process.env.NO_PROXY;
         else process.env.NO_PROXY = prevNoProxy;
         fs.rmSync(home, { recursive: true, force: true });

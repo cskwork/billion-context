@@ -121,6 +121,10 @@ export interface QoderConfig {
     modelServerHost?: string;
 }
 
+export interface TraeConfig {
+    modelApiHost?: string;
+}
+
 export interface ClientConfig {
     claude?: ClaudeSettings;
     codex?: CodexConfig;
@@ -132,6 +136,7 @@ export interface ClientConfig {
     dsh?: DshConfig;
     codebuddy?: CodebuddyConfig;
     qoder?: QoderConfig;
+    trae?: TraeConfig;
 }
 
 /** qoder's default model-inference hosts, hardcoded in the binary (no config
@@ -402,6 +407,33 @@ export function readDshConfig(dshHome: string): DshConfig {
         return { baseUrls: [] };
     }
     return { baseUrls: parseDshSettingsYaml(text) };
+}
+
+/** Default model API gateways for Trae CLI (ByteDance). The CLI is a Go
+ *  binary that honors HTTPS_PROXY (Go net/http) and resolves its API host
+ *  from TRAE_CLI_API_HOST (chatmodel.resolveBaseURL); without it the
+ *  enterprise gateway is console.enterprise.trae.cn. These hosts are
+ *  cert-MITM'd so `bili trae` can compress the model traffic. */
+export const TRAE_DEFAULT_MODEL_HOSTS = [
+    "console.enterprise.trae.cn",
+    "www.trae.cn",
+];
+
+/** Trae CLI keeps its config under TRAE_CONFIG_DIR (default ~/.trae):
+ *  traecli.yaml, skills, session state. */
+export function resolveTraeHome(env: NodeJS.ProcessEnv): string {
+    const h = os.homedir();
+    return nonEmpty(env.TRAE_CONFIG_DIR) ? env.TRAE_CONFIG_DIR!
+        : path.join(h, ".trae");
+}
+
+export function readTraeConfig(env: NodeJS.ProcessEnv): TraeConfig {
+    const result: TraeConfig = {};
+    const host = nonEmpty(env.TRAE_CLI_API_HOST)
+        ? env.TRAE_CLI_API_HOST!.replace(/^https?:\/\//i, "").replace(/\/+$/, "")
+        : undefined;
+    if (host) result.modelApiHost = host;
+    return result;
 }
 
 export function readClaudeSettings(homeDir: string, cwd: string, env: NodeJS.ProcessEnv = process.env): ClaudeSettings {
@@ -797,6 +829,7 @@ export function loadClientConfig(env: NodeJS.ProcessEnv, cwd: string): ClientCon
     config.dsh = readDshConfig(resolveDshHome(env));
     config.codebuddy = readCodebuddyConfig(resolveCodebuddyHome(env), cwd, env);
     config.qoder = readQoderConfig(resolveQoderHome(env), env);
+    config.trae = readTraeConfig(env);
     return config;
 }
 
@@ -804,7 +837,7 @@ export function loadClientConfig(env: NodeJS.ProcessEnv, cwd: string): ClientCon
  *  launched client's own declarations are authoritative (#436: launching
  *  `bili omp` with omp's models.yml declaring 131072 must not be overridden by
  *  another client's larger declaration for the same model id). */
-export type ModelWindowScope = "claude" | "codex" | "pi" | "omp" | "opencode" | "hermes" | "dsh" | "codebuddy" | "qoder";
+export type ModelWindowScope = "claude" | "codex" | "pi" | "omp" | "opencode" | "hermes" | "dsh" | "codebuddy" | "qoder" | "trae";
 
 /** Collect per-model context windows from client configs the launcher can
  *  read (pi models.json, omp models.yml, opencode opencode.json, codex
