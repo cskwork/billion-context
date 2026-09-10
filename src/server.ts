@@ -1822,7 +1822,7 @@ function diagNudge(turn: { nudge?: { shouldInject: boolean; reason: string; cont
     return `[${sessionId}] nudge ${inject}: usage=${pct} (${tokenCount}/${limit}), growth=${growth}/${floor} (ref=${ref}, interval=${interval}), pendingT1=${pendingT1}/${interval}${modelTag}, reason="${n.reason.slice(0, 120)}"`;
 }
 
-// #408/#590/#623: hosts that get the #408 uncompressed-baseline usage
+// #408/#590/#623/#648: hosts that get the #408 uncompressed-baseline usage
 // backfill. pi's AND omp's bili extensions cancel the host's NATIVE compaction
 // so ACP owns compression — pi cancels auto-compaction, omp cancels ALL
 // compaction (its session_before_compact event carries no reason field, so
@@ -1832,14 +1832,23 @@ function diagNudge(turn: { nudge?: { shouldInject: boolean; reason: string; cont
 // (#590 pi 302.7%, #623 omp 205%). Gate on pluginAgent so ONLY the
 // bili-launched extensions are exempted: plain proxy clients and codex
 // native-compact interception keep the #408 behavior (their native compaction
-// stays live and consumes the baseline).
+// stays live and consumes the baseline). The `hostUsageCredit` config option
+// (#648) additionally lets a plain proxy client opt out entirely ("off") —
+// ZCode and similar plain anthropic clients otherwise show the cumulative,
+// drifting baseline as inflated context in their UI.
 function armHostUsageCredit(
     session: Session,
     originalMessages: CoreMessage[],
     processedMessages: CoreMessage[],
+    hostUsageCredit: "auto" | "off",
     log: (level: string, msg: string) => void,
 ): void {
     session.hostCreditTokens = 0;
+    // #648: "off" disables the #408 uncompressed-baseline backfill — the host
+    // sees the actually-forwarded (folded) request, matching [acp-usage]
+    // input=. Plain proxy clients (ZCode) otherwise show a cumulative,
+    // drifting baseline that overstates real context pressure.
+    if (hostUsageCredit === "off") return;
     if (session.metadata.pluginAgent === "pi" || session.metadata.pluginAgent === "omp") return;
     // #408: tokens folded out of the forwarded view vs the host's own (unfolded)
     // view — added back into the usage reported to the host so its anchor
@@ -1990,7 +1999,7 @@ function prepareAnthropic(
     // identity chain (#268), not part of the Anthropic Messages API — strip it
     // so the real upstream never sees a field it doesn't know.
     delete (rebuilt as Record<string, unknown>).prompt_cache_key;
-    armHostUsageCredit(session, originalMessages, processedMessages, log);
+    armHostUsageCredit(session, originalMessages, processedMessages, opts.hostUsageCredit, log);
     return { body: JSON.stringify(rebuilt), session, processedMessages, originalMessages, anthropicSystem: parsed.system, protocol: "anthropic", stream, compressInjected: injectTools, pluginMode, nudge, prompts, renderTags: "text-only" } as Prepared;
 }
 
@@ -2245,7 +2254,7 @@ function prepareOpenai(
     if (stream && (rebuilt as Record<string, unknown>).stream_options === undefined) {
         (rebuilt as Record<string, unknown>).stream_options = { include_usage: true };
     }
-    armHostUsageCredit(session, originalMessages, processedMessages, log);
+    armHostUsageCredit(session, originalMessages, processedMessages, opts.hostUsageCredit, log);
     // #532: title-gen side requests carry their own tiny system and would
     // clobber the conversation's measured overhead — skip them.
     if (!isTitleGen && openaiOutboundSystem !== undefined) {
@@ -2501,7 +2510,7 @@ function prepareResponses(
         });
         log("info", `[${sessionId}] responses forward tools=[${fwdTools.join(",")}] injectTool=${injectTools}${pluginMode ? " (plugin mode: wire injection suppressed)" : ""} NO_INJECT_TOOL=${!!process.env.ACP_NO_INJECT_TOOL} NO_COMPRESS_PROMPT=${!!process.env.ACP_NO_COMPRESS_PROMPT}`);
     }
-    armHostUsageCredit(session, originalMessages, processedMessages, log);
+    armHostUsageCredit(session, originalMessages, processedMessages, opts.hostUsageCredit, log);
     // #532: measure the outbound developer(system)+tools overhead for the panel.
     // On this wire the system rides the injected developer message outside the
     // fold space, so counting devContent + tools does not double-count the
