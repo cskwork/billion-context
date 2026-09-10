@@ -43,6 +43,10 @@ import {
     prepareDshHome,
     writeDshAcpPatch,
     dshArgsWithPatch,
+    buildCodexMcpArgs,
+    prepareCodexHome,
+    prepareCodexMcpInjection,
+    resolveCodexHome,
     readOpencodeConfig,
     resolveOpencodeConfigFile,
     findFreePort,
@@ -1710,6 +1714,128 @@ test("prepareDshHome: returns undefined for unreadable settings even with rewrit
     try {
         const rewrites: HttpRewrite[] = [{ key: "dsh-1", realUpstream: "http://127.0.0.1:8199/v1" }];
         assert.equal(prepareDshHome(dir, "http://127.0.0.1:8787", rewrites), undefined);
+    } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("resolveCodexHome: honours CODEX_HOME, defaults to ~/.codex", () => {
+    assert.equal(resolveCodexHome({ CODEX_HOME: "/tmp/cx" }), "/tmp/cx");
+    assert.ok(resolveCodexHome({}).endsWith(".codex"));
+});
+
+test("prepareCodexHome: no real config → overlay holds only the bili MCP block, siblings shared, real home untouched (#681)", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cx-home-"));
+    const origin = "http://127.0.0.1:8787";
+    const cid = "conv-1";
+    try {
+        fs.writeFileSync(path.join(dir, "auth.json"), '{"id_token":"x"}');
+        fs.mkdirSync(path.join(dir, "sessions"));
+        const authOriginal = fs.readFileSync(path.join(dir, "auth.json"), "utf8");
+
+        const overlay = prepareCodexHome(dir, origin, cid);
+        assert.ok(overlay);
+        assert.equal(overlay, `${dir}-bili`);
+        const txt = fs.readFileSync(path.join(overlay, "config.toml"), "utf8");
+        assert.equal((txt.match(/\[mcp_servers\.bili\]/g) ?? []).length, 1);
+        assert.ok(txt.includes(`command = ${JSON.stringify(process.execPath)}`));
+        assert.match(txt, /args = \[.*mcp\.js.*\]/);
+        assert.ok(txt.includes(`BILI_MCP_PROXY = ${JSON.stringify(origin)}`));
+        assert.ok(txt.includes(`BILI_CONVERSATION_ID = ${JSON.stringify(cid)}`));
+        // the command value must be a quoted TOML basic string — only then does a spaced/quoted Windows path survive being read from the file
+        assert.match(txt, /^command = ".+"$/m);
+        assert.ok(fs.lstatSync(path.join(overlay, "auth.json")).isSymbolicLink());
+        assert.ok(fs.lstatSync(path.join(overlay, "sessions")).isSymbolicLink());
+        assert.equal(fs.readFileSync(path.join(dir, "auth.json"), "utf8"), authOriginal);
+        assert.ok(!fs.existsSync(path.join(dir, "config.toml")));
+        fs.rmSync(overlay, { recursive: true, force: true });
+    } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("prepareCodexHome: real config without bili → original preserved, block appended once (#681)", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cx-home-"));
+    try {
+        fs.writeFileSync(
+            path.join(dir, "config.toml"),
+            ['model = "gpt-5"', "", '[model_providers.openai]', 'name = "OpenAI"', ''].join("\n"),
+        );
+        const original = fs.readFileSync(path.join(dir, "config.toml"), "utf8");
+        const overlay = prepareCodexHome(dir, "http://127.0.0.1:8787", "conv-2");
+        assert.ok(overlay);
+        const txt = fs.readFileSync(path.join(overlay, "config.toml"), "utf8");
+        assert.ok(txt.includes('model = "gpt-5"'));
+        assert.ok(txt.includes('[model_providers.openai]'));
+        assert.equal((txt.match(/\[mcp_servers\.bili\]/g) ?? []).length, 1);
+        assert.equal(fs.readFileSync(path.join(dir, "config.toml"), "utf8"), original);
+        fs.rmSync(overlay, { recursive: true, force: true });
+    } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("prepareCodexHome: pre-existing [mcp_servers.bili] is replaced, never duplicated (#681)", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cx-home-"));
+    try {
+        fs.writeFileSync(
+            path.join(dir, "config.toml"),
+            [
+                "model = \"gpt-5\"",
+                "",
+                "[mcp_servers.bili]",
+                "command = \"/old/path/node\"",
+                "args = [\"/old/mcp.js\"]",
+                "env = { BILI_MCP_PROXY = \"http://old:1\" }",
+                "",
+                "[other_table]",
+                "keep = \"me\"",
+                "",
+            ].join("\n"),
+        );
+        const overlay = prepareCodexHome(dir, "http://127.0.0.1:8787", "conv-3");
+        assert.ok(overlay);
+        const txt = fs.readFileSync(path.join(overlay, "config.toml"), "utf8");
+        assert.equal((txt.match(/\[mcp_servers\.bili\]/g) ?? []).length, 1, "exactly one bili block");
+        assert.ok(!txt.includes("/old/path/node"), "stale install block removed");
+        assert.ok(!txt.includes("http://old:1"), "stale proxy origin removed");
+        assert.ok(txt.includes(`BILI_CONVERSATION_ID = ${JSON.stringify("conv-3")}`), "per-spawn conversation id added");
+        assert.ok(txt.includes('model = "gpt-5"'), "unrelated top-level key kept");
+        assert.ok(txt.includes('[other_table]') && txt.includes('keep = "me"'), "unrelated table kept");
+        fs.rmSync(overlay, { recursive: true, force: true });
+    } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("prepareCodexMcpInjection: POSIX keeps inline -c args, no CODEX_HOME redirect (#681)", () => {
+    const r = prepareCodexMcpInjection({
+        platform: "linux",
+        codexHome: "/nonexistent-codex-home",
+        origin: "http://127.0.0.1:8787",
+        conversationId: "conv-x",
+    });
+    assert.deepEqual(r.clientArgs, buildCodexMcpArgs("http://127.0.0.1:8787", "conv-x"));
+    assert.deepEqual(r.envPatch, {});
+    assert.equal(r.warning, undefined);
+});
+
+test("prepareCodexMcpInjection: win32 redirects CODEX_HOME to the overlay, drops inline args (#681)", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cx-home-"));
+    try {
+        fs.writeFileSync(path.join(dir, "auth.json"), "{}");
+        const r = prepareCodexMcpInjection({
+            platform: "win32",
+            codexHome: dir,
+            origin: "http://127.0.0.1:8787",
+            conversationId: "conv-w",
+        });
+        assert.deepEqual(r.clientArgs, [], "no inline -c args on Windows");
+        assert.equal(r.envPatch.CODEX_HOME, `${dir}-bili`);
+        assert.ok(fs.existsSync(path.join(`${dir}-bili`, "config.toml")));
+        const txt = fs.readFileSync(path.join(`${dir}-bili`, "config.toml"), "utf8");
+        assert.equal((txt.match(/\[mcp_servers\.bili\]/g) ?? []).length, 1);
+        fs.rmSync(`${dir}-bili`, { recursive: true, force: true });
     } finally {
         fs.rmSync(dir, { recursive: true, force: true });
     }
