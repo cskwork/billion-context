@@ -8,7 +8,7 @@ import { DEFAULT_STRIP_IMAGES_KEEP_RECENT, stripHistoricalImages } from "./strip
 import type { ProxyOptions } from "./config.js";
 import { loadOptions, loadRoutes } from "./config.js";
 import { resetProxyCache } from "./upstream-proxy.js";
-import { FALLBACK_EFFECTIVE_WINDOW_FLOOR, lookupContextLimit, resolveConfiguredContextLimit, resolveCompressProtocol } from "./config.js";
+import { FALLBACK_EFFECTIVE_WINDOW_FLOOR, findRoute, lookupContextLimit, resolveConfiguredContextLimit, resolveCompressProtocol } from "./config.js";
 import { contextFromRegistry, loadRegistry, peekRegistryContext } from "./registry.js";
 import { codexAlignedWindow } from "./codex-models.js";
 import { fetchWithTimeout, MAX_REQUEST_BYTES } from "./fetch-util.js";
@@ -1166,10 +1166,17 @@ async function handle(
         }
     }
     let prepared: Prepared | null = null;
+    // #661: route-scoped passthrough — the global flag's semantics, limited to
+    // requests whose upstream URL matches a provider route with
+    // `passthrough: true` (upstreams that fingerprint the request body).
+    const routePassthrough = !opts.passthrough && findRoute(opts.routes, route?.rewrittenUrl)?.passthrough === true;
+    if (routePassthrough && hopMarker === undefined && protocol && parsed) {
+        log("info", `[route-passthrough] ${maskUrlsInText(route?.rewrittenUrl ?? "")} matches a passthrough route — forwarding verbatim, kernel bypassed`);
+    }
     // #300: `hopMarker !== undefined` means an upstream bili already processed
     // this request — skip the whole pipeline (prepared stays null) so the
     // passthrough path below forwards it verbatim.
-    if (!opts.passthrough && hopMarker === undefined && protocol && parsed && typeof parsed === "object") {
+    if (!opts.passthrough && !routePassthrough && hopMarker === undefined && protocol && parsed && typeof parsed === "object") {
         const sessionHeader = headerValue(req, opts.sessionHeader);
         // Plugin mode (issue #1, "内外呼应"): a cooperative agent-side plugin
         // announces itself with x-bili-plugin. The proxy then treats the
@@ -1685,7 +1692,7 @@ async function handle(
         }
     }
     if (!prepared) {
-        if (protocol === null && !opts.passthrough && !isModelDiscoveryPath(urlPath)) {
+        if (protocol === null && !opts.passthrough && !routePassthrough && !isModelDiscoveryPath(urlPath)) {
             logUnrecognizedPath(log, req.url ?? "");
         }
         await forward(req, res, opts, bodyBuffer, null, core, reqConfig, log, route, instanceId, undefined);

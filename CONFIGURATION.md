@@ -126,7 +126,7 @@ Top-level keys that control how the proxy listens and behaves globally.
 
 ## Providers
 
-The `providers` block maps **upstream URLs** to per-provider configuration. Each key is a URL prefix; each value can declare model context windows, a per-provider proxy, a compression protocol, and compression overrides.
+The `providers` block maps **upstream URLs** to per-provider configuration. Each key is a URL prefix; each value can declare model context windows, a per-provider proxy, a compression protocol, compression overrides, and a per-route passthrough.
 
 ```jsonc
 {
@@ -185,6 +185,21 @@ A shallow key (`https://open.bigmodel.cn`) matches every path on that host. A de
 - **Default:** `{}` (disabled)
 - **Status:** ACTIVE
 - **Description:** Per-provider wire-compat overrides. `roles` maps message roles to the role name this upstream accepts, e.g. `{"developer": "system"}` for upstreams that reject the `developer` role newer codex clients send (#552). Applied to the final forwarded `openai`/`responses` body — client-sent roles and bili's own injected prompt alike — and to every body the compress-retry loops re-send. Wins per key over the global `compat` block (see [Server Settings](#server-settings)). Default `{}` forwards byte-for-byte unchanged.
+
+### `passthrough`
+
+- **Type:** `boolean`
+- **Default:** *(none — compression active)*
+- **Status:** ACTIVE
+- **Description:** Per-route override of the global [`passthrough`](#passthrough) setting. When `true`, every request matching this route is forwarded **byte-for-byte**: no kernel round-trip (no message re-serialization, no ACP render tags, no `prompt_cache_key` removal), the response is piped through untouched, and no session state is created for that route. Use this for upstreams whose anti-fraud fingerprinting rejects bili's rewritten bodies — e.g. ZCode's `405 / 3012` ("request has been blocked due to unusual activity") on the kernel-rebuilt `messages` body (#661). A `mitm://` key targets only the MITM (login-client) traffic of that host, while a plain `https://` key covers both MITM and `/bili/` (API-key) traffic:
+
+  ```jsonc
+  {
+    "providers": {
+      "mitm://zcode.z.ai": { "passthrough": true }
+    }
+  }
+  ```
 
 ---
 
