@@ -10,7 +10,9 @@ import {
 } from "../src/discover.ts";
 import {
     parseZcodeConfig,
+    TRAE_DEFAULT_MODEL_HOSTS,
     readZcodeConfig,
+    QODER_DEFAULT_MODEL_HOSTS,
     type ClientConfig,
 } from "../src/client-config.ts";
 
@@ -119,6 +121,34 @@ test("extractHttpsHosts: empty config → []", () => {
     assert.deepEqual(extractHttpsHosts({}), []);
 });
 
+test("extractHttpsHosts: codebuddy base URL + models.json urls (https only, unwrapped)", () => {
+    const config: ClientConfig = {
+        codebuddy: {
+            codebuddyBaseUrl: "https://CB.Example.com/v2",
+            modelUrls: [
+                "https://models.example.com/v1/chat/completions",
+                "http://local.example.com/v1/chat/completions",
+                "http://127.0.0.1:8787/bili/https://wrapped.example.com/v1",
+            ],
+        },
+    };
+    assert.deepEqual(extractHttpsHosts(config), [
+        "cb.example.com",
+        "models.example.com",
+        "wrapped.example.com",
+    ]);
+});
+
+test("extractHttpsHosts: qoder → default model hosts; modelServerHost replaces them (#653)", () => {
+    assert.deepEqual(extractHttpsHosts({ qoder: {} }), QODER_DEFAULT_MODEL_HOSTS);
+    assert.deepEqual(extractHttpsHosts({ qoder: { modelServerHost: "my-relay.example.com" } }), ["my-relay.example.com"]);
+});
+
+test("extractHttpsHosts: trae → default model hosts; modelApiHost replaces them (#655)", () => {
+    assert.deepEqual(extractHttpsHosts({ trae: {} }), TRAE_DEFAULT_MODEL_HOSTS);
+    assert.deepEqual(extractHttpsHosts({ trae: { modelApiHost: "my-relay.example.com" } }), ["my-relay.example.com"]);
+});
+
 async function withTempHome<T>(fn: (home: string, env: NodeJS.ProcessEnv) => Promise<T>): Promise<T> {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "bili-disc-"));
     const savedHome = process.env.HOME;
@@ -130,6 +160,7 @@ async function withTempHome<T>(fn: (home: string, env: NodeJS.ProcessEnv) => Pro
             CODEX_HOME: path.join(tmp, ".codex"),
             ZCODE_DATA_BASE_DIR: path.join(tmp, ".zcode"),
             PI_CODING_AGENT_DIR: path.join(tmp, ".pi", "agent"),
+            CODEBUDDY_CONFIG_DIR: path.join(tmp, ".codebuddy"),
         };
         return await fn(tmp, env);
     } finally {
@@ -159,6 +190,26 @@ test("discoverMitmDomains: returns union of https hosts from client configs", as
         const domains = discoverMitmDomains(env);
         assert.ok(domains.includes("open.bigmodel.cn"), `zcode host present: ${domains.join(",")}`);
         assert.ok(domains.includes("api.openai.com"), `codex host present: ${domains.join(",")}`);
+        return Promise.resolve();
+    });
+});
+
+test("discoverMitmDomains: codebuddy settings.json + models.json hosts discovered", async () => {
+    await withTempHome((home, env) => {
+        const cbDir = path.join(home, ".codebuddy");
+        fs.mkdirSync(cbDir, { recursive: true });
+        fs.writeFileSync(
+            path.join(cbDir, "settings.json"),
+            JSON.stringify({ env: { CODEBUDDY_BASE_URL: "https://codebuddy.example.com/v2" } }),
+        );
+        fs.writeFileSync(
+            path.join(cbDir, "models.json"),
+            JSON.stringify({ m1: { url: "https://models.example.com/v1/chat/completions", maxInputTokens: 100000 } }),
+        );
+        _resetDiscoveryCacheForTest();
+        const domains = discoverMitmDomains(env);
+        assert.ok(domains.includes("codebuddy.example.com"), `codebuddy host present: ${domains.join(",")}`);
+        assert.ok(domains.includes("models.example.com"), `models.json host present: ${domains.join(",")}`);
         return Promise.resolve();
     });
 });

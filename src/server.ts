@@ -116,7 +116,7 @@ export function logUnrecognizedPath(log: (level: string, msg: string) => void, u
     const n = (unrecognizedPathCounts.get(key) ?? 0) + 1;
     unrecognizedPathCounts.set(key, n);
     if (n <= 3) {
-        log("warn", `unrecognized path ${key} — not a known protocol (/chat/completions, /v1/messages, /responses, /responses/compact); forwarding unchanged`);
+        log("warn", `unrecognized path ${key} — not a known protocol (/chat/completions, /llm_raw_chat, /v1/messages, /responses, /responses/compact); forwarding unchanged`);
     } else if (n === 4) {
         log("info", `unrecognized path ${key}: forwarding unchanged; further occurrences suppressed`);
     }
@@ -982,7 +982,7 @@ async function handle(
         protocol =
             route?.explicitProtocol
             ?? (req.method === "POST" && bodyBuffer.length > 0
-                ? urlPath.endsWith("/chat/completions")
+                ? urlPath.endsWith("/chat/completions") || urlPath.endsWith("/llm_raw_chat")
                     ? "openai"
                     : urlPath.endsWith("/v1/messages") || urlPath.endsWith("/messages")
                       ? "anthropic"
@@ -2917,7 +2917,7 @@ function logUpstreamProxyDecision(opts: ProxyOptions, upstreamUrl: string | unde
  *  checks in handleRequest; returns null when unknown (no rewrite). */
 function inferWireProtocol(path: string): "openai" | "responses" | null {
     const p = path.split("?", 2)[0];
-    if (p.endsWith("/chat/completions")) return "openai";
+    if (p.endsWith("/chat/completions") || p.endsWith("/llm_raw_chat")) return "openai";
     if (p.endsWith("/responses") || p.endsWith("/responses/compact")) return "responses";
     return null;
 }

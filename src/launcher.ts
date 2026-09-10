@@ -43,7 +43,7 @@ import { selfPackageRoot, isBiliPiEntry, ompPluginLoadedFrom } from "./plugin-in
 function selfDistFile(name: string): string {
     return path.join(selfPackageRoot(), "dist", name);
 }
-import { nonEmpty, resolvePiHome, resolveOmpHome, resolveDshHome, resolveCodexHome, loadClientConfig, collectModelWindows, type ClientConfig, type CodexConfig, resolveOpencodeConfigFile, type OpencodeConfig, type OpencodeProvider, type HermesConfig, type HermesProvider } from "./client-config.js";
+import { nonEmpty, resolvePiHome, resolveOmpHome, resolveDshHome, resolveCodexHome, loadClientConfig, collectModelWindows, type ClientConfig, type CodexConfig, resolveOpencodeConfigFile, type OpencodeConfig, type OpencodeProvider, type HermesConfig, type HermesProvider, qoderIsCnSite, QODER_DEFAULT_MODEL_HOSTS, resolveTraeHome, readTraeConfig, TRAE_DEFAULT_MODEL_HOSTS, type TraeConfig } from "./client-config.js";
 import { loadRoutes, resolveConfiguredContextLimit, lookupContextLimit, type ProviderRoutes } from "./config.js";
 import { contextFromRegistry } from "./registry.js";
 
@@ -76,16 +76,29 @@ export {
     parseDshSettingsYaml,
     resolveDshHome,
     resolveCodexHome,
+    resolveTraeHome,
+    readTraeConfig,
+    TRAE_DEFAULT_MODEL_HOSTS,
+    type TraeConfig,
     resolveOpencodeConfigFile,
     readOpencodeConfig,
     type OpencodeConfig,
     type OpencodeProvider,
+    type CodebuddyConfig,
+    readCodebuddyConfig,
+    parseCodebuddyModelsJson,
+    resolveCodebuddyHome,
+    readQoderConfig,
+    resolveQoderHome,
+    qoderIsCnSite,
+    QODER_DEFAULT_MODEL_HOSTS,
+    type QoderConfig,
 } from "./client-config.js";
 
 export const LAUNCHER_DEFAULT_HOST = "127.0.0.1";
-export const LAUNCH_CLIENTS = ["pi", "codex", "claude", "omp", "opencode", "hermes", "dsh", "pi-test"] as const;
+export const LAUNCH_CLIENTS = ["pi", "codex", "claude", "omp", "opencode", "hermes", "dsh", "codebuddy", "qoder", "trae", "pi-test"] as const;
 export type ClientName = (typeof LAUNCH_CLIENTS)[number];
-export type BaseClientName = "claude" | "codex" | "pi" | "omp" | "opencode" | "hermes" | "dsh";
+export type BaseClientName = "claude" | "codex" | "pi" | "omp" | "opencode" | "hermes" | "dsh" | "codebuddy" | "qoder" | "trae";
 
 const HEALTH_PATH = "/__bili/health";
 const HEALTH_POLL_INTERVAL_MS = 200;
@@ -281,6 +294,42 @@ export function discoverRoutes(client: ClientName, config: ClientConfig): Discov
             // Unparseable base URL: leave routes empty (proxy still runs; claude
             // falls back to its own default endpoint).
         }
+    } else if (client === "codebuddy") {
+        // codebuddy (Tencent CodeBuddy Code CLI) honors CODEBUDDY_BASE_URL
+        // natively; its ModelProvider is the OpenAI SDK, so model traffic is
+        // OpenAI chat completions (POST <base>/chat/completions) — bili routes
+        // it through the openai adapter by path. Every upstream is routed
+        // through the /bili/ URL form. The CN platform default endpoint is the
+        // verified fallback; the international build defaults to
+        // https://www.codebuddy.ai/v2 (product.json), so other deployments
+        // must set CODEBUDDY_BASE_URL in settings.json or the shell.
+        // models.json per-model urls BYPASS CODEBUDDY_BASE_URL, so they are
+        // collected as MITM-whitelist inventory only, never rewritten (v1).
+        const raw = nonEmpty(config.codebuddy?.codebuddyBaseUrl) ? config.codebuddy!.codebuddyBaseUrl! : "https://tencent.sso.codebuddy.cn/v2";
+        const real = unwrapUpstream(raw);
+        try {
+            const url = new URL(real);
+            if ((url.protocol === "https:" || url.protocol === "http:") && !rewriteKeys.has("CODEBUDDY_BASE_URL")) {
+                rewriteKeys.add("CODEBUDDY_BASE_URL");
+                httpRewrites.push({ key: "CODEBUDDY_BASE_URL", realUpstream: real });
+            }
+        } catch {
+            // Unparseable base URL: leave routes empty (proxy still runs;
+            // codebuddy falls back to its own default endpoint).
+        }
+        for (const rawModelUrl of config.codebuddy?.modelUrls ?? []) {
+            try {
+                const url = new URL(unwrapUpstream(rawModelUrl));
+                if (url.protocol !== "https:") continue;
+                const host = url.hostname;
+                if (host && !httpsSeen.has(host.toLowerCase())) {
+                    httpsSeen.add(host.toLowerCase());
+                    httpsDomains.push(host);
+                }
+            } catch {
+                // Unparseable model url: skip.
+            }
+        }
     } else if (client === "pi") {
         for (const [name, prov] of Object.entries(config.pi?.providers ?? {})) {
             classify(prov.baseUrl, name);
@@ -359,6 +408,39 @@ export function discoverRoutes(client: ClientName, config: ClientConfig): Discov
                 // Unparseable endpoint: skip.
             }
         }
+    } else if (client === "qoder") {
+        // #653: qoder's model endpoint scheme is hardcoded https with no
+        // base-URL override env, so /bili/ rewrites cannot reach it — cert
+        // MITM is the only route (qoder honors HTTPS_PROXY +
+        // NODE_EXTRA_CA_CERTS). Whitelist is the binary's static host map
+        // (prod + regional + CN gateway); an explicit QODER_MODEL_SERVER_HOST
+        // REPLACES it (qoder's own resolution order: env > static map).
+        const hosts = nonEmpty(config.qoder?.modelServerHost) ? [config.qoder!.modelServerHost!] : QODER_DEFAULT_MODEL_HOSTS;
+        for (const host of hosts) {
+            const h = host.toLowerCase();
+            if (h && !httpsSeen.has(h)) {
+                httpsSeen.add(h);
+                httpsDomains.push(h);
+            }
+        }
+    } else if (client === "trae") {
+        // #655: Trae CLI is a closed Go binary (no base-URL override) that
+        // honors HTTPS_PROXY; the model API host is TRAE_CLI_API_HOST or the
+        // default enterprise gateway. Whitelist the host(s) for cert-MITM so
+        // the proxy can compress the model traffic. No /bili/ rewrite (the
+        // scheme is hardcoded https).
+        const hosts = nonEmpty(config.trae?.modelApiHost)
+            ? [config.trae!.modelApiHost!]
+            : TRAE_DEFAULT_MODEL_HOSTS;
+        for (const h of hosts) {
+            // MITM whitelist matches the port-less SNI hostname (isMitmHost), so
+            // reduce host:port to its host or the entry never matches.
+            const host = h.split(":", 2)[0]!.toLowerCase();
+            if (host && !httpsSeen.has(host)) {
+                httpsSeen.add(host);
+                httpsDomains.push(host);
+            }
+        }
     } else {
         for (const [name, prov] of Object.entries(config.codex?.providers ?? {})) {
             classify(prov.baseUrl, `model_providers.${name}.base_url`);
@@ -406,6 +488,12 @@ export function buildPiEnv(
 }
 
 export function buildCodexEnv(origin: string, caPath: string, baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+    return { ...baseEnv, HTTPS_PROXY: origin, SSL_CERT_FILE: caPath, BILLION_CONTEXT_PROXY: origin };
+}
+
+export function buildTraeEnv(origin: string, caPath: string, baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+    // #655: trae is a Go binary like codex — the CA rides SSL_CERT_FILE (the
+    // combined bundle, since it replaces Go's system trust store).
     return { ...baseEnv, HTTPS_PROXY: origin, SSL_CERT_FILE: caPath, BILLION_CONTEXT_PROXY: origin };
 }
 
@@ -543,6 +631,77 @@ export function buildClaudeEnv(
     return env;
 }
 
+/** codebuddy budget alignment (#321 pattern, mirrors resolveClaudeBudgetEnv):
+ *  inject CODEBUDDY_AUTO_COMPACT_WINDOW so codebuddy's native auto-compact
+ *  threshold matches bili's compress budget. Returns {} (no injection) when:
+ *  no model resolvable, the user already set an explicit auto-compact window
+ *  (settings `autoCompactWindow` or a shell-exported
+ *  CODEBUDDY_AUTO_COMPACT_WINDOW), or bili resolves no window for the model. */
+export async function resolveCodebuddyBudgetEnv(opts: {
+    model: string | undefined;
+    userAutoCompactWindow: number | undefined;
+    shellAutoCompactWindow: string | undefined;
+    routes: ProviderRoutes;
+    upstreamUrl: string | undefined;
+}): Promise<NodeJS.ProcessEnv> {
+    const { model, userAutoCompactWindow, shellAutoCompactWindow, routes, upstreamUrl } = opts;
+    if (!model || userAutoCompactWindow !== undefined || nonEmpty(shellAutoCompactWindow)) return {};
+    const window = await resolveLauncherWindow(model, routes, upstreamUrl);
+    if (!window) return {};
+    return { CODEBUDDY_AUTO_COMPACT_WINDOW: String(window) };
+}
+
+export function buildCodebuddyEnv(
+    origin: string,
+    caPath: string,
+    httpRewrites: HttpRewrite[],
+    httpsRewrites: HttpRewrite[],
+    baseEnv: NodeJS.ProcessEnv,
+): NodeJS.ProcessEnv {
+    const env: NodeJS.ProcessEnv = { ...baseEnv, HTTPS_PROXY: origin, NODE_EXTRA_CA_CERTS: caPath, BILLION_CONTEXT_PROXY: origin };
+    const r = httpRewrites.find((rw) => rw.key === "CODEBUDDY_BASE_URL");
+    if (r) env.CODEBUDDY_BASE_URL = wrapUpstream(origin, r.realUpstream);
+    const hr = httpsRewrites.find((rw) => rw.key === "CODEBUDDY_BASE_URL");
+    if (hr) env.CODEBUDDY_BASE_URL = hr.realUpstream;
+    return env;
+}
+
+/** #653: qoder's model endpoint scheme is hardcoded https (no base-URL
+ *  override env), so the launcher can only route it via cert MITM: its
+ *  built-in undici stack honors HTTPS_PROXY, and NODE_EXTRA_CA_CERTS is
+ *  ADDITIVE (unlike codex's SSL_CERT_FILE), so the plain root CA suffices.
+ *  No base-URL rewrite of any kind. */
+export function buildQoderEnv(origin: string, caPath: string, baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+    return { ...baseEnv, HTTPS_PROXY: origin, NODE_EXTRA_CA_CERTS: caPath, BILLION_CONTEXT_PROXY: origin };
+}
+
+/**
+ * #653: qoder's auto-compact window is a single env knob —
+ * `QODER_AUTOCOMPACT_WINDOW` (`QODERCN_` prefix on the CN site) caps the
+ * effective context window (`min(modelWindow, env)`), so injecting bili's
+ * window is always safe (same #321 pattern as claude).
+ *
+ * Returns {} (no injection) when: no model resolvable, the user already set
+ * an explicit auto-compact window (shell-exported env var), or bili resolves
+ * no window for the model. qoder's model catalog is server-driven, so its
+ * model names are usually absent from bili's configured limits and the
+ * models.dev registry — the common outcome is no injection, with the user's
+ * own `QODER_AUTOCOMPACT_WINDOW` as the fallback (issue #653 open question 3).
+ */
+export async function resolveQoderBudgetEnv(opts: {
+    model: string | undefined;
+    userAutoCompactWindow: string | undefined;
+    windowKey: string;
+    routes: ProviderRoutes;
+    upstreamUrl: string | undefined;
+}): Promise<NodeJS.ProcessEnv> {
+    const { model, userAutoCompactWindow, windowKey, routes, upstreamUrl } = opts;
+    if (!model || nonEmpty(userAutoCompactWindow)) return {};
+    const window = await resolveLauncherWindow(model, routes, upstreamUrl);
+    if (!window) return {};
+    return { [windowKey]: String(window) };
+}
+
 // --- Launcher plugin mode (#162): inject the MCP shell + session hooks as
 // spawn-time flags, never touching host config files on disk. ---
 
@@ -614,9 +773,13 @@ function isPrivateIPv4(host: string): boolean {
  *  fumbles for them. When the codex upstream is a local/private endpoint and
  *  the user has not chosen explicitly, wire mode (flat tools every server
  *  understands) is the sane default. `BILI_LAUNCHER_PLUGIN=1` forces plugin
- *  mode regardless of the upstream. */
+ *  mode regardless of the upstream.
+ *
+ *  codebuddy is always excluded too: its `--mcp-config` compatibility is not
+ *  yet verified against a real build, so v1 runs pure wire mode (the proxy
+ *  injects the context tools on the wire). */
 export function launcherInjectMcp(env: NodeJS.ProcessEnv, base: string, codexUpstream?: string): boolean {
-    if (base === "pi" || base === "omp" || base === "opencode" || base === "hermes" || base === "dsh") return false;
+    if (base === "pi" || base === "omp" || base === "opencode" || base === "hermes" || base === "dsh" || base === "codebuddy" || base === "qoder" || base === "trae") return false;
     if (env.BILI_LAUNCHER_PLUGIN === "0") return false;
     if (base === "codex" && env.BILI_LAUNCHER_PLUGIN === undefined && codexUpstream !== undefined && isPrivateUpstreamHost(codexUpstream)) {
         return false;
@@ -1787,6 +1950,22 @@ export function resolveClientCommand(
         );
         return { command: process.execPath, prefixArgs: [cli] };
     }
+    if (client === "codebuddy") {
+        const resolved = resolveOnPath("codebuddy", env) ?? resolveOnPath("cbc", env);
+        return { command: resolved ?? "codebuddy", prefixArgs: [] };
+    }
+    if (client === "qoder") {
+        // npm bin names: `qoder` (primary) with `qodercli` as the alternate
+        // registration (both packages ship either).
+        const resolved = resolveOnPath("qoder", env) ?? resolveOnPath("qodercli", env);
+        return { command: resolved ?? "qoder", prefixArgs: [] };
+    }
+    if (client === "trae") {
+        const traeBin = resolveOnPath("traecli", env)
+            ?? resolveOnPath("trae-cli", env)
+            ?? resolveOnPath("trae", env);
+        return { command: traeBin ?? "traecli", prefixArgs: [] };
+    }
     const resolved = resolveOnPath(client, env);
     return { command: resolved ?? client, prefixArgs: [] };
 }
@@ -1886,6 +2065,10 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         } else if (base === "claude") {
             console.error(
                 "bili: direct-URL mode — claude's ANTHROPIC_BASE_URL is overridden to the proxy; a pre-configured relay is bypassed unless BILI_CLAUDE_UPSTREAM=<relay> is set. OAuth-subscription traffic requires the default MITM mode.",
+            );
+        } else if (base === "qoder") {
+            console.error(
+                "bili: BILI_LAUNCHER_DIRECT has no effect for qoder — its model endpoint scheme is hardcoded https with no base-URL override env, so qoder always runs in cert-MITM mode.",
             );
         }
     }
@@ -2017,6 +2200,37 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         // settings rewrite above), so it exists on every profile dsh boots.
         const dshAcpPatch = writeDshAcpPatch(dshHomeDir);
         if (dshAcpPatch) clientArgs = dshArgsWithPatch(clientArgs, dshAcpPatch);
+    } else if (base === "qoder") {
+        // #653: cert-MITM only — the model endpoint scheme is hardcoded https
+        // (no base-URL override env), so /bili/ rewrites cannot reach it.
+        // qoder's undici stack honors HTTPS_PROXY + NODE_EXTRA_CA_CERTS
+        // (additive, so the plain root CA suffices). Proxy vars are fully
+        // stripped (same contract as hermes). QODER_MODEL_TRANSPORT=http
+        // forces the OpenAI chat-completions wire: the default transport is a
+        // server feature-gate whose `legacy` fallback wire is unverified
+        // (#653 open question 1). The env prefix family follows the CN-site
+        // detection (qoderIsCnSite).
+        env = buildQoderEnv(origin, ca, stripInheritedProxy(process.env));
+        const qoderPrefix = qoderIsCnSite(process.env) ? "QODERCN" : "QODER";
+        env[`${qoderPrefix}_MODEL_TRANSPORT`] = "http";
+        const qoderBudget = await resolveQoderBudgetEnv({
+            model: nonEmpty(process.env[`${qoderPrefix}_MODEL`]) ? process.env[`${qoderPrefix}_MODEL`] : config.qoder?.model,
+            userAutoCompactWindow: process.env[`${qoderPrefix}_AUTOCOMPACT_WINDOW`],
+            windowKey: `${qoderPrefix}_AUTOCOMPACT_WINDOW`,
+            routes: biliRoutes,
+            upstreamUrl: `https://${config.qoder?.modelServerHost ?? QODER_DEFAULT_MODEL_HOSTS[0]}`,
+        });
+        Object.assign(env, qoderBudget);
+        if (qoderBudget[`${qoderPrefix}_AUTOCOMPACT_WINDOW`] !== undefined) {
+            console.error(`bili: qoder budget aligned — ${qoderPrefix}_AUTOCOMPACT_WINDOW=${qoderBudget[`${qoderPrefix}_AUTOCOMPACT_WINDOW`]}`);
+        }
+    } else if (base === "trae") {
+        // #655: cert-MITM like codex/qoder (Go binary honors HTTPS_PROXY; CA
+        // via SSL_CERT_FILE combined bundle). No budget env (the CLI manages
+        // its own context window) and no transport forcing — the wire is the
+        // proprietary /api/ide/v2/llm_raw_chat, recognized as OpenAI by the
+        // proxy.
+        env = buildTraeEnv(origin, resolveCombinedCaPath(process.env), stripInheritedProxy(process.env));
     } else if (base === "codex") {
         // Per-spawn conversation id for the MCP shell's headless
         // self-registration (codex provides no session id of its own).
@@ -2048,6 +2262,19 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
             if (inj.clientArgs.length > 0) clientArgs = [...inj.clientArgs, ...clientArgs];
             Object.assign(env, inj.envPatch);
             if (inj.warning) console.error(`bili: ${inj.warning}`);
+        }
+    } else if (base === "codebuddy") {
+        env = buildCodebuddyEnv(origin, ca, routes.httpRewrites, routes.httpsRewrites, process.env);
+        const codebuddyBudget = await resolveCodebuddyBudgetEnv({
+            model: config.codebuddy?.model,
+            userAutoCompactWindow: config.codebuddy?.autoCompactWindow,
+            shellAutoCompactWindow: process.env.CODEBUDDY_AUTO_COMPACT_WINDOW,
+            routes: biliRoutes,
+            upstreamUrl: config.codebuddy?.codebuddyBaseUrl ?? "https://tencent.sso.codebuddy.cn/v2",
+        });
+        Object.assign(env, codebuddyBudget);
+        if (codebuddyBudget.CODEBUDDY_AUTO_COMPACT_WINDOW !== undefined) {
+            console.error(`bili: codebuddy budget aligned — CODEBUDDY_AUTO_COMPACT_WINDOW=${codebuddyBudget.CODEBUDDY_AUTO_COMPACT_WINDOW}`);
         }
     } else {
         env = directUrl
