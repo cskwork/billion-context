@@ -298,7 +298,7 @@ test("runLaunch pi: native -e plugin injected only when not installed", async ()
     // home and the second assertion fails.
     if (prevUserProfile !== undefined) process.env.USERPROFILE = home;
     delete process.env.PI_CODING_AGENT_DIR;
-    const fakePi = path.join(home, "fake-pi");
+    const fakePi = path.join(home, process.platform === "win32" ? "fake-pi.exe" : "fake-pi");
     fs.writeFileSync(fakePi, "");
     process.env.PI_BIN = fakePi;
     const piHome = path.join(home, ".pi/agent");
@@ -414,7 +414,7 @@ test("runLaunch pi #535: refuses launch when http rewrites needed and extension 
     const distExisted = fs.existsSync(distAgent);
     if (distExisted) fs.renameSync(distAgent, distBackup);
 
-    const fakePi = path.join(home, "fake-pi");
+    const fakePi = path.join(home, process.platform === "win32" ? "fake-pi.exe" : "fake-pi");
     fs.writeFileSync(fakePi, "");
     const prevPiBin = process.env.PI_BIN;
     process.env.PI_BIN = fakePi;
@@ -483,7 +483,7 @@ test("runLaunch omp #535: refuses launch when http rewrites needed and extension
     process.env.HOME = home;
     if (prevUserProfile !== undefined) process.env.USERPROFILE = home;
     delete process.env.PI_CODING_AGENT_DIR;
-    process.env.BILI_CLIENT_BIN = path.join(home, "fake-omp");
+    process.env.BILI_CLIENT_BIN = path.join(home, process.platform === "win32" ? "fake-omp.exe" : "fake-omp");
     fs.writeFileSync(process.env.BILI_CLIENT_BIN, "");
     const ompHome = path.join(home, ".omp", "agent");
     fs.mkdirSync(ompHome, { recursive: true });
@@ -563,7 +563,7 @@ test("runLaunch hermes #535: proxy env routing, no HERMES_HOME overlay, real con
     process.env.HOME = home;
     if (prevUserProfile !== undefined) process.env.USERPROFILE = home;
     delete process.env.HTTPS_PROXY;
-    const fakeHermes = path.join(home, "fake-hermes");
+    const fakeHermes = path.join(home, process.platform === "win32" ? "fake-hermes.exe" : "fake-hermes");
     fs.writeFileSync(fakeHermes, "");
     process.env.BILI_CLIENT_BIN = fakeHermes;
     const hermesHome = path.join(home, ".hermes");
@@ -674,7 +674,7 @@ test("runLaunch omp: native -e plugin injected only when no loadable config entr
     process.env.HOME = home;
     if (prevUserProfile !== undefined) process.env.USERPROFILE = home;
     delete process.env.PI_CODING_AGENT_DIR;
-    const fakeOmp = path.join(home, "fake-omp");
+    const fakeOmp = path.join(home, process.platform === "win32" ? "fake-omp.exe" : "fake-omp");
     fs.writeFileSync(fakeOmp, "");
     process.env.BILI_CLIENT_BIN = fakeOmp;
     const ompHome = path.join(home, ".omp", "agent");
@@ -1762,7 +1762,7 @@ test("runLaunch dsh: non-loopback upstreams ride proxy envs, loopback keeps the 
     );
     fs.mkdirSync(path.join(dshHome, "profiles"));
     const original = fs.readFileSync(path.join(dshHome, "settings.yaml"), "utf8");
-    const fakeDsh = path.join(home, "fake-dsh");
+    const fakeDsh = path.join(home, process.platform === "win32" ? "fake-dsh.exe" : "fake-dsh");
     fs.writeFileSync(fakeDsh, "");
     process.env.BILI_CLIENT_BIN = fakeDsh;
     process.env.DSH_HOME = dshHome;
@@ -1867,7 +1867,7 @@ test("runLaunch dsh: no loopback custom providers — no DSH_HOME overlay (#535 
             "      baseURL: https://api.anthropic.com",
         ].join("\n"),
     );
-    const fakeDsh = path.join(home, "fake-dsh");
+    const fakeDsh = path.join(home, process.platform === "win32" ? "fake-dsh.exe" : "fake-dsh");
     fs.writeFileSync(fakeDsh, "");
     process.env.BILI_CLIENT_BIN = fakeDsh;
     process.env.DSH_HOME = dshHome;
@@ -1930,7 +1930,7 @@ test("runLaunch omp: launcher hands per-model windows to the spawned proxy", asy
     process.env.HOME = home;
     if (prevUserProfile !== undefined) process.env.USERPROFILE = home;
     delete process.env.PI_CODING_AGENT_DIR;
-    const fakeOmp = path.join(home, "fake-omp");
+    const fakeOmp = path.join(home, process.platform === "win32" ? "fake-omp.exe" : "fake-omp");
     fs.writeFileSync(fakeOmp, "");
     process.env.BILI_CLIENT_BIN = fakeOmp;
     const ompHome = path.join(home, ".omp", "agent");
@@ -2175,7 +2175,7 @@ test("runLaunch codex: budget args injected for MITM mode (built-in table window
     if (prevUserProfile !== undefined) process.env.USERPROFILE = home;
     delete process.env.ANTHROPIC_MODEL;
     delete process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW;
-    const fakeCodex = path.join(home, "fake-codex");
+    const fakeCodex = path.join(home, process.platform === "win32" ? "fake-codex.exe" : "fake-codex");
     fs.writeFileSync(fakeCodex, "");
     process.env.BILI_CLIENT_BIN = fakeCodex;
     const codexHome = path.join(home, ".codex");
@@ -2260,7 +2260,7 @@ test("runLaunch claude: CLAUDE_CODE_AUTO_COMPACT_WINDOW injected (built-in table
     if (prevUserProfile !== undefined) process.env.USERPROFILE = home;
     delete process.env.ANTHROPIC_MODEL;
     delete process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW;
-    const fakeClaude = path.join(home, "fake-claude");
+    const fakeClaude = path.join(home, process.platform === "win32" ? "fake-claude.exe" : "fake-claude");
     fs.writeFileSync(fakeClaude, "");
     process.env.BILI_CLIENT_BIN = fakeClaude;
     const claudeDir = path.join(home, ".claude");
