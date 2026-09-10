@@ -204,13 +204,16 @@ test("#679 real win32: spaced .exe spawns directly with spaced argv", { skip: pr
         fs.mkdirSync(outDir, { recursive: true });
         const outFile = path.join(outDir, "argv.json");
         const script = `require("fs").writeFileSync(${JSON.stringify(outFile)}, JSON.stringify(process.argv))`;
-        const code = await runClient(process.execPath, ["-e", script], process.env);
+        // node -e consumes the script string (it never lands in process.argv); a
+        // trailing arg does. The marker carries spaces AND quotes, so surviving
+        // the round-trip proves direct-spawn quoting on win32.
+        const marker = 'MARK spaced "quoted" arg';
+        const code = await runClient(process.execPath, ["-e", script, marker], process.env);
         assert.equal(code, 0);
         const argv = JSON.parse(fs.readFileSync(outFile, "utf8")) as string[];
-        assert.equal(argv.length, 3);
+        assert.equal(argv.length, 2);
         assert.equal(argv[0], process.execPath);
-        assert.equal(argv[1], "-e");
-        assert.equal(argv[2], script, "arg with spaces AND embedded quotes must round-trip");
+        assert.equal(argv[1], marker, "spaced+quoted arg must round-trip intact");
     } finally {
         fs.rmSync(root, { recursive: true, force: true });
     }
