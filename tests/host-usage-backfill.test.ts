@@ -13,7 +13,7 @@ import { backfillHostUsage, promptInputTotal, usageTotals } from "../src/util.ts
 import { pipePluginChatWithStrip, pipePluginResponsesWithStrip, pipePluginJson, _resetPluginStateForTest } from "../src/plugin.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { startServer } from "../src/server.ts";
-import type { ProxyOptions } from "../src/config.ts";
+import { parseHostUsageCredit, type HostUsagePolicy, type ProxyOptions } from "../src/config.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 
 function makeSession(id: string, hostCreditTokens?: number): Session {
@@ -139,6 +139,16 @@ test("backfillHostUsage: credit <= 0 or missing input field is a no-op", () => {
     const v: Record<string, unknown> = { completion_tokens: 5 };
     assert.equal(backfillHostUsage("openai", v, 40000), false);
     assert.equal(v.completion_tokens, 5);
+});
+
+test("parseHostUsageCredit: canonical values and legacy aliases normalize to a policy", () => {
+    assert.equal(parseHostUsageCredit(undefined), "postfold");
+    assert.equal(parseHostUsageCredit(""), "postfold");
+    assert.equal(parseHostUsageCredit("postfold"), "postfold");
+    assert.equal(parseHostUsageCredit("POSTFOLD"), "postfold");
+    assert.equal(parseHostUsageCredit("  baseline  "), "baseline");
+    assert.equal(parseHostUsageCredit("auto"), "baseline");
+    assert.equal(parseHostUsageCredit("off"), "postfold");
 });
 
 test("#408: responses loop — host completion carries uncompressed baseline, internal ledger stays post-fold", async () => {
@@ -441,6 +451,7 @@ test("#408: prepareOpenai arms the credit — host sees backfilled usage after a
         upstream: "http://127.0.0.1",
         routes: { [`http://127.0.0.1:${relayPort}`]: { models: { "gpt-test": { context: 1_000_000 } }, compressProtocol: "marker" } } as ProxyOptions["routes"],
         modelContextLimit: 1_000_000,
+        hostUsageCredit: "baseline",
         kernelConfig: defaultConfig(1_000_000, {
             // preserveRecentTokens defaults to 5000 — the whole small fixture
             // conversation would sit inside the token window and every range
@@ -749,13 +760,13 @@ test("#623: omp plugin mode reports folded usage — host backfill suppressed", 
     }
 });
 
-// #648: ZCode — a plain proxy client on the anthropic wire (no x-bili-plugin
-// header, no special UA) — must be able to opt out of the #408
-// uncompressed-baseline backfill via hostUsageCredit: "off", reporting the
-// folded request's own usage (matching [acp-usage] input=). The control test
-// pins the other side of the gate: an identical plain client on the default
-// (hostUsageCredit: "auto") still gets the #408 backfill. The fold is real
-// (the relay emits a compress tool_use), not a vacuous pass.
+// #648/#660: ZCode — a plain proxy client on the anthropic wire (no
+// x-bili-plugin header, no special UA). By default (#660) every host sees the
+// folded request's own usage (matching [acp-usage] input=); the #408
+// uncompressed-baseline backfill is opt-in via hostUsageCredit: "baseline".
+// The two tests pin both sides: postfold (default) reports folded; baseline
+// reports the uncompressed total. The fold is real (the relay emits a compress
+// tool_use), not a vacuous pass.
 
 const ZCODE_CONV_648 = "zcode-usage-648";
 
@@ -803,7 +814,7 @@ function zcodeConversation(): Array<{ role: string; content: string }> {
     return history;
 }
 
-async function withZCodeHarness(hostUsageCredit: "auto" | "off", fn: (h: { proxy: http.Server; upstream: http.Server; bodies: string[]; url: string }) => Promise<void>): Promise<void> {
+async function withZCodeHarness(hostUsageCredit: HostUsagePolicy, fn: (h: { proxy: http.Server; upstream: http.Server; bodies: string[]; url: string }) => Promise<void>): Promise<void> {
     const bodies: string[] = [];
     const upstream = http.createServer((req, res) => {
         const chunks: Buffer[] = [];
@@ -879,8 +890,8 @@ async function setupZCodeCompressedSession(h: { bodies: string[]; url: string })
     return h.bodies.length;
 }
 
-test("#648: ZCode (anthropic wire, hostUsageCredit off) reports folded usage — host backfill suppressed", async () => {
-    await withZCodeHarness("off", async (h) => {
+test("#648/#660: ZCode (anthropic wire, hostUsageCredit postfold) reports folded usage — no baseline backfill", async () => {
+    await withZCodeHarness("postfold", async (h) => {
         const afterSetup = await setupZCodeCompressedSession(h);
         const r2 = await fetch(h.url, {
             method: "POST",
@@ -891,12 +902,12 @@ test("#648: ZCode (anthropic wire, hostUsageCredit off) reports folded usage —
         const raw = await r2.text();
         assert.equal(h.bodies.length, afterSetup + 1, "post-fold turn forwarded to upstream exactly once");
         assert.ok(!h.bodies[h.bodies.length - 1]!.includes("SENTINEL_FOLD_GONE"), "post-fold upstream body must not carry the folded head content");
-        assert.equal(zcodeInputTokensOf(raw), 1000, "hostUsageCredit off must report the folded request's own usage — no uncompressed-baseline backfill (#648)");
+        assert.equal(zcodeInputTokensOf(raw), 1000, "hostUsageCredit postfold must report the folded request's own usage — no uncompressed-baseline backfill (#648/#660)");
     });
 });
 
-test("#648 control: plain client (anthropic wire, hostUsageCredit auto) still gets the #408 backfill", async () => {
-    await withZCodeHarness("auto", async (h) => {
+test("#648/#660 control: plain client (anthropic wire, hostUsageCredit baseline) still gets the #408 baseline backfill", async () => {
+    await withZCodeHarness("baseline", async (h) => {
         const afterSetup = await setupZCodeCompressedSession(h);
         const r2 = await fetch(h.url, {
             method: "POST",
@@ -907,17 +918,18 @@ test("#648 control: plain client (anthropic wire, hostUsageCredit auto) still ge
         const raw = await r2.text();
         assert.equal(h.bodies.length, afterSetup + 1, "post-fold turn forwarded to upstream exactly once");
         assert.ok(!h.bodies[h.bodies.length - 1]!.includes("SENTINEL_FOLD_GONE"), "post-fold upstream body must not carry the folded head content");
-        assert.ok(zcodeInputTokensOf(raw) > 1000, "plain proxy client with hostUsageCredit auto must still see the uncompressed baseline (#408)");
+        assert.ok(zcodeInputTokensOf(raw) > 1000, "plain proxy client with hostUsageCredit baseline must still see the uncompressed baseline (#408)");
     });
 });
 
-// #645: codex — a plain proxy client on the responses wire identified by UA —
-// must report the folded request's own usage; the #408 uncompressed-baseline
-// backfill is suppressed (virtual number the model never receives, drifts
-// turn-to-turn, exceeds the window: 1315/950k). The control test pins the
-// other side of the gate: an identical non-codex client still gets the
-// backfill. Harness mirrors codex-compact-e2e.test.ts (real fold, not a
-// vacuous pass).
+// #645/#660: codex — a plain proxy client on the responses wire identified by
+// UA. By default (#660) every host sees the folded request's own usage; the
+// #408 uncompressed-baseline backfill (virtual number the model never receives,
+// drifts turn-to-turn, exceeded the window: 1315/950k) is now opt-in via
+// hostUsageCredit: "baseline" instead of being suppressed per-host. The two
+// tests pin both sides: default reports folded even for a codex UA; baseline
+// reports the uncompressed total. Harness mirrors codex-compact-e2e.test.ts
+// (real fold, not a vacuous pass).
 
 const CODEX_UA_645 = "codex_cli_rs/0.1.0 (linux x86_64)";
 const CODEX_CONV_645 = "codex-usage-645";
@@ -962,7 +974,7 @@ function completedUsageOf(raw: string): { input_tokens: number; total_tokens: nu
     return frame.response.usage;
 }
 
-async function withCodexHarness(fn: (h: { proxy: http.Server; upstream: http.Server; bodies: string[]; url: string }) => Promise<void>): Promise<void> {
+async function withCodexHarness(hostUsageCredit?: HostUsagePolicy, fn: (h: { proxy: http.Server; upstream: http.Server; bodies: string[]; url: string }) => Promise<void>): Promise<void> {
     const bodies: string[] = [];
     const upstream = http.createServer((req, res) => {
         const chunks: Buffer[] = [];
@@ -997,6 +1009,7 @@ async function withCodexHarness(fn: (h: { proxy: http.Server; upstream: http.Ser
         debug: false,
         passthrough: false,
         autoUpdate: false,
+        ...(hostUsageCredit !== undefined ? { hostUsageCredit } : {}),
         mitm: { enabled: false, domains: [] },
     } as ProxyOptions);
     await once(proxy, "listening");
@@ -1033,8 +1046,8 @@ async function setupCodexCompressedSession(h: { bodies: string[]; url: string },
     return h.bodies.length;
 }
 
-test("#645: codex (responses wire, UA) reports folded usage — host backfill suppressed", async () => {
-    await withCodexHarness(async (h) => {
+test("#645/#660: codex UA client (responses wire) reports folded usage by default — no baseline backfill", async () => {
+    await withCodexHarness(undefined, async (h) => {
         const afterSetup = await setupCodexCompressedSession(h, CODEX_UA_645);
         const r2 = await fetch(h.url, {
             method: "POST",
@@ -1045,12 +1058,12 @@ test("#645: codex (responses wire, UA) reports folded usage — host backfill su
         const raw = await r2.text();
         assert.equal(h.bodies.length, afterSetup + 1, "post-fold turn forwarded to upstream exactly once");
         assert.ok(!h.bodies[h.bodies.length - 1]!.includes("SENTINEL_FOLD_GONE"), "post-fold upstream body must not carry the folded head content");
-        assert.equal(completedUsageOf(raw).input_tokens, 1000, "codex must report the folded request's own usage — no uncompressed-baseline backfill (#645)");
+        assert.equal(completedUsageOf(raw).input_tokens, 1000, "codex (UA) must report the folded request's own usage by default — no baseline backfill (#645/#660)");
     });
 });
 
-test("#645 control: non-codex plain client (responses wire) still gets the #408 backfill", async () => {
-    await withCodexHarness(async (h) => {
+test("#645/#660 control: plain client (responses wire, hostUsageCredit baseline) still gets the #408 baseline backfill", async () => {
+    await withCodexHarness("baseline", async (h) => {
         const afterSetup = await setupCodexCompressedSession(h);
         const r2 = await fetch(h.url, {
             method: "POST",

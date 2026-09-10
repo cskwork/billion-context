@@ -184,6 +184,11 @@ export type CompressSettings = {
 };
 export type PromptCacheRouting = "auto" | "enabled" | "disabled";
 export type UpstreamProxyMode = "auto" | "manual" | "direct";
+/** #408 host-usage accounting policy. "postfold" (default) reports the
+ *  actually-forwarded (folded) request — the tokens the model really receives.
+ *  "baseline" applies the uncompressed-baseline backfill for hosts whose native
+ *  accounting consumes it. */
+export type HostUsagePolicy = "postfold" | "baseline";
 
 /** Built-in context window for common model families, keyed by a lowercase
  *  prefix. This is a FALLBACK used when the per-route model declaration in
@@ -316,15 +321,14 @@ export type ProxyOptions = {
     autoUpdate: boolean;
     /** Dist-tag channel the auto-updater follows (default "latest"). */
     updateTag: string;
-    /** #408 host-usage backfill mode. "auto" (default) = the uncompressed-
-     *  baseline backfill is armed for plain proxy clients (the bili-launched
-     *  pi/omp extensions are exempted — their host compaction is cancelled, so
-     *  the baseline drives nothing on the host side). "off" = never backfill —
-     *  the usage reported to the host is the actually-forwarded (folded)
-     *  request, matching [acp-usage] input= (#648: plain anthropic proxy
-     *  clients like ZCode otherwise show a cumulative, drifting baseline that
-     *  overstates real context pressure). */
-    hostUsageCredit: "auto" | "off";
+    /** #408 host-usage accounting mode. "postfold" (default) = report the
+     *  actually-forwarded (folded) request — the tokens the model really
+     *  receives; sane for any host display and free of the >100% drift that hit
+     *  pi/omp/codex/zcode (#590/#623/#645/#648). "baseline" = the uncompressed-
+     *  baseline backfill, opt-in for hosts whose native accounting genuinely
+     *  consumes it. Legacy aliases normalized by parseHostUsageCredit: "off" ->
+     *  "postfold", "auto" -> "baseline". */
+    hostUsageCredit: HostUsagePolicy;
     logFile?: string;
     /** MITM transparent-proxy mode. When enabled, an HTTP CONNECT handler is
      *  attached so clients that only know how to set HTTP_PROXY (ZCode with a
@@ -497,7 +501,7 @@ type FileConfig = {
     autoUpdate?: boolean;
     /** Dist-tag channel the auto-updater follows (default "latest"). */
     updateTag?: string;
-    hostUsageCredit?: "auto" | "off";
+    hostUsageCredit?: HostUsagePolicy;
     upstreamProxy?: string;
     upstreamProxyMode?: string;
     logFile?: string;
@@ -609,8 +613,12 @@ export function parseUpstreamProxyMode(value: string | undefined): UpstreamProxy
     return value === "manual" || value === "auto" ? value : "direct";
 }
 
-export function parseHostUsageCredit(value: string | undefined): "auto" | "off" {
-    return value === "off" ? "off" : "auto";
+export function parseHostUsageCredit(value: string | undefined): HostUsagePolicy {
+    const v = value?.trim().toLowerCase();
+    // "baseline" (and legacy "auto") -> the #408 uncompressed-baseline backfill;
+    // everything else (default "postfold", legacy "off") -> the forwarded usage.
+    // Default flipped to postfold in #660 — the baseline is now opt-in.
+    return v === "baseline" || v === "auto" ? "baseline" : "postfold";
 }
 
 export function parseCompressSettings(v: unknown): (CompressSettings & { injectTool?: boolean; injectNudge?: boolean }) | undefined {
