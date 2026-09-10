@@ -2728,7 +2728,7 @@ test("runLaunch codebuddy: CODEBUDDY_BASE_URL /bili/ rewrite + budget injected (
     delete process.env.CODEBUDDY_BASE_URL;
     delete process.env.CODEBUDDY_AUTO_COMPACT_WINDOW;
     delete process.env.CODEBUDDY_CONFIG_DIR;
-    const fakeCodebuddy = path.join(home, "fake-codebuddy");
+    const fakeCodebuddy = path.join(home, process.platform === "win32" ? "fake-codebuddy.exe" : "fake-codebuddy");
     fs.writeFileSync(fakeCodebuddy, "");
     process.env.BILI_CLIENT_BIN = fakeCodebuddy;
     const cbDir = path.join(home, ".codebuddy");
@@ -2963,7 +2963,7 @@ test("runLaunch qoder: cert-MITM envs, transport forced, budget aligned, default
     const qoderDir = path.join(home, ".qoder");
     fs.mkdirSync(qoderDir, { recursive: true });
     fs.writeFileSync(path.join(qoderDir, "settings.json"), JSON.stringify({ model: { name: "claude-sonnet-4-5" } }));
-    const fakeQoder = path.join(home, "fake-qoder");
+    const fakeQoder = path.join(home, process.platform === "win32" ? "fake-qoder.exe" : "fake-qoder");
     fs.writeFileSync(fakeQoder, "");
     process.env.BILI_CLIENT_BIN = fakeQoder;
     process.env.NO_PROXY = "localhost,.corp";
@@ -3105,7 +3105,7 @@ test("runLaunch trae: cert-MITM envs (SSL_CERT_FILE combined bundle), no budget/
     const prevNoProxy = process.env.NO_PROXY;
     process.env.HOME = home;
     if (prevUserProfile !== undefined) process.env.USERPROFILE = home;
-    const fakeTrae = path.join(home, "fake-traecli");
+    const fakeTrae = path.join(home, process.platform === "win32" ? "fake-traecli.exe" : "fake-traecli");
     fs.writeFileSync(fakeTrae, "");
     process.env.BILI_CLIENT_BIN = fakeTrae;
     process.env.NO_PROXY = "localhost,.corp";
