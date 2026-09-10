@@ -1762,7 +1762,7 @@ test("runLaunch dsh: non-loopback upstreams ride proxy envs, loopback keeps the 
     );
     fs.mkdirSync(path.join(dshHome, "profiles"));
     const original = fs.readFileSync(path.join(dshHome, "settings.yaml"), "utf8");
-    const fakeDsh = path.join(home, "fake-dsh");
+    const fakeDsh = path.join(home, process.platform === "win32" ? "fake-dsh.exe" : "fake-dsh");
     fs.writeFileSync(fakeDsh, "");
     process.env.BILI_CLIENT_BIN = fakeDsh;
     process.env.DSH_HOME = dshHome;
@@ -1867,7 +1867,7 @@ test("runLaunch dsh: no loopback custom providers — no DSH_HOME overlay (#535 
             "      baseURL: https://api.anthropic.com",
         ].join("\n"),
     );
-    const fakeDsh = path.join(home, "fake-dsh");
+    const fakeDsh = path.join(home, process.platform === "win32" ? "fake-dsh.exe" : "fake-dsh");
     fs.writeFileSync(fakeDsh, "");
     process.env.BILI_CLIENT_BIN = fakeDsh;
     process.env.DSH_HOME = dshHome;
