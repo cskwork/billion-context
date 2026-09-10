@@ -1579,9 +1579,9 @@ async function handle(
                     return countTokens
                         ? prepareCountTokens(work as AnthropicRequestBody, core, reqConfig, log, session)
                         : protocol === "anthropic"
-                          ? prepareAnthropic(work as AnthropicRequestBody, req, opts, core, reqConfig, reqPrompts, log, session, pluginMode, reasoningCfg)
+                          ? prepareAnthropic(work as AnthropicRequestBody, req, opts, core, reqConfig, reqPrompts, log, session, pluginMode, upstreamOrigin, reasoningCfg)
                           : protocol === "openai"
-                             ? prepareOpenai(work as OpenAIRequestBody, req, opts, core, reqConfig, reqPrompts, log, session, pluginMode, nativeWindow, reasoningCfg)
+                             ? prepareOpenai(work as OpenAIRequestBody, req, opts, core, reqConfig, reqPrompts, log, session, pluginMode, upstreamOrigin, nativeWindow, reasoningCfg)
                              : responsesCompact
                                 // #618 review nit: when no bili compaction item is present,
                                 // prepareResponsesCompact falls back to the raw bodyBuffer — forward
@@ -1723,12 +1723,98 @@ function withReasoningDrop(
     reasoning: CompressReasoningConfig | undefined,
     log: (level: string, msg: string) => void,
     sessionId: string,
+    strictEcho: boolean,
 ): BiliMessage[] {
+    // [#684] strict-echo upstreams: reasoning must round-trip with tool_calls,
+    // so #651's drop must not fire. Learned/static strictness both land here.
+    if (strictEcho) return msgs;
     const out = dropCompressReasoning(msgs, reasoning);
     if (out.length !== msgs.length) {
         log("info", `[${sessionId}] compress-reasoning: dropped ${msgs.length - out.length} reasoning message(s) from closed compress turns (#651)`);
     }
     return out;
+}
+
+/** [#684] Strict-echo reasoning upstreams: DeepSeek documents that
+ *  thinking-mode "reasoning_content ... must be passed back to the API" —
+ *  a rebuilt request whose assistant tool-call turns lost their reasoning is
+ *  rejected with 400. Learned flag first (set on first 400 whose body mentions
+ *  reasoning_content, see the loop's UpstreamHttpError handler), then the
+ *  static host check. */
+export function isStrictReasoningEcho(session: Session, upstreamOrigin: string | undefined): boolean {
+    if (session.metadata.strictReasoningEcho === true) return true;
+    return upstreamOrigin !== undefined && /deepseek/i.test(upstreamOrigin);
+}
+
+/** [#684] Exit sentinel: in a thinking session, an assistant tool_calls
+ *  message WITHOUT reasoning_content while sibling turns carry it is the
+ *  signature of a split turn — strict-echo upstreams reject the whole request.
+ *  The kernel turn gate makes this unreachable; warn if a new path
+ *  reintroduces it. */
+export function warnReasoningPairs(
+    wireMessages: unknown[],
+    log: (level: string, msg: string) => void,
+    sessionId: string,
+): void {
+    let withRc = 0;
+    let split = 0;
+    for (const m of wireMessages) {
+        const msg = m as { role?: string; tool_calls?: unknown; reasoning_content?: unknown };
+        if (msg?.role !== "assistant") continue;
+        const hasRc = typeof msg.reasoning_content === "string" && msg.reasoning_content.length > 0;
+        if (hasRc) withRc++;
+        else if (Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0) split++;
+    }
+    if (withRc > 0 && split > 0) {
+        log("warn", `[${sessionId}] reasoning-pair-violated: ${split} assistant tool-call message(s) lack reasoning_content while ${withRc} carry it — strict-echo upstreams (DeepSeek thinking mode) will reject the request (#684)`);
+    }
+}
+
+/** [#684] Anthropic-wire twin of the openai sentinel: with extended thinking
+ *  + tool use, a preserved tool_use message whose thinking block was folded
+ *  away is rejected by the API. */
+export function warnAnthropicThinkingPairs(
+    wireMessages: unknown[],
+    log: (level: string, msg: string) => void,
+    sessionId: string,
+): void {
+    let withThinking = 0;
+    let split = 0;
+    for (const m of wireMessages) {
+        const msg = m as { role?: string; content?: Array<{ type?: string }> };
+        if (msg?.role !== "assistant" || !Array.isArray(msg.content)) continue;
+        const hasThinking = msg.content.some((b) => b?.type === "thinking");
+        if (hasThinking) withThinking++;
+        else if (msg.content.some((b) => b?.type === "tool_use")) split++;
+    }
+    if (withThinking > 0 && split > 0) {
+        log("warn", `[${sessionId}] thinking-pair-violated: ${split} assistant tool_use message(s) lack a thinking block while ${withThinking} carry one — extended-thinking tool use requires preserved thinking (#684)`);
+    }
+}
+
+/** [#684] Responses-wire twin: function_call item with no reasoning item
+ *  immediately preceding it while other turns carry reasoning. */
+export function warnResponsesReasoningPairs(
+    input: unknown[],
+    log: (level: string, msg: string) => void,
+    sessionId: string,
+): void {
+    let withReasoning = 0;
+    let split = 0;
+    let prevWasReasoning = false;
+    for (const item of input) {
+        const it = item as { type?: string };
+        if (it?.type === "reasoning") {
+            withReasoning++;
+            prevWasReasoning = true;
+            continue;
+        }
+        if (it?.type === "function_call" && !prevWasReasoning) split++;
+        prevWasReasoning = false;
+    }
+    if (withReasoning > 0 && split > 0) {
+        log("warn", `[${sessionId}] reasoning-pair-violated: ${split} function_call item(s) lack a preceding reasoning item while ${withReasoning} exist — strict-echo upstreams will reject the request (#684)`);
+    }
 }
 
 export function stripKernelSummaries(messages: BiliMessage[], state: CompressionState): BiliMessage[] {
@@ -1901,6 +1987,7 @@ function prepareAnthropic(
     log: (level: string, msg: string) => void,
     session: Session,
     pluginMode: boolean,
+    upstreamOrigin: string,
     reasoning: CompressReasoningConfig | undefined,
 ): Prepared {
     const sessionId = session.id;
@@ -1908,7 +1995,7 @@ function prepareAnthropic(
     ++session.stats.requests;
     session.hostCreditTokens = 0;
     const injectTools = opts.compress.injectTool && !pluginMode;
-    const stripReasoning = (msgs: BiliMessage[]): BiliMessage[] => withReasoningDrop(msgs, reasoning, log, sessionId);
+    const stripReasoning = (msgs: BiliMessage[]): BiliMessage[] => withReasoningDrop(msgs, reasoning, log, sessionId, isStrictReasoningEcho(session, upstreamOrigin));
 
     if (isAutoModeClassifier(parsed)) {
         log("info", `[${sessionId}] auto-mode classifier passthrough (skipping compress injection)`);
@@ -2011,6 +2098,7 @@ function prepareAnthropic(
     markDirty(session);
 
     const rebuilt: AnthropicRequestBody = { ...parsed, messages: rebuiltMessages, system: systemOut, tools: toolsOut };
+    warnAnthropicThinkingPairs(rebuiltMessages, log, sessionId);
     // prompt_cache_key is the omp plugin's session id stamped for the proxy's
     // identity chain (#268), not part of the Anthropic Messages API — strip it
     // so the real upstream never sees a field it doesn't know.
@@ -2137,6 +2225,7 @@ function prepareOpenai(
     log: (level: string, msg: string) => void,
     session: Session,
     pluginMode: boolean,
+    upstreamOrigin: string,
     nativeWindow: number,
     reasoning: CompressReasoningConfig | undefined,
 ): Prepared {
@@ -2145,7 +2234,7 @@ function prepareOpenai(
     ++session.stats.requests;
     session.hostCreditTokens = 0;
     let openaiSystemText = "";
-    const stripReasoning = (msgs: BiliMessage[]): BiliMessage[] => withReasoningDrop(msgs, reasoning, log, sessionId);
+    const stripReasoning = (msgs: BiliMessage[]): BiliMessage[] => withReasoningDrop(msgs, reasoning, log, sessionId, isStrictReasoningEcho(session, upstreamOrigin));
     let openaiOutboundSystem: string | undefined;
     let processedMessages: CoreMessage[] = [];
     let originalMessages: CoreMessage[] = [];
@@ -2252,6 +2341,7 @@ function prepareOpenai(
     }
 
     const rebuilt: OpenAIRequestBody = { ...parsed, messages: rebuiltMessages, tools: toolsOut as OpenAITool[] | undefined };
+    warnReasoningPairs(rebuiltMessages, log, sessionId);
     clampOutgoingOutput(rebuilt as Record<string, unknown>, typeof (parsed as Record<string, unknown>).max_completion_tokens === "number" ? "max_completion_tokens" : "max_tokens", { systemText: openaiSystemText, tools: toolsOut, processedMessages, lastInputTokens: session.stats.lastInputTokens, nativeWindow, imageTokens: imageTokensInParsedBody("openai", rebuilt) }, sessionId, log);
     // prompt_cache_retention is an OpenAI-host-only cache directive; the dsh
     // launcher forces PI_CACHE_RETENTION=long (for the session-id
@@ -2300,7 +2390,7 @@ function prepareResponses(
     const stream = parsed.stream === true;
     ++session.stats.requests;
     session.hostCreditTokens = 0;
-    const stripReasoning = (msgs: BiliMessage[]): BiliMessage[] => withReasoningDrop(msgs, reasoning, log, sessionId);
+    const stripReasoning = (msgs: BiliMessage[]): BiliMessage[] => withReasoningDrop(msgs, reasoning, log, sessionId, isStrictReasoningEcho(session, upstreamOrigin));
     if (reconcileNativeCompactionBoundary(session)) {
         log("info", `[${sessionId}] reconciled ACP state after native Responses compact boundary`);
     }
@@ -2486,6 +2576,7 @@ function prepareResponses(
     }
 
     const rebuilt: ResponsesRequestBody = { ...parsed, input: rebuiltInput, tools: toolsOut };
+    warnResponsesReasoningPairs(Array.isArray(rebuiltInput) ? rebuiltInput : [], log, sessionId);
     if (!isCompactionTrigger) {
         clampOutgoingOutput(rebuilt as Record<string, unknown>, "max_output_tokens", { systemText: (responsesProjection?.systemParts ?? []).join("\n"), tools: toolsOut, processedMessages, lastInputTokens: session.stats.lastInputTokens, nativeWindow, imageTokens: imageTokensInParsedBody("responses", rebuilt) }, sessionId, log);
     }
