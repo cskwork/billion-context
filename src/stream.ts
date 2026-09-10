@@ -121,7 +121,16 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         const shrinkRatio = preContext > 0 ? r.tokensCompressed / preContext : 0;
         const foldPoint = [...ranges].sort((a, b) => refNum(a.startRef) - refNum(b.startRef))[0]?.startRef ?? "unknown";
         ctx.session.lastCompress = { at: Date.now(), shrinkRatio, foldPoint, blocks: r.blocksCreated, tokensCompressed: r.tokensCompressed };
-        ctx.log(`[acp-compress-obs] shrink ${Math.round(shrinkRatio * 100)}% (~${r.tokensCompressed}/${preContext} tok) foldPoint=${foldPoint} blocks=${r.blocksCreated}`);
+        ctx.session.stats.pendingFoldUsage = true;
+        // #695: the next request materializes this fold — its prefix-cache hit
+        // ceiling ≈ anchor / postFoldContext. sys length is unknown here, so
+        // anchor (active block summaries) is a LOWER bound; the fold=new
+        // [acp-usage] line reports the real cached, separating physics from
+        // upstream eviction.
+        const anchorTok = res.state.blocks.reduce((n, b) => n + (b.active ? Math.ceil(b.summary.length / 4) : 0), 0);
+        const postCtx = Math.max(0, preContext - r.tokensCompressed);
+        const ceiling = postCtx > 0 ? Math.floor((100 * anchorTok) / postCtx) : 0;
+        ctx.log(`[acp-compress-obs] shrink ${Math.round(shrinkRatio * 100)}% (~${r.tokensCompressed}/${preContext} tok) foldPoint=${foldPoint} blocks=${r.blocksCreated} anchor≈${anchorTok} tok (${res.state.blocks.filter((b) => b.active).length} active blocks, sys excluded) postCtx≈${postCtx} → next-request cache ceiling ≥${ceiling}%`);
 
         const warn = r.warnings.length > 0 ? ` ${r.warnings.join("; ")}` : "";
         let msg = `[Compressed ${detail} → ${r.blocksCreated} block(s), ~${r.tokensCompressed} tokens saved.${warn}]`;
