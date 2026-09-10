@@ -60,6 +60,10 @@ test("planClientSpawn win32: .exe spawns directly even when spaced — the OS qu
         planClientSpawn("C:\\Program Files\\nodejs\\node.exe", ["C:\\Users\\John Doe\\cli.js"], WIN_ENV, "win32"),
         { command: "C:\\Program Files\\nodejs\\node.exe", args: ["C:\\Users\\John Doe\\cli.js"] },
     );
+    assert.deepEqual(
+        planClientSpawn("C:\\TOOLS\\NODE.EXE", [], WIN_ENV, "win32"),
+        { command: "C:\\TOOLS\\NODE.EXE", args: [] },
+    );
 });
 
 test("planClientSpawn win32: .cmd/.bat shims route through comspec /d /s /c with verbatim quoting", () => {
@@ -78,8 +82,14 @@ test("planClientSpawn win32: unset COMSPEC falls back to cmd.exe", () => {
     assert.equal(p.windowsVerbatimArguments, true);
 });
 
+test("planClientSpawn win32: a COMSPEC with spaces is used verbatim as the program", () => {
+    const p = planClientSpawn("tool.cmd", [], { COMSPEC: "C:\\My Tools\\cmd.exe" }, "win32");
+    assert.equal(p.command, "C:\\My Tools\\cmd.exe");
+    assert.deepEqual(p.args.slice(0, 3), ["/d", "/s", "/c"]);
+});
+
 test("planClientSpawn win32: unresolved bare names and extensionless paths keep cmd's PATHEXT resolution", () => {
-    for (const c of ["codex", "C:\\tools\\extensionless"]) {
+    for (const c of ["codex", "C:\\tools\\extensionless", "C:\\tools\\.hidden"]) {
         const p = planClientSpawn(c, [], WIN_ENV, "win32");
         assert.equal(p.command, "C:\\Windows\\System32\\cmd.exe");
         assert.equal(p.windowsVerbatimArguments, true);
