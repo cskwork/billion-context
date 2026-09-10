@@ -68,6 +68,7 @@ Usage:
   bili hermes [opts --] [args]     start a proxy + launch hermes-agent against it (/bili/ rewrite)
   bili dsh [opts --] [args]        start a proxy + launch deepseek-harness against it (/bili/ rewrite)
   bili codebuddy [opts --] [args]  start a proxy + launch codebuddy against it (/bili/ rewrite)
+  bili qoder [opts --] [args]      start a proxy + launch qoder against it (cert-MITM)
   bili test pi                     non-polluting pi smoke test through the proxy
   bili export [session] [--full]   list sessions / export one as a Markdown handoff
                                     (--full includes original messages; --output FILE)
@@ -82,12 +83,13 @@ Usage:
   bili --version                   print version
   bili --help                      show this help
 
-Launcher (bili pi / bili codex / bili claude / bili omp / bili opencode / bili hermes / bili dsh / bili codebuddy):
+Launcher (bili pi / bili codex / bili claude / bili omp / bili opencode / bili hermes / bili dsh / bili codebuddy) / bili qoder):
   Brings up a proxy on an independent port (a fresh instance every launch), then runs the client pointed at it via HTTPS_PROXY + the proxy's
   MITM CA — no config-file edits. Discovered HTTPS upstream domains are
   auto-whitelisted for MITM so the proxy TLS-terminates exactly the hosts the
-  client uses; HTTP / localhost providers go direct. pi/claude trust the CA
-  via NODE_EXTRA_CA_CERTS, codex via SSL_CERT_FILE. Proxy killed on client exit.
+   client uses; HTTP / localhost providers go direct. pi/claude/qoder trust
+   the CA via NODE_EXTRA_CA_CERTS, codex via SSL_CERT_FILE. Proxy killed on
+   client exit.
   bili flags (-F, --mitm-domain, --port, ...) must precede the client name;
   everything after the client name is passed through to the client.
     bili pi                               # launch pi through the proxy
@@ -99,6 +101,7 @@ Launcher (bili pi / bili codex / bili claude / bili omp / bili opencode / bili h
     bili hermes                           # launch hermes-agent through the proxy (/bili/ rewrite of ~/.hermes/config.yaml)
     bili dsh --profile web "task"         # launch deepseek-harness through the proxy (/bili/ rewrite of ~/.dsh/settings.yaml)
     bili codebuddy                        # launch codebuddy through the proxy (CODEBUDDY_BASE_URL /bili/ rewrite)
+    bili qoder                            # launch qoder through the proxy (cert-MITM; model endpoint is hardcoded https, so no /bili/ rewrite)
     bili test pi                          # quick end-to-end check of the pi path
     bili --mitm-domain api.foo.com pi     # add a domain to the MITM whitelist (flags precede the client)
     bili -F http://127.0.0.1:7897 codex   # route bili's upstream through a proxy (gost-style -F)

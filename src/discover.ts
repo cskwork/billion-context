@@ -3,7 +3,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { loadClientConfig, resolvePiHome, resolveCodebuddyHome, nonEmpty, type ClientConfig } from "./client-config.js";
+import { loadClientConfig, resolvePiHome, resolveCodebuddyHome, resolveQoderHome, nonEmpty, QODER_DEFAULT_MODEL_HOSTS, type ClientConfig } from "./client-config.js";
 
 const TTL_MS = 2000;
 
@@ -47,6 +47,13 @@ export function extractHttpsHosts(config: ClientConfig): string[] {
         push(config.codebuddy.codebuddyBaseUrl);
         for (const u of config.codebuddy.modelUrls ?? []) push(u);
     }
+    if (config.qoder) {
+        // qoder's model hosts are binary-hardcoded (no config file), so the
+        // discovery set is the static default map — replaced entirely by an
+        // explicit QODER_MODEL_SERVER_HOST (qoder's own resolution order).
+        const hosts = nonEmpty(config.qoder.modelServerHost) ? [config.qoder.modelServerHost] : QODER_DEFAULT_MODEL_HOSTS;
+        for (const h of hosts) push(`https://${h}`);
+    }
     return out;
 }
 
@@ -64,6 +71,7 @@ function configFilePaths(env: NodeJS.ProcessEnv): string[] {
         path.join(codebuddyHome, "settings.json"),
         path.join(codebuddyHome, "models.json"),
         path.join(process.cwd(), ".codebuddy", "models.json"),
+        path.join(resolveQoderHome(env), "settings.json"),
     ];
 }
 
