@@ -287,6 +287,10 @@ Windows 下会自动发现常见 Clash/Mihomo 静态系统代理;Web UI 会显�
 
 针对 pi / omp / opencode 的客户端插件随 `billion-context` 一起发布(`dist/agent/*.js`),用于协作代理路径。三者(`billion-context`、独立的 `billion-context-pi`、`opencode-acp`)如何取舍,见上文「该选哪个?」一节。
 
+## 社区
+
+QQ 群 —— 三个项目共用一个群（[`billion-context`](https://github.com/ranxianglei/billion-context)、[`billion-context-pi`](https://github.com/ranxianglei/billion-context-pi)、[`opencode-acp`](https://github.com/ranxianglei/opencode-acp)）：**1056132097**
+
 ## 许可证
 
 MIT
