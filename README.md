@@ -466,6 +466,10 @@ Early. Protocol handling and compression work against mock tests (500+ passing).
 
 Client-side plugins for pi / omp / opencode ship inside `billion-context` (`dist/agent/*.js`) for the cooperative-proxy path. See the **"Which do I need?"** section above for how `billion-context`, the standalone `billion-context-pi`, and `opencode-acp` relate.
 
+## Community
+
+QQ group — one shared group for all three projects ([`billion-context`](https://github.com/ranxianglei/billion-context), [`billion-context-pi`](https://github.com/ranxianglei/billion-context-pi), [`opencode-acp`](https://github.com/ranxianglei/opencode-acp)): **1056132097**
+
 ## License
 
 MIT
