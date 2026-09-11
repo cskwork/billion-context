@@ -63,7 +63,7 @@
     "LICENSE"
   ],
   "pi": {
-    "image": "https://raw.githubusercontent.com/ranxianglei/billion-context/master/docs/logo.svg",
+    "image": "https://raw.githubusercontent.com/ranxianglei/billion-context/master/docs/logo.png",
     "extensions": [
       "./dist/agent/pi.js"
     ]
