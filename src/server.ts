@@ -5,7 +5,7 @@ import { createCore, type CompressionCore, type CompressionState, type Config, t
 import { resolveCompress, resolveCompressPrompts, resolveRequestConfig } from "./compress-settings.js";
 import { dropCompressReasoning, type CompressReasoningConfig } from "./reasoning-drop.js";
 import { DEFAULT_STRIP_IMAGES_KEEP_RECENT, stripHistoricalImages } from "./strip-images.js";
-import type { HostUsagePolicy, ProxyOptions } from "./config.js";
+import type { ProxyOptions } from "./config.js";
 import { loadOptions, loadRoutes } from "./config.js";
 import { resetProxyCache } from "./upstream-proxy.js";
 import { FALLBACK_EFFECTIVE_WINDOW_FLOOR, findRoute, lookupContextLimit, resolveConfiguredContextLimit, resolveCompressProtocol } from "./config.js";
@@ -73,7 +73,7 @@ import { flushPrefixAffinity, hydratePrefixAffinity, scheduleAffinityPersist } f
 import { consumePluginRegisterFor, flushConversations, handlePluginCompact, handlePluginManifest, handlePluginRegister, handlePluginStatus, handlePluginTool, loadConversations, pipePluginChatWithStrip, pipePluginJson, pipePluginResponsesWithStrip, pluginAgentHeader, pluginConversationHeader, pluginReportedContextWindow, recordPluginSession, rememberPluginMessages, takePendingPluginRegister } from "./plugin.js";
 import { setupMitm, readMitmUpstream } from "./mitm.js";
 import type { BiliMessage } from "acp-kernel/wire";
-import { backfillHostUsage, isLoopbackAddress, inspectContextOverflow, reserveOutputHeadroom, shouldReserveOutputHeadroom, systemToUser, usageTotals, type WireProtocol } from "./util.js";
+import { isLoopbackAddress, inspectContextOverflow, reserveOutputHeadroom, shouldReserveOutputHeadroom, systemToUser, usageTotals, type WireProtocol } from "./util.js";
 import { resolveConfirmedLimit, resolveLearnedLimit, resolveSpeculativeLimit, retractStaleLearnedLimits } from "./weak-overflow.js";
 import { BILI_TUNNEL_HEADER, checkTunnelDestination, tunnelAllowlistFromEnv } from "./tunnel-guard.js";
 
@@ -1916,46 +1916,6 @@ function diagNudge(turn: { nudge?: { shouldInject: boolean; reason: string; cont
     return `[${sessionId}] nudge ${inject}: usage=${pct} (${tokenCount}/${limit}), growth=${growth}/${floor} (ref=${ref}, interval=${interval}), pendingT1=${pendingT1}/${interval}${modelTag}, reason="${n.reason.slice(0, 120)}"`;
 }
 
-// #408 host-usage accounting. By default the host sees the ACTUALLY-FORWARDED
-// (folded) request — the tokens the model really receives — which is sane for
-// every display and avoids the >100% drift that hit pi (#590 302.7%), omp
-// (#623 205%), codex (#645 138%) and plain anthropic clients like ZCode (#648)
-// when they were shown the uncompressed baseline instead. The baseline is now
-// OPT-IN, resolved per host: an entry in HOST_USAGE_POLICY keyed on the
-// announced agent type wins; otherwise the global `hostUsageCredit` switch
-// applies. Add a host as one map entry below — not a new if in armHostUsageCredit.
-const HOST_USAGE_POLICY: Partial<Record<string, HostUsagePolicy>> = {};
-
-function resolveHostUsagePolicy(
-    pluginAgent: unknown,
-    globalPolicy: HostUsagePolicy,
-): HostUsagePolicy {
-    const override = typeof pluginAgent === "string" ? HOST_USAGE_POLICY[pluginAgent] : undefined;
-    return override ?? globalPolicy;
-}
-
-function armHostUsageCredit(
-    session: Session,
-    originalMessages: CoreMessage[],
-    processedMessages: CoreMessage[],
-    hostUsageCredit: HostUsagePolicy,
-    log: (level: string, msg: string) => void,
-): void {
-    const policy = resolveHostUsagePolicy(session.metadata.pluginAgent, hostUsageCredit);
-    session.hostCreditTokens = 0;
-    if (policy !== "baseline") return;
-    // #408: tokens folded out of the forwarded view vs the host's own (unfolded)
-    // view — added back into the usage reported to the host so its anchor
-    // reflects the uncompressed baseline. Same estimator both sides, so
-    // systematic error cancels in the difference.
-    session.hostCreditTokens = processedMessages.length > 0
-        ? Math.max(0, estimateCoreMessages(originalMessages) - estimateCoreMessages(processedMessages))
-        : 0;
-    if (session.hostCreditTokens > 0) {
-        log("info", `[${session.id}] host usage backfill armed: +${session.hostCreditTokens} tok (forwarded view is folded); host usage will report the uncompressed baseline`);
-    }
-}
-
 // Zero-baseline sessions are judged conservatively ONLY when they arrived
 // anonymously (prefix-affinity forks/reloads, #553): they carry the full raw
 // history but no measurement yet, so feeding 0 blinds the nudge (usage 0%,
@@ -1985,7 +1945,6 @@ function prepareAnthropic(
     const sessionId = session.id;
     const stream = parsed.stream === true;
     ++session.stats.requests;
-    session.hostCreditTokens = 0;
     const injectTools = opts.compress.injectTool && !pluginMode;
     const stripReasoning = (msgs: BiliMessage[]): BiliMessage[] => withReasoningDrop(msgs, reasoning, log, sessionId, isStrictReasoningEcho(session, upstreamOrigin));
 
@@ -2095,7 +2054,6 @@ function prepareAnthropic(
     // identity chain (#268), not part of the Anthropic Messages API — strip it
     // so the real upstream never sees a field it doesn't know.
     delete (rebuilt as Record<string, unknown>).prompt_cache_key;
-    armHostUsageCredit(session, originalMessages, processedMessages, opts.hostUsageCredit, log);
     return { body: JSON.stringify(rebuilt), session, processedMessages, originalMessages, anthropicSystem: parsed.system, protocol: "anthropic", stream, compressInjected: injectTools, pluginMode, nudge, prompts, renderTags: "text-only" } as Prepared;
 }
 
@@ -2224,7 +2182,6 @@ function prepareOpenai(
     const sessionId = session.id;
     const stream = parsed.stream === true;
     ++session.stats.requests;
-    session.hostCreditTokens = 0;
     let openaiSystemText = "";
     const stripReasoning = (msgs: BiliMessage[]): BiliMessage[] => withReasoningDrop(msgs, reasoning, log, sessionId, isStrictReasoningEcho(session, upstreamOrigin));
     let openaiOutboundSystem: string | undefined;
@@ -2352,7 +2309,6 @@ function prepareOpenai(
     if (stream && (rebuilt as Record<string, unknown>).stream_options === undefined) {
         (rebuilt as Record<string, unknown>).stream_options = { include_usage: true };
     }
-    armHostUsageCredit(session, originalMessages, processedMessages, opts.hostUsageCredit, log);
     // #532: title-gen side requests carry their own tiny system and would
     // clobber the conversation's measured overhead — skip them.
     if (!isTitleGen && openaiOutboundSystem !== undefined) {
@@ -2381,7 +2337,6 @@ function prepareResponses(
     const sessionId = session.id;
     const stream = parsed.stream === true;
     ++session.stats.requests;
-    session.hostCreditTokens = 0;
     const stripReasoning = (msgs: BiliMessage[]): BiliMessage[] => withReasoningDrop(msgs, reasoning, log, sessionId, isStrictReasoningEcho(session, upstreamOrigin));
     if (reconcileNativeCompactionBoundary(session)) {
         log("info", `[${sessionId}] reconciled ACP state after native Responses compact boundary`);
@@ -2609,7 +2564,6 @@ function prepareResponses(
         });
         log("info", `[${sessionId}] responses forward tools=[${fwdTools.join(",")}] injectTool=${injectTools}${pluginMode ? " (plugin mode: wire injection suppressed)" : ""} NO_INJECT_TOOL=${!!process.env.ACP_NO_INJECT_TOOL} NO_COMPRESS_PROMPT=${!!process.env.ACP_NO_COMPRESS_PROMPT}`);
     }
-    armHostUsageCredit(session, originalMessages, processedMessages, opts.hostUsageCredit, log);
     // #532: measure the outbound developer(system)+tools overhead for the panel.
     // On this wire the system rides the injected developer message outside the
     // fold space, so counting devContent + tools does not double-count the
@@ -3887,7 +3841,7 @@ async function forward(
                 ? `\n\n---\n\n${buildAbsorbSystemPrompt(absorbToolName(loopConfig))}`
                 : "";
             const systemPrompt = (textProtocol ? buildCompressHybridSystemPrompt(prepared.prompts ?? defaultPrompts) : buildCompressSystemPrompt(prepared.prompts ?? defaultPrompts)) + absorbSection;
-            const adapter = pickAdapter(prepared.protocol, parsedReq, textProtocol, prepared.responsesProjection, prepared.anthropicSystem, prepared.openaiSystemText, prepared.session.hostCreditTokens ?? 0, absorbActive ? absorbToolName(loopConfig) : undefined);
+            const adapter = pickAdapter(prepared.protocol, parsedReq, textProtocol, prepared.responsesProjection, prepared.anthropicSystem, prepared.openaiSystemText, absorbActive ? absorbToolName(loopConfig) : undefined);
             const refreshFolded = (current: CoreMessage[]): CoreMessage[] => {
                 // #422: mirror the prepare's fold with the post-compress state so
                 // the re-request shows the compression the model just performed.
@@ -3995,13 +3949,6 @@ async function forward(
                     }
                     const out = u.completion_tokens ?? u.output_tokens;
                     if (typeof out === "number") prepared.session.stats.outputTokens += out;
-                }
-                // #408: the provider measured the folded view — add the
-                // prepare-time credit back so the host anchors on the
-                // uncompressed baseline.
-                const credit = prepared.session.hostCreditTokens ?? 0;
-                if (credit > 0 && backfillHostUsage(prepared.protocol, u, credit)) {
-                    prepared.session.hostContextTokens = (typeof total === "number" ? total : 0) + credit;
                 }
                 if (prepared.protocol === "openai") {
                     rewriteOpenaiJsonResponse(json, ctx);

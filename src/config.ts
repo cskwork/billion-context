@@ -184,11 +184,6 @@ export type CompressSettings = {
 };
 export type PromptCacheRouting = "auto" | "enabled" | "disabled";
 export type UpstreamProxyMode = "auto" | "manual" | "direct";
-/** #408 host-usage accounting policy. "postfold" (default) reports the
- *  actually-forwarded (folded) request — the tokens the model really receives.
- *  "baseline" applies the uncompressed-baseline backfill for hosts whose native
- *  accounting consumes it. */
-export type HostUsagePolicy = "postfold" | "baseline";
 
 /** Built-in context window for common model families, keyed by a lowercase
  *  prefix. This is a FALLBACK used when the per-route model declaration in
@@ -321,14 +316,6 @@ export type ProxyOptions = {
     autoUpdate: boolean;
     /** Dist-tag channel the auto-updater follows (default "latest"). */
     updateTag: string;
-    /** #408 host-usage accounting mode. "postfold" (default) = report the
-     *  actually-forwarded (folded) request — the tokens the model really
-     *  receives; sane for any host display and free of the >100% drift that hit
-     *  pi/omp/codex/zcode (#590/#623/#645/#648). "baseline" = the uncompressed-
-     *  baseline backfill, opt-in for hosts whose native accounting genuinely
-     *  consumes it. Legacy aliases normalized by parseHostUsageCredit: "off" ->
-     *  "postfold", "auto" -> "baseline". */
-    hostUsageCredit: HostUsagePolicy;
     logFile?: string;
     /** MITM transparent-proxy mode. When enabled, an HTTP CONNECT handler is
      *  attached so clients that only know how to set HTTP_PROXY (ZCode with a
@@ -466,7 +453,6 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
         passthrough: passthrough.enabled,
         passthroughSource: passthrough.source,
         autoUpdate: (env.ACP_AUTO_UPDATE ?? (fileConfig.autoUpdate === false ? "0" : "1")) !== "0",
-        hostUsageCredit: parseHostUsageCredit(env.BILI_HOST_USAGE_CREDIT ?? fileConfig.hostUsageCredit),
         updateTag: (env.ACP_UPDATE_TAG ?? fileConfig.updateTag ?? "latest").trim() || "latest",
         logFile: env.ACP_LOG_FILE !== undefined ? (env.ACP_LOG_FILE || undefined) : fileConfig.logFile,
         mitm: {
@@ -501,7 +487,6 @@ type FileConfig = {
     autoUpdate?: boolean;
     /** Dist-tag channel the auto-updater follows (default "latest"). */
     updateTag?: string;
-    hostUsageCredit?: HostUsagePolicy;
     upstreamProxy?: string;
     upstreamProxyMode?: string;
     logFile?: string;
@@ -611,14 +596,6 @@ export function parsePromptCacheRouting(value: string | undefined): PromptCacheR
 
 export function parseUpstreamProxyMode(value: string | undefined): UpstreamProxyMode {
     return value === "manual" || value === "auto" ? value : "direct";
-}
-
-export function parseHostUsageCredit(value: string | undefined): HostUsagePolicy {
-    const v = value?.trim().toLowerCase();
-    // "baseline" (and legacy "auto") -> the #408 uncompressed-baseline backfill;
-    // everything else (default "postfold", legacy "off") -> the forwarded usage.
-    // Default flipped to postfold in #660 — the baseline is now opt-in.
-    return v === "baseline" || v === "auto" ? "baseline" : "postfold";
 }
 
 export function parseCompressSettings(v: unknown): (CompressSettings & { injectTool?: boolean; injectNudge?: boolean }) | undefined {
