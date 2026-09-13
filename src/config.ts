@@ -6,6 +6,7 @@ import { log as loggerLog } from "./logger.js";
 import { validateHttpProxy, type ProxyFallbackOptions } from "./upstream-proxy.js";
 
 import { parseCompatRoles } from "./compat-roles.js";
+import type { ReasoningGuardConfig } from "./reasoning-guard.js";
 
 export function safeReadJson(path: string): unknown {
     try {
@@ -329,6 +330,8 @@ export type ProxyOptions = {
      *  hosts are TLS-terminated locally and fed back into the same request
      *  pipeline; all other hosts are blind-tunnelled. */
     mitm: { enabled: boolean; domains: string[] };
+    /** Opt-in gpt-5.x reasoning-truncation guard (#739). Default off. */
+    reasoningGuard?: ReasoningGuardConfig;
 };
 
 /** Re-read ONLY the routes from the current config sources, returning a fresh
@@ -468,6 +471,7 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
                 ...splitCsv(env.BILI_MITM_DOMAINS),
             ]),
         },
+        reasoningGuard: fileConfig.reasoningGuard,
     };
 }
 
@@ -507,6 +511,8 @@ type FileConfig = {
      *  upstreams accept (e.g. `{"developer":"system"}`) — applied to the
      *  final forwarded body for openai/responses requests (#552). */
     compat?: { roles?: Record<string, string> };
+    /** Opt-in gpt-5.x reasoning-truncation guard (#739). Default off. */
+    reasoningGuard?: ReasoningGuardConfig;
 };
 
 function nonEmpty(value: string | undefined): string | undefined {

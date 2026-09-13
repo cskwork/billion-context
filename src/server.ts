@@ -60,6 +60,7 @@ import { compressLoopResponsesJson } from "./compress-loop-responses.js";
 import { runCompressLoop, pickAdapter } from "./loop/index.js";
 import { containsToolCallXmlFragment } from "./loop/tag-echo-filter.js";
 import { isFakeCompletion, injectFakeCompletionHint, maxFakeCompletionRetries, fakeBufCap } from "./fake-completion.js";
+import { reasoningGuardEngages, runReasoningGuard } from "./reasoning-guard.js";
 import { sanitizeResponsesInputIds, dropWhitespaceResponsesMessages, normalizeResponsesMessageItems } from "./loop/adapter-responses.js";
 import { codexCompactMode, isCodexClient, hasCompactionTrigger, stripBiliCompactionItems, replaceBiliCompactionItems, codexCompactGate, codexCompactGatePre, buildTriggerForgeBody, mergeForgedSummaries } from "./codex-compact.js";
 import { stripAcpPanelMessages, stripAcpPanelResponsesInput } from "./acp-panel.js";
@@ -849,6 +850,7 @@ async function handle(
             opts.proxyFallback = fresh.proxyFallback;
             opts.compress = fresh.compress;
             opts.compat = fresh.compat;
+            opts.reasoningGuard = fresh.reasoningGuard;
             resetProxyCache();
             for (const k of Object.keys(opts.routes)) delete opts.routes[k];
             Object.assign(opts.routes, loadRoutes());
@@ -3802,6 +3804,34 @@ async function forward(
         }
         return;
     }
+    const rg = opts.reasoningGuard;
+    if (rg && prepared && prepared.protocol === "responses" && prepared.stream && !prepared.sidePassthrough && !prepared.compressInjected) {
+        const sse = (upstream.headers.get("content-type") ?? "").includes("text/event-stream");
+        if (sse) {
+            let reqModel: string | undefined;
+            try {
+                const wb = typeof wireBody === "string" ? wireBody : wireBody.toString("utf8");
+                const parsed = JSON.parse(wb) as Record<string, unknown>;
+                if (typeof parsed.model === "string") reqModel = parsed.model;
+            } catch { /* non-JSON body: guard stays off */ }
+            if (reasoningGuardEngages(rg, reqModel)) {
+                log("info", `[reasoning-guard] engaged model=${reqModel ?? "?"} session=${prepared.session?.id ?? "-"}`);
+                await runReasoningGuard({
+                    firstResponse: upstream,
+                    clearFirstTimer: clearUpstreamTimer,
+                    upstreamUrl,
+                    reqHeaders: buildForwardHeaders(headers),
+                    dispatcher,
+                    originalBody: wireBody,
+                    signal: clientAbort.signal,
+                    res,
+                    config: rg,
+                    log: (msg) => log("info", msg),
+                });
+                return;
+            }
+        }
+    }
     // #371: detect + retry a fake completion for every non-plugin streaming
     // response (any turn, not just compress-injected). Buffering is required:
     // the retry re-requests before the client sees the fake completion.
@@ -4223,6 +4253,7 @@ function handleConfigReload(opts: ProxyOptions, res: http.ServerResponse, log: (
     Object.assign(opts.routes, fresh);
     opts.compress = loadOptions().compress;
     opts.compat = loadOptions().compat;
+    opts.reasoningGuard = loadOptions().reasoningGuard;
     // Release cached ProxyAgents so agents for proxy URLs that were
     // removed/changed don't leak for the process lifetime. The next request
     // re-creates the needed agent lazily via proxyDispatcher().
