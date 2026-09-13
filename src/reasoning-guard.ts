@@ -13,7 +13,7 @@ export interface SseSink {
     once(event: "drain", cb: () => void): unknown;
 }
 
-/** Guard against OpenAI gpt-5.x "lattice" reasoning truncation (#739): these
+/** Guard against OpenAI gpt-5.x/gpt-6.x "lattice" reasoning truncation (#739): these
  *  models intermittently stop at exactly base*n+offset reasoning tokens (default
  *  518n-2 -> 516,1034,...) mid-thought. On a matched-model terminal round hitting
  *  the lattice AND carrying an encrypted_content blob, re-send replaying its own
@@ -23,8 +23,8 @@ export interface SseSink {
 
 export interface ReasoningGuardConfig {
     enabled?: boolean;
-    /** Model prefixes to scope detection to. Default gpt-5.x. Empty array =
-     *  apply the signature to every model. */
+    /** Model prefixes to scope detection to. Default gpt-5.x / gpt-6.x.
+     *  Empty array = apply the signature to every model. */
     models?: string[];
     /** Max continuation rounds after the initial round (default 3). */
     maxContinue?: number;
@@ -34,12 +34,12 @@ export interface ReasoningGuardConfig {
     markerText?: string;
     /** Lattice base (default 518); truncated tokens == base*n + offset. */
     base?: number;
-    /** Lattice offset (default -2); gpt-5.x truncates at 518n-2. */
+    /** Lattice offset (default -2); gpt-5.x/gpt-6.x truncate at 518n-2. */
     offset?: number;
     debugLog?: boolean;
 }
 
-const DEFAULT_MODELS = ["gpt-5.5", "gpt-5.6"];
+const DEFAULT_MODELS = ["gpt-5", "gpt-6"];
 const MIN_N = 1;
 const DEFAULT_MARKER = "Continue thinking...";
 const ENC_INCLUDE = "reasoning.encrypted_content";

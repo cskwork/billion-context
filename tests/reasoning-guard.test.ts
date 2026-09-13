@@ -44,6 +44,8 @@ test("reasoningGuardEngages gates on enable/model/scope", () => {
     assert.ok(!reasoningGuardEngages({ enabled: true }, undefined));
     assert.ok(reasoningGuardEngages({ enabled: true }, "gpt-5.5"));
     assert.ok(reasoningGuardEngages({ enabled: true }, "gpt-5.6-luna"));
+    assert.ok(reasoningGuardEngages({ enabled: true }, "gpt-6"));
+    assert.ok(reasoningGuardEngages({ enabled: true }, "gpt-6-sol"));
     assert.ok(!reasoningGuardEngages({ enabled: true }, "gpt-4o"));
     assert.ok(reasoningGuardEngages({ enabled: true, models: [] }, "anything-model"));
     assert.ok(!reasoningGuardEngages({ enabled: true, models: ["claude"] }, "gpt-5.5"));
