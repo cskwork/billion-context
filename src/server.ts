@@ -48,8 +48,9 @@ import { responsesToCoreWithToolImages as responsesToCore, patchResponsesInputWi
 import { getSession, listSessions, type Session, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight, totalInFlight, withSessionLock, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, snapshotMessages, applyCompactionArchive, detectUnannouncedHistoryRewrite, markCompactionBoundary, ensureCanonicalId, storeEffectiveConfig } from "./session.js";
 import { detectStaleInstall } from "./update.js";
 import { PACKAGE_NAME, VERSION } from "./version.js";
-import { ABSORB_TOOL, ABSORB_TOOL_OPENAI, ABSORB_TOOL_RESPONSES, COMPRESS_TOOL, BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_OPENAI, BILI_ACP_TOOLS_RESPONSES, BILI_ACP_READONLY_TOOLS_RESPONSES, COMPRESS_TOOL_NAME, buildAbsorbSystemPrompt, buildCompressSystemPrompt, buildCompressHybridSystemPrompt, withConversationIdNote, withMarkerIntegrityNote, withStagedCompressGuidance, withSummaryBudgetNote } from "./compress-tool.js";
+import { ABSORB_TOOL, ABSORB_TOOL_OPENAI, ABSORB_TOOL_RESPONSES, COMPRESS_TOOL, BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_OPENAI, BILI_ACP_TOOLS_RESPONSES, BILI_ACP_READONLY_TOOLS_RESPONSES, COMPRESS_TOOL_NAME, RULE_TOOL, RULE_TOOL_OPENAI, RULE_TOOL_RESPONSES, buildAbsorbSystemPrompt, buildCompressSystemPrompt, buildCompressHybridSystemPrompt, withConversationIdNote, withMarkerIntegrityNote, withStagedCompressGuidance, withSummaryBudgetNote } from "./compress-tool.js";
 import { applyAbsorbView, absorbEnabled, absorbToolName, storeEffectiveAbsorb } from "./absorb.js";
+import { rulesEnabled, storeEffectiveRules } from "./rules-feature.js";
 import { rewriteJsonResponse, type RewriteCtx } from "./stream.js";
 import { applyRanges } from "./stream.js";
 import { buildSessionCacheReport } from "./cache-ledger.js";
@@ -2027,6 +2028,10 @@ function prepareAnthropic(
         // reaches the wire. Hiding recorded absorptions is unaffected
         // (applyAbsorbView hides regardless of enablement).
         const absorbActive = absorbEnabled(config) && opts.compress.injectTool;
+        // acp_rule has no processTurn side effect (no markers/instructions are
+        // ever injected into messages), so unlike absorb it needs no loop-
+        // config stripping — only tool availability matters.
+        const rulesActive = rulesEnabled(config) && opts.compress.injectTool;
         const loopConfig = absorbActive ? config : { ...config, absorb: undefined };
         const turn = core.processTurn({ messages: msgs, state: session.state, config: loopConfig, tokenCount, renderTags: process.env.ACP_RENDER_NONE ? "none" : "text-only" });
         session.state = turn.state;
@@ -2034,6 +2039,7 @@ function prepareAnthropic(
         // future usage reports are post-fold reality, drop the credit.
         session.stats.compressCreditTokens = 0;
         storeEffectiveAbsorb(session, loopConfig);
+        storeEffectiveRules(session, config);
         turn.messages = applyAbsorbView(turn.messages, session.state, loopConfig, tokenCount);
         // Drop sub-viability fragments before any consumer sees them: a tiny
         // range in the list makes batched compress attempts fail atomically
@@ -2065,7 +2071,7 @@ function prepareAnthropic(
 
         systemOut = injectSystem(parsed, opts, prompts, loopConfig, ensureCanonicalId(session), surface);
         if (injectTools) {
-            toolsOut = injectTool(parsed.tools, absorbActive ? ABSORB_TOOL : undefined, surface?.toolPrompts);
+            toolsOut = injectTool(parsed.tools, [...(absorbActive ? [ABSORB_TOOL] : []), ...(rulesActive ? [RULE_TOOL] : [])], surface?.toolPrompts);
         }
         // Nudge as a separate trailing user message (cache-friendly): the
         // system block stays byte-stable so the prefix cache survives.
@@ -2177,6 +2183,7 @@ function prepareOpenai(
         // config.absorb). Title-gen requests skip ALL injection for
         // prefix-cache stability, so strip absorb from the loop config there.
         const absorbActive = absorbEnabled(config) && shouldInject;
+        const rulesActive = rulesEnabled(config) && shouldInject;
         const loopConfig = absorbActive ? config : { ...config, absorb: undefined };
         const turn = core.processTurn({ messages: msgs, state: session.state, config: loopConfig, tokenCount, renderTags: process.env.ACP_RENDER_NONE ? "none" : "text-only" });
         session.state = turn.state;
@@ -2786,30 +2793,30 @@ function injectSystem(
 // cannot be filtered per request) are dropped here so the upstream sees
 // exactly one definition per name, and it is bili's (its arg schemas are what
 // the compress loop dispatches on). Plugin mode never calls these helpers.
-function injectTool(tools: unknown[] | undefined, extra?: { name: string }, toolPrompts?: ToolPrompts): unknown[] {
+function injectTool(tools: unknown[] | undefined, extras?: readonly { name: string }[], toolPrompts?: ToolPrompts): unknown[] {
     const acp = applyAcpToolOverrides(BILI_ACP_TOOLS_ANTHROPIC, toolPrompts);
-    if (!Array.isArray(tools)) return extra ? [...acp, extra] : [...acp];
+    const list = extras ?? [];
+    if (!Array.isArray(tools)) return [...acp, ...list];
     const owned = new Set<string>(acp.map((t) => t.name));
-    if (extra) owned.add(extra.name);
+    for (const e of list) owned.add(e.name);
     const kept = tools.filter((t) => {
         const n = (t as { name?: string })?.name;
         return typeof n !== "string" || !owned.has(n);
     });
-    return [...kept, ...acp, ...(extra ? [extra] : [])];
+    return [...kept, ...acp, ...list];
 }
 
-function injectOpenaiTool(tools: OpenAITool[] | undefined, extra?: OpenAITool, toolPrompts?: ToolPrompts): OpenAITool[] {
+function injectOpenaiTool(tools: OpenAITool[] | undefined, extras?: readonly OpenAITool[], toolPrompts?: ToolPrompts): OpenAITool[] {
     const acp = applyAcpToolOverrides(BILI_ACP_TOOLS_OPENAI, toolPrompts) as OpenAITool[];
-    if (!Array.isArray(tools)) return extra ? [...acp, extra] : ([...acp] as OpenAITool[]);
+    const list = extras ?? [];
+    if (!Array.isArray(tools)) return [...acp, ...list] as OpenAITool[];
     const owned = new Set<string>(acp.map((t) => t.function.name));
-    if (extra) owned.add(extra.function.name);
+    for (const e of list) owned.add(e.function.name);
     const kept = tools.filter((t) => {
         const n = t?.function?.name;
         return typeof n !== "string" || !owned.has(n);
     });
-    const out = [...kept, ...acp];
-    if (extra) out.push(extra);
-    return out;
+    return [...kept, ...acp, ...list];
 }
 
 /** When true, the Responses path teaches compression via a text trigger

@@ -61,6 +61,7 @@ export {
     ABSORB_TOOL,
     ABSORB_TOOL_OPENAI,
     buildAbsorbSystemPrompt,
+    RULE_TOOL_NAME,
 } from "acp-kernel";
 export type { ParsedRange, AbsorbConfig } from "acp-kernel";
 export { ACP_TOOL_NAMES as PROXY_TOOL_NAMES, ACP_MUTATING_TOOLS as MUTATING_PROXY_TOOLS, ACP_READONLY_TOOLS as READONLY_PROXY_TOOLS } from "acp-kernel";
@@ -116,6 +117,20 @@ export const ABSORB_TOOL_RESPONSES = {
     description: ABSORB_TOOL_OPENAI.function.description,
     parameters: ABSORB_TOOL_OPENAI.function.parameters,
 };
+
+// The reconciled kernel (acp-kernel#332) ships RULE_TOOL_NAME + the rule state
+// helpers but no wire tool objects. Synthesize all three shapes here so every
+// injection point (wire helpers, plugin manifest) serves one definition.
+const RULE_TOOL_DESCRIPTION = "Record a short, principle-level reminder so it survives context compression — the call and its result are protected and stay in context. Record when: the user calls out or repeatedly emphasizes a lesson; the user asks you to remember or follow a behavior; you personally hit a major pitfall worth remembering long-term. Keep each rule to one short line. Omit the rule argument to list recorded rules.";
+const RULE_PARAM_SCHEMA = {
+    type: "object",
+    properties: {
+        rule: { type: "string", description: "Short principle-level reminder to record. Omit to list recorded rules." },
+    },
+};
+export const RULE_TOOL = { name: RULE_TOOL_NAME, description: RULE_TOOL_DESCRIPTION, input_schema: RULE_PARAM_SCHEMA };
+export const RULE_TOOL_OPENAI = { type: "function" as const, function: { name: RULE_TOOL_NAME, description: RULE_TOOL_DESCRIPTION, parameters: RULE_PARAM_SCHEMA } };
+export const RULE_TOOL_RESPONSES = { type: "function" as const, name: RULE_TOOL_NAME, description: RULE_TOOL_DESCRIPTION, parameters: RULE_PARAM_SCHEMA };
 
 export function parseCompressInput(input: unknown, callId?: string) {
     const parsed = parseCompressArgs(input, { callId });
