@@ -325,6 +325,26 @@ For each request, the proxy resolves the settings by longest-URL-prefix match (t
     ```
   - `threshold: number` — character gate; runs **strictly greater** than this are dropped (`0` = drop any non-empty run). Invalid values fall back to the default instead of throwing.
 
+#### `reasoningGuard`
+
+- **Type:** `object` (`{ enabled?, models?, maxContinue?, maxTierN?, markerText?, base?, offset?, debugLog? }`)
+- **Default:** *(disabled — off unless you set `enabled: true` at some level)*
+- **Status:** ACTIVE
+- **Description:** Opt-in guard against gpt-5.x/gpt-6.x **"lattice" reasoning truncation** (issue #739; upstream [openai/codex#30364](https://github.com/openai/codex/issues/30364)). These models intermittently stop at exactly `base*n + offset` reasoning tokens (default `518n−2` → 516, 1034, 1552, …) mid-thought, then answer from a half-finished thought. When a matched-model terminal round hits the lattice **and** carries an `encrypted_content` blob, bili buffers the response, re-sends it replaying its own reasoning plus a continue nudge (up to `maxContinue` continuation rounds), and folds everything into ONE response whose usage is the true summed total. Reasoning streams live to the client during the fold (no full buffering); only the final clean round's non-reasoning output is passed through. Applies to Responses/SSE streaming requests only (bili is SSE-only); compress-injected turns are exempt (the loop owns those). Sub-fields (merged deepest-wins like every other CompressSettings field):
+  - `enabled: boolean` — master switch; anything other than `true` keeps the guard fully off.
+  - `models: string[]` — model prefixes to scope detection to (default `["gpt-5", "gpt-6"]`, covering both families by prefix match). Empty array = apply the signature to every model; set per-provider/model to narrow or extend.
+  - `maxContinue: number` — max continuation rounds after the initial round (default `3`).
+  - `maxTierN: number` — highest lattice tier `n` allowed to continue (default `6`); `0` = unlimited. Raise for rare deep-tier truncations (e.g. an `n=11` hit observed on gpt-6-astra).
+  - `markerText: string` — nudge text appended as a commentary message each continued round (default `"Continue thinking..."`).
+  - `base: number` / `offset: number` — the lattice signature `tokens == base*n + offset` (defaults `518` / `-2`). Override if another model family truncates on a different lattice.
+  - `debugLog: boolean` — verbose per-round logging (default `false`).
+  ```jsonc
+  // enable globally
+  { "compress": { "reasoningGuard": { "enabled": true } } }
+  // scope + tune per provider
+  { "providers": { "https://your-relay.example": { "compress": { "reasoningGuard": { "enabled": true, "models": ["gpt-5", "gpt-6"], "maxContinue": 2 } } } } }
+  ```
+
 #### `stripImages`
 
 - **Type:** `boolean`

@@ -323,6 +323,26 @@
     ```
   - `threshold: number` — 字符门槛；**严格大于**该值的段才被剥离（`0` = 只要非空就剥）。非法值回退默认而不是报错。
 
+#### `reasoningGuard`
+
+- **类型：** `object`（`{ enabled?, models?, maxContinue?, maxTierN?, markerText?, base?, offset?, debugLog? }`）
+- **默认值：** *（禁用 —— 除非在某一层设置 `enabled: true`）*
+- **状态：** ACTIVE
+- **说明：** gpt-5.x/gpt-6.x **"晶格"（lattice）推理截断**守卫（issue #739；上游 [openai/codex#30364](https://github.com/openai/codex/issues/30364)）。这些模型会间歇性地在恰好 `base*n + offset` 个 reasoning token 处（默认 `518n−2` → 516、1034、1552 …）思考到一半就停下，然后基于未完成的思路作答。当命中模型的终止回合落在晶格上**且**携带 `encrypted_content` 块时，bili 会缓冲该响应、带着自己的 reasoning 加一条继续提示重发（最多 `maxContinue` 个续写回合），再把全部折叠成**一个**响应，其 usage 为真实求和值。折叠期间 reasoning 实时流式发给客户端（不做整段缓冲），只有最后一轮干净回合的非 reasoning 输出被透传。仅作用于 Responses/SSE 流式请求（bili 只支持 SSE）；压缩注入的回合被豁免（由循环负责）。子字段与其他 CompressSettings 字段一样按“深层覆盖”合并：
+  - `enabled: boolean` — 总开关；非 `true` 时守卫完全关闭。
+  - `models: string[]` — 限定检测范围的前缀列表（默认 `["gpt-5", "gpt-6"]`，按前缀匹配覆盖两个家族）。空数组 = 对所有模型应用该签名；可按 provider/model 收窄或扩展。
+  - `maxContinue: number` — 首轮之后最多续写的回合数（默认 `3`）。
+  - `maxTierN: number` — 允许续写的最高晶格层级 `n`（默认 `6`）；`0` = 不限制。遇到罕见的深层截断时调高（例如在 gpt-6-astra 上观察到一次 `n=11`）。
+  - `markerText: string` — 每个续写回合追加的 commentary 提示文本（默认 `"Continue thinking..."`）。
+  - `base: number` / `offset: number` — 晶格签名 `tokens == base*n + offset`（默认 `518` / `-2`）。若其他模型家族在不同晶格上截断则覆盖。
+  - `debugLog: boolean` — 逐回合详细日志（默认 `false`）。
+  ```jsonc
+  // 全局开启
+  { "compress": { "reasoningGuard": { "enabled": true } } }
+  // 按 provider 限定 + 调参
+  { "providers": { "https://your-relay.example": { "compress": { "reasoningGuard": { "enabled": true, "models": ["gpt-5", "gpt-6"], "maxContinue": 2 } } } } }
+  ```
+
 #### `stripImages`
 
 - **类型：** `boolean`
