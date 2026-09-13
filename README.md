@@ -150,7 +150,8 @@ Pick by your client:
 | Client | Use |
 |---|---|
 | **pi** | [`billion-context-pi`](https://github.com/ranxianglei/billion-context-pi) (in-process extension) |
-| **opencode** | [`opencode-acp`](https://github.com/ranxianglei/opencode-acp) (in-process extension) |
+| **opencode 1.x** | [`opencode-acp`](https://github.com/ranxianglei/opencode-acp) (in-process extension, V1 plugin API) or `bili opencode` |
+| **opencode 2.0+** | `bili opencode` (built-in V2 plugin — native tools, no separate package) |
 | **omp** | [`billion-context`](https://github.com/ranxianglei/billion-context) via `bili omp` (built-in plugin) |
 | **everything else** (no context hook) | [`billion-context`](https://github.com/ranxianglei/billion-context) — `bili <client>` (launcher, preferred) or `/bili/` prefix |
 
@@ -202,7 +203,7 @@ bili pi                               # launch pi through the proxy — file-fre
 bili codex                            # launch codex through the proxy
 bili claude                           # launch claude through the proxy
 bili omp                              # pi-style, file-free (#535): env + extension registerProvider + compaction cancel, real ~/.omp untouched
-bili opencode                         # MITM for HTTPS + temp opencode.json (/bili/ for HTTP) + thin /acp plugin
+bili opencode                         # MITM for HTTPS + temp opencode.json (/bili/ for HTTP) + thin /acp plugin; OpenCode 2.0+: built-in V2 plugin with native bili tools, native compaction auto-disabled
 bili hermes                           # file-free (#535): hermes proxy env (HTTPS_PROXY + HERMES_CA_BUNDLE) — https via CONNECT MITM, http via absolute-form forward proxy; real ~/.hermes untouched
 bili dsh                              # deepseek-harness: non-loopback upstreams ride proxy envs (https MITM, http absolute-form), loopback keeps the overlay DSH_HOME (~/.dsh-bili) rewrite (#535), built-in deepseek route via DEEPSEEK_BASE_URL, native /acp command injected via --patch
 bili codebuddy                        # Tencent CodeBuddy Code CLI: CODEBUDDY_BASE_URL /bili/ rewrite (OpenAI chat completions wire), budget aligned via CODEBUDDY_AUTO_COMPACT_WINDOW; real ~/.codebuddy untouched
@@ -235,6 +236,45 @@ automatically.
 
 For per-client configuration examples (OpenCode, Codex, Pi, login-client
 MITM, …) see the web UI guide at [http://localhost:8787](http://localhost:8787).
+
+### OpenCode 2.0
+
+OpenCode 2.0 ships a new plugin API (`@opencode/plugin`); the standalone
+`opencode-acp` extension is V1-only and does not load under 2.0. Both bili
+modes work on 2.0 (verified against a 2.0 pre-release build):
+
+- **Launcher:** `bili opencode` works unchanged. On a 2.0 host it injects the
+  built-in V2 plugin (`dist/agent/opencode.js`), which registers the bili
+  tools natively in-host — compress / decompress / search_context /
+  acp_status (+ absorb), JSON-Schema inputs — and stamps the proxy headers on
+  every outgoing provider request, so compression runs in plugin mode with no
+  wire-level tool injection. Native auto-compaction is disabled automatically
+  (`compaction.auto: false`).
+- **Pure proxy:** point the provider baseURL at the proxy like any other
+  client:
+
+  ```json
+  {
+    "provider": {
+      "myprovider": {
+        "npm": "@ai-sdk/openai-compatible",
+        "options": {
+          "baseURL": "http://localhost:8787/bili/http://upstream.example/v1",
+          "apiKey": "sk-any"
+        }
+      }
+    }
+  }
+  ```
+
+  Note: 2.0 AI-SDK providers require an `apiKey` field even for local
+  endpoints that never check it — set any non-empty value.
+
+Caveats: the 2.0 command API only exposes list/get/update/remove, so plugins
+cannot add commands — there is no `/acp` under 2.0; call the `acp_status`
+tool instead. The bundled agent file keeps the V1 `server()` export alongside
+the V2 `setup()`, so the same artifact also loads on hosts ≥ 1.18.29 that
+support dual-shape plugins.
 
 ### Verify
 

@@ -1784,6 +1784,7 @@ test("prepareOpencodeHttpRewrite: writes rewritten copy, original untouched", ()
         const rewritten = JSON.parse(fs.readFileSync(tmpFile, "utf8"));
         assert.equal(rewritten.provider["zhipuai-lb"].options.baseURL, "http://127.0.0.1:8787/bili/http://127.0.0.1:18081/v1");
         assert.deepEqual(rewritten.plugin, ["opencode-acp@latest"]);
+        assert.deepEqual(rewritten.compaction, { auto: false });
         assert.equal(fs.readFileSync(cfgFile, "utf8"), original);
         fs.rmSync(path.dirname(tmpFile), { recursive: true, force: true });
         assert.equal(prepareOpencodeHttpRewrite(cfgFile, "http://127.0.0.1:8787", [], []), undefined);
@@ -1797,6 +1798,7 @@ test("prepareOpencodeHttpRewrite: writes rewritten copy, original untouched", ()
         assert.ok(missingCfg);
         const fromEmpty = JSON.parse(fs.readFileSync(missingCfg, "utf8"));
         assert.deepEqual(fromEmpty.plugin, ["/opt/bili/dist/agent/opencode.js"]);
+        assert.deepEqual(fromEmpty.compaction, { auto: false });
         fs.rmSync(path.dirname(missingCfg), { recursive: true, force: true });
     } finally {
         fs.rmSync(dir, { recursive: true, force: true });

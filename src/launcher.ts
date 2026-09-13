@@ -1585,6 +1585,15 @@ export function prepareOpencodeHttpRewrite(
         if (!plugins.includes(pluginPath)) plugins.push(pluginPath);
         root.plugin = plugins;
     }
+    // ACP owns compression in launcher mode: disable the host's native
+    // auto-compaction so it cannot destroy ACP-tagged context. The key is
+    // unknown (and ignored) on OpenCode 1.x, so this is safe on both
+    // generations; user-set fields (keep/buffer) survive via the merge.
+    const existingCompaction = root.compaction;
+    root.compaction = {
+        ...(existingCompaction && typeof existingCompaction === "object" && !Array.isArray(existingCompaction) ? existingCompaction as Record<string, unknown> : {}),
+        auto: false,
+    };
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "bili-opencode-"));
     const tmpFile = path.join(tmp, "opencode.json");
     fs.writeFileSync(tmpFile, JSON.stringify(root));
