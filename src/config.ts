@@ -124,7 +124,9 @@ export type CompressSettings = {
      *  fields are LOAD-BEARING: the kernel rules were tuned in production and
      *  overriding them can degrade summary quality (lost paths / signatures /
      *  decisions → broken retrieval). Ignored unless `acknowledgePromptsRisk`
-     *  is also true at the winning level. Same three-level merge as the other
+     *  resolves to `true` after the merge (the flag merges independently,
+     *  deepest defined level wins — no co-location with this block required).
+     *  Same three-level merge as the other
      *  fields, but the object is merged via kernel `resolvePrompts` (non-string
      *  fields silently dropped), not a raw pass-through. */
     prompts?: Partial<Prompts>;
