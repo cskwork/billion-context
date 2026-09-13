@@ -4,7 +4,7 @@ import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { defaultPrompts, buildCompressSystemPrompt, ACP_TOOLS_OPENAI, applyAcpToolOverrides } from "acp-kernel";
-import { mergeCompress, resolveCompressSurface } from "../src/compress-settings.js";
+import { mergeCompress, resolveCompressSurface, resolveCompressSurfaceDetailed } from "../src/compress-settings.js";
 
 test("promptPack merges deepest-wins like every other field", () => {
     const merged = mergeCompress(
@@ -71,6 +71,31 @@ test("resolveCompressSurface: nudge/prompt section overrides flow into the kerne
         const prompt = buildCompressSystemPrompt(defaultPrompts, surface.promptSections);
         assert.ok(prompt.includes("QUIET-TAGS"));
         assert.ok(!prompt.includes("COMPRESSION SUMMARIES IN CONTEXT"));
+    } finally {
+        rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("resolveCompressSurfaceDetailed: pack identity travels with the surface", () => {
+    assert.deepEqual(resolveCompressSurfaceDetailed({}).packName, "default");
+    assert.deepEqual(resolveCompressSurfaceDetailed({ promptPack: "../etc/passwd" }).packName, "default");
+    assert.deepEqual(resolveCompressSurfaceDetailed({ promptPack: "no-such-pack" }).packName, "default");
+    const lean = resolveCompressSurfaceDetailed({ promptPack: "lean" });
+    assert.equal(lean.packName, "lean");
+    assert.equal(typeof lean.packVersion, "string");
+    assert.equal(lean.surface.toolPrompts?.compress?.description, "Replace consumed conversation ranges with self-contained summaries using mNNNNN or bN refs.");
+});
+
+test("resolveCompressSurfaceDetailed: file pack reports the requested name and its version", () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "bili-pack-meta-"));
+    try {
+        writeFileSync(
+            path.join(dir, "versioned.json"),
+            JSON.stringify({ name: "versioned", version: "9.9.9", toolPrompts: { compress: { description: "v" } } }),
+        );
+        const res = resolveCompressSurfaceDetailed({ promptPack: "versioned" }, { projectDir: dir });
+        assert.equal(res.packName, "versioned");
+        assert.equal(res.packVersion, "9.9.9");
     } finally {
         rmSync(dir, { recursive: true, force: true });
     }

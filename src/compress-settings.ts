@@ -117,18 +117,28 @@ export function resolveCompressPrompts(s: CompressSettings): Prompts {
 
 let warnedUnknownPack = new Set<string>();
 
+export interface SurfaceResolution {
+    surface: PackSurface;
+    /** Effective pack name — "default" when unset/invalid/unresolvable
+     *  (the surface that actually serves requests). Feeds status-report
+     *  surface meta and the session audit stamp. */
+    packName: string;
+    /** Pack-declared version, when the resolved pack carries one. */
+    packVersion?: string;
+}
+
 /** Resolve the pack surface for one request: `promptPack` names a pack in the
  *  kernel's resolver chain [project `./.billion-context/packs` > user
  *  `<configDir>/packs` > builtin registry]. Unknown names fall back to the
  *  identity surface ({} — kernel defaults everywhere) with a one-time-per-name
  *  warning, so a typo never degrades the compression prompts. Directory
  *  layout is host policy; resolution/sanitization is the kernel's. */
-export function resolveCompressSurface(
+export function resolveCompressSurfaceDetailed(
     s: CompressSettings,
     dirs?: { projectDir?: string; userDirs?: readonly string[] },
-): PackSurface {
+): SurfaceResolution {
     const name = s.promptPack;
-    if (typeof name !== "string" || name === "default" || !isValidPackName(name)) return {};
+    if (typeof name !== "string" || name === "default" || !isValidPackName(name)) return { surface: {}, packName: "default" };
     const resolver = createPackResolver(
         defaultPackSources({
             projectDir: dirs?.projectDir ?? path.join(process.cwd(), ".billion-context", "packs"),
@@ -141,9 +151,16 @@ export function resolveCompressSurface(
             warnedUnknownPack.add(name);
             loggerLog("warn", `[compress] promptPack "${name}" not found (project/user/builtin); using default surface`);
         }
-        return {};
+        return { surface: {}, packName: "default" };
     }
-    return pack.surface;
+    return { surface: pack.surface, packName: name, packVersion: pack.version };
+}
+
+export function resolveCompressSurface(
+    s: CompressSettings,
+    dirs?: { projectDir?: string; userDirs?: readonly string[] },
+): PackSurface {
+    return resolveCompressSurfaceDetailed(s, dirs).surface;
 }
 
 /** True when a CompressSettings carries at least one configured field (i.e. it
