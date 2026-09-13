@@ -188,6 +188,15 @@ export type CompressSettings = {
          *  dropped (default 2048). */
         threshold?: number;
     };
+    /** [#739] Opt-in guard against gpt-5.x/gpt-6.x "lattice" reasoning truncation
+     *  (reasoning stops at exactly base*n+offset tokens, default 518n-2 -> 516,
+     *  1034, ..., mid-thought). When engaged on a matched-model terminal round that
+     *  hits the lattice AND carries an encrypted_content blob, bili buffers the
+     *  response, replays its own reasoning plus a continue nudge (up to maxContinue
+     *  rounds), and folds to ONE response with true summed usage. Merged sub-field-wise
+     *  across the three levels like `absorb`/`reasoning`; off unless enabled at some
+     *  level. See src/reasoning-guard.ts. */
+    reasoningGuard?: ReasoningGuardConfig;
 };
 export type PromptCacheRouting = "auto" | "enabled" | "disabled";
 export type UpstreamProxyMode = "auto" | "manual" | "direct";
@@ -330,8 +339,6 @@ export type ProxyOptions = {
      *  hosts are TLS-terminated locally and fed back into the same request
      *  pipeline; all other hosts are blind-tunnelled. */
     mitm: { enabled: boolean; domains: string[] };
-    /** Opt-in gpt-5.x reasoning-truncation guard (#739). Default off. */
-    reasoningGuard?: ReasoningGuardConfig;
 };
 
 /** Re-read ONLY the routes from the current config sources, returning a fresh
@@ -471,7 +478,6 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
                 ...splitCsv(env.BILI_MITM_DOMAINS),
             ]),
         },
-        reasoningGuard: fileConfig.reasoningGuard,
     };
 }
 
@@ -511,8 +517,6 @@ type FileConfig = {
      *  upstreams accept (e.g. `{"developer":"system"}`) — applied to the
      *  final forwarded body for openai/responses requests (#552). */
     compat?: { roles?: Record<string, string> };
-    /** Opt-in gpt-5.x reasoning-truncation guard (#739). Default off. */
-    reasoningGuard?: ReasoningGuardConfig;
 };
 
 function nonEmpty(value: string | undefined): string | undefined {
@@ -704,6 +708,36 @@ export function parseCompressSettings(v: unknown): (CompressSettings & { injectT
     if ("promptPack" in obj && obj.promptPack !== undefined) {
         if (typeof obj.promptPack !== "string" || obj.promptPack.trim().length === 0) ok = false;
         else out.promptPack = obj.promptPack.trim();
+    }
+    if ("reasoningGuard" in obj && obj.reasoningGuard !== undefined) {
+        const rg = obj.reasoningGuard;
+        if (!rg || typeof rg !== "object" || Array.isArray(rg)) {
+            ok = false;
+        } else {
+            const rgo = rg as Record<string, unknown>;
+            const cleaned: ReasoningGuardConfig = {};
+            for (const key of ["enabled", "models", "maxContinue", "maxTierN", "markerText", "base", "offset", "debugLog"] as const) {
+                if (!(key in rgo)) continue;
+                const v = rgo[key];
+                if (key === "enabled") {
+                    if (typeof v !== "boolean") { ok = false; continue; }
+                    cleaned.enabled = v;
+                } else if (key === "debugLog") {
+                    if (typeof v !== "boolean") { ok = false; continue; }
+                    cleaned.debugLog = v;
+                } else if (key === "models") {
+                    if (!Array.isArray(v) || v.some((x) => typeof x !== "string")) { ok = false; continue; }
+                    cleaned.models = [...v] as string[];
+                } else if (key === "markerText") {
+                    if (typeof v !== "string" || v.trim().length === 0) { ok = false; continue; }
+                    cleaned.markerText = v.trim();
+                } else {
+                    if (typeof v !== "number" || !Number.isFinite(v)) { ok = false; continue; }
+                    (cleaned as Record<string, unknown>)[key] = v;
+                }
+            }
+            if (ok) out.reasoningGuard = cleaned;
+        }
     }
     if (!ok) return undefined;
     return out;

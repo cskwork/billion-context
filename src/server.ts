@@ -850,7 +850,6 @@ async function handle(
             opts.proxyFallback = fresh.proxyFallback;
             opts.compress = fresh.compress;
             opts.compat = fresh.compat;
-            opts.reasoningGuard = fresh.reasoningGuard;
             resetProxyCache();
             for (const k of Object.keys(opts.routes)) delete opts.routes[k];
             Object.assign(opts.routes, loadRoutes());
@@ -3804,8 +3803,7 @@ async function forward(
         }
         return;
     }
-    const rg = opts.reasoningGuard;
-    if (rg && prepared && prepared.protocol === "responses" && prepared.stream && !prepared.sidePassthrough && !prepared.compressInjected) {
+    if (prepared && prepared.protocol === "responses" && prepared.stream && !prepared.sidePassthrough && !prepared.compressInjected) {
         const sse = (upstream.headers.get("content-type") ?? "").includes("text/event-stream");
         if (sse) {
             let reqModel: string | undefined;
@@ -3814,7 +3812,8 @@ async function forward(
                 const parsed = JSON.parse(wb) as Record<string, unknown>;
                 if (typeof parsed.model === "string") reqModel = parsed.model;
             } catch { /* non-JSON body: guard stays off */ }
-            if (reasoningGuardEngages(rg, reqModel)) {
+            const rg = resolveCompress(opts.routes, upstreamUrl, reqModel, opts.compress).reasoningGuard;
+            if (rg && reasoningGuardEngages(rg, reqModel)) {
                 log("info", `[reasoning-guard] engaged model=${reqModel ?? "?"} session=${prepared.session?.id ?? "-"}`);
                 await runReasoningGuard({
                     firstResponse: upstream,
@@ -4253,7 +4252,6 @@ function handleConfigReload(opts: ProxyOptions, res: http.ServerResponse, log: (
     Object.assign(opts.routes, fresh);
     opts.compress = loadOptions().compress;
     opts.compat = loadOptions().compat;
-    opts.reasoningGuard = loadOptions().reasoningGuard;
     // Release cached ProxyAgents so agents for proxy URLs that were
     // removed/changed don't leak for the process lifetime. The next request
     // re-creates the needed agent lazily via proxyDispatcher().

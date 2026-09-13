@@ -257,3 +257,39 @@ test("parseCompressSettings: parses stripImages (bool) + stripImagesKeepRecent (
     assert.equal(parseCompressSettings({ stripImages: "yes" }), undefined);
     assert.equal(parseCompressSettings({ stripImagesKeepRecent: "many" }), undefined);
 });
+
+test("mergeCompress: reasoningGuard merges sub-field-wise deepest-wins (#739)", () => {
+    const merged = mergeCompress(
+        { reasoningGuard: { enabled: true, maxContinue: 3 } },
+        { reasoningGuard: { models: ["gpt-6"], maxContinue: 2 } },
+        { reasoningGuard: { maxTierN: 4 } },
+    );
+    assert.equal(merged.reasoningGuard?.enabled, true);
+    assert.deepEqual(merged.reasoningGuard?.models, ["gpt-6"]);
+    assert.equal(merged.reasoningGuard?.maxContinue, 2);
+    assert.equal(merged.reasoningGuard?.maxTierN, 4);
+});
+
+test("mergeCompress: reasoningGuard absent at all levels stays undefined", () => {
+    const merged = mergeCompress({ nudgeGrowthTokens: 50000 }, { tiers: false }, undefined);
+    assert.equal(merged.reasoningGuard, undefined);
+});
+
+test("parseCompressSettings: parses reasoningGuard sub-fields and rejects malformed (#739)", () => {
+    const ok = parseCompressSettings({
+        reasoningGuard: { enabled: true, models: ["gpt-5", "gpt-6"], maxContinue: 3, maxTierN: 6, markerText: " go ", base: 518, offset: -2, debugLog: true },
+    });
+    assert.equal(ok?.reasoningGuard?.enabled, true);
+    assert.deepEqual(ok?.reasoningGuard?.models, ["gpt-5", "gpt-6"]);
+    assert.equal(ok?.reasoningGuard?.maxContinue, 3);
+    assert.equal(ok?.reasoningGuard?.maxTierN, 6);
+    assert.equal(ok?.reasoningGuard?.markerText, "go");
+    assert.equal(ok?.reasoningGuard?.base, 518);
+    assert.equal(ok?.reasoningGuard?.offset, -2);
+    assert.equal(ok?.reasoningGuard?.debugLog, true);
+    assert.equal(parseCompressSettings({})?.reasoningGuard, undefined);
+    assert.equal(parseCompressSettings({ reasoningGuard: { enabled: "yes" } }), undefined);
+    assert.equal(parseCompressSettings({ reasoningGuard: { models: ["ok", 7] } }), undefined);
+    assert.equal(parseCompressSettings({ reasoningGuard: { base: "518" } }), undefined);
+    assert.equal(parseCompressSettings({ reasoningGuard: [] }), undefined);
+});
