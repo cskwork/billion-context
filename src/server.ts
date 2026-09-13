@@ -3101,8 +3101,14 @@ async function preflightCompressIfNeeded(
         const rangesClause = rangesLeft !== undefined ? `, with ${rangesLeft} compressible range(s) still visible` : "";
         // #736: when the wall is bili's own shrunken window, say so — "raise the
         // model context window" otherwise sends operators to the upstream when
-        // their compress.modelContextLimit is the actual ceiling.
-        const shrinkNote = resolvedNativeWindow !== undefined && limit < resolvedNativeWindow
+        // their compress.modelContextLimit is the actual ceiling. Gate on
+        // windowShrinkReason (set ONLY by the operator-override and codex-align
+        // paths) — NOT just on limit < resolvedNativeWindow: the per-request
+        // output-headroom reservation (reserveOutputHeadroom) also lowers
+        // reqConfig.modelContextLimit below native for every non-Anthropic turn
+        // with a max_tokens, so comparing alone would emit this note for a
+        // setting the operator never touched (#737 review).
+        const shrinkNote = windowShrinkReason !== undefined && resolvedNativeWindow !== undefined && limit < resolvedNativeWindow
             ? ` Note: bili's effective window ${limit} is below the model's full window ${resolvedNativeWindow} — ` +
                 (windowShrinkReason === "codex"
                     ? `it was aligned down to codex's own window perception; set compress.modelContextLimit explicitly if your upstream serves the larger window.`
@@ -3110,7 +3116,7 @@ async function preflightCompressIfNeeded(
             : "";
         const message =
             `${sizeClause} (model=${model})${rangesClause} ` +
-            `and preflight compression could not bring it under: ${detail}.` +
+            `and preflight compression could not bring it under: ${detail.replace(/\.\s*$/, "")}.` +
             imageNote +
             shrinkNote +
             ` The over-window payload was NOT forwarded.`;
