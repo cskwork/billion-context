@@ -190,6 +190,9 @@ interface V2PluginContext {
 
 const WINDOW_REFRESH_MS = 60000;
 
+// Kill switch = fully inert (same semantics as detectProxyBase): gates header stamping, tool forwarding, compaction reporting.
+const pluginDisabled = (): boolean => process.env.BILLION_CONTEXT_PLUGIN === "0";
+
 const V2_BILI_TOOLS = [...ACP_TOOLS_OPENAI, ABSORB_TOOL_OPENAI].map((t) => ({
     name: t.function.name,
     description: t.function.description,
@@ -242,7 +245,7 @@ const setup = async (ctx: V2PluginContext): Promise<() => void> => {
     };
 
     const httpRequestHook = async (e: V2HttpRequestEvent): Promise<void> => {
-        if (process.env.BILLION_CONTEXT_PLUGIN === "0") return;
+        if (pluginDisabled()) return;
         const url = e.request?.url;
         if (typeof url !== "string") return;
         if (!state.proxyBase) {
@@ -264,6 +267,7 @@ const setup = async (ctx: V2PluginContext): Promise<() => void> => {
                 input: t.input,
                 options: { codemode: false, permission: "allow" },
                 execute: async (args, tctx) => {
+                    if (pluginDisabled()) return { content: "bili: disabled (BILLION_CONTEXT_PLUGIN=0)" };
                     const base = state.proxyBase ?? proxyBaseFromEnv();
                     if (!base) return { content: "bili: no proxy detected (launch opencode through `bili opencode`, or point the provider baseURL at the bili proxy)" };
                     try {
@@ -283,7 +287,7 @@ const setup = async (ctx: V2PluginContext): Promise<() => void> => {
         void (async () => {
             try {
                 for await (const evt of subscription) {
-                    if (evt?.type !== "session.compaction.ended") continue;
+                    if (evt?.type !== "session.compaction.ended" || pluginDisabled()) continue;
                     const data = evt.data;
                     const cid = data && typeof data.sessionID === "string" ? data.sessionID : "";
                     const base = state.proxyBase ?? proxyBaseFromEnv();

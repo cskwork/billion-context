@@ -195,14 +195,25 @@ test("v2 setup: inert without proxy detection (tools present but no headers, no 
     });
 });
 
-test("v2 setup: kill switch stays inert even with /bili/ URL", async () => {
+test("v2 setup: kill switch stays inert even with /bili/ URL + proxy env", async () => {
+    const proxy = await startFakeProxyV2();
     const fake = makeFakeCtx();
-    await withEnv({ BILLION_CONTEXT_PROXY: undefined, BILLION_CONTEXT_PLUGIN: "0" }, async () => {
-        const cleanup = await biliOpencodePlugin.setup(fake.ctx as never);
-        const res = await fake.fireModelRequest({ sessionID: "s1", baseURL: "http://127.0.0.1:9/bili/http://upstream.example/v1" });
-        assert.deepEqual(res.headers, {});
-        cleanup();
-    });
+    try {
+        await withEnv({ BILLION_CONTEXT_PROXY: proxy.origin, BILLION_CONTEXT_PLUGIN: "0" }, async () => {
+            const cleanup = await biliOpencodePlugin.setup(fake.ctx as never);
+            try {
+                const res = await fake.fireModelRequest({ sessionID: "s1", baseURL: `${proxy.origin}/bili/http://upstream.example/v1` });
+                assert.deepEqual(res.headers, {});
+                const out = await fake.addedTools.find((t) => t.name === "compress")!.execute({ content: [] }, { sessionID: "s1" });
+                assert.match(out.content, /disabled \(BILLION_CONTEXT_PLUGIN=0\)/);
+                assert.equal(proxy.toolCalls.length, 0);
+            } finally {
+                cleanup();
+            }
+        });
+    } finally {
+        await proxy.close();
+    }
 });
 
 test("v2 setup: activates from /bili/ baseURL on round 1, stamps headers, forwards tools", async () => {

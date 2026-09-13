@@ -49,7 +49,9 @@ Native tool `execute(input)` → `forwardTool(proxyBase, sessionID, name, args)`
 and returns the result text; the agent returns `{ content }`. Because the
 header marks the session plugin-mode, the proxy suppresses wire-level ACP tool
 injection for these sessions (existing behavior, no change) — the model sees
-exactly one copy of each tool, the native one.
+exactly one copy of each tool, the native one. The kill switch
+(`BILLION_CONTEXT_PLUGIN=0`) gates `execute` too, alongside header stamping
+and compaction reporting — fully inert, matching `detectProxyBase` semantics.
 
 ## Native compaction boundary
 
