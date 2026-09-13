@@ -49,6 +49,8 @@ import {
     readTraeConfig,
     buildTraeEnv,
     TRAE_DEFAULT_MODEL_HOSTS,
+    buildJcodeEnv,
+    JCODE_DEFAULT_MODEL_HOSTS,
     resolveDshHome,
     prepareDshHome,
     writeDshAcpPatch,
@@ -106,6 +108,7 @@ test("isLaunchClient: pi/claude/codex/omp/opencode/pi-test true, others false", 
     assert.equal(isLaunchClient("dsh"), true);
     assert.equal(isLaunchClient("trae"), true);
     assert.equal(isLaunchClient("qoder"), true);
+    assert.equal(isLaunchClient("jcode"), true);
     assert.equal(isLaunchClient("pi-test"), true);
     assert.equal(isLaunchClient("start"), false);
     assert.equal(isLaunchClient(""), false);
@@ -3379,6 +3382,21 @@ test("buildTraeEnv: HTTPS_PROXY + SSL_CERT_FILE + BILLION_CONTEXT_PROXY, baseEnv
     assert.equal(env.SSL_CERT_FILE, "/tmp/ca.pem");
     assert.equal(env.BILLION_CONTEXT_PROXY, "http://127.0.0.1:8787");
     assert.equal(env.FOO, "bar");
+});
+
+test("buildJcodeEnv: HTTPS_PROXY + SSL_CERT_FILE + BILLION_CONTEXT_PROXY + NO_PROXY loopback, baseEnv preserved", () => {
+    const env = buildJcodeEnv("http://127.0.0.1:8787", "/tmp/ca.pem", { FOO: "bar" });
+    assert.equal(env.HTTPS_PROXY, "http://127.0.0.1:8787");
+    assert.equal(env.SSL_CERT_FILE, "/tmp/ca.pem");
+    assert.equal(env.BILLION_CONTEXT_PROXY, "http://127.0.0.1:8787");
+    assert.equal(env.NO_PROXY, "localhost,127.0.0.1,::1");
+    assert.equal(env.no_proxy, "localhost,127.0.0.1,::1");
+    assert.equal(env.FOO, "bar");
+});
+
+test("discoverRoutes: jcode whitelists the default zai host for cert-MITM", () => {
+    const routes = discoverRoutes("jcode", {});
+    assert.deepEqual(routes.httpsDomains, [...JCODE_DEFAULT_MODEL_HOSTS]);
 });
 
 test("resolveClientCommand: trae resolves `traecli`, falls back to `trae-cli` then `trae`", () => {

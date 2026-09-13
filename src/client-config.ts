@@ -419,6 +419,12 @@ export const TRAE_DEFAULT_MODEL_HOSTS = [
     "www.trae.cn",
 ];
 
+/** jcode (Rust harness) default model hosts, cert-MITM'd so `bili jcode`
+ *  compresses the zai leg. Loopback providers stay direct via NO_PROXY. */
+export const JCODE_DEFAULT_MODEL_HOSTS = [
+    "api.z.ai",
+];
+
 /** Trae CLI keeps its config under TRAE_CONFIG_DIR (default ~/.trae):
  *  traecli.yaml, skills, session state. */
 export function resolveTraeHome(env: NodeJS.ProcessEnv): string {
@@ -837,7 +843,7 @@ export function loadClientConfig(env: NodeJS.ProcessEnv, cwd: string): ClientCon
  *  launched client's own declarations are authoritative (#436: launching
  *  `bili omp` with omp's models.yml declaring 131072 must not be overridden by
  *  another client's larger declaration for the same model id). */
-export type ModelWindowScope = "claude" | "codex" | "pi" | "omp" | "opencode" | "hermes" | "dsh" | "codebuddy" | "qoder" | "trae";
+export type ModelWindowScope = "claude" | "codex" | "pi" | "omp" | "opencode" | "hermes" | "dsh" | "codebuddy" | "qoder" | "trae" | "jcode";
 
 /** Collect per-model context windows from client configs the launcher can
  *  read (pi models.json, omp models.yml, opencode opencode.json, codex
