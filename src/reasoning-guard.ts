@@ -18,14 +18,13 @@ export interface SseSink {
  *  518n-2 -> 516,1034,...) mid-thought. On a matched-model terminal round hitting
  *  the lattice AND carrying an encrypted_content blob, re-send replaying its own
  *  reasoning plus a nudge (up to N rounds), then fold into ONE response with true
- *  summed usage. Detection is data-driven (config); recovery is generic; the model
- *  list is pure scoping applied before detection (empty = all). Default off. */
+ *  summed usage. Detection is data-driven (config); recovery is generic. Scope is
+ *  expressed by WHERE the config sits in the three-level tree (global/provider/model);
+ *  the strict signature (exact lattice hit + encrypted_content + no tool calls) limits
+ *  actual action. Default off. */
 
 export interface ReasoningGuardConfig {
     enabled?: boolean;
-    /** Model prefixes to scope detection to. Default gpt-5.x / gpt-6.x.
-     *  Empty array = apply the signature to every model. */
-    models?: string[];
     /** Max continuation rounds after the initial round (default 3). */
     maxContinue?: number;
     /** Max lattice tier n allowed to continue (default 6); 0 = unlimited. */
@@ -39,14 +38,12 @@ export interface ReasoningGuardConfig {
     debugLog?: boolean;
 }
 
-const DEFAULT_MODELS = ["gpt-5", "gpt-6"];
 const MIN_N = 1;
 const DEFAULT_MARKER = "Continue thinking...";
 const ENC_INCLUDE = "reasoning.encrypted_content";
 const TERMINAL_TYPES = new Set(["response.completed", "response.failed", "response.incomplete"]);
 
 interface ResolvedGuard {
-    models: string[];
     maxContinue: number;
     maxTierN: number;
     markerText: string;
@@ -59,9 +56,7 @@ type Usage = Record<string, unknown>;
 
 export function resolveGuardConfig(cfg: ReasoningGuardConfig | undefined): ResolvedGuard {
     const c = cfg ?? {};
-    const models = Array.isArray(c.models) ? c.models.filter((m) => typeof m === "string" && m.length > 0) : DEFAULT_MODELS;
     return {
-        models,
         maxContinue: numOr(c.maxContinue, 3),
         maxTierN: numOr(c.maxTierN, 6),
         markerText: typeof c.markerText === "string" && c.markerText.trim() ? c.markerText.trim() : DEFAULT_MARKER,
@@ -75,13 +70,8 @@ function numOr(v: unknown, dflt: number): number {
     return typeof v === "number" && Number.isFinite(v) ? v : dflt;
 }
 
-/** Model filter applied BEFORE detection (pure scoping). Empty list = all. */
-export function reasoningGuardEngages(cfg: ReasoningGuardConfig | undefined, model: string | undefined): boolean {
-    if (!cfg?.enabled) return false;
-    if (!model) return false;
-    const r = resolveGuardConfig(cfg);
-    if (r.models.length === 0) return true;
-    return r.models.some((m) => m === model || model.startsWith(m));
+export function reasoningGuardEngages(cfg: ReasoningGuardConfig | undefined): boolean {
+    return cfg?.enabled === true;
 }
 
 export function reasoningTokens(usage: Usage | null | undefined): number | null {

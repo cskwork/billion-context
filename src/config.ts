@@ -716,7 +716,7 @@ export function parseCompressSettings(v: unknown): (CompressSettings & { injectT
         } else {
             const rgo = rg as Record<string, unknown>;
             const cleaned: ReasoningGuardConfig = {};
-            for (const key of ["enabled", "models", "maxContinue", "maxTierN", "markerText", "base", "offset", "debugLog"] as const) {
+            for (const key of ["enabled", "maxContinue", "maxTierN", "markerText", "base", "offset", "debugLog"] as const) {
                 if (!(key in rgo)) continue;
                 const v = rgo[key];
                 if (key === "enabled") {
@@ -725,9 +725,6 @@ export function parseCompressSettings(v: unknown): (CompressSettings & { injectT
                 } else if (key === "debugLog") {
                     if (typeof v !== "boolean") { ok = false; continue; }
                     cleaned.debugLog = v;
-                } else if (key === "models") {
-                    if (!Array.isArray(v) || v.some((x) => typeof x !== "string")) { ok = false; continue; }
-                    cleaned.models = [...v] as string[];
                 } else if (key === "markerText") {
                     if (typeof v !== "string" || v.trim().length === 0) { ok = false; continue; }
                     cleaned.markerText = v.trim();

@@ -38,17 +38,11 @@ test("inContinueWindow bounds the lattice tier", () => {
     assert.ok(!inContinueWindow(0, 6));
 });
 
-test("reasoningGuardEngages gates on enable/model/scope", () => {
-    assert.ok(!reasoningGuardEngages(undefined, "gpt-5.5"));
-    assert.ok(!reasoningGuardEngages({ enabled: false }, "gpt-5.5"));
-    assert.ok(!reasoningGuardEngages({ enabled: true }, undefined));
-    assert.ok(reasoningGuardEngages({ enabled: true }, "gpt-5.5"));
-    assert.ok(reasoningGuardEngages({ enabled: true }, "gpt-5.6-luna"));
-    assert.ok(reasoningGuardEngages({ enabled: true }, "gpt-6"));
-    assert.ok(reasoningGuardEngages({ enabled: true }, "gpt-6-sol"));
-    assert.ok(!reasoningGuardEngages({ enabled: true }, "gpt-4o"));
-    assert.ok(reasoningGuardEngages({ enabled: true, models: [] }, "anything-model"));
-    assert.ok(!reasoningGuardEngages({ enabled: true, models: ["claude"] }, "gpt-5.5"));
+test("reasoningGuardEngages gates on enabled only", () => {
+    assert.ok(!reasoningGuardEngages(undefined));
+    assert.ok(!reasoningGuardEngages({}));
+    assert.ok(!reasoningGuardEngages({ enabled: false }));
+    assert.ok(reasoningGuardEngages({ enabled: true }));
 });
 
 test("hasEncryptedContent inspects the last reasoning item", () => {

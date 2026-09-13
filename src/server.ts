@@ -3813,7 +3813,7 @@ async function forward(
                 if (typeof parsed.model === "string") reqModel = parsed.model;
             } catch { /* non-JSON body: guard stays off */ }
             const rg = resolveCompress(opts.routes, upstreamUrl, reqModel, opts.compress).reasoningGuard;
-            if (rg && reasoningGuardEngages(rg, reqModel)) {
+            if (rg && reasoningGuardEngages(rg)) {
                 log("info", `[reasoning-guard] engaged model=${reqModel ?? "?"} session=${prepared.session?.id ?? "-"}`);
                 await runReasoningGuard({
                     firstResponse: upstream,
