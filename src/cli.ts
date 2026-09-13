@@ -29,31 +29,7 @@ import { runMcpStdio } from "./mcp.js";
 import { PLUGIN_AGENTS, isPluginAgent, pluginInstall, pluginRemove, pluginStatusAll, type PluginAgent } from "./plugin-install.js";
 import { runLaunch, runTestPi, isLaunchClient, type ClientName } from "./launcher.js";
 import { exportSession } from "./export.js";
-import { readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
-import path from "node:path";
-
-const VERSION = (() => {
-    try {
-        // Works in both dev (tsx: src/cli.ts → ../package.json) and bundled
-        // (tsup: dist/index.js → ../package.json).
-        const here = fileURLToPath(import.meta.url);
-        const pkg = path.join(path.dirname(here), "..", "package.json");
-        return (JSON.parse(readFileSync(pkg, "utf8")).version as string) ?? "dev";
-    } catch {
-        return "dev";
-    }
-})();
-
-const PACKAGE_NAME = (() => {
-    try {
-        const here = fileURLToPath(import.meta.url);
-        const pkg = path.join(path.dirname(here), "..", "package.json");
-        return (JSON.parse(readFileSync(pkg, "utf8")).name as string) ?? "billion-context";
-    } catch {
-        return "billion-context";
-    }
-})();
+import { VERSION, PACKAGE_NAME } from "./version.js";
 
 const HELP = `bili ${VERSION} — billion-context proxy
 

@@ -2,7 +2,7 @@ import http from "node:http";
 import fs from "node:fs";
 import { randomUUID } from "node:crypto";
 import { createCore, type CompressionCore, type CompressionState, type Config, type CoreMessage, type NudgeDecision, type Prompts, type PackSurface, type ToolPrompts, applyAcpToolOverrides, defaultPrompts, defaultCountTokens, estimateTokensFast, renderNudgeText, deactivateBlock, viableRanges } from "acp-kernel";
-import { resolveCompress, resolveCompressPrompts, resolveCompressSurface, resolveRequestConfig } from "./compress-settings.js";
+import { resolveCompress, resolveCompressPrompts, resolveCompressSurfaceDetailed, resolveRequestConfig } from "./compress-settings.js";
 import { dropCompressReasoning, type CompressReasoningConfig } from "./reasoning-drop.js";
 import { DEFAULT_STRIP_IMAGES_KEEP_RECENT, stripHistoricalImages } from "./strip-images.js";
 import type { ProxyOptions } from "./config.js";
@@ -1099,6 +1099,7 @@ async function handle(
     // (kernel contract: renderNudgeText and the adapter prompt must match).
     let reqPrompts: Prompts = defaultPrompts;
     let reqSurface: PackSurface = {};
+    let reqSurfacePack = "default";
     if (parsed && typeof parsed === "object") {
         const model = (parsed as { model?: string }).model;
         if (model) {
@@ -1177,7 +1178,9 @@ async function handle(
             }
             const compressCfg = resolveCompress(opts.routes, embeddedUrl, model, opts.compress);
             reqPrompts = resolveCompressPrompts(compressCfg);
-            reqSurface = resolveCompressSurface(compressCfg);
+            const surfaceRes = resolveCompressSurfaceDetailed(compressCfg);
+            reqSurface = surfaceRes.surface;
+            reqSurfacePack = surfaceRes.packName;
         }
     }
     let prepared: Prepared | null = null;
@@ -1352,6 +1355,10 @@ async function handle(
             ? bodyIdentity.value
             : clientConversationHeader(req.headers);
         const session = getSession(sessionId, { protocol, upstreamOrigin, label: clientLabel ?? (anonAffinity ? "prefix-affinity" : undefined) });
+        // Audit stamp (#730 forensics): the effective pack for the most recent
+        // request (route/model can change it — latest wins). Persisted with the
+        // session so post-hoc forensics never needs config-mtime archaeology.
+        session.meta.activePack = reqSurfacePack;
         if (anonAffinity) {
             prefixAffinity.note(sessionId, anonAffinity.incomingDepth, anonAffinity.tailHash, anonAffinity.itemHashes);
             scheduleAffinityPersist();

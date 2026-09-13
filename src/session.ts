@@ -57,6 +57,12 @@ export type Session = {
          *  (truncated). Lets the web UI show "Fix auth bug" instead of a hash.
          *  Set once on the first request that has a user message. */
         title?: string;
+        /** Effective compress prompt pack for the most recent request
+         *  ("default" when none). Route/model can change it mid-session, so
+         *  this is stamped per request (latest wins) — persisted so post-hoc
+         *  forensics can tell which surface served the session without config
+         *  archaeology. */
+        activePack?: string;
     };
     /** Cumulative usage stats, summed across all requests. Each sample =
      *  one upstream usage report. Persisted; survives restart. */

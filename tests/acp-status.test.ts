@@ -125,3 +125,15 @@ test("#389: same-turn loop — acp_status after compress in one round shows live
         globalThis.fetch = orig;
     }
 });
+
+test("acp_status renders the ACTIVE SURFACE line from the session's pack stamp", () => {
+    const ctx = makeCtx12();
+    const unstamped = handleAcpStatus({}, ctx).split("\n").find((l) => l.startsWith("ACTIVE SURFACE:"));
+    assert.ok(unstamped?.includes("pack=default"), `unstamped session reports pack=default (got: ${unstamped})`);
+    const stamped = makeCtx12();
+    (stamped.session as { meta: { activePack?: string } }).meta.activePack = "lean";
+    const report = handleAcpStatus({}, stamped);
+    const line = report.split("\n").find((l) => l.startsWith("ACTIVE SURFACE:"));
+    assert.ok(line, "ACTIVE SURFACE line present once stamped");
+    assert.ok(line!.startsWith("ACTIVE SURFACE: pack=lean | host=billion-context "), `host identity rendered (got: ${line})`);
+});
