@@ -1,6 +1,7 @@
 import type { CoreMessage } from "acp-kernel";
 import { coreToResponses, injectResponsesDeveloperMessage, patchResponsesInput, type ResponseInputItem, type ResponsesProjection } from "acp-kernel/wire";
 import { buildVisibilityMarker } from "../compress-loop.js";
+import { hoistTrappedToolItems } from "../tool-pair-order.js";
 import { hashId } from "../util.js";
 import { composeStreamFilters, createMarkerLineFilter, createTagEchoFilter, stripResponsesText, containsMarkerLineText, containsRenderTagText, ACP_NAME_ALT } from "./tag-echo-filter.js";
 import { degenerateTurnWarning } from "../degenerate-turn.js";
@@ -288,6 +289,7 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
             } else {
                 inputItems = coreToResponses(coreMessages, customToolCallIds);
             }
+            inputItems = hoistTrappedToolItems(inputItems);
             const devParts = projection && projection.systemParts.length > 0
                 ? [...projection.systemParts, systemPrompt]
                 : [systemPrompt];
