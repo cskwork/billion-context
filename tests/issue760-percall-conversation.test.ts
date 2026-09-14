@@ -19,7 +19,7 @@ import { ACP_TOOLS_ANTHROPIC } from "../src/compress-tool.ts";
 // env/meta session channel, so the model supplies the target conversation per
 // tool call. Covered here: manifest schema, the proxy's injected id note,
 // first-call routing (peekSession fallback), unknown-id rejection, sticky
-// plugin-mode flip via identity-mode lazy registration, and the shim's
+// plugin-mode flip via successful-tool evidence, and the shim's
 // per-call routing / arg stripping / adoption guard.
 
 function listen(server: http.Server): Promise<void> {
@@ -336,24 +336,27 @@ test("shared shim, no env/meta id: per-call ids route two sessions independently
             assert.equal((t.inputSchema?.properties?.conversation_id as { type?: string } | undefined)?.type, "string", `shim exposes conversation_id on ${t.inputSchema ? "tool" : "unknown"}`);
         }
 
-        // Session A exists; first per-call tool call must route immediately
-        // (lazy identity registration rides along).
+        // Session A exists; first per-call tool call routes immediately via
+        // the canonical reverse lookup — the model copies the pfa-* id the
+        // proxy printed in A's note, not the raw client id.
         await postModel(rig, "conv-mcp-a");
-        h.send({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "acp_status", arguments: { conversation_id: "conv-mcp-a" } } });
+        h.send({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "acp_status", arguments: { conversation_id: canonicalOf("conv-mcp-a") } } });
         await waitFor(() => h.lines.some((l) => (JSON.parse(l) as { id?: number }).id === 3), "per-call acp_status(A)");
         const callA = byId(h.lines, 3) as { result?: { content?: { text?: string }[]; isError?: boolean } };
         assert.equal(callA.result?.isError, false, `per-call call routed to A${callA.result?.isError ? ": " + (callA.result?.content?.[0]?.text ?? "") : ""}`);
         assert.match(callA.result?.content?.[0]?.text ?? "", /CONTEXT BREAKDOWN/);
 
-        // A brand-new unrelated session lands BEFORE A's next request: a
-        // headless registration would have bound IT instead of A.
+        // An unrelated session lands between A's requests: the evidence-based
+        // flip touches ONLY the session whose own tool executed, so this one
+        // must NOT be flipped or routed to.
         await postModel(rig, "conv-other");
         await postModel(rig, "conv-mcp-a");
         await postModel(rig, "conv-mcp-b");
-        h.send({ jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "acp_status", arguments: { conversation_id: "conv-mcp-b" } } });
+        h.send({ jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "acp_status", arguments: { conversation_id: canonicalOf("conv-mcp-b") } } });
         // Await the tool result BEFORE B's next request: real agents only
-        // resume the model loop after the tool call returns, so the lazy
-        // registration always lands first — the test must mirror that order.
+        // resume the model loop after the tool call returns, and the
+        // evidence-based flip lands synchronously inside that call — the test
+        // must mirror that order.
         await waitFor(() => h.lines.some((l) => (JSON.parse(l) as { id?: number }).id === 4), "per-call acp_status(B)");
         await postModel(rig, "conv-mcp-b");
         const callB = byId(h.lines, 4) as { result?: { content?: { text?: string }[]; isError?: boolean } };
@@ -375,14 +378,14 @@ test("shared shim, no env/meta id: per-call ids route two sessions independently
         // Sticky plugin-mode flip, and the untouched sibling stays wire mode.
         const stA = await statusOf(rig, "conv-mcp-a");
         assert.equal(stA.ok, true);
-        assert.equal(stA.pluginAgent, "mcp", "A flipped to plugin mode via identity-mode lazy registration");
+        assert.equal(stA.pluginAgent, "mcp", "A flipped to plugin mode via successful-tool evidence");
         const stB = await statusOf(rig, "conv-mcp-b");
         assert.equal(stB.pluginAgent, "mcp", "B flipped independently");
         const stOther = await statusOf(rig, "conv-other");
-        assert.notEqual(stOther.pluginAgent, "mcp", "unrelated session NOT stolen by a headless registration");
+        assert.notEqual(stOther.pluginAgent, "mcp", "unrelated session NOT flipped (evidence flip touches only the session whose own tool ran)");
 
         // A repeat per-call call still routes to A.
-        h.send({ jsonrpc: "2.0", id: 5, method: "tools/call", params: { name: "acp_status", arguments: { conversation_id: "conv-mcp-a" } } });
+        h.send({ jsonrpc: "2.0", id: 5, method: "tools/call", params: { name: "acp_status", arguments: { conversation_id: canonicalOf("conv-mcp-a") } } });
         await waitFor(() => h.lines.some((l) => (JSON.parse(l) as { id?: number }).id === 5), "repeat per-call acp_status(A)");
         const callA2 = byId(h.lines, 5) as { result?: { isError?: boolean } };
         assert.equal(callA2.result?.isError, false, "repeat call still routes to A");
@@ -392,7 +395,7 @@ test("shared shim, no env/meta id: per-call ids route two sessions independently
     }
 });
 
-test("shim: per-call id strips the forwarded arg, registers identity-once, never adopts for per-call 404s", async () => {
+test("shim: per-call id strips the forwarded arg, routes on the body field, never registers or adopts for per-call ids", async () => {
     const posts: { url: string; body: Record<string, unknown> }[] = [];
     const mock = http.createServer((req, res) => {
         const chunks: Buffer[] = [];
@@ -444,17 +447,18 @@ test("shim: per-call id strips the forwarded arg, registers identity-once, never
         assert.equal(callX.result?.isError, false);
         assert.equal(callX.result?.content?.[0]?.text, "fine");
 
-        const regs = posts.filter((p) => p.url.startsWith("/__bili/plugin/register"));
-        assert.equal(regs.length, 1, "exactly one lazy registration");
-        assert.deepEqual(regs[0].body, { conversationId: "X", agent: "mcp", identity: true }, "identity-mode registration, never headless");
+        // No lazy registration for per-call ids anymore — the sticky flip comes
+        // from successful-tool evidence inside the call, not from a registration
+        // a raw-client-id request would never consume.
+        assert.equal(posts.filter((p) => p.url.startsWith("/__bili/plugin/register")).length, 0, "no lazy registration issued for a per-call id");
         const toolPost = posts.find((p) => p.url.startsWith("/__bili/plugin/tool"));
         assert.equal(toolPost?.body.conversationId, "X", "routes on the body-level field");
         assert.deepEqual(toolPost?.body.args, { extra: 1 }, "conversation_id stripped from the forwarded args");
 
-        // Issue-once: a repeat call issues no second registration.
+        // A repeat call still issues no registration.
         h.send({ jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "acp_status", arguments: { conversation_id: "X" } } });
         await waitFor(() => h.lines.some((l) => (JSON.parse(l) as { id?: number }).id === 4), "repeat per-call X");
-        assert.equal(posts.filter((p) => p.url.startsWith("/__bili/plugin/register")).length, 1, "registration issue-once");
+        assert.equal(posts.filter((p) => p.url.startsWith("/__bili/plugin/register")).length, 0, "still no registration after a repeat call");
 
         // Unknown per-call id fails loudly — no orphan adoption (which would
         // mutate the shared default binding for everyone else's calls).

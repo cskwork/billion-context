@@ -144,26 +144,6 @@ export async function forwardTool(tool: string, args: unknown, timeoutMs: number
     }
 }
 
-/** #760: lazy registration for a per-call conversation id. Always identity-
- *  mode: the id names an EXISTING conversation whose model requests carry the
- *  same value, so binding fires on that conversation's next request only —
- *  never headless (which would bind the NEXT new session, i.e. some other
- *  client's conversation, on a shared multi-session proxy). */
-async function ensureRegistered(conversationIdArg: string): Promise<void> {
-    if (registeredConversations.has(conversationIdArg)) return;
-    registeredConversations.add(conversationIdArg); // issue-once even if the fetch fails
-    try {
-        await fetch(`${resolveProxyOrigin()}/__bili/plugin/register`, {
-            method: "POST",
-            headers: { "content-type": "application/json" },
-            body: JSON.stringify({ conversationId: conversationIdArg, agent: "mcp", identity: true }),
-            signal: AbortSignal.timeout(5000),
-        });
-    } catch (err) {
-        process.stderr.write(`[bili-mcp] per-call registration of "${conversationIdArg}" failed: ${err instanceof Error ? err.message : String(err)}\n`);
-    }
-}
-
 /** One-shot recovery for a stale shim id (#656): resolve the proxy's
  *  most-recent ACTIVE conversation via the status endpoint's fallback=latest
  *  and adopt it for all subsequent tool calls. Returns true when an adoption
@@ -273,7 +253,6 @@ async function handleMessage(msg: {
                 return;
             }
             try {
-                if (perCall) await ensureRegistered(perCall);
                 const text = await forwardTool(tool, args, TOOL_TIMEOUT_MS, perCall || undefined);
                 sendResult(id, { content: [{ type: "text", text }], isError: false });
             } catch (err) {
