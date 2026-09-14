@@ -226,6 +226,23 @@ test("#408: pipePluginChatWithStrip — split-semantics openai usage keeps lastI
     });
 });
 
+test("#779: pipePluginChatWithStrip — DeepSeek top-level prompt_cache_hit_tokens counted (openai SSE)", async () => {
+    await withTempStore("pipe-ds-sse", async (_dir, store) => {
+        _setStoreForTest(store);
+        const session = makeSession("pipe-ds-sse");
+        const chunks: Buffer[] = [];
+        const res = makeRes(chunks);
+        const stream = streamOf([
+            `data: ${JSON.stringify({ id: "c1", object: "chat.completion.chunk", choices: [{ index: 0, delta: { content: "Hi" } }] })}\n\n`,
+            `data: ${JSON.stringify({ id: "c1", object: "chat.completion.chunk", choices: [], usage: { prompt_tokens: 42, completion_tokens: 7, total_tokens: 49, prompt_cache_hit_tokens: 30 } })}\n\n`,
+            "data: [DONE]\n\n",
+        ]);
+        await pipePluginChatWithStrip(stream, res, "openai", session);
+        assert.equal(session.stats.cachedTokens, 30, "DeepSeek hit tokens counted");
+        assert.equal(session.stats.cacheSamples, 1, "cache sample recorded");
+    });
+});
+
 test("#660: pipePluginResponsesWithStrip — response.completed usage forwarded verbatim", async () => {
     await withTempStore("pipe-resp", async (_dir, store) => {
         _setStoreForTest(store);
@@ -260,6 +277,26 @@ test("#660: pipePluginJson — openai JSON usage forwarded verbatim", async () =
         assert.equal(json.usage.prompt_tokens, 60000);
         assert.equal(json.usage.total_tokens, 60005);
         assert.equal(session.stats.lastInputTokens, 60000);
+    });
+});
+
+test("#779: pipePluginJson — DeepSeek top-level prompt_cache_hit_tokens counted (openai JSON)", async () => {
+    await withTempStore("pipe-ds-json", async (_dir, store) => {
+        _setStoreForTest(store);
+        const session = makeSession("pipe-ds-json");
+        const chunks: Buffer[] = [];
+        const res = makeRes(chunks);
+        const body = JSON.stringify({
+            id: "c1",
+            object: "chat.completion",
+            created: 1,
+            model: "deepseek-chat",
+            choices: [{ index: 0, message: { role: "assistant", content: "Hi" }, finish_reason: "stop" }],
+            usage: { prompt_tokens: 42, completion_tokens: 7, total_tokens: 49, prompt_cache_hit_tokens: 30 },
+        });
+        await pipePluginJson(streamOf([body]), res, session, "openai");
+        assert.equal(session.stats.cachedTokens, 30, "DeepSeek hit tokens counted");
+        assert.equal(session.stats.cacheSamples, 1, "cache sample recorded");
     });
 });
 

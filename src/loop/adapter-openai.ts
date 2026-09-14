@@ -116,6 +116,17 @@ function stripFinishReasonChunk(buf: Buffer): Buffer {
     }
 }
 
+// OpenAI-wire upstreams disagree on where the cached-prompt count lives: the
+// standard field is prompt_tokens_details.cached_tokens, while DeepSeek reports
+// KV-cache hits as top-level prompt_cache_hit_tokens (#779). Both mean "input
+// tokens served from cache", so normalize to one number.
+function openaiCachedTokens(u: Record<string, unknown>): number | undefined {
+    const pd = u.prompt_tokens_details as Record<string, unknown> | undefined;
+    if (typeof pd?.cached_tokens === "number") return pd.cached_tokens;
+    if (typeof u.prompt_cache_hit_tokens === "number") return u.prompt_cache_hit_tokens;
+    return undefined;
+}
+
 export function createOpenaiAdapter(requestBody: Record<string, unknown>, clientSystem?: string, absorbName?: string): CompressLoopAdapter {
     const model = (requestBody.model as string) ?? "unknown";
     let responseId = `chatcmpl-proxy-${Date.now()}`;
@@ -327,12 +338,11 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
                 if (!choice) {
                     if (parsed.usage) {
                         const u = parsed.usage as Record<string, unknown>;
-                        const pd = u.prompt_tokens_details as Record<string, unknown> | undefined;
                         yield {
                             kind: "usage",
                             inputTokens: typeof u.prompt_tokens === "number" ? u.prompt_tokens : undefined,
                             outputTokens: typeof u.completion_tokens === "number" ? u.completion_tokens : undefined,
-                            cachedTokens: typeof pd?.cached_tokens === "number" ? pd.cached_tokens : undefined,
+                            cachedTokens: openaiCachedTokens(u),
                         } as ParsedStreamEvent;
                         // #589: include_usage clients (dsh, OpenAI SDK) read usage
                         // from this trailing empty-choices frame; raw tool-call rounds
@@ -352,12 +362,11 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
                     const hadToolCalls = [...pending.values()].some((tc) => tc.name.length > 0 || tc.id.length > 0);
                     yield* settleToolCalls();
                     const u = parsed.usage as Record<string, unknown> | undefined;
-                    const pd = u?.prompt_tokens_details as Record<string, unknown> | undefined;
                     yield {
                         kind: "usage",
                         inputTokens: typeof u?.prompt_tokens === "number" ? u.prompt_tokens : undefined,
                         outputTokens: typeof u?.completion_tokens === "number" ? u.completion_tokens : undefined,
-                        cachedTokens: typeof pd?.cached_tokens === "number" ? pd.cached_tokens : undefined,
+                        cachedTokens: u ? openaiCachedTokens(u) : undefined,
                     } as ParsedStreamEvent;
                     if (sawRealToolCall) {
                         // The raw finish chunk (provider-measured usage) reaches

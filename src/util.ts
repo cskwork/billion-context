@@ -51,7 +51,9 @@ export type WireProtocol = "anthropic" | "openai" | "responses";
  *     (`cache_read_input_tokens`) and cache-write (`cache_creation_input_tokens`)
  *     portions are reported as separate fields.
  *   - OpenAI Chat: `prompt_tokens` is the TOTAL — it ALREADY includes the
- *     `prompt_tokens_details.cached_tokens` subset.
+ *     `prompt_tokens_details.cached_tokens` subset (DeepSeek-style upstreams
+ *     carry that subset as top-level `prompt_cache_hit_tokens`; both are
+ *     normalized here, #779).
  *   - Responses: `input_tokens` is the TOTAL — it ALREADY includes the
  *     `input_tokens_details.cached_tokens` subset.
  *
@@ -79,7 +81,9 @@ export function usageTotals(
     }
     if (protocol === "openai") {
         const prompt = num(usage["prompt_tokens"]);
-        const cached = num((usage["prompt_tokens_details"] as Record<string, unknown> | undefined)?.["cached_tokens"]);
+        // #779: DeepSeek-style upstreams carry the cached subset as top-level
+        // prompt_cache_hit_tokens instead of prompt_tokens_details.cached_tokens.
+        const cached = num((usage["prompt_tokens_details"] as Record<string, unknown> | undefined)?.["cached_tokens"]) ?? num(usage["prompt_cache_hit_tokens"]);
         return {
             total: prompt !== undefined ? promptInputTotal("openai", prompt, cached) : undefined,
             cached,
