@@ -241,7 +241,10 @@ MITM, …) see the web UI guide at [http://localhost:8787](http://localhost:8787
 
 OpenCode 2.0 ships a new plugin API (`@opencode/plugin`); the standalone
 `opencode-acp` extension is V1-only and does not load under 2.0. Both bili
-modes work on 2.0 (verified against a 2.0 pre-release build):
+modes work on 2.0. The 2.x plugin API surface is still moving between builds
+(adjacent npm `dev`-channel builds expose different `ctx` shapes), so the
+hook/tool details below are version-specific observations, not a stable
+contract:
 
 - **Launcher:** `bili opencode` works unchanged. On a 2.0 host it injects the
   built-in V2 plugin (`dist/agent/opencode.js`), which registers the bili
@@ -249,7 +252,12 @@ modes work on 2.0 (verified against a 2.0 pre-release build):
   acp_status (+ absorb), JSON-Schema inputs — and stamps the proxy headers on
   every outgoing provider request, so compression runs in plugin mode with no
   wire-level tool injection. Native auto-compaction is disabled automatically
-  (`compaction.auto: false`).
+  (`compaction.auto: false`). Every registration is defensive (optional
+  chaining): on any 2.x build where a seam is missing or never fires, the
+  plugin stays inert and the session transparently runs in plain proxy mode
+  (wire-level tool injection) instead of breaking — observed on two adjacent
+  `dev` builds (2026-09-13 / 2026-09-14) whose API surfaces differ from each
+  other (#754 review probes).
 - **Pure proxy:** point the provider baseURL at the proxy like any other
   client:
 
@@ -270,11 +278,17 @@ modes work on 2.0 (verified against a 2.0 pre-release build):
   Note: 2.0 AI-SDK providers require an `apiKey` field even for local
   endpoints that never check it — set any non-empty value.
 
-Caveats: the 2.0 command API only exposes list/get/update/remove, so plugins
-cannot add commands — there is no `/acp` under 2.0; call the `acp_status`
-tool instead. The bundled agent file keeps the V1 `server()` export alongside
-the V2 `setup()`, so the same artifact also loads on hosts ≥ 1.18.29 that
-support dual-shape plugins.
+Caveats: no 2.x build observed so far exposes an add-command entry point
+(the command editor has been list/get/update/remove-shaped on one pre-release
+and list/transform/reload-shaped on others), so plugins cannot create
+commands — there is no `/acp` under 2.0; call the `acp_status` tool instead.
+The bundled agent file keeps the V1 `server()` export alongside the V2
+`setup()`, so the same artifact also loads on hosts ≥ 1.18.29 that support
+dual-shape plugins. Design note: the V2 plugin is a thin protocol client (no
+acp-kernel inside) because the proxy stays the single compression authority,
+which eliminates kernel-version drift between agent and proxy — it does not
+rely on the plugin API being unable to mutate context (that capability varies
+by 2.x build).
 
 ### Verify
 

@@ -134,19 +134,27 @@ const server = async (ctx: OpencodePluginContext): Promise<OpencodeHooks> => {
 // stays loadable under both host generations via the object export below
 // (V2 validates `{ id, setup }`; V1 >= 1.18.29 calls `.server()`).
 //
-// Runtime API facts (OpenCode 2.0 pre-release, probed live against the real
-// binary — these CONTRADICT the published @opencode/plugin@2.0.2 typings):
-// - session.hook("model.request") registers successfully but NEVER FIRES; the
-//   working interception point is session.hook("http.request"), which fires
-//   per outgoing provider request with a standard fetch Request at e.request
-//   (mutating e.request.headers reaches the wire — verified end-to-end);
-// - there is NO ctx.tool.reload() — host replays transforms on its own reload
-//   events, so tools must be registered SYNCHRONOUSLY from bundled schemas
-//   (exact parity: this file and the proxy's openai tool list are built from
-//   the same source, src/compress-tool.ts);
-// - the command editor exposes list/get/update/remove only — plugins cannot
-//   ADD commands, so /acp does not exist under V2; the acp_status tool is the
-//   in-host equivalent.
+// Runtime API facts — VERSION-SPECIFIC (the 2.x plugin surface changes between
+// builds; do not generalize beyond the build named):
+// - next-17444 pre-release (probed live by the author): model.request registers
+//   but NEVER FIRES; http.request fires per outgoing provider request with a
+//   fetch Request at e.request (mutating e.request.headers reaches the wire);
+//   NO ctx.tool.reload(); command editor list/get/update/remove only (no ADD —
+//   hence no /acp under V2; acp_status tool is the in-host equivalent).
+// - 2.0.1 stable (reported via #754 review with repro script; awaiting
+//   artifact provenance for exact re-probe): model.request / http.request /
+//   context hooks all fire and reach the wire; ctx.tool = {reload, transform,
+//   hook}; ctx.command = {list, transform, reload} (still no ADD entry point).
+// - npm dev builds 2026-09-13 / 2026-09-14 (probed live during #754 review):
+//   first loads plugins via V1 server() only; second exposes setup() but has
+//   no ctx.session / ctx.tool at all. Adjacent dev builds disagree with each
+//   other and with both of the above.
+// Consequence: every registration below uses optional chaining so the plugin
+// is inert-safe on any surface; when no seam fires, sessions transparently run
+// in proxy mode (wire-level tool injection) instead of failing. Tools stay
+// registered synchronously from bundled schemas (exact parity with the proxy's
+// openai tool list, src/compress-tool.ts) because reload-based refresh is not
+// available on all observed surfaces.
 // ---------------------------------------------------------------------------
 
 type V2Registration = { dispose?: () => void | Promise<void> };

@@ -67,3 +67,36 @@ and disposes every registration.
 `prepareOpencodeHttpRewrite` merges `compaction.auto: false` into the temp
 config (preserving any user-set sibling keys). Verified tolerant on V1 1.14.46
 (unknown top-level key ignored), so no version detection is needed.
+
+## Addendum 2026-09-14 — API-surface drift (PR #754 review)
+
+External report (@jensenojs, #754 thread, with repro script `v2probe.sh`): on
+**2.0.1 stable** all four "runtime facts" above from the next-17444
+pre-release invert or shift — `model.request` fires; `ctx.tool = {reload,
+transform, hook}`; `ctx.command = {list, transform, reload}`; and `context`
+mutation reaches the wire. Provenance of that binary is not on any public
+channel checked (npm `opencode-ai` has no 2.x versions under any package name;
+GitHub releases ≤ v1.18.30) — exact re-probe pending an artifact identifier.
+
+Independent probes during review (local LLM upstream, hermetic HOME):
+
+| build | plugin entry | ctx.session | ctx.tool | hooks fired | bili outcome |
+|---|---|---|---|---|---|
+| next-17444 pre-release (author) | setup() | yes | no reload | http.request only | plugin mode (author's Live ②) |
+| npm dev 2026-09-13 (`0.0.0-dev-202609132139`) | V1 server() only | n/a | n/a | n/a | proxy-mode fallback (zero `[plugin]`, one `[acp-loop]`) |
+| npm dev 2026-09-14 (`0.0.0-dev-202609140717`) | setup() | **absent** (ctx = options,agent,aisdk,catalog,command,integration,plugin,reference,skill) | absent | none (cannot register) | proxy-mode fallback (same log signature) |
+
+Consequences applied:
+
+1. README + this file now state the facts as version-specific observations,
+   not general V2 behavior.
+2. The thin-shell rationale was re-based: single compression authority +
+   kernel-version-drift elimination, NOT "plugins cannot mutate context"
+   (that capability varies by build).
+3. No code change required — every registration already uses optional
+   chaining (inert-safe); new test pins `setup({})` resolving cleanly. The
+   graceful-degradation path (no seam → transparent proxy mode) is now
+   empirically verified on two adjacent builds.
+4. `/acp` conclusion survives: no observed 2.x build exposes an add-command
+   entry point (both list/get/update/remove and list/transform/reload shapes
+   lack one).

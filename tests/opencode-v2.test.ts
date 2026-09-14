@@ -195,6 +195,12 @@ test("v2 setup: inert without proxy detection (tools present but no headers, no 
     });
 });
 
+test("v2 setup: inert-safe when the host exposes none of the V2 seams", async () => {
+    const cleanup = await biliOpencodePlugin.setup({} as never);
+    assert.equal(typeof cleanup, "function");
+    cleanup();
+});
+
 test("v2 setup: kill switch stays inert even with /bili/ URL + proxy env", async () => {
     const proxy = await startFakeProxyV2();
     const fake = makeFakeCtx();
