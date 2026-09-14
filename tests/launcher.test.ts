@@ -3597,7 +3597,9 @@ test("resolveClientCommand: kimi resolves `kimi` on PATH, falls back to <home>/b
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-kimi-bin-"));
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-kimi-home-"));
     const prevHome = process.env.HOME;
+    const prevUserProfile = process.env.USERPROFILE;
     process.env.HOME = home;
+    if (prevUserProfile !== undefined) process.env.USERPROFILE = home;
     try {
         const env: NodeJS.ProcessEnv = { PATH: dir };
         assert.deepEqual(resolveClientCommand("kimi", env), { command: path.join(home, ".kimi-code", "bin", "kimi"), prefixArgs: [] });
@@ -3609,6 +3611,8 @@ test("resolveClientCommand: kimi resolves `kimi` on PATH, falls back to <home>/b
     } finally {
         if (prevHome === undefined) delete process.env.HOME;
         else process.env.HOME = prevHome;
+        if (prevUserProfile === undefined) delete process.env.USERPROFILE;
+        else process.env.USERPROFILE = prevUserProfile;
         fs.rmSync(dir, { recursive: true, force: true });
         fs.rmSync(home, { recursive: true, force: true });
     }
