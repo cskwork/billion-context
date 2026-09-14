@@ -1838,8 +1838,10 @@ test("opencodeMajorVersion: parses --version output, defaults to 1 on failure", 
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "oc-ver-"));
     try {
         const mk = (name: string, out: string): string => {
-            const f = path.join(dir, name);
-            fs.writeFileSync(f, `#!/bin/sh\necho "${out}"\n`);
+            // win32 cannot exec shebang scripts; .cmd files spawn natively via cmd.exe
+            const win = process.platform === "win32";
+            const f = path.join(dir, win ? name.replace(/\.sh$/, ".cmd") : name);
+            fs.writeFileSync(f, win ? `@echo off\r\necho ${out}\r\n` : `#!/bin/sh\necho "${out}"\n`);
             fs.chmodSync(f, 0o755);
             return f;
         };
