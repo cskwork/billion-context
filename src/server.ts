@@ -49,7 +49,7 @@ import { applyAbsorbView, absorbEnabled, absorbToolName, storeEffectiveAbsorb } 
 import { rewriteJsonResponse, type RewriteCtx } from "./stream.js";
 import { applyRanges } from "./stream.js";
 import { preflightCompress, estimateCoreMessages, estimateRawBodyTokens, estimateCoreMessagesUpper, type PreflightResult } from "./preflight.js";
-import { imageTokensInRawBody, imageTokensInParsedBody } from "./image-tokens.js";
+import { imageTokensInRawBody, imageTokensInParsedBody, resolveImageBilling, type ResolvedImageBilling } from "./image-tokens.js";
 import { renderUI, handleConfigGet, handleConfigPut } from "./web/index.js";
 import { reapOrphanBlocks } from "./orphan-gc.js";
 import { getStore } from "./persist.js";
@@ -57,6 +57,7 @@ import { log as loggerLog, configureLogger, getLogPath, closeLogger } from "./lo
 import { configFile, defaultLogFile, stateDir } from "./paths.js";
 import { atomicWriteInstanceFile, clearProxyInstanceFile, isPidAlive, registerInstanceAndWarn, unregisterInstance } from "./instance.js";
 import { compressLoopResponsesJson } from "./compress-loop-responses.js";
+import { hoistTrappedToolItems } from "./tool-pair-order.js";
 import { runCompressLoop, pickAdapter } from "./loop/index.js";
 import { containsToolCallXmlFragment } from "./loop/tag-echo-filter.js";
 import { isFakeCompletion, injectFakeCompletionHint, maxFakeCompletionRetries, fakeBufCap } from "./fake-completion.js";
@@ -718,14 +719,26 @@ export function sideRequestGuard(
     protocol: WireProtocol,
     modelContextLimit: number,
     learnedLimit: number | undefined,
+    imageBilling: ResolvedImageBilling = "bytes",
 ): { blocked: boolean; estimate: number; limit: number } {
     let limit = modelContextLimit;
     if (typeof learnedLimit === "number" && learnedLimit > 0 && learnedLimit < limit) limit = learnedLimit;
     const field = outputBudgetField(parsed);
     const maxOut = field ? ((parsed as Record<string, unknown>)[field] as number) : 0;
     if (limit > 0 && shouldReserveOutputHeadroom(protocol)) limit = reserveOutputHeadroom(limit, maxOut);
-    const estimate = estimateRawBodyTokens(parsed) + imageTokensInParsedBody(protocol, parsed);
+    const estimate = estimateRawBodyTokens(parsed) + imageTokensInParsedBody(protocol, parsed, imageBilling);
     return { blocked: limit > 0 && estimate >= limit * SIDE_REQUEST_GUARD_TOLERANCE, estimate, limit };
+}
+
+// #767: per-request image billing mode — env BILI_IMAGE_BILLING (live, like
+// BILI_IMAGE_TOKEN_CAP) wins over the per-provider route entry, which wins over
+// the global config level; "auto"/unset classifies known first-party pixel-tile
+// hosts by upstream URL. Every payload-size decision below consults this so one
+// over-estimate cannot block all of them at once.
+function imageBillingFor(opts: ProxyOptions, upstreamUrl: string | undefined): ResolvedImageBilling {
+    const env = process.env.BILI_IMAGE_BILLING;
+    const configured = env === "pixels" || env === "bytes" ? env : findRoute(opts.routes, upstreamUrl)?.imageBilling ?? opts.imageBilling ?? "auto";
+    return resolveImageBilling(configured, upstreamUrl);
 }
 
 function isTrustedAdminOrigin(origin: string | undefined, host: string | undefined, trustedHosts: Set<string>): boolean {
@@ -1449,7 +1462,7 @@ async function handle(
             // then scalar) — the learner now writes the confirmed channel, so the
             // legacy direct map read would miss windows learned from real 400s.
             const learnedLimit = resolveLearnedLimit(session, reqModel);
-            const guard = sideRequestGuard(parsed, protocol, reqConfig.modelContextLimit, learnedLimit);
+            const guard = sideRequestGuard(parsed, protocol, reqConfig.modelContextLimit, learnedLimit, imageBillingFor(opts, route?.rewrittenUrl ?? upstreamOrigin));
             if (guard.blocked) {
                 log("warn", `[${session.id}] side request (~${guard.estimate} tokens) ≥ effective window ${guard.limit} (model=${reqModel ?? "?"}) — NOT forwarded: guaranteed upstream 400 (side requests bypass preflight by design, #388)`);
                 if (!res.headersSent && !res.writableEnded && !res.destroyed) {
@@ -1604,20 +1617,20 @@ async function handle(
                         : protocol === "anthropic"
                           ? prepareAnthropic(work as AnthropicRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, upstreamOrigin, reasoningCfg)
                           : protocol === "openai"
-                             ? prepareOpenai(work as OpenAIRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, upstreamOrigin, nativeWindow, reasoningCfg)
+                              ? prepareOpenai(work as OpenAIRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, upstreamOrigin, nativeWindow, reasoningCfg, route?.rewrittenUrl)
                              : responsesCompact
                                 // #618 review nit: when no bili compaction item is present,
                                 // prepareResponsesCompact falls back to the raw bodyBuffer — forward
                                 // the re-serialized post-strip work instead so dropped images don't
                                 // ride along. Unchanged bodies keep the original buffer byte-identical.
                                 ? prepareResponsesCompact(stripped.removed > 0 ? Buffer.from(JSON.stringify(work)) : bodyBuffer, work as ResponsesRequestBody, session, req, core, reqConfig, log)
-                               : prepareResponses(work as ResponsesRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, responsesIdentity!, pluginMode, upstreamOrigin, nativeWindow, reasoningCfg);
+                                : prepareResponses(work as ResponsesRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, responsesIdentity!, pluginMode, upstreamOrigin, nativeWindow, reasoningCfg, route?.rewrittenUrl);
                 };
                 // #332: codex's native remote-compaction request (trigger form)
                 // is dispatched BEFORE prepare/preflight. When it is not
-                // intercepted, the upstream must receive exactly what codex
-                // sent: a preflight-compressed/rebuilt payload diverges from
-                // codex's local history, non-OpenAI backends 400 the
+                // intercepted, preserve what codex sent except for local bili
+                // compaction markers: a preflight-compressed/rebuilt payload
+                // diverges from codex's local history, non-OpenAI backends 400 the
                 // compaction_trigger item, and folding bili's state as a side
                 // effect of handling codex's own compaction is wrong.
                 const isCodexCompactTrigger =
@@ -1634,9 +1647,16 @@ async function handle(
                         rememberPluginMessages(sessionId, prepared.processedMessages, prepared.originalMessages, prepared.nudge);
                         return;
                     }
+                    // runPrepare may have mutated parsed before failing to forge.
+                    // Normalize the original wire input only: fc_bili_* records
+                    // are local summaries, not valid upstream compaction items.
+                    const original = JSON.parse(bodyBuffer.toString("utf8")) as ResponsesRequestBody;
+                    const { items, replaced, dropped } = replaceBiliCompactionItems(Array.isArray(original.input) ? original.input : []);
+                    const normalized = replaced + dropped > 0;
+                    const forwardBody = normalized ? Buffer.from(JSON.stringify({ ...original, input: items })) : bodyBuffer;
                     const why = mode !== "intercept" ? "BILI_CODEX_COMPACT=pass" : !gatePre ? "gate preconditions not met" : "transform/forge failed";
-                    log("info", `[${session.id}] codex compaction_trigger request not intercepted (${why}) — forwarding verbatim (no preflight, no rebuild, no window clamp)`);
-                    await forward(req, res, opts, bodyBuffer, null, core, reqConfig, log, route, instanceId, affinity);
+                    log("info", `[${session.id}] codex compaction_trigger request not intercepted (${why}) — forwarding ${normalized ? `with bili summaries normalized (replaced=${replaced}, dropped=${dropped})` : "verbatim"} (no preflight, no rebuild, no window clamp)`);
+                    await forward(req, res, opts, forwardBody, null, core, reqConfig, log, route, instanceId, affinity);
                     return;
                 }
                 prepared = runPrepare();
@@ -2203,6 +2223,7 @@ function prepareOpenai(
     upstreamOrigin: string,
     nativeWindow: number,
     reasoning: CompressReasoningConfig | undefined,
+    billingUpstream?: string,
 ): Prepared {
     const sessionId = session.id;
     const stream = parsed.stream === true;
@@ -2316,7 +2337,7 @@ function prepareOpenai(
 
     const rebuilt: OpenAIRequestBody = { ...parsed, messages: rebuiltMessages, tools: toolsOut as OpenAITool[] | undefined };
     warnReasoningPairs(rebuiltMessages, log, sessionId);
-    clampOutgoingOutput(rebuilt as Record<string, unknown>, typeof (parsed as Record<string, unknown>).max_completion_tokens === "number" ? "max_completion_tokens" : "max_tokens", { systemText: openaiSystemText, tools: toolsOut, processedMessages, lastInputTokens: session.stats.lastInputTokens, nativeWindow, imageTokens: imageTokensInParsedBody("openai", rebuilt) }, sessionId, log);
+    clampOutgoingOutput(rebuilt as Record<string, unknown>, typeof (parsed as Record<string, unknown>).max_completion_tokens === "number" ? "max_completion_tokens" : "max_tokens", { systemText: openaiSystemText, tools: toolsOut, processedMessages, lastInputTokens: session.stats.lastInputTokens, nativeWindow, imageTokens: imageTokensInParsedBody("openai", rebuilt, imageBillingFor(opts, billingUpstream ?? upstreamOrigin)) }, sessionId, log);
     // prompt_cache_retention is an OpenAI-host-only cache directive; the dsh
     // launcher forces PI_CACHE_RETENTION=long (for the session-id
     // prompt_cache_key) which makes the client also emit it. Third-party
@@ -2359,6 +2380,7 @@ function prepareResponses(
     upstreamOrigin: string,
     nativeWindow: number,
     reasoning: CompressReasoningConfig | undefined,
+    billingUpstream?: string,
 ): Prepared {
     const sessionId = session.id;
     const stream = parsed.stream === true;
@@ -2464,6 +2486,7 @@ function prepareResponses(
         processedMessages = repairResponsesAssistantOrdering(stripReasoning(stripKernelSummaries(turn.messages, turn.state)), originalMessages);
         reapOrphanBlocks(session, msgs, deactivateBlock);
         rebuiltInput = patchResponsesInput(projection, processedMessages);
+        if (Array.isArray(rebuiltInput)) rebuiltInput = hoistTrappedToolItems(rebuiltInput);
         // Fallback path: when the echo did NOT come back this turn (client
         // dropped it / restarted), the history-borne handoff is absent and the
         // forge-time captured summaries are re-injected into the developer
@@ -2551,7 +2574,7 @@ function prepareResponses(
     const rebuilt: ResponsesRequestBody = { ...parsed, input: rebuiltInput, tools: toolsOut };
     warnResponsesReasoningPairs(Array.isArray(rebuiltInput) ? rebuiltInput : [], log, sessionId);
     if (!isCompactionTrigger) {
-        clampOutgoingOutput(rebuilt as Record<string, unknown>, "max_output_tokens", { systemText: (responsesProjection?.systemParts ?? []).join("\n"), tools: toolsOut, processedMessages, lastInputTokens: session.stats.lastInputTokens, nativeWindow, imageTokens: imageTokensInParsedBody("responses", rebuilt) }, sessionId, log);
+        clampOutgoingOutput(rebuilt as Record<string, unknown>, "max_output_tokens", { systemText: (responsesProjection?.systemParts ?? []).join("\n"), tools: toolsOut, processedMessages, lastInputTokens: session.stats.lastInputTokens, nativeWindow, imageTokens: imageTokensInParsedBody("responses", rebuilt, imageBillingFor(opts, billingUpstream ?? upstreamOrigin)) }, sessionId, log);
     }
     // Route with the upstream THIS request goes to — session.meta.upstreamOrigin
     // is first-wins and would keep injecting pck toward a relay we switched
@@ -2727,11 +2750,12 @@ function prepareResponsesCompact(
         }
         const viewed = applyAbsorbView(turn.messages, turn.state, compactConfig, session.stats.lastInputTokens);
         const processed = repairResponsesAssistantOrdering(stripKernelSummaries(viewed, turn.state), projection.msgs);
-        const output = patchResponsesInput(projection, processed);
+        let output = patchResponsesInput(projection, processed);
         if (typeof output === "string") {
             session.state = prevState;
             return base;
         }
+        output = hoistTrappedToolItems(output);
         snapshotMessages(session, projection.msgs);
         markDirty(session);
         log("info", `[${session.id}] codex compact intercepted (endpoint); forged history with ${output.length} item(s), upstream not contacted`);
@@ -3076,7 +3100,10 @@ async function preflightCompressIfNeeded(
     // trigger on the real post-fold payload too.
     // #488: images are forwarded verbatim but invisible to the kernel's text model —
     // add their cost to every size decision here (trigger, fit gates, self-heal).
-    const imageTokens = imageTokensInRawBody(prepared.protocol, prepared.body);
+    // #767: bill them by the resolved mode (same upstream-URL fallback as buildForwardTarget).
+    const preflightReqUrl = req.url ?? "";
+    const billingUpstream = route?.rewrittenUrl ?? (/^https?:\/\//i.test(preflightReqUrl) ? preflightReqUrl : opts.upstream);
+    const imageTokens = imageTokensInRawBody(prepared.protocol, prepared.body, imageBillingFor(opts, billingUpstream));
     const textEstimate = estimateCoreMessages(prepared.processedMessages);
     // #470: system + tool definitions ride the wire too but are invisible to
     // estimateCoreMessages — without them the trigger fires late (text alone
@@ -3640,7 +3667,7 @@ async function forward(
                     parsedBody = JSON.parse(rawBody) as Record<string, unknown>;
                     reqModel = typeof parsedBody.model === "string" ? parsedBody.model : undefined;
                     // #488: the rejected payload's size must include its images (they were forwarded verbatim).
-                    rejectedImageTokens = imageTokensInParsedBody(prepared.protocol, parsedBody);
+                    rejectedImageTokens = imageTokensInParsedBody(prepared.protocol, parsedBody, imageBillingFor(opts, upstreamUrl));
                 } catch {
                     reqModel = undefined; // non-JSON body — fall back to the legacy scalar
                 }
@@ -4253,6 +4280,7 @@ function handleConfigReload(opts: ProxyOptions, res: http.ServerResponse, log: (
     Object.assign(opts.routes, fresh);
     opts.compress = loadOptions().compress;
     opts.compat = loadOptions().compat;
+    opts.imageBilling = loadOptions().imageBilling;
     // Release cached ProxyAgents so agents for proxy URLs that were
     // removed/changed don't leak for the process lifetime. The next request
     // re-creates the needed agent lazily via proxyDispatcher().
