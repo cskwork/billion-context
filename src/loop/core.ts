@@ -19,6 +19,8 @@ import { fetchWithRetry, UpstreamHttpError } from "../fetch-util.js";
 import { proxyDispatcher } from "../upstream-proxy.js";
 import { noteWeakOverflow } from "../weak-overflow.js";
 import { warnCacheCollapse } from "../cache-warn.js";
+import { dumpRejectedBody } from "../error-dump.js";
+import { isStrictReasoningEcho, normalizeStrictEchoBody } from "../strict-echo.js";
 import { log as loggerLog } from "../logger.js";
 import { promptInputTotal, type WireProtocol } from "../util.js";
 
@@ -222,6 +224,15 @@ export async function* runCompressLoop(
     // deterministic (identical args → identical failure), so a byte-identical
     // re-submission can never succeed — break early instead of at MAX_LOOP_ROUNDS.
     const failedSignatures = new Set<string>();
+
+    // #762: strict-echo origin for re-request normalization (the learned flag
+    // rides on ctx.session.metadata; mirrors prepareOpenai's static gate).
+    let strictEchoOrigin: string | undefined;
+    try {
+        strictEchoOrigin = new URL(requestOptions.url).origin;
+    } catch {
+        strictEchoOrigin = undefined;
+    }
 
     try {
         for (let round = 1; round <= MAX_LOOP_ROUNDS; round++) {
@@ -580,6 +591,10 @@ export async function* runCompressLoop(
             if (signal?.aborted) break;
 
             let newBody = adapter.buildRequest(coreMessages, systemPrompt, requestBody);
+            // #762: this re-request bypasses prepareOpenai, whose strict-echo
+            // repair never reaches it — the kernel round-trip drops blank
+            // reasoning echoes, so DeepSeek thinking rejects the rebuilt body.
+            newBody = normalizeStrictEchoBody(newBody, isStrictReasoningEcho(ctx.session, strictEchoOrigin), (level, msg) => loggerLog(level, `[acp-loop] ${msg}`), ctx.session.id ?? "unknown");
             if (process.env.ACP_DUMP_BODY === "1") {
                 try {
                     const fs = await import("node:fs");
@@ -632,6 +647,10 @@ export async function* runCompressLoop(
                     ctx.session.metadata.strictReasoningEcho = true;
                     ctx.log(`[acp-loop] 400 mentions reasoning_content — learned strict reasoning echo for this session; #651 reasoning-drop disabled (#684)`);
                     loggerLog("warn", `[acp-loop] learned strictReasoningEcho (session ${ctx.session.id}); reasoning-drop disabled (#684)`);
+                }
+                // #762: persist the exact re-requested body on 4xx (env-gated: BILI_DUMP_4XX=1).
+                if (e.status >= 400 && e.status < 500) {
+                    dumpRejectedBody(e.status, ctx.session.id ?? "unknown", JSON.stringify(newBody));
                 }
                 const suffix = e.attempts > 1 ? ` after ${e.attempts} attempt(s)` : "";
                 ctx.log(`[acp-proxy: compress loop upstream error ${e.status}${suffix}: ${e.body.slice(0, 200)}]`);

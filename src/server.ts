@@ -60,6 +60,8 @@ import { compressLoopResponsesJson } from "./compress-loop-responses.js";
 import { hoistTrappedToolItems } from "./tool-pair-order.js";
 import { runCompressLoop, pickAdapter } from "./loop/index.js";
 import { containsToolCallXmlFragment } from "./loop/tag-echo-filter.js";
+import { isStrictReasoningEcho, normalizeStrictEchoReasoning } from "./strict-echo.js";
+export { isStrictReasoningEcho, normalizeStrictEchoReasoning };
 import { isFakeCompletion, injectFakeCompletionHint, maxFakeCompletionRetries, fakeBufCap } from "./fake-completion.js";
 import { reasoningGuardEngages, runReasoningGuard } from "./reasoning-guard.js";
 import { sanitizeResponsesInputIds, dropWhitespaceResponsesMessages, normalizeResponsesMessageItems } from "./loop/adapter-responses.js";
@@ -78,6 +80,7 @@ import type { BiliMessage } from "acp-kernel/wire";
 import { hardenOpenaiAssistantContent, isLoopbackAddress, inspectContextOverflow, reserveOutputHeadroom, shouldReserveOutputHeadroom, systemToUser, usageTotals, type WireProtocol } from "./util.js";
 import { resolveConfirmedLimit, resolveLearnedLimit, resolveSpeculativeLimit, retractStaleLearnedLimits } from "./weak-overflow.js";
 import { BILI_TUNNEL_HEADER, checkTunnelDestination, tunnelAllowlistFromEnv } from "./tunnel-guard.js";
+import { dumpRejectedBody } from "./error-dump.js";
 
 import { decodeRequestBody, DecompressedTooLargeError } from "./content-encoding.js";
 import { applyCompatRoles, applyCompatRolesJson, detectRoleRejection, detectSystemPlacementError, resolveCompatRoles, type CompatRoles } from "./compat-roles.js";
@@ -1778,22 +1781,14 @@ function withReasoningDrop(
     return out;
 }
 
-/** [#684] Strict-echo reasoning upstreams: DeepSeek documents that
- *  thinking-mode "reasoning_content ... must be passed back to the API" —
- *  a rebuilt request whose assistant tool-call turns lost their reasoning is
- *  rejected with 400. Learned flag first (set on first 400 whose body mentions
- *  reasoning_content, see the loop's UpstreamHttpError handler), then the
- *  static host check. */
-export function isStrictReasoningEcho(session: Session, upstreamOrigin: string | undefined): boolean {
-    if (session.metadata.strictReasoningEcho === true) return true;
-    return upstreamOrigin !== undefined && /deepseek/i.test(upstreamOrigin);
-}
-
 /** [#684] Exit sentinel: in a thinking session, an assistant tool_calls
  *  message WITHOUT reasoning_content while sibling turns carry it is the
  *  signature of a split turn — strict-echo upstreams reject the whole request.
  *  The kernel turn gate makes this unreachable; warn if a new path
- *  reintroduces it. */
+ *  reintroduces it. [#762] presence, not emptiness: a BLANK echo ("") is what
+ *  DeepSeek accepts — counting it as absent fired on every turn of every
+ *  healthy thinking session (38× in one). Only a missing field is the
+ *  rejection signature. */
 export function warnReasoningPairs(
     wireMessages: unknown[],
     log: (level: string, msg: string) => void,
@@ -1804,7 +1799,7 @@ export function warnReasoningPairs(
     for (const m of wireMessages) {
         const msg = m as { role?: string; tool_calls?: unknown; reasoning_content?: unknown };
         if (msg?.role !== "assistant") continue;
-        const hasRc = typeof msg.reasoning_content === "string" && msg.reasoning_content.length > 0;
+        const hasRc = typeof msg.reasoning_content === "string";
         if (hasRc) withRc++;
         else if (Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0) split++;
     }
@@ -2335,6 +2330,9 @@ function prepareOpenai(
         processedMessages = [];
     }
 
+    // #762: repair the strict-echo rejection class BEFORE the sentinel sees
+    // the array — a normalized body must not fire its own canary.
+    rebuiltMessages = normalizeStrictEchoReasoning(rebuiltMessages, isStrictReasoningEcho(session, upstreamOrigin), log, sessionId);
     const rebuilt: OpenAIRequestBody = { ...parsed, messages: rebuiltMessages, tools: toolsOut as OpenAITool[] | undefined };
     warnReasoningPairs(rebuiltMessages, log, sessionId);
     clampOutgoingOutput(rebuilt as Record<string, unknown>, typeof (parsed as Record<string, unknown>).max_completion_tokens === "number" ? "max_completion_tokens" : "max_tokens", { systemText: openaiSystemText, tools: toolsOut, processedMessages, lastInputTokens: session.stats.lastInputTokens, nativeWindow, imageTokens: imageTokensInParsedBody("openai", rebuilt, imageBillingFor(opts, billingUpstream ?? upstreamOrigin)) }, sessionId, log);
@@ -3731,6 +3729,17 @@ async function forward(
                 // lost on restart and the next overflow must be re-learned.
                 markDirty(s);
             }
+            // #762: learn strict-echo on the MAIN request path too. The loop-only
+            // learner (src/loop/core.ts) never sees client-originated 400s, so a
+            // first post-fold rejection left strictReasoningEcho unset — #651 kept
+            // dropping reasoning and every following turn split again.
+            if (upstream.status === 400 && /reasoning_content/i.test(errBody.toString("utf8"))) {
+                if (s.metadata.strictReasoningEcho !== true) {
+                    s.metadata.strictReasoningEcho = true;
+                    markDirty(s);
+                    log("warn", `[${s.id}] upstream 400 mentions reasoning_content — learned strictReasoningEcho for this session (#684/#762); reasoning-drop disabled`);
+                }
+            }
         }
         // #604: relay/gateway 5xx — no usage report will arrive, so arm the
         // emergency shrink with a local estimate of the wire body we just sent
@@ -3753,6 +3762,10 @@ async function forward(
         if (bodyText.length > 600) snippet += " …";
         if (!snippet) snippet = "(no body)";
         loggerLog("warn", `[${errSid}] ← upstream ${upstream.status}${reqIdText}: ${snippet}`);
+        // #762: persist the exact forwarded body on 4xx (env-gated: BILI_DUMP_4XX=1).
+        if (upstream.status >= 400 && upstream.status < 500) {
+            dumpRejectedBody(upstream.status, errSid, wireBody);
+        }
         if (res.headersSent) {
             // #568: the preflight hold already committed 200 early — the status can no
             // longer change, so deliver the upstream failure in-band (protocol error
