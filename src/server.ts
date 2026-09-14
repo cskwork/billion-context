@@ -30,6 +30,7 @@ import {
     injectOpenaiSystem,
     conversationSignalOpenai,
     type OpenAIRequestBody,
+    type OpenAIMessage,
     type OpenAITool,
 } from "acp-kernel/wire";
 import {
@@ -77,6 +78,7 @@ import type { BiliMessage } from "acp-kernel/wire";
 import { hardenOpenaiAssistantContent, isLoopbackAddress, inspectContextOverflow, reserveOutputHeadroom, shouldReserveOutputHeadroom, systemToUser, usageTotals, type WireProtocol } from "./util.js";
 import { resolveConfirmedLimit, resolveLearnedLimit, resolveSpeculativeLimit, retractStaleLearnedLimits } from "./weak-overflow.js";
 import { BILI_TUNNEL_HEADER, checkTunnelDestination, tunnelAllowlistFromEnv } from "./tunnel-guard.js";
+import { dumpRejectedBody } from "./error-dump.js";
 
 import { decodeRequestBody, DecompressedTooLargeError } from "./content-encoding.js";
 import { applyCompatRoles, applyCompatRolesJson, detectRoleRejection, detectSystemPlacementError, resolveCompatRoles, type CompatRoles } from "./compat-roles.js";
@@ -1773,7 +1775,10 @@ export function isStrictReasoningEcho(session: Session, upstreamOrigin: string |
  *  message WITHOUT reasoning_content while sibling turns carry it is the
  *  signature of a split turn — strict-echo upstreams reject the whole request.
  *  The kernel turn gate makes this unreachable; warn if a new path
- *  reintroduces it. */
+ *  reintroduces it. [#762] presence, not emptiness: a BLANK echo ("") is what
+ *  DeepSeek accepts — counting it as absent fired on every turn of every
+ *  healthy thinking session (38× in one). Only a missing field is the
+ *  rejection signature. */
 export function warnReasoningPairs(
     wireMessages: unknown[],
     log: (level: string, msg: string) => void,
@@ -1784,7 +1789,7 @@ export function warnReasoningPairs(
     for (const m of wireMessages) {
         const msg = m as { role?: string; tool_calls?: unknown; reasoning_content?: unknown };
         if (msg?.role !== "assistant") continue;
-        const hasRc = typeof msg.reasoning_content === "string" && msg.reasoning_content.length > 0;
+        const hasRc = typeof msg.reasoning_content === "string";
         if (hasRc) withRc++;
         else if (Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0) split++;
     }
@@ -1838,6 +1843,36 @@ export function warnResponsesReasoningPairs(
     if (withReasoning > 0 && split > 0) {
         log("warn", `[${sessionId}] reasoning-pair-violated: ${split} function_call item(s) lack a preceding reasoning item while ${withReasoning} exist — strict-echo upstreams will reject the request (#684)`);
     }
+}
+
+/** [#762] Strict-echo normalization: DeepSeek thinking mode accepts a BLANK
+ *  reasoning_content echo but rejects an ABSENT field on assistant tool-call
+ *  turns ("reasoning_content ... must be passed back"). The kernel round-trip
+ *  drops blank echoes (an empty string carries no core message), so any
+ *  rebuild can ship absent fields into a thinking session — the residual 400
+ *  of #762. Inject "" on assistant tool-call messages lacking the field so the
+ *  rejection class cannot reach the wire; hermes-agent PR #15527 (openclaw
+ *  #71455) confirms DeepSeek accepts the blank form. Returns the input array
+ *  unchanged when disabled or when nothing needed patching. */
+export function normalizeStrictEchoReasoning(
+    messages: OpenAIMessage[],
+    enabled: boolean,
+    log: (level: string, msg: string) => void,
+    sessionId: string,
+): OpenAIMessage[] {
+    if (!enabled) return messages;
+    let patched = 0;
+    const out = messages.map((m) => {
+        if (m.role !== "assistant") return m;
+        if (!Array.isArray(m.tool_calls) || m.tool_calls.length === 0) return m;
+        if (typeof m.reasoning_content === "string") return m;
+        patched++;
+        return { ...m, reasoning_content: "" };
+    });
+    if (patched > 0) {
+        log("info", `[${sessionId}] strict-echo: injected blank reasoning_content on ${patched} assistant tool-call message(s) (#762)`);
+    }
+    return patched > 0 ? out : messages;
 }
 
 export function stripKernelSummaries(messages: BiliMessage[], state: CompressionState): BiliMessage[] {
@@ -2314,6 +2349,9 @@ function prepareOpenai(
         processedMessages = [];
     }
 
+    // #762: repair the strict-echo rejection class BEFORE the sentinel sees
+    // the array — a normalized body must not fire its own canary.
+    rebuiltMessages = normalizeStrictEchoReasoning(rebuiltMessages, isStrictReasoningEcho(session, upstreamOrigin), log, sessionId);
     const rebuilt: OpenAIRequestBody = { ...parsed, messages: rebuiltMessages, tools: toolsOut as OpenAITool[] | undefined };
     warnReasoningPairs(rebuiltMessages, log, sessionId);
     clampOutgoingOutput(rebuilt as Record<string, unknown>, typeof (parsed as Record<string, unknown>).max_completion_tokens === "number" ? "max_completion_tokens" : "max_tokens", { systemText: openaiSystemText, tools: toolsOut, processedMessages, lastInputTokens: session.stats.lastInputTokens, nativeWindow, imageTokens: imageTokensInParsedBody("openai", rebuilt) }, sessionId, log);
@@ -3704,6 +3742,17 @@ async function forward(
                 // lost on restart and the next overflow must be re-learned.
                 markDirty(s);
             }
+            // #762: learn strict-echo on the MAIN request path too. The loop-only
+            // learner (src/loop/core.ts) never sees client-originated 400s, so a
+            // first post-fold rejection left strictReasoningEcho unset — #651 kept
+            // dropping reasoning and every following turn split again.
+            if (upstream.status === 400 && /reasoning_content/i.test(errBody.toString("utf8"))) {
+                if (s.metadata.strictReasoningEcho !== true) {
+                    s.metadata.strictReasoningEcho = true;
+                    markDirty(s);
+                    log("warn", `[${s.id}] upstream 400 mentions reasoning_content — learned strictReasoningEcho for this session (#684/#762); reasoning-drop disabled`);
+                }
+            }
         }
         // #604: relay/gateway 5xx — no usage report will arrive, so arm the
         // emergency shrink with a local estimate of the wire body we just sent
@@ -3726,6 +3775,10 @@ async function forward(
         if (bodyText.length > 600) snippet += " …";
         if (!snippet) snippet = "(no body)";
         loggerLog("warn", `[${errSid}] ← upstream ${upstream.status}${reqIdText}: ${snippet}`);
+        // #762: persist the exact forwarded body on 4xx (env-gated: BILI_DUMP_4XX=1).
+        if (upstream.status >= 400 && upstream.status < 500) {
+            dumpRejectedBody(upstream.status, errSid, wireBody);
+        }
         if (res.headersSent) {
             // #568: the preflight hold already committed 200 early — the status can no
             // longer change, so deliver the upstream failure in-band (protocol error
