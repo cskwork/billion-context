@@ -78,8 +78,7 @@ export function messageImages(m: CoreMessage): ImageRef[] {
         if (refs.length > 0) return refs;
     }
     if (isObj(mm.rawOpenaiContent) && mm.rawOpenaiContent.type === "image_url") {
-        const r = refFromDataUrl(isObj(mm.rawOpenaiContent.image_url) ? mm.rawOpenaiContent.image_url.url : undefined);
-        if (r) return [r];
+        return [refFromDataUrl(isObj(mm.rawOpenaiContent.image_url) ? mm.rawOpenaiContent.image_url.url : undefined) ?? {}];
     }
     return [];
 }

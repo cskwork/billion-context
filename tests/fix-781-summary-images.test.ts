@@ -108,6 +108,12 @@ test("image-note: openai developer-role rawOpenaiContent object is not an image"
     assert.deepEqual(messageImages(m), []);
 });
 
+test("image-note: openai single rawOpenaiContent without a decodable data URL degrades to the bare placeholder", () => {
+    const m = msg({ text: "", rawOpenaiContent: { type: "image_url", image_url: { url: "https://example.com/legacy.png" } } });
+    assert.deepEqual(messageImages(m), [{}]);
+    assert.deepEqual(imagePlaceholders(m), [IMAGE_PLACEHOLDER]);
+});
+
 test("image-note: responses item keeps every input_image part", () => {
     const m = msg({
         text: "see the shots",
