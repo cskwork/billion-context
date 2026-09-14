@@ -284,14 +284,14 @@ For each request, the proxy resolves the settings by longest-URL-prefix match (t
 - **Type:** `object` (`{ compressPhilosophy?, howToCompressRules?, tier2DistillRules?, tier3CondenseRules? }`, all strings)
 - **Default:** *(kernel defaults — see `acp-kernel` `defaultPrompts`)*
 - **Status:** ACTIVE
-- **Description:** Override the compression prompt text injected into the system prompt and nudge messages. Every field is **load-bearing**: the kernel rules were tuned over months of production use, and overriding them can degrade summary quality (lost paths / signatures / decisions → broken retrieval). Overrides only take effect when `acknowledgePromptsRisk: true` is set at the same (winning) level; otherwise they are ignored and a one-time warning is logged. Non-string fields are silently dropped (a malformed partial never clobbers a good default). Useful mainly for non-English or small-model tuning — see issue #156.
+- **Description:** Override the compression prompt text injected into the system prompt and nudge messages. Every field is **load-bearing**: the kernel rules were tuned over months of production use, and overriding them can degrade summary quality (lost paths / signatures / decisions → broken retrieval). Overrides only take effect when `acknowledgePromptsRisk` resolves to `true` after the three-level merge — the flag resolves independently at its own deepest defined level and gates **all** `prompts` overrides regardless of which level each piece lives at (a global-level flag activates model-level `prompts`); otherwise they are ignored and a one-time warning is logged. Non-string fields are silently dropped (a malformed partial never clobbers a good default). Useful mainly for non-English or small-model tuning — see issue #156.
 
 #### `acknowledgePromptsRisk`
 
 - **Type:** `boolean`
 - **Default:** `false`
 - **Status:** ACTIVE
-- **Description:** Must be `true` for `prompts` overrides to take effect. Setting it acknowledges the summary-quality risk documented above.
+- **Description:** Must be `true` for `prompts` overrides to take effect. Resolves like every other field (deepest defined level wins) and gates all `prompts` overrides regardless of which level each piece lives at — it does not need to sit in the same block as the `prompts` it unlocks. Setting it acknowledges the summary-quality risk documented above.
 
 #### `promptPack`
 
@@ -324,6 +324,25 @@ For each request, the proxy resolves the settings by longest-URL-prefix match (t
     "providers": { "https://api.deepseek.com": { "compress": { "reasoning": { "drop": false } } } }
     ```
   - `threshold: number` — character gate; runs **strictly greater** than this are dropped (`0` = drop any non-empty run). Invalid values fall back to the default instead of throwing.
+
+#### `reasoningGuard`
+
+- **Type:** `object` (`{ enabled?, maxContinue?, maxTierN?, markerText?, base?, offset?, debugLog? }`)
+- **Default:** *(disabled — off unless you set `enabled: true` at some level)*
+- **Status:** ACTIVE
+- **Description:** Opt-in guard against gpt-5.x/gpt-6.x **"lattice" reasoning truncation** (issue #739; upstream [openai/codex#30364](https://github.com/openai/codex/issues/30364)). These models intermittently stop at exactly `base*n + offset` reasoning tokens (default `518n−2` → 516, 1034, 1552, …) mid-thought, then answer from a half-finished thought. When an in-scope terminal round hits the lattice **and** carries an `encrypted_content` blob, bili buffers the response, re-sends it replaying its own reasoning plus a continue nudge (up to `maxContinue` continuation rounds), and folds everything into ONE response whose usage is the true summed total. Reasoning streams live to the client during the fold (no full buffering); only the final clean round's non-reasoning output is passed through. Applies to Responses/SSE streaming requests only (bili is SSE-only); compress-injected turns are exempt (the loop owns those). Sub-fields (merged deepest-wins like every other CompressSettings field):
+  - `enabled: boolean` — master switch; anything other than `true` keeps the guard fully off. Scope is set by **where** this block sits in the three-level tree (global / provider / model) — there is no separate model list. The strict signature (exact lattice hit + `encrypted_content` + no tool calls) limits which rounds actually trigger recovery.
+  - `maxContinue: number` — max continuation rounds after the initial round (default `3`).
+  - `maxTierN: number` — highest lattice tier `n` allowed to continue (default `6`); `0` = unlimited. Raise for rare deep-tier truncations (e.g. an `n=11` hit observed on gpt-6-astra).
+  - `markerText: string` — nudge text appended as a commentary message each continued round (default `"Continue thinking..."`).
+  - `base: number` / `offset: number` — the lattice signature `tokens == base*n + offset` (defaults `518` / `-2`). Override if another model family truncates on a different lattice.
+  - `debugLog: boolean` — verbose per-round logging (default `false`).
+  ```jsonc
+  // enable globally
+  { "compress": { "reasoningGuard": { "enabled": true } } }
+   // tune per provider (placement scopes it to that provider's traffic)
+   { "providers": { "https://your-relay.example": { "compress": { "reasoningGuard": { "enabled": true, "maxContinue": 2 } } } } }
+  ```
 
 #### `stripImages`
 
@@ -475,6 +494,8 @@ Full command surface (`bili --help` prints an abridged version). Precedence ever
 | `bili codebuddy [opts --] [args]` | Proxy + **codebuddy** (Tencent CodeBuddy Code CLI) — `CODEBUDDY_BASE_URL` `/bili/` rewrite, OpenAI chat-completions wire; budget via `CODEBUDDY_AUTO_COMPACT_WINDOW` (#640) |
 | `bili qoder [opts --] [args]` | Proxy + **qoder** — cert-MITM via `HTTPS_PROXY` + `NODE_EXTRA_CA_CERTS`; model endpoint hardcoded https so no `/bili/` rewrite (default host map whitelisted) (#653) |
 | `bili trae [opts --] [args]` | Proxy + **Trae CLI** (ByteDance, closed Go binary) — cert-MITM via `HTTPS_PROXY` + `SSL_CERT_FILE`; model host from `TRAE_CLI_API_HOST` or the default enterprise gateway (#655) |
+| `bili jcode [opts --] [args]` | Proxy + **jcode** (Rust agent harness) — env-only cert-MITM launch via `HTTPS_PROXY` + `SSL_CERT_FILE`; hosted model host (`api.z.ai`) whitelisted, local loopback providers stay direct via `NO_PROXY` |
+| `bili kimi [opts --] [args]` | Proxy + **Kimi Code** (Moonshot CLI) — cert-MITM via `HTTPS_PROXY` + `NODE_EXTRA_CA_CERTS`/`SSL_CERT_FILE`; provider/model hosts from `~/.kimi-code/config.toml` (`KIMI_CODE_HOME` respected) or the managed OAuth endpoints when none declared; loopback endpoints inventoried with a manual `/bili/` prefix hint (#757) |
 | `bili test pi` | Non-polluting end-to-end smoke test of the pi path |
 | `bili export [session] [--full] [--output FILE]` | List persisted sessions / export one as a Markdown handoff — see [Sessions & Migration](#sessions--migration) |
 | `bili update` | Check for & install a newer version now (bypasses the 3-minute throttle) |

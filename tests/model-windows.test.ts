@@ -6,6 +6,7 @@ import path from "node:path";
 import {
     parseOmpYaml,
     parseCodexToml,
+    parseKimiToml,
     readPiConfig,
     readOpencodeConfig,
     collectModelWindows,
@@ -164,6 +165,35 @@ test("collectModelWindows(scope): same id across providers of the SAME client â†
         },
     };
     assert.deepEqual(collectModelWindows(config, "omp"), { m: 3000 });
+});
+
+test("parseKimiToml: model + max_context_size pair captured, overrides win, wire id keys the window (#757)", () => {
+    const toml = [
+        '[models.k3]',
+        'model = "kimi-for-coding"',
+        "max_context_size = 1048576",
+        "",
+        "[models.k3.overrides]",
+        "max_context_size = 200000",
+        "",
+        "[models.alias-only]",
+        "max_context_size = 49000",
+    ].join("\n");
+    const cfg = parseKimiToml(toml);
+    assert.deepEqual(cfg.models, [
+        { id: "kimi-for-coding", contextWindow: 200000 },
+        { id: "alias-only", contextWindow: 49000 },
+    ]);
+});
+
+test("collectModelWindows(scope): kimi scope only; unscoped merge still max-wins (#757)", () => {
+    const config: ClientConfig = {
+        codex: { providers: {}, modelWindows: [{ id: "m", contextWindow: 272000 }] },
+        kimi: { providers: {}, models: [{ id: "m", contextWindow: 1048576 }] },
+    };
+    assert.deepEqual(collectModelWindows(config, "kimi"), { m: 1048576 });
+    assert.deepEqual(collectModelWindows(config, "codex"), { m: 272000 });
+    assert.deepEqual(collectModelWindows(config), { m: 1048576 });
 });
 
 test("parseLauncherModelWindows: valid JSON, invalid input, non-numeric filtered", () => {

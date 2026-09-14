@@ -282,14 +282,14 @@
 - **类型：** `object`（`{ compressPhilosophy?, howToCompressRules?, tier2DistillRules?, tier3CondenseRules? }`，均为字符串）
 - **默认值：** *（内核默认值 —— 见 `acp-kernel` 的 `defaultPrompts`）*
 - **状态：** ACTIVE
-- **说明：** 覆盖注入到系统提示词与 nudge 消息中的压缩提示词文本。每个字段都是**承重的（load-bearing）**：内核规则经过数月生产调优，覆盖它们可能降低摘要质量（丢失路径 / 签名 / 决策 → 检索失效）。只有当同一（胜出的）层级同时设置了 `acknowledgePromptsRisk: true` 时覆盖才生效；否则会被忽略并记录一次警告。非字符串字段会被静默丢弃（畸形的局部配置不会破坏正常默认值）。主要用于非英文或小模型调优 —— 见 issue #156。
+- **说明：** 覆盖注入到系统提示词与 nudge 消息中的压缩提示词文本。每个字段都是**承重的（load-bearing）**：内核规则经过数月生产调优，覆盖它们可能降低摘要质量（丢失路径 / 签名 / 决策 → 检索失效）。只有当 `acknowledgePromptsRisk` 经三级合并后解析为 `true` 时覆盖才生效 —— 该标志按自身最深层级独立解析，并门控**所有** `prompts` 覆盖，与各覆盖片段所在层级无关（全局层级的标志即可激活模型层级的 `prompts`）；否则会被忽略并记录一次警告。非字符串字段会被静默丢弃（畸形的局部配置不会破坏正常默认值）。主要用于非英文或小模型调优 —— 见 issue #156。
 
 #### `acknowledgePromptsRisk`
 
 - **类型：** `boolean`
 - **默认值：** `false`
 - **状态：** ACTIVE
-- **说明：** 必须为 `true`，`prompts` 覆盖才生效。设置它即表示知悉上述摘要质量风险。
+- **说明：** 必须为 `true`，`prompts` 覆盖才生效。与其他字段一样按最深层级独立解析（最深层级胜出），并门控所有 `prompts` 覆盖，与各覆盖片段所在层级无关 —— 无需与所解锁的 `prompts` 位于同一层级。设置它即表示知悉上述摘要质量风险。
 
 #### `promptPack`
 
@@ -322,6 +322,25 @@
     "providers": { "https://api.deepseek.com": { "compress": { "reasoning": { "drop": false } } } }
     ```
   - `threshold: number` — 字符门槛；**严格大于**该值的段才被剥离（`0` = 只要非空就剥）。非法值回退默认而不是报错。
+
+#### `reasoningGuard`
+
+- **类型：** `object`（`{ enabled?, maxContinue?, maxTierN?, markerText?, base?, offset?, debugLog? }`）
+- **默认值：** *（禁用 —— 除非在某一层设置 `enabled: true`）*
+- **状态：** ACTIVE
+- **说明：** gpt-5.x/gpt-6.x **"晶格"（lattice）推理截断**守卫（issue #739；上游 [openai/codex#30364](https://github.com/openai/codex/issues/30364)）。这些模型会间歇性地在恰好 `base*n + offset` 个 reasoning token 处（默认 `518n−2` → 516、1034、1552 …）思考到一半就停下，然后基于未完成的思路作答。当作用域内的终止回合落在晶格上**且**携带 `encrypted_content` 块时，bili 会缓冲该响应、带着自己的 reasoning 加一条继续提示重发（最多 `maxContinue` 个续写回合），再把全部折叠成**一个**响应，其 usage 为真实求和值。折叠期间 reasoning 实时流式发给客户端（不做整段缓冲），只有最后一轮干净回合的非 reasoning 输出被透传。仅作用于 Responses/SSE 流式请求（bili 只支持 SSE）；压缩注入的回合被豁免（由循环负责）。子字段与其他 CompressSettings 字段一样按“深层覆盖”合并：
+  - `enabled: boolean` — 总开关；非 `true` 时守卫完全关闭。作用域由该块在三级树（全局 / provider / model）**放在哪一层**决定——没有单独模型列表。严格签名（精确晶格命中 + `encrypted_content` + 无工具调用）限制哪些回合真正触发续写。
+  - `maxContinue: number` — 首轮之后最多续写的回合数（默认 `3`）。
+  - `maxTierN: number` — 允许续写的最高晶格层级 `n`（默认 `6`）；`0` = 不限制。遇到罕见的深层截断时调高（例如在 gpt-6-astra 上观察到一次 `n=11`）。
+  - `markerText: string` — 每个续写回合追加的 commentary 提示文本（默认 `"Continue thinking..."`）。
+  - `base: number` / `offset: number` — 晶格签名 `tokens == base*n + offset`（默认 `518` / `-2`）。若其他模型家族在不同晶格上截断则覆盖。
+  - `debugLog: boolean` — 逐回合详细日志（默认 `false`）。
+  ```jsonc
+  // 全局开启
+  { "compress": { "reasoningGuard": { "enabled": true } } }
+   // 按 provider 调参（放在哪一层就作用于哪一层的流量）
+   { "providers": { "https://your-relay.example": { "compress": { "reasoningGuard": { "enabled": true, "maxContinue": 2 } } } } }
+  ```
 
 #### `stripImages`
 
@@ -472,6 +491,8 @@
 | `bili codebuddy [opts --] [args]` | 代理 + **codebuddy**（Tencent CodeBuddy Code CLI）—— `CODEBUDDY_BASE_URL` `/bili/` 重写,OpenAI chat-completions wire;预算对齐走 `CODEBUDDY_AUTO_COMPACT_WINDOW`(#640) |
 | `bili qoder [opts --] [args]` | 代理 + **qoder** —— 证书 MITM(`HTTPS_PROXY` + `NODE_EXTRA_CA_CERTS`);模型端点硬编码 https(`/bili/` 改写不可用,默认主机表加白名单)(#653) |
 | `bili trae [opts --] [args]` | 代理 + **Trae CLI**（字节跳动,闭源 Go 二进制)—— 证书 MITM(`HTTPS_PROXY` + `SSL_CERT_FILE`);模型主机取 `TRAE_CLI_API_HOST` 或默认企业网关(#655) |
+| `bili jcode [opts --] [args]` | 代理 + **jcode**（Rust 终端编码 agent)—— 环境变量式证书 MITM 启动(`HTTPS_PROXY` + `SSL_CERT_FILE`);托管模型主机 `api.z.ai` 默认加白,本地回环 provider 走 `NO_PROXY` 直连 |
+| `bili kimi [opts --] [args]` | 代理 + **Kimi Code**(Moonshot CLI)—— 证书 MITM(`HTTPS_PROXY` + `NODE_EXTRA_CA_CERTS`/`SSL_CERT_FILE`);provider/model 主机取自 `~/.kimi-code/config.toml`(遵循 `KIMI_CODE_HOME`),未声明时用托管 OAuth 端点;回环端点编目并附手动 `/bili/` 前缀提示(#757) |
 | `bili test pi` | 无污染的 pi 链路端到端冒烟测试 |
 | `bili export [session] [--full] [--output FILE]` | 列出持久化会话 / 把一个会话导出为 Markdown 交接文档 —— 见[会话与迁移](#会话与迁移) |
 | `bili update` | 立即检查并安装新版本（绕过 3 分钟节流） |

@@ -60,6 +60,7 @@ import { compressLoopResponsesJson } from "./compress-loop-responses.js";
 import { runCompressLoop, pickAdapter } from "./loop/index.js";
 import { containsToolCallXmlFragment } from "./loop/tag-echo-filter.js";
 import { isFakeCompletion, injectFakeCompletionHint, maxFakeCompletionRetries, fakeBufCap } from "./fake-completion.js";
+import { reasoningGuardEngages, runReasoningGuard } from "./reasoning-guard.js";
 import { sanitizeResponsesInputIds, dropWhitespaceResponsesMessages, normalizeResponsesMessageItems } from "./loop/adapter-responses.js";
 import { codexCompactMode, isCodexClient, hasCompactionTrigger, stripBiliCompactionItems, replaceBiliCompactionItems, codexCompactGate, codexCompactGatePre, buildTriggerForgeBody, mergeForgedSummaries } from "./codex-compact.js";
 import { stripAcpPanelMessages, stripAcpPanelResponsesInput } from "./acp-panel.js";
@@ -1614,9 +1615,9 @@ async function handle(
                 };
                 // #332: codex's native remote-compaction request (trigger form)
                 // is dispatched BEFORE prepare/preflight. When it is not
-                // intercepted, the upstream must receive exactly what codex
-                // sent: a preflight-compressed/rebuilt payload diverges from
-                // codex's local history, non-OpenAI backends 400 the
+                // intercepted, preserve what codex sent except for local bili
+                // compaction markers: a preflight-compressed/rebuilt payload
+                // diverges from codex's local history, non-OpenAI backends 400 the
                 // compaction_trigger item, and folding bili's state as a side
                 // effect of handling codex's own compaction is wrong.
                 const isCodexCompactTrigger =
@@ -1633,9 +1634,16 @@ async function handle(
                         rememberPluginMessages(sessionId, prepared.processedMessages, prepared.originalMessages, prepared.nudge);
                         return;
                     }
+                    // runPrepare may have mutated parsed before failing to forge.
+                    // Normalize the original wire input only: fc_bili_* records
+                    // are local summaries, not valid upstream compaction items.
+                    const original = JSON.parse(bodyBuffer.toString("utf8")) as ResponsesRequestBody;
+                    const { items, replaced, dropped } = replaceBiliCompactionItems(Array.isArray(original.input) ? original.input : []);
+                    const normalized = replaced + dropped > 0;
+                    const forwardBody = normalized ? Buffer.from(JSON.stringify({ ...original, input: items })) : bodyBuffer;
                     const why = mode !== "intercept" ? "BILI_CODEX_COMPACT=pass" : !gatePre ? "gate preconditions not met" : "transform/forge failed";
-                    log("info", `[${session.id}] codex compaction_trigger request not intercepted (${why}) — forwarding verbatim (no preflight, no rebuild, no window clamp)`);
-                    await forward(req, res, opts, bodyBuffer, null, core, reqConfig, log, route, instanceId, affinity);
+                    log("info", `[${session.id}] codex compaction_trigger request not intercepted (${why}) — forwarding ${normalized ? `with bili summaries normalized (replaced=${replaced}, dropped=${dropped})` : "verbatim"} (no preflight, no rebuild, no window clamp)`);
+                    await forward(req, res, opts, forwardBody, null, core, reqConfig, log, route, instanceId, affinity);
                     return;
                 }
                 prepared = runPrepare();
@@ -3801,6 +3809,34 @@ async function forward(
             clearUpstreamTimer();
         }
         return;
+    }
+    if (prepared && prepared.protocol === "responses" && prepared.stream && !prepared.sidePassthrough && !prepared.compressInjected) {
+        const sse = (upstream.headers.get("content-type") ?? "").includes("text/event-stream");
+        if (sse) {
+            let reqModel: string | undefined;
+            try {
+                const wb = typeof wireBody === "string" ? wireBody : wireBody.toString("utf8");
+                const parsed = JSON.parse(wb) as Record<string, unknown>;
+                if (typeof parsed.model === "string") reqModel = parsed.model;
+            } catch { /* non-JSON body: guard stays off */ }
+            const rg = resolveCompress(opts.routes, upstreamUrl, reqModel, opts.compress).reasoningGuard;
+            if (rg && reasoningGuardEngages(rg)) {
+                log("info", `[reasoning-guard] engaged model=${reqModel ?? "?"} session=${prepared.session?.id ?? "-"}`);
+                await runReasoningGuard({
+                    firstResponse: upstream,
+                    clearFirstTimer: clearUpstreamTimer,
+                    upstreamUrl,
+                    reqHeaders: buildForwardHeaders(headers),
+                    dispatcher,
+                    originalBody: wireBody,
+                    signal: clientAbort.signal,
+                    res,
+                    config: rg,
+                    log: (msg) => log("info", msg),
+                });
+                return;
+            }
+        }
     }
     // #371: detect + retry a fake completion for every non-plugin streaming
     // response (any turn, not just compress-injected). Buffering is required:

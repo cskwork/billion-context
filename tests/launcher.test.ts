@@ -49,6 +49,8 @@ import {
     readTraeConfig,
     buildTraeEnv,
     TRAE_DEFAULT_MODEL_HOSTS,
+    buildJcodeEnv,
+    JCODE_DEFAULT_MODEL_HOSTS,
     resolveDshHome,
     prepareDshHome,
     writeDshAcpPatch,
@@ -78,6 +80,10 @@ import {
     readCodebuddyConfig,
     parseCodebuddyModelsJson,
     resolveCodebuddyHome,
+    parseKimiToml,
+    readKimiConfig,
+    resolveKimiHome,
+    KIMI_DEFAULT_MODEL_HOSTS,
     type SpawnChild,
     type SpawnFn,
     runLaunch,
@@ -106,6 +112,8 @@ test("isLaunchClient: pi/claude/codex/omp/opencode/pi-test true, others false", 
     assert.equal(isLaunchClient("dsh"), true);
     assert.equal(isLaunchClient("trae"), true);
     assert.equal(isLaunchClient("qoder"), true);
+    assert.equal(isLaunchClient("jcode"), true);
+    assert.equal(isLaunchClient("kimi"), true);
     assert.equal(isLaunchClient("pi-test"), true);
     assert.equal(isLaunchClient("start"), false);
     assert.equal(isLaunchClient(""), false);
@@ -3383,6 +3391,21 @@ test("buildTraeEnv: HTTPS_PROXY + SSL_CERT_FILE + BILLION_CONTEXT_PROXY, baseEnv
     assert.equal(env.FOO, "bar");
 });
 
+test("buildJcodeEnv: HTTPS_PROXY + SSL_CERT_FILE + BILLION_CONTEXT_PROXY + NO_PROXY loopback, baseEnv preserved", () => {
+    const env = buildJcodeEnv("http://127.0.0.1:8787", "/tmp/ca.pem", { FOO: "bar" });
+    assert.equal(env.HTTPS_PROXY, "http://127.0.0.1:8787");
+    assert.equal(env.SSL_CERT_FILE, "/tmp/ca.pem");
+    assert.equal(env.BILLION_CONTEXT_PROXY, "http://127.0.0.1:8787");
+    assert.equal(env.NO_PROXY, "localhost,127.0.0.1,::1");
+    assert.equal(env.no_proxy, "localhost,127.0.0.1,::1");
+    assert.equal(env.FOO, "bar");
+});
+
+test("discoverRoutes: jcode whitelists the default zai host for cert-MITM", () => {
+    const routes = discoverRoutes("jcode", {});
+    assert.deepEqual(routes.httpsDomains, [...JCODE_DEFAULT_MODEL_HOSTS]);
+});
+
 test("resolveClientCommand: trae resolves `traecli`, falls back to `trae-cli` then `trae`", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-trae-bin-"));
     try {
@@ -3453,6 +3476,210 @@ test("runLaunch trae: cert-MITM envs (SSL_CERT_FILE combined bundle), no budget/
         for (const h of TRAE_DEFAULT_MODEL_HOSTS) {
             assert.ok(mitm.includes(h), `whitelist has ${h}: ${mitm.join(",")}`);
         }
+    } finally {
+        process.exit = prevExit;
+        process.env.HOME = prevHome;
+        if (prevUserProfile === undefined) delete process.env.USERPROFILE;
+        else process.env.USERPROFILE = prevUserProfile;
+        if (prevBin === undefined) delete process.env.BILI_CLIENT_BIN;
+        else process.env.BILI_CLIENT_BIN = prevBin;
+        if (prevNoProxy === undefined) delete process.env.NO_PROXY;
+        else process.env.NO_PROXY = prevNoProxy;
+        fs.rmSync(home, { recursive: true, force: true });
+    }
+});
+
+test("parseKimiToml: providers/models/env channels (quoted names, overrides win, per-model base_url)", () => {
+    const toml = [
+        "# comment",
+        'default_model = "k3"',
+        "",
+        '[providers."managed:kimi-code"]',
+        'type = "kimi"',
+        'base_url = "https://api.kimi.com/coding/v1"',
+        "",
+        "[providers.local]",
+        "type = \"openai\"",
+        'base_url = "http://127.0.0.1:8199/v1"',
+        "",
+        "[providers.envonly]",
+        "type = \"openai\"",
+        "",
+        "[providers.envonly.env]",
+        'OPENAI_BASE_URL = "https://relay.example.com/v1"',
+        "",
+        "[models.k3]",
+        'provider = "managed:kimi-code"',
+        'model = "kimi-for-coding"',
+        "max_context_size = 1048576",
+        "",
+        "[models.k3.overrides]",
+        "max_context_size = 200000",
+        "",
+        "[models.local-m]",
+        'provider = "local"',
+        'model = "qwen3.8-27b"',
+        "max_context_size = 262144",
+        'base_url = "http://10.0.0.5:9000/v1"',
+        "",
+        "[models.nowin]",
+        'model = "x"',
+        "max_context_size = notanumber",
+    ].join("\n");
+    const cfg = parseKimiToml(toml);
+    assert.equal(cfg.defaultModel, "k3");
+    assert.equal(cfg.providers["managed:kimi-code"]?.baseUrl, "https://api.kimi.com/coding/v1");
+    assert.equal(cfg.providers.local?.baseUrl, "http://127.0.0.1:8199/v1");
+    assert.equal(cfg.providers.envonly?.baseUrl, "https://relay.example.com/v1");
+    assert.deepEqual(cfg.modelUrls, ["http://10.0.0.5:9000/v1"]);
+    assert.deepEqual(cfg.models, [
+        { id: "kimi-for-coding", contextWindow: 200000 },
+        { id: "qwen3.8-27b", contextWindow: 262144 },
+    ]);
+});
+
+test("readKimiConfig + resolveKimiHome: KIMI_CODE_HOME override, env channels, synthetic KIMI_MODEL window (#757)", () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-kimi-home-"));
+    try {
+        assert.equal(resolveKimiHome({ KIMI_CODE_HOME: "/tmp/kh" }), "/tmp/kh");
+        assert.ok(resolveKimiHome({}).endsWith(path.join(".kimi-code")));
+        assert.deepEqual(readKimiConfig(home, {}), { providers: {} });
+        fs.writeFileSync(
+            path.join(home, "config.toml"),
+            ['[providers.p]', 'base_url = "https://api.kimi.com/coding/v1"', "", "[models.m]", 'model = "kimi-for-coding"', "max_context_size = 1048576"].join("\n"),
+        );
+        const cfg = readKimiConfig(home, {
+            KIMI_MODEL_NAME: "synthetic-model",
+            KIMI_MODEL_MAX_CONTEXT_SIZE: "999999",
+            KIMI_MODEL_BASE_URL: "http://10.1.1.1:2/v1",
+            KIMI_CODE_BASE_URL: "https://api.kimi.ai/coding/v1",
+        } as NodeJS.ProcessEnv);
+        assert.deepEqual(cfg.envUrls, ["http://10.1.1.1:2/v1", "https://api.kimi.ai/coding/v1"]);
+        assert.deepEqual(cfg.models, [
+            { id: "kimi-for-coding", contextWindow: 1048576 },
+            { id: "synthetic-model", contextWindow: 999999 },
+        ]);
+        const defSize = readKimiConfig(home, { KIMI_MODEL_NAME: "m2" } as NodeJS.ProcessEnv);
+        assert.deepEqual(defSize.models, [
+            { id: "kimi-for-coding", contextWindow: 1048576 },
+            { id: "m2", contextWindow: 262144 },
+        ]);
+    } finally {
+        fs.rmSync(home, { recursive: true, force: true });
+    }
+});
+
+test("discoverRoutes: kimi — loopback inventory, https MITM whitelist, http proxy-env, wrapped skip (#757)", () => {
+    const config: ClientConfig = {
+        kimi: {
+            providers: {
+                local: { baseUrl: "http://127.0.0.1:8199/v1" },
+                remote: { baseUrl: "https://api.kimi.com/coding/v1" },
+                lan: { baseUrl: "http://10.0.0.5:1234/v1" },
+                wrapped: { baseUrl: "http://127.0.0.1:8787/bili/http://127.0.0.1:9999/v1" },
+            },
+            modelUrls: ["https://api.kimi.com/coding/v1", "::::"],
+            envUrls: ["http://10.0.0.5:1234/v1"],
+        },
+    };
+    const routes = discoverRoutes("kimi", config);
+    assert.deepEqual(routes.httpRewrites, [{ key: "kimi-1", realUpstream: "http://127.0.0.1:8199/v1" }]);
+    assert.deepEqual(routes.httpsDomains, ["api.kimi.com"]);
+    assert.deepEqual(routes.httpEnvRoutes, ["http://10.0.0.5:1234/v1"]);
+});
+
+test("discoverRoutes: kimi empty config → managed OAuth fallback hosts (#757)", () => {
+    const routes = discoverRoutes("kimi", {});
+    assert.deepEqual(routes.httpsDomains, KIMI_DEFAULT_MODEL_HOSTS);
+    assert.deepEqual(routes.httpRewrites, []);
+    assert.deepEqual(routes.httpEnvRoutes, []);
+});
+
+test("resolveClientCommand: kimi resolves `kimi` on PATH, falls back to <home>/bin/kimi (#757)", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-kimi-bin-"));
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-kimi-home-"));
+    const prevHome = process.env.HOME;
+    const prevUserProfile = process.env.USERPROFILE;
+    process.env.HOME = home;
+    if (prevUserProfile !== undefined) process.env.USERPROFILE = home;
+    try {
+        const env: NodeJS.ProcessEnv = { PATH: dir };
+        assert.deepEqual(resolveClientCommand("kimi", env), { command: path.join(home, ".kimi-code", "bin", "kimi"), prefixArgs: [] });
+        fs.writeFileSync(path.join(dir, "kimi"), "");
+        assert.deepEqual(resolveClientCommand("kimi", env), { command: path.join(dir, "kimi"), prefixArgs: [] });
+        const emptyDir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-kimi-empty-"));
+        assert.deepEqual(resolveClientCommand("kimi", { PATH: emptyDir, KIMI_CODE_HOME: "/tmp/kh" }), { command: path.join("/tmp/kh", "bin", "kimi"), prefixArgs: [] });
+        fs.rmSync(emptyDir, { recursive: true, force: true });
+    } finally {
+        if (prevHome === undefined) delete process.env.HOME;
+        else process.env.HOME = prevHome;
+        if (prevUserProfile === undefined) delete process.env.USERPROFILE;
+        else process.env.USERPROFILE = prevUserProfile;
+        fs.rmSync(dir, { recursive: true, force: true });
+        fs.rmSync(home, { recursive: true, force: true });
+    }
+});
+
+test("runLaunch kimi: cert-MITM envs (combined CA on SSL_CERT_FILE + NODE_EXTRA_CA_CERTS), discovered host whitelist, model windows (#757)", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-kimi-launch-"));
+    const prevHome = process.env.HOME;
+    const prevUserProfile = process.env.USERPROFILE;
+    const prevBin = process.env.BILI_CLIENT_BIN;
+    const prevNoProxy = process.env.NO_PROXY;
+    fs.mkdirSync(path.join(home, ".kimi-code"));
+    fs.writeFileSync(
+        path.join(home, ".kimi-code", "config.toml"),
+        ['default_model = "k3"', "", '[providers."managed:kimi-code"]', "type = \"kimi\"", 'base_url = "https://api.kimi.com/coding/v1"', "", "[models.k3]", 'model = "kimi-for-coding"', "max_context_size = 1048576"].join("\n"),
+    );
+    process.env.HOME = home;
+    if (prevUserProfile !== undefined) process.env.USERPROFILE = home;
+    const fakeKimi = path.join(home, process.platform === "win32" ? "fake-kimi.exe" : "fake-kimi");
+    fs.writeFileSync(fakeKimi, "");
+    process.env.BILI_CLIENT_BIN = fakeKimi;
+    process.env.NO_PROXY = "localhost,.corp";
+
+    const clientEnvs: (NodeJS.ProcessEnv | undefined)[] = [];
+    const proxyEnvs: (NodeJS.ProcessEnv | undefined)[] = [];
+    const spawnImpl: SpawnFn = (cmd, args, opts) => {
+        const env = (opts as { env?: NodeJS.ProcessEnv } | undefined)?.env;
+        if (cmd === fakeKimi) {
+            clientEnvs.push(env);
+            const child = makeFakeChild(0);
+            const orig = child.on.bind(child);
+            (child as { on: SpawnChild["on"] }).on = (event, listener) => {
+                orig(event, listener);
+                if (event === "exit") setTimeout(() => listener(0, null), 0);
+                return child;
+            };
+            return child;
+        }
+        proxyEnvs.push(env);
+        return makeFakeChild(42425);
+    };
+    const fetchImpl = async () => ({ ok: true });
+    const prevExit = process.exit;
+    process.exit = (() => undefined) as typeof process.exit;
+
+    try {
+        await runLaunch(
+            { client: "kimi", clientArgs: [], overrides: {} },
+            { fetchImpl, spawnImpl, sleep: () => Promise.resolve() },
+        );
+        assert.equal(clientEnvs.length, 1);
+        const seenEnv = clientEnvs[0]!;
+        const origin = seenEnv.HTTPS_PROXY;
+        assert.ok(/^http:\/\/127\.0\.0\.1:\d+$/.test(String(origin)), `origin: ${origin}`);
+        assert.ok(String(seenEnv.SSL_CERT_FILE).endsWith(path.join("billion-context", "ca", "combined-ca.pem")), String(seenEnv.SSL_CERT_FILE));
+        assert.equal(seenEnv.NODE_EXTRA_CA_CERTS, seenEnv.SSL_CERT_FILE, "combined bundle on both CA vars");
+        assert.equal(seenEnv.HTTP_PROXY, undefined, "no plain-http routes → no HTTP_PROXY");
+        assert.equal(seenEnv.NO_PROXY, undefined, "inherited NO_PROXY stripped");
+        assert.equal(seenEnv.BILLION_CONTEXT_PROXY, undefined, "kimi has no agent-side plugin consumer");
+        assert.ok(proxyEnvs.length > 0, "proxy child spawned");
+        const mitm = String(proxyEnvs[0]!.BILI_MITM_DOMAINS).split(",");
+        assert.ok(mitm.includes("api.kimi.com"), `whitelist has api.kimi.com: ${mitm.join(",")}`);
+        assert.ok(!mitm.includes("api.kimi.ai"), "explicit provider present → no managed fallback hosts");
+        const windows = String(proxyEnvs[0]!.BILI_LAUNCHER_MODEL_WINDOWS ?? "");
+        assert.ok(windows.includes("kimi-for-coding"), `windows: ${windows}`);
     } finally {
         process.exit = prevExit;
         process.env.HOME = prevHome;
