@@ -1624,6 +1624,11 @@ export function dshArgsWithPatch(args: readonly string[], patchFile: string): st
     return ["--patch", patchFile, ...args];
 }
 
+export function parseOpencodeMajor(output: string): number | undefined {
+    const m = /(\d+)\s*\./.exec(output);
+    return m ? parseInt(m[1], 10) : undefined;
+}
+
 const ocMajorCache = new Map<string, number>();
 
 /** Major version of an OpenCode CLI binary via `--version` (cached per path).
@@ -1635,8 +1640,8 @@ export function opencodeMajorVersion(command: string): number {
     let major = 1;
     try {
         const out = execFileSync(command, ["--version"], { timeout: 5000, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
-        const m = /(\d+)\s*\./.exec(out);
-        if (m) major = parseInt(m[1], 10);
+        const parsed = parseOpencodeMajor(out);
+        if (parsed !== undefined) major = parsed;
     } catch {}
     ocMajorCache.set(command, major);
     return major;

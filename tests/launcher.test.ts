@@ -29,6 +29,7 @@ import {
     buildCodexArgs,
     prepareOpencodeHttpRewrite,
     opencodeMajorVersion,
+    parseOpencodeMajor,
     stripInheritedProxy,
     resolvePiHome,
     resolveOmpHome,
@@ -1835,19 +1836,21 @@ test("prepareOpencodeHttpRewrite: pluginDirMode wraps the plugin in an index.js 
 });
 
 test("opencodeMajorVersion: parses --version output, defaults to 1 on failure", () => {
+    assert.equal(parseOpencodeMajor("opencode v2.0.3"), 2);
+    assert.equal(parseOpencodeMajor("1.14.46"), 1);
+    assert.equal(parseOpencodeMajor("no digits here"), undefined);
+    assert.equal(opencodeMajorVersion("/nonexistent/bili-test-bin"), 1);
+    if (process.platform === "win32") return; // shebang fakes are not executable on Windows
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "oc-ver-"));
     try {
         const mk = (name: string, out: string): string => {
-            // win32 cannot exec shebang scripts; .cmd files spawn natively via cmd.exe
-            const win = process.platform === "win32";
-            const f = path.join(dir, win ? name.replace(/\.sh$/, ".cmd") : name);
-            fs.writeFileSync(f, win ? `@echo off\r\necho ${out}\r\n` : `#!/bin/sh\necho "${out}"\n`);
+            const f = path.join(dir, name);
+            fs.writeFileSync(f, `#!/bin/sh\necho "${out}"\n`);
             fs.chmodSync(f, 0o755);
             return f;
         };
         assert.equal(opencodeMajorVersion(mk("oc-v2.sh", "opencode v2.0.3")), 2);
         assert.equal(opencodeMajorVersion(mk("oc-v1.sh", "1.14.46")), 1);
-        assert.equal(opencodeMajorVersion("/nonexistent/bili-test-bin"), 1);
     } finally {
         fs.rmSync(dir, { recursive: true, force: true });
     }
