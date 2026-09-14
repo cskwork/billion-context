@@ -1615,9 +1615,9 @@ async function handle(
                 };
                 // #332: codex's native remote-compaction request (trigger form)
                 // is dispatched BEFORE prepare/preflight. When it is not
-                // intercepted, the upstream must receive exactly what codex
-                // sent: a preflight-compressed/rebuilt payload diverges from
-                // codex's local history, non-OpenAI backends 400 the
+                // intercepted, preserve what codex sent except for local bili
+                // compaction markers: a preflight-compressed/rebuilt payload
+                // diverges from codex's local history, non-OpenAI backends 400 the
                 // compaction_trigger item, and folding bili's state as a side
                 // effect of handling codex's own compaction is wrong.
                 const isCodexCompactTrigger =
@@ -1634,9 +1634,16 @@ async function handle(
                         rememberPluginMessages(sessionId, prepared.processedMessages, prepared.originalMessages, prepared.nudge);
                         return;
                     }
+                    // runPrepare may have mutated parsed before failing to forge.
+                    // Normalize the original wire input only: fc_bili_* records
+                    // are local summaries, not valid upstream compaction items.
+                    const original = JSON.parse(bodyBuffer.toString("utf8")) as ResponsesRequestBody;
+                    const { items, replaced, dropped } = replaceBiliCompactionItems(Array.isArray(original.input) ? original.input : []);
+                    const normalized = replaced + dropped > 0;
+                    const forwardBody = normalized ? Buffer.from(JSON.stringify({ ...original, input: items })) : bodyBuffer;
                     const why = mode !== "intercept" ? "BILI_CODEX_COMPACT=pass" : !gatePre ? "gate preconditions not met" : "transform/forge failed";
-                    log("info", `[${session.id}] codex compaction_trigger request not intercepted (${why}) — forwarding verbatim (no preflight, no rebuild, no window clamp)`);
-                    await forward(req, res, opts, bodyBuffer, null, core, reqConfig, log, route, instanceId, affinity);
+                    log("info", `[${session.id}] codex compaction_trigger request not intercepted (${why}) — forwarding ${normalized ? `with bili summaries normalized (replaced=${replaced}, dropped=${dropped})` : "verbatim"} (no preflight, no rebuild, no window clamp)`);
+                    await forward(req, res, opts, forwardBody, null, core, reqConfig, log, route, instanceId, affinity);
                     return;
                 }
                 prepared = runPrepare();

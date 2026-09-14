@@ -10,6 +10,7 @@ import { startServer, type ProxyOptions } from "../src/server.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { listSessions, _resetSessionsForTest } from "../src/session.ts";
+import { buildTriggerForgeBody } from "../src/codex-compact.ts";
 
 // Issue #321 PR-E2: conditional interception + forgery of codex's native
 // compaction requests. When BILI_CODEX_COMPACT=intercept, the client is codex,
@@ -65,7 +66,7 @@ type Harness = {
     compactUrl: string;
 };
 
-async function withHarness(opts: { mode?: string; firstTurnTokens: number }, fn: (h: Harness) => Promise<void>): Promise<void> {
+async function withHarness(opts: { mode?: string; firstTurnTokens: number; strictCompactionIds?: boolean }, fn: (h: Harness) => Promise<void>): Promise<void> {
     const bodies: string[] = [];
     const upstream = http.createServer((req, res) => {
         const chunks: Buffer[] = [];
@@ -73,6 +74,15 @@ async function withHarness(opts: { mode?: string; firstTurnTokens: number }, fn:
         req.on("end", () => {
             const raw = Buffer.concat(chunks).toString("utf8");
             bodies.push(raw);
+            if (opts.strictCompactionIds) {
+                const input = (JSON.parse(raw) as { input?: { type?: string; id?: string }[] }).input ?? [];
+                const invalid = input.findIndex((item) => item.type === "compaction" && !item.id?.startsWith("cmp"));
+                if (invalid >= 0) {
+                    res.writeHead(400, { "content-type": "application/json" });
+                    res.end(JSON.stringify({ error: { message: `Invalid 'input[${invalid}].id': '${input[invalid].id}'. Expected an ID that begins with 'cmp'.`, type: "invalid_request_error", param: `input[${invalid}].id`, code: "invalid_value" } }));
+                    return;
+                }
+            }
             if ((req.url ?? "").includes("/responses/compact")) {
                 res.writeHead(200, { "content-type": "application/json" });
                 res.end(JSON.stringify({ output: [] }));
@@ -145,6 +155,37 @@ async function setupCompressedSession(h: Harness): Promise<number> {
     assert.ok(s, "session exists");
     assert.ok((s!.state.blocks ?? []).some((b) => b.active), "setup created an active block");
     return h.bodies.length;
+}
+
+for (const mode of ["intercept", "pass"]) {
+    test(`native compact fallback (${mode}): echoed bili summary reaches a strict upstream without private compaction IDs`, async () => {
+        await withHarness({ mode, firstTurnTokens: 1000, strictCompactionIds: true }, async (h) => {
+            const summary = "Keep approval requirements enabled and preserve the pending repair task.";
+            const forged = JSON.parse(buildTriggerForgeBody(summary, { inputTokens: 20, outputTokens: 5, totalTokens: 25 }, false).body) as { output: unknown[] };
+            const prefix = Array.from({ length: 6 }, (_, i) => ({ type: "message", role: "user", content: `Retained message ${i}` }));
+            const native = { type: "compaction", id: "cmp_native", encrypted_content: "opaque-native-summary" };
+            const trigger = { type: "compaction_trigger" };
+            const original = {
+                model: "gpt-resp",
+                stream: true,
+                session_id: `echo-fallback-${mode}`,
+                instructions: "Preserve the client's compaction request.",
+                input: [...prefix, forged.output[0], native, trigger],
+            };
+            const response = await fetch(h.url, {
+                method: "POST",
+                headers: { "content-type": "application/json", "user-agent": CODEX_UA },
+                body: JSON.stringify(original),
+            });
+            const responseText = await response.text();
+            assert.equal(response.status, 200, responseText);
+            assert.equal(h.bodies.length, 1, "native fallback makes exactly one upstream request");
+            assert.deepEqual(JSON.parse(h.bodies[0]), {
+                ...original,
+                input: [...prefix, { type: "message", role: "user", content: [{ type: "input_text", text: `[bili] context summary after compaction:\n${summary}` }] }, native, trigger],
+            }, "only the bili item changes; summary, native blob, final trigger and request fields survive");
+        });
+    });
 }
 
 test("e2e E2 (trigger form): intercept + healthy ACP → forged 2-frame SSE, upstream untouched", async () => {
