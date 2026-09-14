@@ -449,7 +449,7 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
         const sysTokRaw = session.metadata.systemPromptTokens;
         const systemPromptTokens = typeof sysTokRaw === "number" && Number.isFinite(sysTokRaw) && sysTokRaw > 0 ? sysTokRaw : 0;
         panel = buildStatusPanel({
-            version: `billion-context@${PROXY_VERSION}`,
+            version: `billion-context@${PROXY_VERSION} · pack: ${session.meta.activePack ?? "default"}`,
             tokenCount: session.stats.lastInputTokens,
             systemPromptTokens,
             state: session.state,

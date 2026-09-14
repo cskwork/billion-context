@@ -2,7 +2,7 @@ import http from "node:http";
 import fs from "node:fs";
 import { randomUUID } from "node:crypto";
 import { createCore, type CompressionCore, type CompressionState, type Config, type CoreMessage, type NudgeDecision, type Prompts, type PackSurface, type ToolPrompts, applyAcpToolOverrides, defaultPrompts, defaultCountTokens, estimateTokensFast, renderNudgeText, deactivateBlock, viableRanges } from "acp-kernel";
-import { resolveCompress, resolveCompressPrompts, resolveCompressSurface, resolveRequestConfig } from "./compress-settings.js";
+import { resolveCompress, resolveCompressPrompts, resolveCompressSurfaceDetailed, resolveRequestConfig } from "./compress-settings.js";
 import { dropCompressReasoning, type CompressReasoningConfig } from "./reasoning-drop.js";
 import { DEFAULT_STRIP_IMAGES_KEEP_RECENT, stripHistoricalImages } from "./strip-images.js";
 import type { ProxyOptions } from "./config.js";
@@ -60,6 +60,7 @@ import { compressLoopResponsesJson } from "./compress-loop-responses.js";
 import { runCompressLoop, pickAdapter } from "./loop/index.js";
 import { containsToolCallXmlFragment } from "./loop/tag-echo-filter.js";
 import { isFakeCompletion, injectFakeCompletionHint, maxFakeCompletionRetries, fakeBufCap } from "./fake-completion.js";
+import { reasoningGuardEngages, runReasoningGuard } from "./reasoning-guard.js";
 import { sanitizeResponsesInputIds, dropWhitespaceResponsesMessages, normalizeResponsesMessageItems } from "./loop/adapter-responses.js";
 import { codexCompactMode, isCodexClient, hasCompactionTrigger, stripBiliCompactionItems, replaceBiliCompactionItems, codexCompactGate, codexCompactGatePre, buildTriggerForgeBody, mergeForgedSummaries } from "./codex-compact.js";
 import { stripAcpPanelMessages, stripAcpPanelResponsesInput } from "./acp-panel.js";
@@ -1111,6 +1112,7 @@ async function handle(
     // (kernel contract: renderNudgeText and the adapter prompt must match).
     let reqPrompts: Prompts = defaultPrompts;
     let reqSurface: PackSurface = {};
+    let reqSurfacePack = "default";
     if (parsed && typeof parsed === "object") {
         const model = (parsed as { model?: string }).model;
         if (model) {
@@ -1189,7 +1191,9 @@ async function handle(
             }
             const compressCfg = resolveCompress(opts.routes, embeddedUrl, model, opts.compress);
             reqPrompts = resolveCompressPrompts(compressCfg);
-            reqSurface = resolveCompressSurface(compressCfg);
+            const surfaceRes = resolveCompressSurfaceDetailed(compressCfg);
+            reqSurface = surfaceRes.surface;
+            reqSurfacePack = surfaceRes.packName;
         }
     }
     let prepared: Prepared | null = null;
@@ -1364,6 +1368,10 @@ async function handle(
             ? bodyIdentity.value
             : clientConversationHeader(req.headers);
         const session = getSession(sessionId, { protocol, upstreamOrigin, label: clientLabel ?? (anonAffinity ? "prefix-affinity" : undefined) });
+        // Audit stamp (#730 forensics): the effective pack for the most recent
+        // request (route/model can change it — latest wins). Persisted with the
+        // session so post-hoc forensics never needs config-mtime archaeology.
+        session.meta.activePack = reqSurfacePack;
         if (anonAffinity) {
             prefixAffinity.note(sessionId, anonAffinity.incomingDepth, anonAffinity.tailHash, anonAffinity.itemHashes);
             scheduleAffinityPersist();
@@ -3811,6 +3819,34 @@ async function forward(
             clearUpstreamTimer();
         }
         return;
+    }
+    if (prepared && prepared.protocol === "responses" && prepared.stream && !prepared.sidePassthrough && !prepared.compressInjected) {
+        const sse = (upstream.headers.get("content-type") ?? "").includes("text/event-stream");
+        if (sse) {
+            let reqModel: string | undefined;
+            try {
+                const wb = typeof wireBody === "string" ? wireBody : wireBody.toString("utf8");
+                const parsed = JSON.parse(wb) as Record<string, unknown>;
+                if (typeof parsed.model === "string") reqModel = parsed.model;
+            } catch { /* non-JSON body: guard stays off */ }
+            const rg = resolveCompress(opts.routes, upstreamUrl, reqModel, opts.compress).reasoningGuard;
+            if (rg && reasoningGuardEngages(rg)) {
+                log("info", `[reasoning-guard] engaged model=${reqModel ?? "?"} session=${prepared.session?.id ?? "-"}`);
+                await runReasoningGuard({
+                    firstResponse: upstream,
+                    clearFirstTimer: clearUpstreamTimer,
+                    upstreamUrl,
+                    reqHeaders: buildForwardHeaders(headers),
+                    dispatcher,
+                    originalBody: wireBody,
+                    signal: clientAbort.signal,
+                    res,
+                    config: rg,
+                    log: (msg) => log("info", msg),
+                });
+                return;
+            }
+        }
     }
     // #371: detect + retry a fake completion for every non-plugin streaming
     // response (any turn, not just compress-injected). Buffering is required:

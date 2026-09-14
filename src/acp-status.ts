@@ -8,6 +8,7 @@ import {
     type CoreMessage,
 } from "acp-kernel";
 import { preCompactionArchiveOf, type Session } from "./session.js";
+import { VERSION } from "./version.js";
 
 export interface AcpStatusCtx {
     core: CompressionCore;
@@ -28,7 +29,17 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
     const tool = typeof args.tool === "string" ? args.tool : undefined;
     const sort = typeof args.sort === "string" ? (args.sort as "size" | "time" | "tool" | "age") : undefined;
     const limit = typeof args.limit === "number" ? args.limit : undefined;
-    const base = buildStatusReport(ctx.session.state, ctx.messages, defaultCountTokens, { scope, view, tool, sort, limit });
+    const base = buildStatusReport(ctx.session.state, ctx.messages, defaultCountTokens, {
+        scope,
+        view,
+        tool,
+        sort,
+        limit,
+        meta: {
+            pack: ctx.session.meta.activePack ?? "default",
+            host: `billion-context ${VERSION}`,
+        },
+    });
     if (scope) return base;
     const extra: string[] = [];
     try {
