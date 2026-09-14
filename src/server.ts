@@ -2729,11 +2729,12 @@ function prepareResponsesCompact(
         }
         const viewed = applyAbsorbView(turn.messages, turn.state, compactConfig, session.stats.lastInputTokens);
         const processed = repairResponsesAssistantOrdering(stripKernelSummaries(viewed, turn.state), projection.msgs);
-        const output = patchResponsesInput(projection, processed);
+        let output = patchResponsesInput(projection, processed);
         if (typeof output === "string") {
             session.state = prevState;
             return base;
         }
+        output = hoistTrappedToolItems(output);
         snapshotMessages(session, projection.msgs);
         markDirty(session);
         log("info", `[${session.id}] codex compact intercepted (endpoint); forged history with ${output.length} item(s), upstream not contacted`);
