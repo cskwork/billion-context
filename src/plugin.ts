@@ -3,7 +3,7 @@ import { buildStatusPanel } from "acp-kernel/panel";
 import { fileURLToPath } from "node:url";
 import fs from "node:fs";
 import path from "node:path";
-import { acquireInFlight, listSessions, markCompactionBoundary, markDirty, peekSession, releaseInFlight, withSessionLock, type Session } from "./session.js";
+import { acquireInFlight, findSessionByCanonicalId, listSessions, markCompactionBoundary, markDirty, peekSession, releaseInFlight, withSessionLock, type Session } from "./session.js";
 import { ABSORB_TOOL, ABSORB_TOOL_NAME, ABSORB_TOOL_OPENAI, ABSORB_TOOL_RESPONSES, ACP_TOOLS_ANTHROPIC, ACP_TOOLS_OPENAI, ACP_TOOLS_RESPONSES, PROXY_TOOL_NAMES } from "./compress-tool.js";
 import { effectiveAbsorbConfig, isProxyToolFor } from "./absorb.js";
 import { executeProxyTool } from "./loop/core.js";
@@ -319,17 +319,7 @@ export function handlePluginCompact(payload: string, res: import("node:http").Se
         res.end(JSON.stringify({ ok: false, error: "conversationId is required" }));
         return;
     }
-    const entry = conversations.get(conversationId);
-    let session = entry ? peekSession(entry.sessionId) : undefined;
-    // #760: the session id IS the client-provided conversation value verbatim
-    // (#286), so resolve directly when the map has no entry yet — a FIRST tool
-    // call must route before any plugin binding recorded the mapping (header-
-    // based clients have no prompt_cache_key record to lean on). Read-only: an
-    // unknown id finds nothing and creates nothing.
-    if (!session) {
-        session = peekSession(conversationId);
-        if (session) recordPluginSession(conversationId, session.id);
-    }
+    const { session, entry } = resolveConversation(conversationId);
     // #760: the verbatim-id fallback above can resolve a session with NO map
     // entry (first call), so only the session itself gates execution.
     if (!session) {
@@ -427,14 +417,32 @@ function conversationIdForSession(sessionId: string): string | undefined {
     return bestId;
 }
 
+/** Resolve a caller-supplied conversation id to a resident session through every
+ *  known channel, in precedence order: (1) the persisted conversation→session map
+ *  (plugin binding / prior calls), (2) the verbatim session id (#760 — the id IS
+ *  the client-provided conversation value), (3) the proxy-derived canonical pfa-*
+ *  alias (#760b — every session exposes a stable canonical id the model echoes
+ *  back from the wire notes). Paths 2/3 record the resolved mapping so later
+ *  calls hit path 1 directly. Read-only w.r.t. creation: an unknown id finds
+ *  nothing and creates nothing. */
+function resolveConversation(conversationId: string): { session: Session | undefined; entry?: ConversationEntry } {
+    const entry = conversations.get(conversationId);
+    let session = entry ? peekSession(entry.sessionId) : undefined;
+    if (!session) {
+        session = peekSession(conversationId) ?? findSessionByCanonicalId(conversationId);
+        if (session) recordPluginSession(conversationId, session.id);
+    }
+    return { session, entry };
+}
+
 /** Context-level visibility for plugin UIs (status bars / slash commands):
  *  the same usage the nudge decision sees, keyed by conversation id. */
 export function handlePluginStatus(conversationId: string, res: import("node:http").ServerResponse, deps: PluginToolDeps, fallbackLatest = false): void {
-    let entry = conversations.get(conversationId);
-    let session = entry ? peekSession(entry.sessionId) : undefined;
+    const { session: resolvedSession, entry } = resolveConversation(conversationId);
+    let session = resolvedSession;
     let viaFallback = false;
     let resolvedConversationId = conversationId;
-    if ((!entry || !session) && fallbackLatest) {
+    if (!session && fallbackLatest) {
         // #404: only sessions with real activity in THIS process qualify.
         // Before the fix every boot-restored session carried lastSeen =
         // restore time, so a 245-way tie resolved by insertion (readdir)
@@ -549,15 +557,7 @@ export async function handlePluginTool(
         res.end(JSON.stringify({ ok: false, error: `conversationId is required (send the same value as the ${PLUGIN_CONVERSATION_HEADER} header)` }));
         return;
     }
-    const entry = conversations.get(conversationId);
-    let session = entry ? peekSession(entry.sessionId) : undefined;
-    // #760: same first-call routing as handlePluginCompact — resolve the
-    // verbatim session id directly when the map has no entry yet. Read-only:
-    // an unknown id finds nothing and creates nothing.
-    if (!session) {
-        session = peekSession(conversationId);
-        if (session) recordPluginSession(conversationId, session.id);
-    }
+    const { session, entry } = resolveConversation(conversationId);
     // #760: the verbatim-id fallback above can resolve a session with NO map
     // entry (first call), so only the session itself gates execution.
     if (!session) {
@@ -618,6 +618,14 @@ export async function handlePluginTool(
         return;
     }
     releaseInFlight(session);
+    // #760b: evidence-based plugin-mode flip. A successful MCP tool execution proves
+    // this session's host owns the bili compression tools, so bind it to plugin mode
+    // (sticky) — the next model request stops injecting the duplicate ephemeral wire
+    // tools. Guarded: only flips a session with NO existing agent binding, never
+    // overriding a pi/omp/opencode plugin or a launcher-registered agent.
+    if (typeof session.metadata.pluginAgent !== "string") {
+        session.metadata.pluginAgent = "mcp";
+    }
     markDirty(session);
     deps.log("info", `[${session.id}] [plugin] tool ${tool} executed via plugin (${result.length} chars)`);
     res.writeHead(200, { "content-type": "application/json" });

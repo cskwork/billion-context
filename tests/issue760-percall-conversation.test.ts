@@ -3,6 +3,7 @@ import http from "node:http";
 import { once } from "node:events";
 import test from "node:test";
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 
 process.env.NODE_ENV = "test";
 
@@ -158,6 +159,12 @@ function schemaOf(tool: unknown): SchemaObj | undefined {
     return undefined;
 }
 
+// Mirrors src/session.ts derivedLegacyCanonicalId: the stable pfa-* id a
+// non-pfa (client-named) session exposes for MCP routing.
+function canonicalOf(sessionId: string): string {
+    return `pfa-${createHash("sha256").update(`legacy:${sessionId}`).digest("hex").slice(0, 16)}`;
+}
+
 test("plugin manifest advertises an optional conversation_id in all three tool formats", async () => {
     const rig = await startRig();
     try {
@@ -190,7 +197,9 @@ test("wire mode: proxy prints its own conversation id in the static system part,
         await postModel(rig, "conv-760-a");
         await waitFor(() => rig.upstreamBodies.length >= 2, "two upstream bodies");
         const sys0 = sysText(rig.upstreamBodies[0]);
-        assert.match(sys0, /\[Your bili conversation id: conv-760-a\./, "id note present in wire mode");
+        const canon = canonicalOf("conv-760-a");
+        assert.match(sys0, new RegExp(`\\[Your bili conversation id: ${canon}\\.`), "id note carries the derived canonical pfa-* id");
+        assert.doesNotMatch(sys0, /\[Your bili conversation id: conv-760-a\./, "note no longer leaks the raw client session id");
         assert.equal(sysText(rig.upstreamBodies[1]), sys0, "system bytes stable across turns (prefix-cache anchor)");
     } finally {
         await rig.closeAll();
@@ -222,6 +231,55 @@ test("unknown conversation id is rejected without creating a session", async () 
         assert.match(r.data.error ?? "", /no model request has arrived/, "orphan-adoption trigger substring preserved");
         const st = await statusOf(rig, "conv-ghost");
         assert.notEqual(st.ok, true, "no session materialized for the fabricated id");
+    } finally {
+        await rig.closeAll();
+    }
+});
+
+test("canonical pfa-* id (derived, not the client's own) routes to the right session; raw id still works", async () => {
+    const rig = await startRig();
+    try {
+        await postModel(rig, "conv-canonical");
+        await waitFor(() => rig.upstreamBodies.length >= 1, "one upstream body");
+        const sys0 = sysText(rig.upstreamBodies[0]);
+        const canon = canonicalOf("conv-canonical");
+        assert.match(sys0, new RegExp(`\\[Your bili conversation id: ${canon}\\.`), "note carries the derived canonical id");
+
+        // Route by the CANONICAL id — the value the model actually echoes back.
+        const rCanon = await toolCall(rig, canon);
+        assert.equal(rCanon.status, 200, `canonical-id routing succeeded: ${JSON.stringify(rCanon.data)}`);
+        assert.equal(rCanon.data.ok, true);
+        assert.match(rCanon.data.result ?? "", /CONTEXT BREAKDOWN/);
+
+        // Backward compat: the raw client session id STILL routes.
+        const rRaw = await toolCall(rig, "conv-canonical");
+        assert.equal(rRaw.status, 200, `raw-id routing still succeeds: ${JSON.stringify(rRaw.data)}`);
+        assert.equal(rRaw.data.ok, true);
+
+        // A fabricated canonical-looking id is rejected and creates nothing.
+        const rGhost = await toolCall(rig, "pfa-deadbeefdeadbeef");
+        assert.equal(rGhost.status, 404);
+        assert.match(rGhost.data.error ?? "", /no model request has arrived/);
+    } finally {
+        await rig.closeAll();
+    }
+});
+
+test("successful MCP tool execution flips a wire-mode session to plugin mode (evidence-based)", async () => {
+    const rig = await startRig();
+    try {
+        await postModel(rig, "conv-ev-a");
+        await postModel(rig, "conv-ev-b");
+        await waitFor(() => rig.upstreamBodies.length >= 2, "two upstream bodies");
+        // Neither is bound yet — both wire mode.
+        assert.notEqual((await statusOf(rig, "conv-ev-a")).pluginAgent, "mcp", "A starts in wire mode");
+        // A successful tool call against A flips ONLY A.
+        const r = await toolCall(rig, "conv-ev-a");
+        assert.equal(r.status, 200, `tool call succeeded: ${JSON.stringify(r.data)}`);
+        const stA = await statusOf(rig, "conv-ev-a");
+        assert.equal(stA.pluginAgent, "mcp", "session flipped to plugin mode after its own MCP tool execution");
+        const stB = await statusOf(rig, "conv-ev-b");
+        assert.notEqual(stB.pluginAgent, "mcp", "sibling without a tool call stays wire mode");
     } finally {
         await rig.closeAll();
     }
@@ -302,15 +360,17 @@ test("shared shim, no env/meta id: per-call ids route two sessions independently
         assert.equal(callB.result?.isError, false, `per-call call routed to B${callB.result?.isError ? ": " + (callB.result?.content?.[0]?.text ?? "") : ""}`);
 
         await waitFor(() => rig.upstreamBodies.length >= 5, "five upstream bodies");
+        const canonA = canonicalOf("conv-mcp-a");
+        const canonB = canonicalOf("conv-mcp-b");
         // A's first request: wire mode — ephemeral compress tool injected, id note present.
         assert.ok(toolNames(rig.upstreamBodies[0]).includes("compress"), "wire request carries the ephemeral compress tool");
-        assert.match(sysText(rig.upstreamBodies[0]), /\[Your bili conversation id: conv-mcp-a\./);
-        // A's second request arrives AFTER the identity registration landed:
+        assert.match(sysText(rig.upstreamBodies[0]), new RegExp(`\\[Your bili conversation id: ${canonA}\\.`));
+        // A's second request arrives AFTER the tool call landed:
         // pure plugin mode — no ephemeral tools, id note still flows.
-        assert.ok(!toolNames(rig.upstreamBodies[2]).includes("compress"), "post-registration request drops the ephemeral compress tool");
-        assert.match(sysText(rig.upstreamBodies[2]), /\[Your bili conversation id: conv-mcp-a\./, "id note flows in plugin mode too");
+        assert.ok(!toolNames(rig.upstreamBodies[2]).includes("compress"), "post-tool-call request drops the ephemeral compress tool");
+        assert.match(sysText(rig.upstreamBodies[2]), new RegExp(`\\[Your bili conversation id: ${canonA}\\.`), "id note flows in plugin mode too");
         // B's requests carry B's id, not A's — no cross-talk.
-        assert.match(sysText(rig.upstreamBodies[3]), /\[Your bili conversation id: conv-mcp-b\./);
+        assert.match(sysText(rig.upstreamBodies[3]), new RegExp(`\\[Your bili conversation id: ${canonB}\\.`));
 
         // Sticky plugin-mode flip, and the untouched sibling stays wire mode.
         const stA = await statusOf(rig, "conv-mcp-a");
