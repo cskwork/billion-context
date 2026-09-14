@@ -8,8 +8,9 @@
 // #760: a fourth channel for hosts that share ONE shim across several
 // concurrent conversations (no env/meta session at all): every tool accepts an
 // optional conversation_id argument the model copies from the proxy's notes,
-// which overrides the default binding and lazily registers the named
-// conversation on first use.
+// which overrides the default binding for that one call only. No registration
+// is issued for per-call ids — the proxy resolves them directly and flips the
+// target session to plugin mode on successful execution.
 
 import fs from "node:fs";
 import path from "node:path";
