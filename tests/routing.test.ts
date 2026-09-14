@@ -89,6 +89,18 @@ test("lookupContextLimit returns undefined for unknown models", () => {
     assert.equal(lookupContextLimit(undefined), undefined);
 });
 
+test("lookupContextLimit retries the bare basename for relay 'org/model' ids (#774)", () => {
+    // The table regexes are ^-anchored on bare names: a prefixed id that no
+    // row matches on the full string must still hit via its basename.
+    assert.equal(lookupContextLimit("alibaba/qwen3.8-27b"), 128_000);
+    assert.equal(lookupContextLimit("some-org/gpt-4o-mini"), 128_000);
+    assert.equal(lookupContextLimit("openai/gpt-5-codex"), 400_000);
+    // A matching full id still outranks the basename.
+    assert.equal(lookupContextLimit("claude-anything/x"), 200_000);
+    // Unknown family stays a miss (no guessing).
+    assert.equal(lookupContextLimit("acme/totally-custom-model-x"), undefined);
+});
+
 // ── resolveContextLimit: longest-prefix matching on URL keys ──────────────
 // The key is the /bili/<this> string. A request matches when its embedded
 // upstream URL equals the key, or starts with key + "/". Longest key wins

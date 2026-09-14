@@ -78,10 +78,47 @@ test("known-provider host does not cross-provider scan on a miss", () => {
     assert.equal(peekRegistryContext("deepseek-chat", "api.minimax.chat"), undefined);
 });
 
+test("relay-served 'org/model' ids resolve via the bare basename (#774)", () => {
+    // The #736/#774 scenario: local vLLM serves HF-style "qwen/qwen3.8-27b"
+    // while models.dev lists it as "alibaba/qwen3.8-27b". The full id never
+    // matches (no key ends in "/qwen/qwen3.8-27b"); the bare basename must.
+    _setForTest({ "alibaba/qwen3.8-27b": { limit: { context: 262_144 } } });
+    assert.equal(peekRegistryContext("qwen/qwen3.8-27b", "127.0.0.1:8199"), 262_144);
+    assert.equal(peekRegistryContext("qwen/qwen3.8-27b"), 262_144);
+});
+
+test("an exactly-listed prefixed id outranks the bare-basename fallback (#774)", () => {
+    _setForTest({
+        "qwen/qwen3.8-27b": { limit: { context: 32_768 } },
+        "alibaba/qwen3.8-27b": { limit: { context: 262_144 } },
+    });
+    assert.equal(peekRegistryContext("qwen/qwen3.8-27b", "relay.example"), 32_768);
+});
+
+test("prefixed id with a reasoning suffix strips before the bare fallback (#774)", () => {
+    _setForTest({ "alibaba/qwen3.8-27b": { limit: { context: 262_144 } } });
+    assert.equal(peekRegistryContext("qwen/qwen3.8-27b-thinking", "relay.example"), 262_144);
+});
+
+test("known-provider host does not cross-provider scan for the bare basename either (#774)", () => {
+    _setForTest({
+        "alibaba/qwen3.8-27b": { limit: { context: 262_144 } },
+        "minimax/qwen3.8-27b-custom": { limit: { context: 1 } },
+    });
+    assert.equal(peekRegistryContext("someone/qwen3.8-27b", "api.minimax.chat"), undefined);
+});
+
 test("bundled snapshot resolves relay-style bare names via provider-prefixed keys", () => {
     // The exact #282 scenario: freeinference.org serving "deepseek-v4-flash",
     // which the registry stores only as "deepseek/deepseek-v4-flash" (1M).
     assert.equal(bundledSnapshotLookup("deepseek-v4-flash", "freeinference.org"), 1_000_000);
+});
+
+test("bundled snapshot resolves the exact #774 relay 'org/model' id offline", () => {
+    // Local vLLM serving HF-style "qwen/qwen3.8-27b"; the snapshot lists it
+    // as "alibaba/qwen3.8-27b". Must resolve from the offline floor alone.
+    const got = bundledSnapshotLookup("qwen/qwen3.8-27b", "127.0.0.1:8199");
+    assert.ok(typeof got === "number" && got >= 128_000, `expected qwen3.8-27b window, got ${got}`);
 });
 
 test("contextFromRegistry resolves from the warm cache (same lookup, async)", async () => {

@@ -290,42 +290,53 @@ function registryLookup(reg: RegistryShape | null, model: string, host?: string)
     if (!reg || !model) return undefined;
     const provider = host ? providerFromHost(host) : undefined;
     for (const name of modelVariants(model)) {
-        const candidates = provider ? [`${provider}/${name}`, name] : [name];
-        for (const key of candidates) {
-            const entry = reg[key];
-            const ctx = entry?.limit?.context;
-            if (typeof ctx === "number" && ctx > 0) return ctx;
-        }
-        // Relay host (not in HOST_TO_PROVIDER): the bare name can miss while
-        // the model exists under a provider-prefixed key (a relay serving
-        // "deepseek-v4-flash" is stored as "deepseek/deepseek-v4-flash"). Scan
-        // */<name> and take the MAXIMUM window across matches when they
-        // disagree: max is never smaller than any single declared deployment,
-        // so compression thresholds never fire earlier than some real
-        // deployment would allow; conflicts are logged once per name. Zero
-        // valid matches falls through to the next (stripped) variant.
-        // Known-provider hosts do not cross-provider scan: a miss means the
-        // model is genuinely unlisted for that provider (its stripped
-        // variants still get their exact-key chance above).
-        if (provider === undefined) {
-            const suffix = `/${name}`;
-            let max: number | undefined;
-            const distinct = new Set<number>();
-            const parts: string[] = [];
-            for (const key of Object.keys(reg)) {
-                if (!key.endsWith(suffix)) continue;
-                const ctx = reg[key].limit?.context;
-                if (typeof ctx !== "number" || ctx <= 0) continue;
-                if (max === undefined || ctx > max) max = ctx;
-                distinct.add(ctx);
-                parts.push(`${key}=${ctx}`);
+        // A relay/vLLM may serve HF-style "org/model" ids under a prefix no
+        // listed provider owns (#774): "qwen/qwen3.8-27b" never matched the
+        // listed "alibaba/qwen3.8-27b" because the cross-provider scan looks
+        // for keys ending in "/qwen/qwen3.8-27b". After the full id, retry
+        // the bare basename — an exactly-listed prefixed id still outranks
+        // the bare fallback (the full id is tried first).
+        const slash = name.lastIndexOf("/");
+        const base = slash >= 0 ? name.slice(slash + 1) : "";
+        const names = base ? [name, base] : [name];
+        for (const n of names) {
+            const candidates = provider ? [`${provider}/${n}`, n] : [n];
+            for (const key of candidates) {
+                const entry = reg[key];
+                const ctx = entry?.limit?.context;
+                if (typeof ctx === "number" && ctx > 0) return ctx;
             }
-            if (max !== undefined) {
-                if (distinct.size > 1 && !warnedConflicts.has(name)) {
-                    warnedConflicts.add(name);
-                    loggerLog("warn", `[acp-registry] conflicting context windows for "${name}" (${parts.join(", ")}) — using max ${max}`);
+            // Relay host (not in HOST_TO_PROVIDER): the bare name can miss while
+            // the model exists under a provider-prefixed key (a relay serving
+            // "deepseek-v4-flash" is stored as "deepseek/deepseek-v4-flash"). Scan
+            // */<name> and take the MAXIMUM window across matches when they
+            // disagree: max is never smaller than any single declared deployment,
+            // so compression thresholds never fire earlier than some real
+            // deployment would allow; conflicts are logged once per name. Zero
+            // valid matches falls through to the next candidate name / stripped
+            // variant. Known-provider hosts do not cross-provider scan: a miss
+            // means the model is genuinely unlisted for that provider (its
+            // stripped variants still get their exact-key chance above).
+            if (provider === undefined) {
+                const suffix = `/${n}`;
+                let max: number | undefined;
+                const distinct = new Set<number>();
+                const parts: string[] = [];
+                for (const key of Object.keys(reg)) {
+                    if (!key.endsWith(suffix)) continue;
+                    const ctx = reg[key].limit?.context;
+                    if (typeof ctx !== "number" || ctx <= 0) continue;
+                    if (max === undefined || ctx > max) max = ctx;
+                    distinct.add(ctx);
+                    parts.push(`${key}=${ctx}`);
                 }
-                return max;
+                if (max !== undefined) {
+                    if (distinct.size > 1 && !warnedConflicts.has(n)) {
+                        warnedConflicts.add(n);
+                        loggerLog("warn", `[acp-registry] conflicting context windows for "${n}" (${parts.join(", ")}) — using max ${max}`);
+                    }
+                    return max;
+                }
             }
         }
     }

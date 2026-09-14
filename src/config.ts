@@ -217,8 +217,17 @@ const CONTEXT_LIMIT_TABLE: Array<{ match: RegExp; limit: number }> = [
 
 export function lookupContextLimit(model: string | undefined): number | undefined {
     if (!model) return undefined;
-    for (const entry of CONTEXT_LIMIT_TABLE) {
-        if (entry.match.test(model)) return entry.limit;
+    // Relay/vLLM ids carry an HF-style "org/model" prefix (#774) and the table
+    // regexes are ^-anchored on bare names: "alibaba/qwen3.8-27b" misses every
+    // row its basename would hit. Try the full id first, then the bare
+    // basename — a matching full id still outranks the basename.
+    const slash = model.lastIndexOf("/");
+    const base = slash >= 0 ? model.slice(slash + 1) : "";
+    const names = base ? [model, base] : [model];
+    for (const name of names) {
+        for (const entry of CONTEXT_LIMIT_TABLE) {
+            if (entry.match.test(name)) return entry.limit;
+        }
     }
     return undefined;
 }
