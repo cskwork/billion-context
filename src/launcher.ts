@@ -12,6 +12,7 @@
  *   bili pi     [-- client args...]   HTTPS_PROXY + NODE_EXTRA_CA_CERTS
  *   bili codex  [-- client args...]   HTTPS_PROXY + SSL_CERT_FILE
  *   bili claude [-- client args...]   HTTPS_PROXY + NODE_EXTRA_CA_CERTS
+ *   bili kimi   [-- client args...]   HTTPS_PROXY + NODE_EXTRA_CA_CERTS (cert-MITM)
  *   bili test pi                      non-polluting pi smoke test
  *
  * The real upstream hosts are DISCOVERED by reading (never editing) the
@@ -53,7 +54,7 @@ import { selfPackageRoot, isBiliPiEntry, ompPluginLoadedFrom } from "./plugin-in
 function selfDistFile(name: string): string {
     return path.join(selfPackageRoot(), "dist", name);
 }
-import { nonEmpty, resolvePiHome, resolveOmpHome, resolveDshHome, resolveCodexHome, loadClientConfig, collectModelWindows, type ClientConfig, type CodexConfig, resolveOpencodeConfigFile, type OpencodeConfig, type OpencodeProvider, type HermesConfig, type HermesProvider, qoderIsCnSite, QODER_DEFAULT_MODEL_HOSTS, resolveTraeHome, readTraeConfig, TRAE_DEFAULT_MODEL_HOSTS, JCODE_DEFAULT_MODEL_HOSTS, type TraeConfig } from "./client-config.js";
+import { nonEmpty, resolvePiHome, resolveOmpHome, resolveDshHome, resolveCodexHome, loadClientConfig, collectModelWindows, type ClientConfig, type CodexConfig, resolveOpencodeConfigFile, type OpencodeConfig, type OpencodeProvider, type HermesConfig, type HermesProvider, qoderIsCnSite, QODER_DEFAULT_MODEL_HOSTS, resolveTraeHome, readTraeConfig, TRAE_DEFAULT_MODEL_HOSTS, JCODE_DEFAULT_MODEL_HOSTS, type TraeConfig, resolveKimiHome, readKimiConfig, parseKimiToml, KIMI_DEFAULT_MODEL_HOSTS, type KimiConfig, type KimiProvider } from "./client-config.js";
 import { loadRoutes, resolveConfiguredContextLimit, lookupContextLimit, type ProviderRoutes } from "./config.js";
 import { contextFromRegistry } from "./registry.js";
 
@@ -104,12 +105,18 @@ export {
     qoderIsCnSite,
     QODER_DEFAULT_MODEL_HOSTS,
     type QoderConfig,
+    parseKimiToml,
+    readKimiConfig,
+    resolveKimiHome,
+    KIMI_DEFAULT_MODEL_HOSTS,
+    type KimiConfig,
+    type KimiProvider,
 } from "./client-config.js";
 
 export const LAUNCHER_DEFAULT_HOST = "127.0.0.1";
-export const LAUNCH_CLIENTS = ["pi", "codex", "claude", "omp", "opencode", "hermes", "dsh", "codebuddy", "qoder", "trae", "jcode", "pi-test"] as const;
+export const LAUNCH_CLIENTS = ["pi", "codex", "claude", "omp", "opencode", "hermes", "dsh", "codebuddy", "qoder", "trae", "jcode", "kimi", "pi-test"] as const;
 export type ClientName = (typeof LAUNCH_CLIENTS)[number];
-export type BaseClientName = "claude" | "codex" | "pi" | "omp" | "opencode" | "hermes" | "dsh" | "codebuddy" | "qoder" | "trae" | "jcode";
+export type BaseClientName = "claude" | "codex" | "pi" | "omp" | "opencode" | "hermes" | "dsh" | "codebuddy" | "qoder" | "trae" | "jcode" | "kimi";
 
 const HEALTH_PATH = "/__bili/health";
 const HEALTH_POLL_INTERVAL_MS = 200;
@@ -220,9 +227,9 @@ export interface DiscoveredRoutes {
     httpRewrites: HttpRewrite[];
     httpsRewrites: HttpRewrite[];
     // Plaintext-http upstreams routed purely via HTTP_PROXY absolute-form
-    // forward-proxy requests (no URL rewriting). dsh-only today, and never
-    // loopback — dsh bypasses proxy envs for loopback targets unconditionally,
-    // so those ride httpRewrites instead (#535 phase 4).
+    // forward-proxy requests (no URL rewriting). dsh/kimi today, and never
+    // loopback — both bypass proxy envs for loopback targets unconditionally,
+    // so those ride httpRewrites instead (dsh: #535 phase 4; kimi: #757).
     httpEnvRoutes: string[];
 }
 
@@ -421,6 +428,57 @@ export function discoverRoutes(client: ClientName, config: ClientConfig): Discov
                 }
             } catch {
                 // Unparseable endpoint: skip.
+            }
+        }
+    } else if (client === "kimi") {
+        // #757: Kimi Code honors standard proxy envs for all outbound traffic
+        // EXCEPT an unconditional loopback NO_PROXY bypass (verified against
+        // the v0.42.0 binary), so only non-loopback upstreams can ride the
+        // proxy: https → cert MITM (host whitelisted below), plain http →
+        // absolute-form forward-proxy requests (httpEnvRoutes). Loopback
+        // destinations need a manual /bili/ prefix in config.toml — inventory
+        // only here, feeding the banner. Endpoints the user already wrapped
+        // (raw !== real) are skipped so they don't trigger the warning.
+        const kimiSeen = new Set<string>();
+        let anon = 0;
+        const kimiUrls: string[] = [];
+        for (const prov of Object.values(config.kimi?.providers ?? {})) {
+            if (nonEmpty(prov.baseUrl)) kimiUrls.push(prov.baseUrl!);
+        }
+        for (const raw of [...(config.kimi?.modelUrls ?? []), ...(config.kimi?.envUrls ?? [])]) {
+            kimiUrls.push(raw);
+        }
+        for (const raw of kimiUrls) {
+            const real = unwrapUpstream(raw);
+            try {
+                const url = new URL(real);
+                if (url.protocol !== "http:" && url.protocol !== "https:") continue;
+                if (kimiSeen.has(real)) continue;
+                kimiSeen.add(real);
+                if (isLoopbackHost(url.hostname)) {
+                    if (raw !== real) continue;
+                    anon += 1;
+                    rewriteKeys.add(`kimi-${anon}`);
+                    httpRewrites.push({ key: `kimi-${anon}`, realUpstream: real });
+                } else if (url.protocol === "https:") {
+                    const host = url.hostname.toLowerCase();
+                    if (host && !httpsSeen.has(host)) {
+                        httpsSeen.add(host);
+                        httpsDomains.push(host);
+                    }
+                } else if (!httpEnvRoutes.includes(real)) {
+                    httpEnvRoutes.push(real);
+                }
+            } catch {
+                // Unparseable endpoint: skip.
+            }
+        }
+        if (kimiUrls.length === 0) {
+            for (const h of KIMI_DEFAULT_MODEL_HOSTS) {
+                if (!httpsSeen.has(h)) {
+                    httpsSeen.add(h);
+                    httpsDomains.push(h);
+                }
             }
         }
     } else if (client === "qoder") {
@@ -817,9 +875,11 @@ function isPrivateIPv4(host: string): boolean {
  *
  *  codebuddy is always excluded too: its `--mcp-config` compatibility is not
  *  yet verified against a real build, so v1 runs pure wire mode (the proxy
- *  injects the context tools on the wire). */
+ *  injects the context tools on the wire). kimi is excluded as well: its
+ *  mcp.json path is hardcoded in the binary with no ephemeral-config flag,
+ *  so v1 runs pure wire mode (#757). */
 export function launcherInjectMcp(env: NodeJS.ProcessEnv, base: string, codexUpstream?: string): boolean {
-    if (base === "pi" || base === "omp" || base === "opencode" || base === "hermes" || base === "dsh" || base === "codebuddy" || base === "qoder" || base === "trae" || base === "jcode") return false;
+    if (base === "pi" || base === "omp" || base === "opencode" || base === "hermes" || base === "dsh" || base === "codebuddy" || base === "qoder" || base === "trae" || base === "jcode" || base === "kimi") return false;
     if (env.BILI_LAUNCHER_PLUGIN === "0") return false;
     if (base === "codex" && env.BILI_LAUNCHER_PLUGIN === undefined && codexUpstream !== undefined && isPrivateUpstreamHost(codexUpstream)) {
         return false;
@@ -2092,6 +2152,12 @@ export function resolveClientCommand(
             ?? resolveOnPath("trae", env);
         return { command: traeBin ?? "traecli", prefixArgs: [] };
     }
+    if (client === "kimi") {
+        // install.sh / npm postinstall both place the binary at <KIMI_CODE_HOME>/bin/kimi.
+        const resolved = resolveOnPath("kimi", env);
+        if (resolved) return { command: resolved, prefixArgs: [] };
+        return { command: path.join(resolveKimiHome(env), "bin", "kimi"), prefixArgs: [] };
+    }
     const resolved = resolveOnPath(client, env);
     return { command: resolved ?? client, prefixArgs: [] };
 }
@@ -2167,7 +2233,7 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
     const handle = await ensureProxyRunning({ host, port, passthrough, debug, mitmDomains: domains, modelWindows: collectModelWindows(config, base) }, deps);
     console.error(
         `bili: started proxy at ${handle.origin} (MITM domains: ${domains.length ? domains.join(", ") : "defaults"})` +
-            (routes.httpRewrites.length > 0 ? ` (HTTP /bili/ rewrites: ${routes.httpRewrites.length})` : "") +
+            ((base !== "kimi" && routes.httpRewrites.length > 0) ? ` (HTTP /bili/ rewrites: ${routes.httpRewrites.length})` : "") +
             (routes.httpsRewrites.length > 0 ? ` (HTTPS cert rewrites: ${routes.httpsRewrites.length})` : "") +
             (routes.httpEnvRoutes.length > 0 ? ` (HTTP proxy-env routes: ${routes.httpEnvRoutes.length})` : "") +
             (params.client === "pi-test" ? " (no extensions)" : ""),
@@ -2332,6 +2398,37 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         // settings rewrite above), so it exists on every profile dsh boots.
         const dshAcpPatch = writeDshAcpPatch(dshHomeDir);
         if (dshAcpPatch) clientArgs = dshArgsWithPatch(clientArgs, dshAcpPatch);
+    } else if (base === "kimi") {
+        // #757: cert-MITM like hermes/dsh — Kimi Code honors standard proxy
+        // envs for all outbound traffic EXCEPT an unconditional loopback
+        // NO_PROXY bypass (verified against the v0.42.0 binary). Non-loopback
+        // https rides CONNECT + cert MITM; non-loopback plain-http rides
+        // absolute-form forward-proxy requests. The COMBINED bundle goes to
+        // BOTH SSL_CERT_FILE (OpenSSL replace-semantics readers) and
+        // NODE_EXTRA_CA_CERTS (Node append-semantics readers; Windows' official
+        // Node ignores SSL_CERT_FILE, #710). Loopback endpoints are inventoried
+        // only — no rewrite channel exists without editing the user's
+        // config.toml. No budget env: kimi's native auto-compaction fires at
+        // W − reserved_context_size (~95% of window), which ACP compression
+        // (~55% once windows align via BILI_LAUNCHER_MODEL_WINDOWS) precedes.
+        const usesProxyEnv = routes.httpsDomains.length > 0 || routes.httpEnvRoutes.length > 0;
+        env = usesProxyEnv ? stripInheritedProxy(process.env) : { ...process.env };
+        if (usesProxyEnv) {
+            const caBundle = resolveCombinedCaPath(process.env);
+            env.HTTPS_PROXY = origin;
+            env.SSL_CERT_FILE = caBundle;
+            env.NODE_EXTRA_CA_CERTS = caBundle;
+            if (routes.httpEnvRoutes.length > 0) env.HTTP_PROXY = origin;
+        }
+        if (routes.httpRewrites.length > 0) {
+            console.error(
+                `bili: ${routes.httpRewrites.length} loopback endpoint(s) in ${resolveKimiHome(process.env)}/config.toml bypass Kimi Code's unconditional loopback NO_PROXY rule and will NOT go through the proxy — prefix their base_url with ${origin}/bili/ manually to compress them.`,
+            );
+        } else if (!usesProxyEnv) {
+            console.error(
+                `bili: no routable providers found in ${resolveKimiHome(process.env)}/config.toml — traffic will NOT go through the proxy (configure a provider first).`,
+            );
+        }
     } else if (base === "qoder") {
         // #653: cert-MITM only — the model endpoint scheme is hardcoded https
         // (no base-URL override env), so /bili/ rewrites cannot reach it.
