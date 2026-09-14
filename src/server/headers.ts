@@ -1,3 +1,5 @@
+/** Session ids are client-provided verbatim (#286) — sanitize before using
+ *  one in a debug-dump FILENAME so a hostile value cannot escape the dir. */
 export function safeSessionId(id: string | undefined): string {
     return (id ?? "unknown").replace(/[^a-zA-Z0-9._-]/g, "_");
 }

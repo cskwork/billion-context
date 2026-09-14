@@ -30,6 +30,9 @@ export function logDumpFailure(where: string, err: unknown): void {
 // log (~20k lines in one user's capture, #362). Per-path: first 3 at warn, one
 // "suppressed" notice, then silent.
 const unrecognizedPathCounts = new Map<string, number>();
+// Model-enumeration endpoints clients probe at startup (omp's openai-models-list
+// discovery). Expected passthroughs, not unknown protocols — #393: exempt from
+// the warn-level "unrecognized path" log.
 export function isModelDiscoveryPath(path: string): boolean {
     return path.replace(/\/+$/, "").endsWith("/models");
 }

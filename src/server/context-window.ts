@@ -1,5 +1,8 @@
-// Model-enumeration endpoints clients probe at startup (omp's openai-models-list
-// discovery). Expected passthroughs, not unknown protocols — #393: exempt from
+// #300: bili→bili chain marker. When a bili instance forwards a request it has
+// processed upstream, it stamps this header with its own instance id. A bili
+// instance that RECEIVES a request already carrying it knows an upstream bili
+// already ran the compression pipeline on this request — processing it again
+// would double-compress and corrupt session state (issue #292). Clients never
 // send this header, so its presence on an inbound request always means "came
 // from a bili instance".
 export const BILI_HOP_HEADER = "x-bili-hop";

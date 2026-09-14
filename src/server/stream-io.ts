@@ -77,6 +77,3 @@ export async function dumpStreamToFile(stream: ReadableStream<Uint8Array>, dir: 
         logDumpFailure("SSE stream dump", err);
     }
 }
-
-/** Derive a short human-readable title from the first user text message.
- *  Used so the web UI can show "Fix auth bug" instead of an opaque hash. */
