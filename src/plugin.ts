@@ -320,15 +320,63 @@ export function handlePluginCompact(payload: string, res: import("node:http").Se
         return;
     }
     const entry = conversations.get(conversationId);
-    const session = entry ? peekSession(entry.sessionId) : undefined;
-    if (!entry || !session) {
+    let session = entry ? peekSession(entry.sessionId) : undefined;
+    // #760: the session id IS the client-provided conversation value verbatim
+    // (#286), so resolve directly when the map has no entry yet — a FIRST tool
+    // call must route before any plugin binding recorded the mapping (header-
+    // based clients have no prompt_cache_key record to lean on). Read-only: an
+    // unknown id finds nothing and creates nothing.
+    if (!session) {
+        session = peekSession(conversationId);
+        if (session) recordPluginSession(conversationId, session.id);
+    }
+    // #760: the verbatim-id fallback above can resolve a session with NO map
+    // entry (first call), so only the session itself gates execution.
+    if (!session) {
         res.writeHead(404, { "content-type": "application/json" });
-        res.end(JSON.stringify({ ok: false, error: "unknown plugin conversation (no model request has arrived with this conversation id yet)" }));
+        res.end(JSON.stringify({
+            ok: false,
+            error: entry
+                ? `unknown plugin conversation id "${conversationId}" (id registered but session not resident)`
+                : `unknown plugin conversation id "${conversationId}" (no model request has arrived with this conversation id yet)`,
+        }));
         return;
     }
     markCompactionBoundary(session);
-    entry.lastSeen = Date.now();
+    if (entry) entry.lastSeen = Date.now();
     res.end(JSON.stringify({ ok: true, conversationId }));
+}
+
+// #760: per-call conversation_id for MCP tools. Hosts that share ONE shim
+// process across several concurrent conversations have no env/meta session
+// channel, so the model supplies the target conversation per call (the proxy
+// prints its own session id in the wire notes). The param is added to CLONED
+// schemas only — wire-mode injection serves the kernel constants directly and
+// those models are routed by request identity, not arguments.
+const CONVERSATION_ID_PARAM = {
+    type: "string" as const,
+    description:
+        "Your bili conversation id (the value from the 'your bili conversation id' line in the proxy notes). " +
+        "Pass it on every call when your host shares one MCP process across several concurrent conversations; " +
+        "omit it when the host bound the session itself.",
+};
+
+function withConversationIdParam(tool: unknown): unknown {
+    const copy = structuredClone(tool);
+    if (!copy || typeof copy !== "object") return copy;
+    const t = copy as Record<string, unknown>;
+    const add = (schema: unknown): void => {
+        if (!schema || typeof schema !== "object") return;
+        const s = schema as { properties?: Record<string, unknown> };
+        s.properties = { ...(s.properties ?? {}), conversation_id: CONVERSATION_ID_PARAM };
+    };
+    if (t.input_schema !== undefined) add(t.input_schema);
+    else {
+        const fn = t.function;
+        if (fn && typeof fn === "object") add((fn as { parameters?: unknown }).parameters);
+        else add(t.parameters);
+    }
+    return copy;
 }
 
 export function handlePluginManifest(res: import("node:http").ServerResponse): void {
@@ -345,9 +393,9 @@ export function handlePluginManifest(res: import("node:http").ServerResponse): v
         // manifest has no request context to know which route will win.
         toolNames: [...PROXY_TOOL_NAMES, ABSORB_TOOL_NAME],
         tools: {
-            anthropic: [...ACP_TOOLS_ANTHROPIC, ABSORB_TOOL],
-            openai: [...ACP_TOOLS_OPENAI, ABSORB_TOOL_OPENAI],
-            responses: [...ACP_TOOLS_RESPONSES, ABSORB_TOOL_RESPONSES],
+            anthropic: [...ACP_TOOLS_ANTHROPIC, ABSORB_TOOL].map(withConversationIdParam),
+            openai: [...ACP_TOOLS_OPENAI, ABSORB_TOOL_OPENAI].map(withConversationIdParam),
+            responses: [...ACP_TOOLS_RESPONSES, ABSORB_TOOL_RESPONSES].map(withConversationIdParam),
         },
         headers: { agent: PLUGIN_AGENT_HEADER, conversation: PLUGIN_CONVERSATION_HEADER, contextWindow: PLUGIN_CONTEXT_WINDOW_HEADER },
         toolEndpoint: "/__bili/plugin/tool",
@@ -502,8 +550,17 @@ export async function handlePluginTool(
         return;
     }
     const entry = conversations.get(conversationId);
-    const session = entry ? peekSession(entry.sessionId) : undefined;
-    if (!entry || !session) {
+    let session = entry ? peekSession(entry.sessionId) : undefined;
+    // #760: same first-call routing as handlePluginCompact — resolve the
+    // verbatim session id directly when the map has no entry yet. Read-only:
+    // an unknown id finds nothing and creates nothing.
+    if (!session) {
+        session = peekSession(conversationId);
+        if (session) recordPluginSession(conversationId, session.id);
+    }
+    // #760: the verbatim-id fallback above can resolve a session with NO map
+    // entry (first call), so only the session itself gates execution.
+    if (!session) {
         // #656: two distinct failures shared one message before. An id that was
         // NEVER registered is the classic stale-shim-id case (host resumed its
         // session after the MCP shim captured CLAUDE_CODE_SESSION_ID) — say so,
@@ -528,8 +585,12 @@ export async function handlePluginTool(
         res.end(JSON.stringify({ ok: false, error: `unknown tool "${tool}" (expected one of: ${allowed.join(", ")})` }));
         return;
     }
-    entry.lastSeen = Date.now();
-    const args = parsed.args && typeof parsed.args === "object" ? (parsed.args as Record<string, unknown>) : {};
+    if (entry) entry.lastSeen = Date.now();
+    const args = parsed.args && typeof parsed.args === "object" ? { ...(parsed.args as Record<string, unknown>) } : {};
+    // #760: the MCP manifest advertises an optional conversation_id argument
+    // for per-call routing; routing itself uses the body-level conversationId
+    // field, so strip it before kernel arg parsing sees it.
+    delete args.conversation_id;
     const callId = `plugin_${Date.now().toString(36)}`;
     acquireInFlight(session);
     let result: string;
