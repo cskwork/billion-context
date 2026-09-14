@@ -495,6 +495,7 @@ Full command surface (`bili --help` prints an abridged version). Precedence ever
 | `bili qoder [opts --] [args]` | Proxy + **qoder** — cert-MITM via `HTTPS_PROXY` + `NODE_EXTRA_CA_CERTS`; model endpoint hardcoded https so no `/bili/` rewrite (default host map whitelisted) (#653) |
 | `bili trae [opts --] [args]` | Proxy + **Trae CLI** (ByteDance, closed Go binary) — cert-MITM via `HTTPS_PROXY` + `SSL_CERT_FILE`; model host from `TRAE_CLI_API_HOST` or the default enterprise gateway (#655) |
 | `bili jcode [opts --] [args]` | Proxy + **jcode** (Rust agent harness) — env-only cert-MITM launch via `HTTPS_PROXY` + `SSL_CERT_FILE`; hosted model host (`api.z.ai`) whitelisted, local loopback providers stay direct via `NO_PROXY` |
+| `bili kimi [opts --] [args]` | Proxy + **Kimi Code** (Moonshot CLI) — cert-MITM via `HTTPS_PROXY` + `NODE_EXTRA_CA_CERTS`/`SSL_CERT_FILE`; provider/model hosts from `~/.kimi-code/config.toml` (`KIMI_CODE_HOME` respected) or the managed OAuth endpoints when none declared; loopback endpoints inventoried with a manual `/bili/` prefix hint (#757) |
 | `bili test pi` | Non-polluting end-to-end smoke test of the pi path |
 | `bili export [session] [--full] [--output FILE]` | List persisted sessions / export one as a Markdown handoff — see [Sessions & Migration](#sessions--migration) |
 | `bili update` | Check for & install a newer version now (bypasses the 3-minute throttle) |

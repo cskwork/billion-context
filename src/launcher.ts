@@ -227,9 +227,9 @@ export interface DiscoveredRoutes {
     httpRewrites: HttpRewrite[];
     httpsRewrites: HttpRewrite[];
     // Plaintext-http upstreams routed purely via HTTP_PROXY absolute-form
-    // forward-proxy requests (no URL rewriting). dsh-only today, and never
-    // loopback — dsh bypasses proxy envs for loopback targets unconditionally,
-    // so those ride httpRewrites instead (#535 phase 4).
+    // forward-proxy requests (no URL rewriting). dsh/kimi today, and never
+    // loopback — both bypass proxy envs for loopback targets unconditionally,
+    // so those ride httpRewrites instead (dsh: #535 phase 4; kimi: #757).
     httpEnvRoutes: string[];
 }
 
@@ -2233,7 +2233,7 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
     const handle = await ensureProxyRunning({ host, port, passthrough, debug, mitmDomains: domains, modelWindows: collectModelWindows(config, base) }, deps);
     console.error(
         `bili: started proxy at ${handle.origin} (MITM domains: ${domains.length ? domains.join(", ") : "defaults"})` +
-            (routes.httpRewrites.length > 0 ? ` (HTTP /bili/ rewrites: ${routes.httpRewrites.length})` : "") +
+            ((base !== "kimi" && routes.httpRewrites.length > 0) ? ` (HTTP /bili/ rewrites: ${routes.httpRewrites.length})` : "") +
             (routes.httpsRewrites.length > 0 ? ` (HTTPS cert rewrites: ${routes.httpsRewrites.length})` : "") +
             (routes.httpEnvRoutes.length > 0 ? ` (HTTP proxy-env routes: ${routes.httpEnvRoutes.length})` : "") +
             (params.client === "pi-test" ? " (no extensions)" : ""),
