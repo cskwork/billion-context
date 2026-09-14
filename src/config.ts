@@ -6,6 +6,7 @@ import { log as loggerLog } from "./logger.js";
 import { validateHttpProxy, type ProxyFallbackOptions } from "./upstream-proxy.js";
 
 import { parseCompatRoles } from "./compat-roles.js";
+import type { ImageBillingMode } from "./image-tokens.js";
 
 export function safeReadJson(path: string): unknown {
     try {
@@ -56,6 +57,12 @@ export type ProviderRoute = {
      *  verbatim, no session state. For upstreams whose anti-cheat fingerprints
      *  the request body (e.g. ZCode 405/3012). */
     passthrough?: boolean;
+    /** Per-provider image billing mode (#767): "bytes" = ceil(base64/4)
+     *  (conservative, matches byte-counting relays); "pixels" = dimension-
+     *  based tile estimate (matches first-party pixel-tile upstreams);
+     *  "auto" (default) classifies known first-party pixel hosts. Wins over
+     *  the global `imageBilling`; env BILI_IMAGE_BILLING wins over both. */
+    imageBilling?: ImageBillingMode;
 };
 export type ProviderRoutes = Record<string, ProviderRoute>; // key = upstream URL prefix (the /bili/<this> string)
 
@@ -310,6 +317,9 @@ export type ProxyOptions = {
      *  forwarded body for upstreams without the developer role (#552). Empty =
      *  byte-for-byte transparent. */
     compat: { roles: Record<string, string> };
+    /** Global-level image billing mode (#767); per-provider route entries
+     *  override it, env BILI_IMAGE_BILLING overrides both. undefined = auto. */
+    imageBilling?: ImageBillingMode;
     sessionHeader: string;
     log: boolean;
     debug: boolean;
@@ -452,6 +462,7 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
             routing: parsePromptCacheRouting(env.ACP_PROMPT_CACHE_ROUTING ?? fileConfig.promptCache?.routing),
         },
         compat: { roles: parseCompatRoles(fileConfig.compat?.roles) ?? {} },
+        imageBilling: parseImageBilling(fileConfig.imageBilling),
         sessionHeader: env.ACP_SESSION_HEADER ?? fileConfig.sessionHeader ?? "x-acp-session",
         log: env.ACP_LOG !== "0" && fileConfig.log !== false,
         debug: (env.ACP_DEBUG ?? (fileConfig.debug ? "1" : "0")) === "1",
@@ -507,6 +518,10 @@ type FileConfig = {
      *  upstreams accept (e.g. `{"developer":"system"}`) — applied to the
      *  final forwarded body for openai/responses requests (#552). */
     compat?: { roles?: Record<string, string> };
+    /** Global image billing mode (#767): "auto" | "pixels" | "bytes".
+     *  Per-provider `imageBilling` overrides it; env BILI_IMAGE_BILLING wins
+     *  over both. See ProviderRoute.imageBilling. */
+    imageBilling?: string;
 };
 
 function nonEmpty(value: string | undefined): string | undefined {
@@ -581,7 +596,7 @@ export function parseRouteEntry(v: unknown): ProviderRoute | undefined {
     // is the KEY in the providers map (identical to the /bili/<url> string),
     // so it is NOT repeated inside the value.
     if (v && typeof v === "object" && !Array.isArray(v)) {
-        const obj = v as { models?: Record<string, ModelEntry>; proxy?: string; compressProtocol?: string; compress?: CompressSettings; compat?: { roles?: unknown }; passthrough?: boolean };
+        const obj = v as { models?: Record<string, ModelEntry>; proxy?: string; compressProtocol?: string; compress?: CompressSettings; compat?: { roles?: unknown }; passthrough?: boolean; imageBilling?: unknown };
         const route: ProviderRoute = { models: obj.models };
         if (typeof obj.proxy === "string") route.proxy = obj.proxy;
         if (obj.compressProtocol === "marker" || obj.compressProtocol === "tools") route.compressProtocol = obj.compressProtocol;
@@ -589,11 +604,17 @@ export function parseRouteEntry(v: unknown): ProviderRoute | undefined {
         const compatRoles = parseCompatRoles(obj.compat?.roles);
         if (compatRoles) route.compat = { roles: compatRoles };
         if (typeof obj.passthrough === "boolean") route.passthrough = obj.passthrough;
+        const imageBilling = parseImageBilling(obj.imageBilling);
+        if (imageBilling) route.imageBilling = imageBilling;
         return route;
     }
     // A bare value (e.g. null) means "this upstream exists, no overrides".
     if (v === null) return {};
     return undefined;
+}
+
+export function parseImageBilling(value: unknown): ImageBillingMode | undefined {
+    return value === "auto" || value === "pixels" || value === "bytes" ? value : undefined;
 }
 
 export function parsePromptCacheRouting(value: string | undefined): PromptCacheRouting {

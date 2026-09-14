@@ -122,11 +122,18 @@ Top-level keys that control how the proxy listens and behaves globally.
 - **Status:** ACTIVE
 - **Description:** Upstream HTTP proxy (`http://host:port`) used for the proxy's **own** outbound connections to model providers. SOCKS5 is not supported. A per-URL `proxy` set inside a `providers` entry overrides this for that provider. An empty string means "explicitly direct" — it disables any environment/system proxy fallback for all providers.
 
+### `imageBilling`
+
+- **Type:** `"auto" | "pixels" | "bytes"`
+- **Default:** `"auto"`
+- **Status:** ACTIVE
+- **Description:** How inline (base64) images are charged by the preflight size gate and output clamp (#488/#496/#767). `"bytes"` charges each image at `base64 length / 4` tokens — conservative, and correct for byte-billing relays. `"pixels"` parses the image header (PNG/JPEG/WebP/GIF/BMP) without decoding the body and charges first-party pixel-tile billing (OpenAI high-detail model: 512px tiles, short side scaled up to 768px, long side capped at 2048px → 765–2805 tokens per image; unparsable formats fall back to a flat 16384). Remote (`https://`) images always charge a flat 4096 in either mode. A per-provider `providers.<url>.imageBilling` wins over this global, and the `BILI_IMAGE_BILLING` env var wins over both (live-read, no restart).
+
 ---
 
 ## Providers
 
-The `providers` block maps **upstream URLs** to per-provider configuration. Each key is a URL prefix; each value can declare model context windows, a per-provider proxy, a compression protocol, compression overrides, and a per-route passthrough.
+The `providers` block maps **upstream URLs** to per-provider configuration. Each key is a URL prefix; each value can declare model context windows, a per-provider proxy, a compression protocol, compression overrides, an image billing mode, and a per-route passthrough.
 
 ```jsonc
 {
@@ -197,6 +204,21 @@ A shallow key (`https://open.bigmodel.cn`) matches every path on that host. A de
   {
     "providers": {
       "mitm://zcode.z.ai": { "passthrough": true }
+    }
+  }
+  ```
+
+### `imageBilling`
+
+- **Type:** `"auto" | "pixels" | "bytes"`
+- **Default:** *(global `imageBilling`, then `"auto"`)*
+- **Status:** ACTIVE
+- **Description:** Per-route override of how inline images are charged by the size gate (#767). Set `"pixels"` for official Codex/OpenAI/Anthropic endpoints (pixel-tile billing) and keep `"bytes"` for byte-counting relays — under byte billing, a stale over-window baseline plus large base64 screenshots fails preflight with 502 forever even though the images bill only a few thousand tokens upstream. When unset at both levels, billing is auto-selected from the upstream host: hosts ending in `openai.com`, `openai.azure.com`, `chatgpt.com`, or `api.anthropic.com` → `pixels`; everything else → `bytes`. The `BILI_IMAGE_BILLING` env var overrides both config levels:
+
+  ```jsonc
+  {
+    "providers": {
+      "https://chatgpt.com/backend-api/codex": { "imageBilling": "pixels" }
     }
   }
   ```
@@ -419,7 +441,8 @@ Environment variables take precedence over the config file. They are useful for 
 | `ACP_COMPRESS_TOOL` | Set to `0` to disable tool injection (same as `"compress.injectTool": false`). |
 | `ACP_COMPRESS_NUDGE` | Set to `0` to disable nudge injection (same as `"compress.injectNudge": false`). |
 | `ACP_MODEL_CONTEXT_LIMIT` | Override the context limit globally (absolute token count). |
-| `BILI_IMAGE_TOKEN_CAP` | Cap the per-image token estimate used by the preflight size gate and output clamp (#488/#496). By default an inline `data:` image counts as `base64 length / 4` tokens with **no cap** — correct for byte-billing relays, but a large over-estimate for pixel-tile upstreams (official Anthropic/OpenAI), which bill each image at roughly 1.1K–1.6K tokens regardless of byte size. Set this to your upstream's per-image tile cost so the gate reflects real billing; unset = no cap (current default). |
+| `BILI_IMAGE_TOKEN_CAP` | Cap the per-image token estimate used by the preflight size gate and output clamp (#488/#496). By default an inline `data:` image counts as `base64 length / 4` tokens with **no cap** — correct for byte-billing relays, but a large over-estimate for pixel-tile upstreams (official Anthropic/OpenAI). For pixel-tile upstreams prefer [`imageBilling`](#imagebilling) (`"pixels"`, or `BILI_IMAGE_BILLING=pixels`) which charges real tile billing instead of capping the byte estimate; the cap still applies on top of both billing modes as a blanket ceiling. Unset = no cap (default). |
+| `BILI_IMAGE_BILLING` | Override the image billing mode used by the preflight size gate and output clamp (#767): `pixels` or `bytes`. Live-read per request (no restart); beats the global `imageBilling` and every per-provider `providers.<url>.imageBilling`. Use `bytes` to force conservative billing on a route configured `"pixels"` (e.g. a byte-counting relay behind an OpenAI lookalike host), or `pixels` to enable tile billing process-wide without editing config. See [`imageBilling`](#imagebilling). |
 | `BILI_PREFLIGHT_HOLD_MS` | Grace period (ms) before a long preflight compression starts holding the client with keep-alive bytes (default `30000`; see #568 / README "Preflight hold"). |
 | `BILI_CONFIG_FILE` | Override the config file path (point at any JSON file). |
 | `ACP_PORT` / `PORT` | Override the listen port. |

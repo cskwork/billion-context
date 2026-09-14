@@ -49,7 +49,7 @@ import { applyAbsorbView, absorbEnabled, absorbToolName, storeEffectiveAbsorb } 
 import { rewriteJsonResponse, type RewriteCtx } from "./stream.js";
 import { applyRanges } from "./stream.js";
 import { preflightCompress, estimateCoreMessages, estimateRawBodyTokens, estimateCoreMessagesUpper, type PreflightResult } from "./preflight.js";
-import { imageTokensInRawBody, imageTokensInParsedBody } from "./image-tokens.js";
+import { imageTokensInRawBody, imageTokensInParsedBody, resolveImageBilling, type ResolvedImageBilling } from "./image-tokens.js";
 import { renderUI, handleConfigGet, handleConfigPut } from "./web/index.js";
 import { reapOrphanBlocks } from "./orphan-gc.js";
 import { getStore } from "./persist.js";
@@ -717,14 +717,26 @@ export function sideRequestGuard(
     protocol: WireProtocol,
     modelContextLimit: number,
     learnedLimit: number | undefined,
+    imageBilling: ResolvedImageBilling = "bytes",
 ): { blocked: boolean; estimate: number; limit: number } {
     let limit = modelContextLimit;
     if (typeof learnedLimit === "number" && learnedLimit > 0 && learnedLimit < limit) limit = learnedLimit;
     const field = outputBudgetField(parsed);
     const maxOut = field ? ((parsed as Record<string, unknown>)[field] as number) : 0;
     if (limit > 0 && shouldReserveOutputHeadroom(protocol)) limit = reserveOutputHeadroom(limit, maxOut);
-    const estimate = estimateRawBodyTokens(parsed) + imageTokensInParsedBody(protocol, parsed);
+    const estimate = estimateRawBodyTokens(parsed) + imageTokensInParsedBody(protocol, parsed, imageBilling);
     return { blocked: limit > 0 && estimate >= limit * SIDE_REQUEST_GUARD_TOLERANCE, estimate, limit };
+}
+
+// #767: per-request image billing mode — env BILI_IMAGE_BILLING (live, like
+// BILI_IMAGE_TOKEN_CAP) wins over the per-provider route entry, which wins over
+// the global config level; "auto"/unset classifies known first-party pixel-tile
+// hosts by upstream URL. Every payload-size decision below consults this so one
+// over-estimate cannot block all of them at once.
+function imageBillingFor(opts: ProxyOptions, upstreamUrl: string | undefined): ResolvedImageBilling {
+    const env = process.env.BILI_IMAGE_BILLING;
+    const configured = env === "pixels" || env === "bytes" ? env : findRoute(opts.routes, upstreamUrl)?.imageBilling ?? opts.imageBilling ?? "auto";
+    return resolveImageBilling(configured, upstreamUrl);
 }
 
 function isTrustedAdminOrigin(origin: string | undefined, host: string | undefined, trustedHosts: Set<string>): boolean {
@@ -1441,7 +1453,7 @@ async function handle(
             // then scalar) — the learner now writes the confirmed channel, so the
             // legacy direct map read would miss windows learned from real 400s.
             const learnedLimit = resolveLearnedLimit(session, reqModel);
-            const guard = sideRequestGuard(parsed, protocol, reqConfig.modelContextLimit, learnedLimit);
+            const guard = sideRequestGuard(parsed, protocol, reqConfig.modelContextLimit, learnedLimit, imageBillingFor(opts, upstreamOrigin));
             if (guard.blocked) {
                 log("warn", `[${session.id}] side request (~${guard.estimate} tokens) ≥ effective window ${guard.limit} (model=${reqModel ?? "?"}) — NOT forwarded: guaranteed upstream 400 (side requests bypass preflight by design, #388)`);
                 if (!res.headersSent && !res.writableEnded && !res.destroyed) {
@@ -2308,7 +2320,7 @@ function prepareOpenai(
 
     const rebuilt: OpenAIRequestBody = { ...parsed, messages: rebuiltMessages, tools: toolsOut as OpenAITool[] | undefined };
     warnReasoningPairs(rebuiltMessages, log, sessionId);
-    clampOutgoingOutput(rebuilt as Record<string, unknown>, typeof (parsed as Record<string, unknown>).max_completion_tokens === "number" ? "max_completion_tokens" : "max_tokens", { systemText: openaiSystemText, tools: toolsOut, processedMessages, lastInputTokens: session.stats.lastInputTokens, nativeWindow, imageTokens: imageTokensInParsedBody("openai", rebuilt) }, sessionId, log);
+    clampOutgoingOutput(rebuilt as Record<string, unknown>, typeof (parsed as Record<string, unknown>).max_completion_tokens === "number" ? "max_completion_tokens" : "max_tokens", { systemText: openaiSystemText, tools: toolsOut, processedMessages, lastInputTokens: session.stats.lastInputTokens, nativeWindow, imageTokens: imageTokensInParsedBody("openai", rebuilt, imageBillingFor(opts, upstreamOrigin)) }, sessionId, log);
     // prompt_cache_retention is an OpenAI-host-only cache directive; the dsh
     // launcher forces PI_CACHE_RETENTION=long (for the session-id
     // prompt_cache_key) which makes the client also emit it. Third-party
@@ -2543,7 +2555,7 @@ function prepareResponses(
     const rebuilt: ResponsesRequestBody = { ...parsed, input: rebuiltInput, tools: toolsOut };
     warnResponsesReasoningPairs(Array.isArray(rebuiltInput) ? rebuiltInput : [], log, sessionId);
     if (!isCompactionTrigger) {
-        clampOutgoingOutput(rebuilt as Record<string, unknown>, "max_output_tokens", { systemText: (responsesProjection?.systemParts ?? []).join("\n"), tools: toolsOut, processedMessages, lastInputTokens: session.stats.lastInputTokens, nativeWindow, imageTokens: imageTokensInParsedBody("responses", rebuilt) }, sessionId, log);
+        clampOutgoingOutput(rebuilt as Record<string, unknown>, "max_output_tokens", { systemText: (responsesProjection?.systemParts ?? []).join("\n"), tools: toolsOut, processedMessages, lastInputTokens: session.stats.lastInputTokens, nativeWindow, imageTokens: imageTokensInParsedBody("responses", rebuilt, imageBillingFor(opts, upstreamOrigin)) }, sessionId, log);
     }
     // Route with the upstream THIS request goes to — session.meta.upstreamOrigin
     // is first-wins and would keep injecting pck toward a relay we switched
@@ -3067,7 +3079,10 @@ async function preflightCompressIfNeeded(
     // trigger on the real post-fold payload too.
     // #488: images are forwarded verbatim but invisible to the kernel's text model —
     // add their cost to every size decision here (trigger, fit gates, self-heal).
-    const imageTokens = imageTokensInRawBody(prepared.protocol, prepared.body);
+    // #767: bill them by the resolved mode (same upstream-URL fallback as buildForwardTarget).
+    const preflightReqUrl = req.url ?? "";
+    const billingUpstream = route?.upstream ?? (/^https?:\/\//i.test(preflightReqUrl) ? preflightReqUrl : opts.upstream);
+    const imageTokens = imageTokensInRawBody(prepared.protocol, prepared.body, imageBillingFor(opts, billingUpstream));
     const textEstimate = estimateCoreMessages(prepared.processedMessages);
     // #470: system + tool definitions ride the wire too but are invisible to
     // estimateCoreMessages — without them the trigger fires late (text alone
@@ -3631,7 +3646,7 @@ async function forward(
                     parsedBody = JSON.parse(rawBody) as Record<string, unknown>;
                     reqModel = typeof parsedBody.model === "string" ? parsedBody.model : undefined;
                     // #488: the rejected payload's size must include its images (they were forwarded verbatim).
-                    rejectedImageTokens = imageTokensInParsedBody(prepared.protocol, parsedBody);
+                    rejectedImageTokens = imageTokensInParsedBody(prepared.protocol, parsedBody, imageBillingFor(opts, upstreamUrl));
                 } catch {
                     reqModel = undefined; // non-JSON body — fall back to the legacy scalar
                 }
@@ -4216,6 +4231,7 @@ function handleConfigReload(opts: ProxyOptions, res: http.ServerResponse, log: (
     Object.assign(opts.routes, fresh);
     opts.compress = loadOptions().compress;
     opts.compat = loadOptions().compat;
+    opts.imageBilling = loadOptions().imageBilling;
     // Release cached ProxyAgents so agents for proxy URLs that were
     // removed/changed don't leak for the process lifetime. The next request
     // re-creates the needed agent lazily via proxyDispatcher().
