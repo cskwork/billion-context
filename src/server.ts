@@ -57,6 +57,7 @@ import { log as loggerLog, configureLogger, getLogPath, closeLogger } from "./lo
 import { configFile, defaultLogFile, stateDir } from "./paths.js";
 import { atomicWriteInstanceFile, clearProxyInstanceFile, isPidAlive, registerInstanceAndWarn, unregisterInstance } from "./instance.js";
 import { compressLoopResponsesJson } from "./compress-loop-responses.js";
+import { hoistTrappedToolItems } from "./tool-pair-order.js";
 import { runCompressLoop, pickAdapter } from "./loop/index.js";
 import { containsToolCallXmlFragment } from "./loop/tag-echo-filter.js";
 import { isFakeCompletion, injectFakeCompletionHint, maxFakeCompletionRetries, fakeBufCap } from "./fake-completion.js";
@@ -2485,6 +2486,7 @@ function prepareResponses(
         processedMessages = repairResponsesAssistantOrdering(stripReasoning(stripKernelSummaries(turn.messages, turn.state)), originalMessages);
         reapOrphanBlocks(session, msgs, deactivateBlock);
         rebuiltInput = patchResponsesInput(projection, processedMessages);
+        if (Array.isArray(rebuiltInput)) rebuiltInput = hoistTrappedToolItems(rebuiltInput);
         // Fallback path: when the echo did NOT come back this turn (client
         // dropped it / restarted), the history-borne handoff is absent and the
         // forge-time captured summaries are re-injected into the developer
@@ -2748,11 +2750,12 @@ function prepareResponsesCompact(
         }
         const viewed = applyAbsorbView(turn.messages, turn.state, compactConfig, session.stats.lastInputTokens);
         const processed = repairResponsesAssistantOrdering(stripKernelSummaries(viewed, turn.state), projection.msgs);
-        const output = patchResponsesInput(projection, processed);
+        let output = patchResponsesInput(projection, processed);
         if (typeof output === "string") {
             session.state = prevState;
             return base;
         }
+        output = hoistTrappedToolItems(output);
         snapshotMessages(session, projection.msgs);
         markDirty(session);
         log("info", `[${session.id}] codex compact intercepted (endpoint); forged history with ${output.length} item(s), upstream not contacted`);
