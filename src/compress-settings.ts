@@ -96,8 +96,10 @@ export function resolveCompress(
 let warnedPromptsRisk = false;
 
 /** Resolve the effective compression prompts from merged settings. `prompts`
- *  overrides only take effect with `acknowledgePromptsRisk: true` at the
- *  winning level (the kernel rules are load-bearing; see Prompts docs). When
+ *  overrides only take effect when `acknowledgePromptsRisk` resolves to `true`
+ *  in the merged settings — the flag merges independently (deepest defined
+ *  level wins) and gates all prompt pieces regardless of their own level (the
+ *  kernel rules are load-bearing; see Prompts docs). When
  *  ignored, a one-time warning is logged so the misconfiguration is visible.
  *  Non-string fields inside `prompts` are silently dropped by the kernel's
  *  resolvePrompts (a malformed partial never clobbers a good default). */

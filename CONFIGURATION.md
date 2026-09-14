@@ -284,14 +284,14 @@ For each request, the proxy resolves the settings by longest-URL-prefix match (t
 - **Type:** `object` (`{ compressPhilosophy?, howToCompressRules?, tier2DistillRules?, tier3CondenseRules? }`, all strings)
 - **Default:** *(kernel defaults — see `acp-kernel` `defaultPrompts`)*
 - **Status:** ACTIVE
-- **Description:** Override the compression prompt text injected into the system prompt and nudge messages. Every field is **load-bearing**: the kernel rules were tuned over months of production use, and overriding them can degrade summary quality (lost paths / signatures / decisions → broken retrieval). Overrides only take effect when `acknowledgePromptsRisk: true` is set at the same (winning) level; otherwise they are ignored and a one-time warning is logged. Non-string fields are silently dropped (a malformed partial never clobbers a good default). Useful mainly for non-English or small-model tuning — see issue #156.
+- **Description:** Override the compression prompt text injected into the system prompt and nudge messages. Every field is **load-bearing**: the kernel rules were tuned over months of production use, and overriding them can degrade summary quality (lost paths / signatures / decisions → broken retrieval). Overrides only take effect when `acknowledgePromptsRisk` resolves to `true` after the three-level merge — the flag resolves independently at its own deepest defined level and gates **all** `prompts` overrides regardless of which level each piece lives at (a global-level flag activates model-level `prompts`); otherwise they are ignored and a one-time warning is logged. Non-string fields are silently dropped (a malformed partial never clobbers a good default). Useful mainly for non-English or small-model tuning — see issue #156.
 
 #### `acknowledgePromptsRisk`
 
 - **Type:** `boolean`
 - **Default:** `false`
 - **Status:** ACTIVE
-- **Description:** Must be `true` for `prompts` overrides to take effect. Setting it acknowledges the summary-quality risk documented above.
+- **Description:** Must be `true` for `prompts` overrides to take effect. Resolves like every other field (deepest defined level wins) and gates all `prompts` overrides regardless of which level each piece lives at — it does not need to sit in the same block as the `prompts` it unlocks. Setting it acknowledges the summary-quality risk documented above.
 
 #### `promptPack`
 
