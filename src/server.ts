@@ -30,7 +30,6 @@ import {
     injectOpenaiSystem,
     conversationSignalOpenai,
     type OpenAIRequestBody,
-    type OpenAIMessage,
     type OpenAITool,
 } from "acp-kernel/wire";
 import {
@@ -60,6 +59,8 @@ import { atomicWriteInstanceFile, clearProxyInstanceFile, isPidAlive, registerIn
 import { compressLoopResponsesJson } from "./compress-loop-responses.js";
 import { runCompressLoop, pickAdapter } from "./loop/index.js";
 import { containsToolCallXmlFragment } from "./loop/tag-echo-filter.js";
+import { isStrictReasoningEcho, normalizeStrictEchoReasoning } from "./strict-echo.js";
+export { isStrictReasoningEcho, normalizeStrictEchoReasoning };
 import { isFakeCompletion, injectFakeCompletionHint, maxFakeCompletionRetries, fakeBufCap } from "./fake-completion.js";
 import { reasoningGuardEngages, runReasoningGuard } from "./reasoning-guard.js";
 import { sanitizeResponsesInputIds, dropWhitespaceResponsesMessages, normalizeResponsesMessageItems } from "./loop/adapter-responses.js";
@@ -1760,17 +1761,6 @@ function withReasoningDrop(
     return out;
 }
 
-/** [#684] Strict-echo reasoning upstreams: DeepSeek documents that
- *  thinking-mode "reasoning_content ... must be passed back to the API" —
- *  a rebuilt request whose assistant tool-call turns lost their reasoning is
- *  rejected with 400. Learned flag first (set on first 400 whose body mentions
- *  reasoning_content, see the loop's UpstreamHttpError handler), then the
- *  static host check. */
-export function isStrictReasoningEcho(session: Session, upstreamOrigin: string | undefined): boolean {
-    if (session.metadata.strictReasoningEcho === true) return true;
-    return upstreamOrigin !== undefined && /deepseek/i.test(upstreamOrigin);
-}
-
 /** [#684] Exit sentinel: in a thinking session, an assistant tool_calls
  *  message WITHOUT reasoning_content while sibling turns carry it is the
  *  signature of a split turn — strict-echo upstreams reject the whole request.
@@ -1843,36 +1833,6 @@ export function warnResponsesReasoningPairs(
     if (withReasoning > 0 && split > 0) {
         log("warn", `[${sessionId}] reasoning-pair-violated: ${split} function_call item(s) lack a preceding reasoning item while ${withReasoning} exist — strict-echo upstreams will reject the request (#684)`);
     }
-}
-
-/** [#762] Strict-echo normalization: DeepSeek thinking mode accepts a BLANK
- *  reasoning_content echo but rejects an ABSENT field on assistant tool-call
- *  turns ("reasoning_content ... must be passed back"). The kernel round-trip
- *  drops blank echoes (an empty string carries no core message), so any
- *  rebuild can ship absent fields into a thinking session — the residual 400
- *  of #762. Inject "" on assistant tool-call messages lacking the field so the
- *  rejection class cannot reach the wire; hermes-agent PR #15527 (openclaw
- *  #71455) confirms DeepSeek accepts the blank form. Returns the input array
- *  unchanged when disabled or when nothing needed patching. */
-export function normalizeStrictEchoReasoning(
-    messages: OpenAIMessage[],
-    enabled: boolean,
-    log: (level: string, msg: string) => void,
-    sessionId: string,
-): OpenAIMessage[] {
-    if (!enabled) return messages;
-    let patched = 0;
-    const out = messages.map((m) => {
-        if (m.role !== "assistant") return m;
-        if (!Array.isArray(m.tool_calls) || m.tool_calls.length === 0) return m;
-        if (typeof m.reasoning_content === "string") return m;
-        patched++;
-        return { ...m, reasoning_content: "" };
-    });
-    if (patched > 0) {
-        log("info", `[${sessionId}] strict-echo: injected blank reasoning_content on ${patched} assistant tool-call message(s) (#762)`);
-    }
-    return patched > 0 ? out : messages;
 }
 
 export function stripKernelSummaries(messages: BiliMessage[], state: CompressionState): BiliMessage[] {

@@ -1,6 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { isStrictReasoningEcho, normalizeStrictEchoReasoning, warnReasoningPairs, warnAnthropicThinkingPairs, warnResponsesReasoningPairs } from "../src/server.js";
+import { normalizeStrictEchoBody } from "../src/strict-echo.js";
 import type { Session } from "../src/session.js";
 import type { OpenAIMessage } from "acp-kernel/wire";
 import { createInitialState } from "acp-kernel";
@@ -164,6 +165,54 @@ describe("#762 strict-echo normalization", () => {
         ];
         const c = collector();
         assert.equal(normalizeStrictEchoReasoning(msgs, true, c.log, "s1"), msgs);
+        assert.equal(c.lines.length, 0);
+    });
+});
+
+describe("#762 strict-echo body normalization (loop re-request path)", () => {
+    it("disabled: returns the same body object", () => {
+        const body = { model: "m", messages: [{ role: "assistant" as const, content: "", tool_calls: [{ id: "c1", type: "function", function: { name: "compress", arguments: "{}" } }] }] };
+        const c = collector();
+        assert.equal(normalizeStrictEchoBody(body, false, c.log, "s1"), body);
+        assert.equal(c.lines.length, 0);
+    });
+
+    it("no messages array (Responses-shaped body): returns the same body object", () => {
+        const body = { model: "m", input: [] };
+        const c = collector();
+        assert.equal(normalizeStrictEchoBody(body, true, c.log, "s1"), body);
+        assert.equal(c.lines.length, 0);
+    });
+
+    it("enabled: patches missing fields, preserves every other key, no mutation", () => {
+        const tcCall = { id: "c1", type: "function", function: { name: "compress", arguments: "{}" } };
+        const body = {
+            model: "m",
+            stream: true,
+            messages: [
+                { role: "user" as const, content: "u" },
+                { role: "assistant" as const, content: "", tool_calls: [tcCall] },
+            ],
+        };
+        const c = collector();
+        const out = normalizeStrictEchoBody(body, true, c.log, "s1");
+        assert.notEqual(out, body);
+        assert.equal(out.model, "m");
+        assert.equal(out.stream, true);
+        const outMsgs = out.messages as Record<string, unknown>[];
+        assert.equal(outMsgs[0], body.messages[0]);
+        assert.notEqual(outMsgs[1], body.messages[1]);
+        assert.deepEqual(outMsgs[1]!.tool_calls, [tcCall]);
+        assert.equal(outMsgs[1]!.reasoning_content, "");
+        assert.equal((body.messages[1] as Record<string, unknown>).reasoning_content, undefined);
+        assert.equal(c.lines.length, 1);
+        assert.match(c.lines[0]!, /injected blank reasoning_content on 1 assistant tool-call message/);
+    });
+
+    it("enabled: nothing to patch returns the same body object", () => {
+        const body = { model: "m", messages: [{ role: "assistant" as const, content: "", tool_calls: [{ id: "c1", type: "function", function: { name: "compress", arguments: "{}" } }], reasoning_content: "" }] };
+        const c = collector();
+        assert.equal(normalizeStrictEchoBody(body, true, c.log, "s1"), body);
         assert.equal(c.lines.length, 0);
     });
 });
