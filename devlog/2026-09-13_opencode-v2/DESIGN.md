@@ -100,3 +100,34 @@ Consequences applied:
 4. `/acp` conclusion survives: no observed 2.x build exposes an add-command
    entry point (both list/get/update/remove and list/transform/reload shapes
    lack one).
+
+## Addendum 2 (2026-09-14, later) — @opencode/cli 2.0.x stable verification + launcher fix
+
+Provenance resolved: the 2.x line publishes on npm as `@opencode/cli`
+(bins `opencode`/`opencode2`; platform packages like
+`@opencode/cli-linux-x64`). `opencode-ai` / `opencode` / `@opencode-ai/cli`
+are the 1.x line. Verified live on 2.0.1 and 2.0.3 in the same hermetic
+setup.
+
+| build | plugin entry | ctx.session | ctx.tool | hooks fired | bili outcome |
+|---|---|---|---|---|---|
+| @opencode/cli 2.0.1 | setup() | yes (hook/create/get/…) | {reload,transform,hook} | model.request + http.request | seam probe green |
+| @opencode/cli 2.0.3 | setup() | yes | {reload,transform,hook} | model.request + http.request | **true plugin mode end-to-end** (`[plugin] tool acp_status executed via plugin`, zero `[acp-loop]`) |
+
+Command-fact correction (supersedes Addendum item 4): on 2.0.x stable
+`ctx.command.transform(editor => editor.add(definition))` WORKS — the
+editor's only key is `add`; added commands appear in the slash menu and are
+invocable in the TUI by accepting the completion (Tab + Enter); `opencode
+run` mode dispatches NO slash commands at all (they pass through to the
+model). The bundled plugin still registers no commands — `acp_status`
+remains the in-host equivalent.
+
+Launcher bug found + fixed (this addendum): OC 2.0.x rejects FILE paths in
+the config `plugin` array (WARN "configured plugin path must be a directory";
+a directory entry's `index.js` is the entrypoint), so `bili opencode` was
+silently degrading every 2.x launch to proxy mode. Fix: `opencodeMajorVersion`
+(`--version` probe, cached per path, failure defaults to 1) gates a new
+`pluginDirMode` on `prepareOpencodeHttpRewrite`, which injects a temp wrapper
+dir whose `index.js` re-exports `dist/agent/opencode.js`. Verified end-to-end
+through the real launcher on 2.0.3 (captured temp config shows the directory
+entry; log shows true plugin mode as above).

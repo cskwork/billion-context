@@ -248,18 +248,24 @@ modes work on 2.0. The 2.x plugin API surface is still moving between builds
 hook/tool details below are version-specific observations, not a stable
 contract:
 
-- **Launcher:** `bili opencode` works unchanged. On a 2.0 host it injects the
-  built-in V2 plugin (`dist/agent/opencode.js`), which registers the bili
-  tools natively in-host — compress / decompress / search_context /
-  acp_status (+ absorb), JSON-Schema inputs — and stamps the proxy headers on
-  every outgoing provider request, so compression runs in plugin mode with no
-  wire-level tool injection. Native auto-compaction is disabled automatically
-  (`compaction.auto: false`). Every registration is defensive (optional
-  chaining): on any 2.x build where a seam is missing or never fires, the
-  plugin stays inert and the session transparently runs in plain proxy mode
-  (wire-level tool injection) instead of breaking — observed on two adjacent
-  `dev` builds (2026-09-13 / 2026-09-14) whose API surfaces differ from each
-  other (#754 review probes).
+- **Launcher:** `bili opencode` works unchanged. On a 2.x host it injects the
+  built-in V2 plugin (`dist/agent/opencode.js`) into the temp config as a temp
+  wrapper directory whose `index.js` re-exports the plugin file — 2.x rejects
+  bare file paths in the config `plugin` array (directory entries use
+  `index.js` as entrypoint); 1.x hosts get the bare file path. Host generation
+  is detected with a `--version` probe (a failed probe defaults to the 1.x
+  shape). The V2 plugin registers the bili tools natively in-host — compress /
+  decompress / search_context / acp_status (+ absorb), JSON-Schema inputs — and
+  stamps the proxy headers on every outgoing provider request, so compression
+  runs in plugin mode with no wire-level tool injection. Native auto-compaction
+  is disabled automatically (`compaction.auto: false`). Every registration is
+  defensive (optional chaining): on any 2.x build where a seam is missing or
+  never fires, the plugin stays inert and the session transparently runs in
+  plain proxy mode (wire-level tool injection) instead of breaking — observed
+  on two adjacent `dev` builds (2026-09-13 / 2026-09-14) whose API surfaces
+  differ from each other (#754 review probes); conversely verified end-to-end
+  on `@opencode/cli` 2.0.3 (native `acp_status` executed through the plugin
+  endpoint, zero wire-level injection).
 - **Pure proxy:** point the provider baseURL at the proxy like any other
   client:
 
@@ -280,13 +286,16 @@ contract:
   Note: 2.0 AI-SDK providers require an `apiKey` field even for local
   endpoints that never check it — set any non-empty value.
 
-Caveats: no 2.x build observed so far exposes an add-command entry point
-(the command editor has been list/get/update/remove-shaped on one pre-release
-and list/transform/reload-shaped on others), so plugins cannot create
-commands — there is no `/acp` under 2.0; call the `acp_status` tool instead.
-The bundled agent file keeps the V1 `server()` export alongside the V2
-`setup()`, so the same artifact also loads on hosts ≥ 1.18.29 that support
-dual-shape plugins. Design note: the V2 plugin is a thin protocol client (no
+Caveats: the 2.x line publishes as npm package `@opencode/cli`. Command
+support is build-dependent: one pre-release exposed only
+list/get/update/remove, while 2.0.x stable lets plugins ADD commands via
+`ctx.command.transform((editor) => editor.add(...))` — invocable in the TUI by
+accepting the slash-menu completion (Tab + Enter); note `opencode run` mode
+dispatches no slash commands at all (they pass through to the model). The
+bundled plugin deliberately registers no commands on either shape — call the
+`acp_status` tool instead of an `/acp` command. The bundled agent file keeps
+the V1 `server()` export alongside the V2 `setup()`, so the same artifact also
+loads on hosts ≥ 1.18.29 that support dual-shape plugins. Design note: the V2 plugin is a thin protocol client (no
 acp-kernel inside) because the proxy stays the single compression authority,
 which eliminates kernel-version drift between agent and proxy — it does not
 rely on the plugin API being unable to mutate context (that capability varies

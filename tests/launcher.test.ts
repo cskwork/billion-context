@@ -28,6 +28,7 @@ import {
     buildClaudeEnv,
     buildCodexArgs,
     prepareOpencodeHttpRewrite,
+    opencodeMajorVersion,
     stripInheritedProxy,
     resolvePiHome,
     resolveOmpHome,
@@ -1808,6 +1809,43 @@ test("prepareOpencodeHttpRewrite: writes rewritten copy, original untouched", ()
         assert.deepEqual(fromEmpty.plugin, ["/opt/bili/dist/agent/opencode.js"]);
         assert.deepEqual(fromEmpty.compaction, { auto: false });
         fs.rmSync(path.dirname(missingCfg), { recursive: true, force: true });
+    } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("prepareOpencodeHttpRewrite: pluginDirMode wraps the plugin in an index.js shim dir", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "oc-rw2-"));
+    try {
+        const cfgFile = path.join(dir, "opencode.json");
+        fs.writeFileSync(cfgFile, JSON.stringify({ provider: {} }));
+        const tmpFile = prepareOpencodeHttpRewrite(cfgFile, "http://127.0.0.1:8787", [], [], "/opt/bili/dist/agent/opencode.js", true);
+        assert.ok(tmpFile);
+        const injected = JSON.parse(fs.readFileSync(tmpFile, "utf8"));
+        const entry = injected.plugin[injected.plugin.length - 1];
+        assert.ok(entry !== "/opt/bili/dist/agent/opencode.js");
+        assert.ok(fs.statSync(entry).isDirectory());
+        const shim = fs.readFileSync(path.join(entry, "index.js"), "utf8");
+        assert.match(shim, /export \{ default \} from "\/opt\/bili\/dist\/agent\/opencode\.js";/);
+        assert.deepEqual(injected.compaction, { auto: false });
+        fs.rmSync(path.dirname(tmpFile), { recursive: true, force: true });
+    } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("opencodeMajorVersion: parses --version output, defaults to 1 on failure", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "oc-ver-"));
+    try {
+        const mk = (name: string, out: string): string => {
+            const f = path.join(dir, name);
+            fs.writeFileSync(f, `#!/bin/sh\necho "${out}"\n`);
+            fs.chmodSync(f, 0o755);
+            return f;
+        };
+        assert.equal(opencodeMajorVersion(mk("oc-v2.sh", "opencode v2.0.3")), 2);
+        assert.equal(opencodeMajorVersion(mk("oc-v1.sh", "1.14.46")), 1);
+        assert.equal(opencodeMajorVersion("/nonexistent/bili-test-bin"), 1);
     } finally {
         fs.rmSync(dir, { recursive: true, force: true });
     }

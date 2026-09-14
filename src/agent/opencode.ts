@@ -141,10 +141,18 @@ const server = async (ctx: OpencodePluginContext): Promise<OpencodeHooks> => {
 //   fetch Request at e.request (mutating e.request.headers reaches the wire);
 //   NO ctx.tool.reload(); command editor list/get/update/remove only (no ADD —
 //   hence no /acp under V2; acp_status tool is the in-host equivalent).
-// - 2.0.1 stable (reported via #754 review with repro script; awaiting
-//   artifact provenance for exact re-probe): model.request / http.request /
-//   context hooks all fire and reach the wire; ctx.tool = {reload, transform,
-//   hook}; ctx.command = {list, transform, reload} (still no ADD entry point).
+// - @opencode/cli 2.0.x stable (provenance confirmed during #754 review;
+//   probed live on 2.0.1 + 2.0.3): setup() is chosen over server(); BOTH
+//   model.request and http.request hooks fire (e.request mutation reaches the
+//   wire); ctx.tool = {reload, transform, hook} (reload EXISTS here);
+//   ctx.command.transform(editor.add) CAN add commands (TUI invocation needs
+//   Tab+Enter completion accept; `run` mode dispatches no slash commands at
+//   all); configured `plugin` entries must be DIRECTORIES (file paths are
+//   rejected with WARN "configured plugin path must be a directory"; the
+//   directory's index.js is the entrypoint) — the launcher wraps this single
+//   file accordingly (src/launcher.ts opencodeMajorVersion). End-to-end
+//   verified on 2.0.3: true plugin mode, native tools via the plugin tool
+//   endpoint, zero wire-level injection.
 // - npm dev builds 2026-09-13 / 2026-09-14 (probed live during #754 review):
 //   first loads plugins via V1 server() only; second exposes setup() but has
 //   no ctx.session / ctx.tool at all. Adjacent dev builds disagree with each
