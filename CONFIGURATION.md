@@ -475,6 +475,7 @@ Full command surface (`bili --help` prints an abridged version). Precedence ever
 | `bili codebuddy [opts --] [args]` | Proxy + **codebuddy** (Tencent CodeBuddy Code CLI) — `CODEBUDDY_BASE_URL` `/bili/` rewrite, OpenAI chat-completions wire; budget via `CODEBUDDY_AUTO_COMPACT_WINDOW` (#640) |
 | `bili qoder [opts --] [args]` | Proxy + **qoder** — cert-MITM via `HTTPS_PROXY` + `NODE_EXTRA_CA_CERTS`; model endpoint hardcoded https so no `/bili/` rewrite (default host map whitelisted) (#653) |
 | `bili trae [opts --] [args]` | Proxy + **Trae CLI** (ByteDance, closed Go binary) — cert-MITM via `HTTPS_PROXY` + `SSL_CERT_FILE`; model host from `TRAE_CLI_API_HOST` or the default enterprise gateway (#655) |
+| `bili jcode [opts --] [args]` | Proxy + **jcode** (Rust agent harness) — env-only cert-MITM launch via `HTTPS_PROXY` + `SSL_CERT_FILE`; hosted model host (`api.z.ai`) whitelisted, local loopback providers stay direct via `NO_PROXY` |
 | `bili test pi` | Non-polluting end-to-end smoke test of the pi path |
 | `bili export [session] [--full] [--output FILE]` | List persisted sessions / export one as a Markdown handoff — see [Sessions & Migration](#sessions--migration) |
 | `bili update` | Check for & install a newer version now (bypasses the 3-minute throttle) |
