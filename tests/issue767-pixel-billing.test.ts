@@ -230,14 +230,14 @@ function startMockUpstream(onStream?: (raw: string) => void): Promise<{ server: 
     });
 }
 
-async function startProxy(upstreamPort: number, routeExtra: Record<string, unknown> = {}): Promise<{ proxy: http.Server; port: number }> {
+async function startProxy(upstreamPort: number, routeExtra: Record<string, unknown> = {}, routeKey?: string): Promise<{ proxy: http.Server; port: number }> {
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
     const proxy = await startServer({
         port: 0,
         host: "127.0.0.1",
         upstream: "http://127.0.0.1",
-        routes: { [`http://127.0.0.1:${upstreamPort}`]: { models: { "gpt-astra": { context: WINDOW } }, ...routeExtra } },
+        routes: { [routeKey ?? `http://127.0.0.1:${upstreamPort}`]: { models: { "gpt-astra": { context: WINDOW } }, ...routeExtra } },
         modelContextLimit: WINDOW,
         kernelConfig: defaultConfig(WINDOW),
         compress: { injectTool: true, injectNudge: true },
@@ -406,6 +406,44 @@ test("e2e #767: env BILI_IMAGE_BILLING beats per-provider route config", async (
         assert.equal(err2.error?.code, "preflight_compress_failed");
         assert.equal(stats.streamingForwards, 1);
         assert.equal(stats.imagesSeen, 0);
+    } finally {
+        proxy.close();
+        await once(proxy, "close");
+        upstream.close();
+        await once(upstream, "close");
+    }
+});
+
+test("e2e #767: per-route imageBilling applies under a path-qualified provider key at every gate", async () => {
+    const { server: upstream, port: upstreamPort, stats } = await startMockUpstream();
+    const { proxy, port: proxyPort } = await startProxy(upstreamPort, { imageBilling: "pixels" }, `http://127.0.0.1:${upstreamPort}/v1`);
+    try {
+        const url = `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/responses`;
+        const headers = { "content-type": "application/json" };
+
+        const r1 = await fetch(url, {
+            method: "POST",
+            headers,
+            body: JSON.stringify({ model: "gpt-astra", stream: true, store: false, session_id: "img-path-sess", instructions: "You are the test coding agent.", input: [{ type: "message", role: "user", content: "hello there" }], max_output_tokens: 1024 }),
+        });
+        assert.equal(r1.status, 200);
+        await r1.text();
+
+        const s = listSessions().find((x) => x.meta.label === "img-path-sess");
+        assert.ok(s, "session established");
+        s!.stats.lastInputTokens = STALE_BASELINE;
+
+        // Regression pin: origin-only route lookups missed this path-qualified key at the
+        // preflight/clamp/guard gates (auto → bytes on a bare IP host → 502); every other
+        // per-route setting resolves against route.rewrittenUrl instead.
+        const r2 = await fetch(url, { method: "POST", headers, body: imageTurn("img-path-sess") });
+        assert.equal(r2.status, 200, "path-qualified per-route override reaches the preflight gate");
+        await r2.text();
+        assert.equal(stats.streamingForwards, 2);
+        assert.equal(stats.imagesSeen, 2);
+
+        const after = listSessions().find((x) => x.meta.label === "img-path-sess")!;
+        assert.ok(after.stats.lastInputTokens > 0 && after.stats.lastInputTokens < WINDOW, `baseline recovered to real usage (got ${after.stats.lastInputTokens})`);
     } finally {
         proxy.close();
         await once(proxy, "close");

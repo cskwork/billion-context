@@ -1453,7 +1453,7 @@ async function handle(
             // then scalar) — the learner now writes the confirmed channel, so the
             // legacy direct map read would miss windows learned from real 400s.
             const learnedLimit = resolveLearnedLimit(session, reqModel);
-            const guard = sideRequestGuard(parsed, protocol, reqConfig.modelContextLimit, learnedLimit, imageBillingFor(opts, upstreamOrigin));
+            const guard = sideRequestGuard(parsed, protocol, reqConfig.modelContextLimit, learnedLimit, imageBillingFor(opts, route?.rewrittenUrl ?? upstreamOrigin));
             if (guard.blocked) {
                 log("warn", `[${session.id}] side request (~${guard.estimate} tokens) ≥ effective window ${guard.limit} (model=${reqModel ?? "?"}) — NOT forwarded: guaranteed upstream 400 (side requests bypass preflight by design, #388)`);
                 if (!res.headersSent && !res.writableEnded && !res.destroyed) {
@@ -1608,14 +1608,14 @@ async function handle(
                         : protocol === "anthropic"
                           ? prepareAnthropic(work as AnthropicRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, upstreamOrigin, reasoningCfg)
                           : protocol === "openai"
-                             ? prepareOpenai(work as OpenAIRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, upstreamOrigin, nativeWindow, reasoningCfg)
+                              ? prepareOpenai(work as OpenAIRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, upstreamOrigin, nativeWindow, reasoningCfg, route?.rewrittenUrl)
                              : responsesCompact
                                 // #618 review nit: when no bili compaction item is present,
                                 // prepareResponsesCompact falls back to the raw bodyBuffer — forward
                                 // the re-serialized post-strip work instead so dropped images don't
                                 // ride along. Unchanged bodies keep the original buffer byte-identical.
                                 ? prepareResponsesCompact(stripped.removed > 0 ? Buffer.from(JSON.stringify(work)) : bodyBuffer, work as ResponsesRequestBody, session, req, core, reqConfig, log)
-                               : prepareResponses(work as ResponsesRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, responsesIdentity!, pluginMode, upstreamOrigin, nativeWindow, reasoningCfg);
+                                : prepareResponses(work as ResponsesRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, responsesIdentity!, pluginMode, upstreamOrigin, nativeWindow, reasoningCfg, route?.rewrittenUrl);
                 };
                 // #332: codex's native remote-compaction request (trigger form)
                 // is dispatched BEFORE prepare/preflight. When it is not
@@ -2207,6 +2207,7 @@ function prepareOpenai(
     upstreamOrigin: string,
     nativeWindow: number,
     reasoning: CompressReasoningConfig | undefined,
+    billingUpstream?: string,
 ): Prepared {
     const sessionId = session.id;
     const stream = parsed.stream === true;
@@ -2320,7 +2321,7 @@ function prepareOpenai(
 
     const rebuilt: OpenAIRequestBody = { ...parsed, messages: rebuiltMessages, tools: toolsOut as OpenAITool[] | undefined };
     warnReasoningPairs(rebuiltMessages, log, sessionId);
-    clampOutgoingOutput(rebuilt as Record<string, unknown>, typeof (parsed as Record<string, unknown>).max_completion_tokens === "number" ? "max_completion_tokens" : "max_tokens", { systemText: openaiSystemText, tools: toolsOut, processedMessages, lastInputTokens: session.stats.lastInputTokens, nativeWindow, imageTokens: imageTokensInParsedBody("openai", rebuilt, imageBillingFor(opts, upstreamOrigin)) }, sessionId, log);
+    clampOutgoingOutput(rebuilt as Record<string, unknown>, typeof (parsed as Record<string, unknown>).max_completion_tokens === "number" ? "max_completion_tokens" : "max_tokens", { systemText: openaiSystemText, tools: toolsOut, processedMessages, lastInputTokens: session.stats.lastInputTokens, nativeWindow, imageTokens: imageTokensInParsedBody("openai", rebuilt, imageBillingFor(opts, billingUpstream ?? upstreamOrigin)) }, sessionId, log);
     // prompt_cache_retention is an OpenAI-host-only cache directive; the dsh
     // launcher forces PI_CACHE_RETENTION=long (for the session-id
     // prompt_cache_key) which makes the client also emit it. Third-party
@@ -2363,6 +2364,7 @@ function prepareResponses(
     upstreamOrigin: string,
     nativeWindow: number,
     reasoning: CompressReasoningConfig | undefined,
+    billingUpstream?: string,
 ): Prepared {
     const sessionId = session.id;
     const stream = parsed.stream === true;
@@ -2555,7 +2557,7 @@ function prepareResponses(
     const rebuilt: ResponsesRequestBody = { ...parsed, input: rebuiltInput, tools: toolsOut };
     warnResponsesReasoningPairs(Array.isArray(rebuiltInput) ? rebuiltInput : [], log, sessionId);
     if (!isCompactionTrigger) {
-        clampOutgoingOutput(rebuilt as Record<string, unknown>, "max_output_tokens", { systemText: (responsesProjection?.systemParts ?? []).join("\n"), tools: toolsOut, processedMessages, lastInputTokens: session.stats.lastInputTokens, nativeWindow, imageTokens: imageTokensInParsedBody("responses", rebuilt, imageBillingFor(opts, upstreamOrigin)) }, sessionId, log);
+        clampOutgoingOutput(rebuilt as Record<string, unknown>, "max_output_tokens", { systemText: (responsesProjection?.systemParts ?? []).join("\n"), tools: toolsOut, processedMessages, lastInputTokens: session.stats.lastInputTokens, nativeWindow, imageTokens: imageTokensInParsedBody("responses", rebuilt, imageBillingFor(opts, billingUpstream ?? upstreamOrigin)) }, sessionId, log);
     }
     // Route with the upstream THIS request goes to — session.meta.upstreamOrigin
     // is first-wins and would keep injecting pck toward a relay we switched
@@ -3081,7 +3083,7 @@ async function preflightCompressIfNeeded(
     // add their cost to every size decision here (trigger, fit gates, self-heal).
     // #767: bill them by the resolved mode (same upstream-URL fallback as buildForwardTarget).
     const preflightReqUrl = req.url ?? "";
-    const billingUpstream = route?.upstream ?? (/^https?:\/\//i.test(preflightReqUrl) ? preflightReqUrl : opts.upstream);
+    const billingUpstream = route?.rewrittenUrl ?? (/^https?:\/\//i.test(preflightReqUrl) ? preflightReqUrl : opts.upstream);
     const imageTokens = imageTokensInRawBody(prepared.protocol, prepared.body, imageBillingFor(opts, billingUpstream));
     const textEstimate = estimateCoreMessages(prepared.processedMessages);
     // #470: system + tool definitions ride the wire too but are invisible to
