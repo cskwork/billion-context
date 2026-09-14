@@ -54,6 +54,7 @@ export function mergeCompress(
     // provider-level excludeTools.
     const absorbLevels = [global?.absorb, provider?.absorb, model?.absorb].filter(Boolean) as NonNullable<CompressSettings["absorb"]>[];
     const reasoningLevels = [global?.reasoning, provider?.reasoning, model?.reasoning].filter(Boolean) as NonNullable<CompressSettings["reasoning"]>[];
+    const reasoningGuardLevels = [global?.reasoningGuard, provider?.reasoningGuard, model?.reasoningGuard].filter(Boolean) as NonNullable<CompressSettings["reasoningGuard"]>[];
     return {
         modelContextLimit: pick("modelContextLimit"),
         maxContextLimit: pick("maxContextLimit"),
@@ -73,6 +74,7 @@ stripImages: pick("stripImages"),
         // exactly like `absorb`/`prompts`: a model-level `threshold` must not
         // discard a provider-level `drop: false`.
         reasoning: reasoningLevels.length > 0 ? Object.assign({}, ...reasoningLevels) : undefined,
+        reasoningGuard: reasoningGuardLevels.length > 0 ? Object.assign({}, ...reasoningGuardLevels) : undefined,
         promptPack: pick("promptPack"),
     };
 }

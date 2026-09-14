@@ -60,6 +60,7 @@ import { compressLoopResponsesJson } from "./compress-loop-responses.js";
 import { runCompressLoop, pickAdapter } from "./loop/index.js";
 import { containsToolCallXmlFragment } from "./loop/tag-echo-filter.js";
 import { isFakeCompletion, injectFakeCompletionHint, maxFakeCompletionRetries, fakeBufCap } from "./fake-completion.js";
+import { reasoningGuardEngages, runReasoningGuard } from "./reasoning-guard.js";
 import { sanitizeResponsesInputIds, dropWhitespaceResponsesMessages, normalizeResponsesMessageItems } from "./loop/adapter-responses.js";
 import { codexCompactMode, isCodexClient, hasCompactionTrigger, stripBiliCompactionItems, replaceBiliCompactionItems, codexCompactGate, codexCompactGatePre, buildTriggerForgeBody, mergeForgedSummaries } from "./codex-compact.js";
 import { stripAcpPanelMessages, stripAcpPanelResponsesInput } from "./acp-panel.js";
@@ -3801,6 +3802,34 @@ async function forward(
             clearUpstreamTimer();
         }
         return;
+    }
+    if (prepared && prepared.protocol === "responses" && prepared.stream && !prepared.sidePassthrough && !prepared.compressInjected) {
+        const sse = (upstream.headers.get("content-type") ?? "").includes("text/event-stream");
+        if (sse) {
+            let reqModel: string | undefined;
+            try {
+                const wb = typeof wireBody === "string" ? wireBody : wireBody.toString("utf8");
+                const parsed = JSON.parse(wb) as Record<string, unknown>;
+                if (typeof parsed.model === "string") reqModel = parsed.model;
+            } catch { /* non-JSON body: guard stays off */ }
+            const rg = resolveCompress(opts.routes, upstreamUrl, reqModel, opts.compress).reasoningGuard;
+            if (rg && reasoningGuardEngages(rg)) {
+                log("info", `[reasoning-guard] engaged model=${reqModel ?? "?"} session=${prepared.session?.id ?? "-"}`);
+                await runReasoningGuard({
+                    firstResponse: upstream,
+                    clearFirstTimer: clearUpstreamTimer,
+                    upstreamUrl,
+                    reqHeaders: buildForwardHeaders(headers),
+                    dispatcher,
+                    originalBody: wireBody,
+                    signal: clientAbort.signal,
+                    res,
+                    config: rg,
+                    log: (msg) => log("info", msg),
+                });
+                return;
+            }
+        }
     }
     // #371: detect + retry a fake completion for every non-plugin streaming
     // response (any turn, not just compress-injected). Buffering is required:
