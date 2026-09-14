@@ -7,6 +7,7 @@ import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { defaultConfig, ACP_TOOLS_OPENAI, ACP_TOOLS_ANTHROPIC, ACP_TOOLS_RESPONSES } from "acp-kernel";
 import { startServer } from "../src/server.ts";
+import { resolveCompressSurface } from "../src/compress-settings.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
@@ -18,9 +19,18 @@ import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 // covers the sibling gap: injectSystem got no surface either, so pack
 // promptSections never reached the Anthropic system block while the #422 loop
 // rebuild used them (byte mismatch between original request and re-requests).
+// Expectations are read from the installed kernel's builtin lean pack via the
+// SAME resolver the server uses, so this pins the wiring (pack values reach
+// the outbound body), not any specific kernel version's wording — hardcoded
+// copies broke when acp-kernel 0.0.69 reworded lean's paramDescriptions.
 
-const LEAN_COMPRESS_DESC = "Replace consumed conversation ranges with self-contained summaries using mNNNNN or bN refs.";
-const LEAN_CONTENT_PARAM_DESC = "Direct array; no JSON strings/nesting/mix.";
+function leanToolPrompts() {
+    const tp = resolveCompressSurface({ promptPack: "lean" }).toolPrompts;
+    assert.ok(tp && Object.keys(tp).length > 0, "builtin lean pack resolves with non-empty toolPrompts");
+    assert.ok(tp.compress?.description, "lean compress carries a description override");
+    assert.ok(tp.compress?.paramDescriptions?.content, "lean compress carries a content paramDescription");
+    return tp;
+}
 
 type Captured = { urlPath: string; body: Record<string, any> };
 type Harness = { proxyUrl: string; captured: Captured[]; close(): Promise<void> };
@@ -89,16 +99,20 @@ test("#747: openai wire — lean pack toolPrompts applied to injected ACP tools"
             body: JSON.stringify({ model: "gpt-test", stream: false, messages: [{ role: "user", content: "hello" }] }),
         });
         assert.equal(h.captured.length, 1);
+        const tp = leanToolPrompts();
         const tools: { type?: string; function?: { name: string; description: string; parameters?: Record<string, any> } }[] = h.captured[0].body.tools;
         assert.ok(Array.isArray(tools) && tools.length > 0, "tools injected");
-        const compress = tools.find((t) => t.function?.name === "compress");
-        assert.ok(compress, "compress tool present");
+        for (const [name, overrides] of Object.entries(tp)) {
+            const tool = tools.find((t) => t.function?.name === name);
+            assert.ok(tool, `${name} injected`);
+            if (overrides.description !== undefined) {
+                assert.equal(tool.function.description, overrides.description, `${name} description from lean pack`);
+            }
+        }
+        const compress = tools.find((t) => t.function?.name === "compress")!;
         const defaultDesc = ACP_TOOLS_OPENAI.find((t) => t.function.name === "compress")!.function.description;
-        assert.notEqual(compress!.function.description, defaultDesc, "not the kernel default");
-        assert.equal(compress!.function.description, LEAN_COMPRESS_DESC);
-        assert.equal(compress!.function.parameters?.properties?.content?.description, LEAN_CONTENT_PARAM_DESC, "paramDescriptions applied");
-        const decompress = tools.find((t) => t.function?.name === "decompress");
-        assert.ok(decompress!.function.description.startsWith("Restore compressed content by block id"), "decompress overridden too");
+        assert.notEqual(compress.function.description, defaultDesc, "not the kernel default");
+        assert.equal(compress.function.parameters?.properties?.content?.description, tp.compress.paramDescriptions?.content, "paramDescriptions applied");
     } finally {
         await h.close();
     }
@@ -113,14 +127,20 @@ test("#747: anthropic wire — lean pack toolPrompts applied to injected ACP too
             body: JSON.stringify({ model: "claude-test", max_tokens: 4096, messages: [{ role: "user", content: "hello" }] }),
         });
         assert.equal(h.captured.length, 1);
+        const tp = leanToolPrompts();
         const tools: { name: string; description: string; input_schema?: Record<string, any> }[] = h.captured[0].body.tools;
         assert.ok(Array.isArray(tools) && tools.length > 0, "tools injected");
-        const compress = tools.find((t) => t.name === "compress");
-        assert.ok(compress, "compress tool present");
+        for (const [name, overrides] of Object.entries(tp)) {
+            const tool = tools.find((t) => t.name === name);
+            assert.ok(tool, `${name} injected`);
+            if (overrides.description !== undefined) {
+                assert.equal(tool.description, overrides.description, `${name} description from lean pack`);
+            }
+        }
+        const compress = tools.find((t) => t.name === "compress")!;
         const defaultDesc = ACP_TOOLS_ANTHROPIC.find((t) => t.name === "compress")!.description;
-        assert.notEqual(compress!.description, defaultDesc, "not the kernel default");
-        assert.equal(compress!.description, LEAN_COMPRESS_DESC);
-        assert.equal(compress!.input_schema?.properties?.content?.description, LEAN_CONTENT_PARAM_DESC, "paramDescriptions applied");
+        assert.notEqual(compress.description, defaultDesc, "not the kernel default");
+        assert.equal(compress.input_schema?.properties?.content?.description, tp.compress.paramDescriptions?.content, "paramDescriptions applied");
     } finally {
         await h.close();
     }
@@ -135,14 +155,20 @@ test("#747: responses wire — lean pack toolPrompts applied to injected ACP too
             body: JSON.stringify({ model: "gpt-test", input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "hello" }] }] }),
         });
         assert.equal(h.captured.length, 1);
+        const tp = leanToolPrompts();
         const tools: { name?: string; description?: string; parameters?: Record<string, any> }[] = h.captured[0].body.tools;
         assert.ok(Array.isArray(tools) && tools.length > 0, "tools injected");
-        const compress = tools.find((t) => t.name === "compress");
-        assert.ok(compress, "compress tool present");
+        for (const [name, overrides] of Object.entries(tp)) {
+            const tool = tools.find((t) => t.name === name);
+            assert.ok(tool, `${name} injected`);
+            if (overrides.description !== undefined) {
+                assert.equal(tool.description, overrides.description, `${name} description from lean pack`);
+            }
+        }
+        const compress = tools.find((t) => t.name === "compress")!;
         const defaultDesc = ACP_TOOLS_RESPONSES.find((t) => t.name === "compress")!.description!;
-        assert.notEqual(compress!.description, defaultDesc, "not the kernel default");
-        assert.equal(compress!.description, LEAN_COMPRESS_DESC);
-        assert.equal(compress!.parameters?.properties?.content?.description, LEAN_CONTENT_PARAM_DESC, "paramDescriptions applied");
+        assert.notEqual(compress.description, defaultDesc, "not the kernel default");
+        assert.equal(compress.parameters?.properties?.content?.description, tp.compress.paramDescriptions?.content, "paramDescriptions applied");
     } finally {
         await h.close();
     }
