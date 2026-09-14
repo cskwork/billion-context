@@ -53,7 +53,7 @@ import { selfPackageRoot, isBiliPiEntry, ompPluginLoadedFrom } from "./plugin-in
 function selfDistFile(name: string): string {
     return path.join(selfPackageRoot(), "dist", name);
 }
-import { nonEmpty, resolvePiHome, resolveOmpHome, resolveDshHome, resolveCodexHome, loadClientConfig, collectModelWindows, type ClientConfig, type CodexConfig, resolveOpencodeConfigFile, type OpencodeConfig, type OpencodeProvider, type HermesConfig, type HermesProvider, qoderIsCnSite, QODER_DEFAULT_MODEL_HOSTS, resolveTraeHome, readTraeConfig, TRAE_DEFAULT_MODEL_HOSTS, type TraeConfig } from "./client-config.js";
+import { nonEmpty, resolvePiHome, resolveOmpHome, resolveDshHome, resolveCodexHome, loadClientConfig, collectModelWindows, type ClientConfig, type CodexConfig, resolveOpencodeConfigFile, type OpencodeConfig, type OpencodeProvider, type HermesConfig, type HermesProvider, qoderIsCnSite, QODER_DEFAULT_MODEL_HOSTS, resolveTraeHome, readTraeConfig, TRAE_DEFAULT_MODEL_HOSTS, JCODE_DEFAULT_MODEL_HOSTS, type TraeConfig } from "./client-config.js";
 import { loadRoutes, resolveConfiguredContextLimit, lookupContextLimit, type ProviderRoutes } from "./config.js";
 import { contextFromRegistry } from "./registry.js";
 
@@ -89,6 +89,7 @@ export {
     resolveTraeHome,
     readTraeConfig,
     TRAE_DEFAULT_MODEL_HOSTS,
+    JCODE_DEFAULT_MODEL_HOSTS,
     type TraeConfig,
     resolveOpencodeConfigFile,
     readOpencodeConfig,
@@ -106,9 +107,9 @@ export {
 } from "./client-config.js";
 
 export const LAUNCHER_DEFAULT_HOST = "127.0.0.1";
-export const LAUNCH_CLIENTS = ["pi", "codex", "claude", "omp", "opencode", "hermes", "dsh", "codebuddy", "qoder", "trae", "pi-test"] as const;
+export const LAUNCH_CLIENTS = ["pi", "codex", "claude", "omp", "opencode", "hermes", "dsh", "codebuddy", "qoder", "trae", "jcode", "pi-test"] as const;
 export type ClientName = (typeof LAUNCH_CLIENTS)[number];
-export type BaseClientName = "claude" | "codex" | "pi" | "omp" | "opencode" | "hermes" | "dsh" | "codebuddy" | "qoder" | "trae";
+export type BaseClientName = "claude" | "codex" | "pi" | "omp" | "opencode" | "hermes" | "dsh" | "codebuddy" | "qoder" | "trae" | "jcode";
 
 const HEALTH_PATH = "/__bili/health";
 const HEALTH_POLL_INTERVAL_MS = 200;
@@ -455,6 +456,18 @@ export function discoverRoutes(client: ClientName, config: ClientConfig): Discov
                 httpsDomains.push(host);
             }
         }
+    } else if (client === "jcode") {
+        // jcode keeps provider base URLs in ~/.jcode/config.toml; there is no
+        // TOML reader yet (add one for per-provider discovery). Whitelist the
+        // default zai coding endpoint so the proxy compresses that leg;
+        // loopback legs (local model servers, MCP) stay direct via NO_PROXY.
+        for (const h of JCODE_DEFAULT_MODEL_HOSTS) {
+            const host = h.split(":", 2)[0]!.toLowerCase();
+            if (host && !httpsSeen.has(host)) {
+                httpsSeen.add(host);
+                httpsDomains.push(host);
+            }
+        }
     } else {
         for (const [name, prov] of Object.entries(config.codex?.providers ?? {})) {
             classify(prov.baseUrl, `model_providers.${name}.base_url`);
@@ -509,6 +522,19 @@ export function buildTraeEnv(origin: string, caPath: string, baseEnv: NodeJS.Pro
     // #655: trae is a Go binary like codex — the CA rides SSL_CERT_FILE (the
     // combined bundle, since it replaces Go's system trust store).
     return { ...baseEnv, HTTPS_PROXY: origin, SSL_CERT_FILE: caPath, BILLION_CONTEXT_PROXY: origin };
+}
+
+export function buildJcodeEnv(origin: string, caPath: string, baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+    // jcode is Rust reqwest: CA rides SSL_CERT_FILE (combined bundle).
+    // NO_PROXY keeps loopback legs (local model endpoints, MCP) direct.
+    return {
+        ...baseEnv,
+        HTTPS_PROXY: origin,
+        SSL_CERT_FILE: caPath,
+        BILLION_CONTEXT_PROXY: origin,
+        NO_PROXY: "localhost,127.0.0.1,::1",
+        no_proxy: "localhost,127.0.0.1,::1",
+    };
 }
 
 export function buildCodexArgs(
@@ -793,7 +819,7 @@ function isPrivateIPv4(host: string): boolean {
  *  yet verified against a real build, so v1 runs pure wire mode (the proxy
  *  injects the context tools on the wire). */
 export function launcherInjectMcp(env: NodeJS.ProcessEnv, base: string, codexUpstream?: string): boolean {
-    if (base === "pi" || base === "omp" || base === "opencode" || base === "hermes" || base === "dsh" || base === "codebuddy" || base === "qoder" || base === "trae") return false;
+    if (base === "pi" || base === "omp" || base === "opencode" || base === "hermes" || base === "dsh" || base === "codebuddy" || base === "qoder" || base === "trae" || base === "jcode") return false;
     if (env.BILI_LAUNCHER_PLUGIN === "0") return false;
     if (base === "codex" && env.BILI_LAUNCHER_PLUGIN === undefined && codexUpstream !== undefined && isPrivateUpstreamHost(codexUpstream)) {
         return false;
@@ -2337,6 +2363,10 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         // proprietary /api/ide/v2/llm_raw_chat, recognized as OpenAI by the
         // proxy.
         env = buildTraeEnv(origin, resolveCombinedCaPath(process.env), stripInheritedProxy(process.env));
+    } else if (base === "jcode") {
+        // Rust reqwest honors HTTPS_PROXY + SSL_CERT_FILE; NO_PROXY keeps the
+        // loopback legs (unsloth endpoint, MCP) out of the proxy.
+        env = buildJcodeEnv(origin, resolveCombinedCaPath(process.env), stripInheritedProxy(process.env));
     } else if (base === "codex") {
         // Per-spawn conversation id for the MCP shell's headless
         // self-registration (codex provides no session id of its own).
