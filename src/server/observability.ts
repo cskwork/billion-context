@@ -30,13 +30,6 @@ export function logDumpFailure(where: string, err: unknown): void {
 // log (~20k lines in one user's capture, #362). Per-path: first 3 at warn, one
 // "suppressed" notice, then silent.
 const unrecognizedPathCounts = new Map<string, number>();
-// Model-enumeration endpoints clients probe at startup (omp's openai-models-list
-// discovery). Expected passthroughs, not unknown protocols — #393: exempt from
-// the warn-level "unrecognized path" log.
-export function isModelDiscoveryPath(path: string): boolean {
-    return path.replace(/\/+$/, "").endsWith("/models");
-}
-
 export function logUnrecognizedPath(log: (level: string, msg: string) => void, url: string): void {
     // Strip the query before masking: a varying query (?ts=…) would otherwise
     // split one endpoint into unbounded keys and defeat the rate limit.
@@ -48,4 +41,11 @@ export function logUnrecognizedPath(log: (level: string, msg: string) => void, u
     } else if (n === 4) {
         log("info", `unrecognized path ${key}: forwarding unchanged; further occurrences suppressed`);
     }
+}
+
+// Model-enumeration endpoints clients probe at startup (omp's openai-models-list
+// discovery). Expected passthroughs, not unknown protocols — #393: exempt from
+// the warn-level "unrecognized path" log.
+export function isModelDiscoveryPath(path: string): boolean {
+    return path.replace(/\/+$/, "").endsWith("/models");
 }

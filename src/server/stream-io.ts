@@ -1,3 +1,6 @@
+import http from "node:http";
+import { logDumpFailure } from "./observability.js";
+
 /** Read a (small) fetch Response body stream fully into a Buffer. Used for the
  *  non-2xx error path, where we inspect the body for a context-overflow before
  *  passing it through. Error bodies are small JSON, so full buffering is safe —
@@ -35,9 +38,6 @@ export function bufferToStream(buf: Buffer): ReadableStream<Uint8Array> {
         },
     });
 }
-
-import http from "node:http";
-import { logDumpFailure } from "./observability.js";
 
 export async function pipeThrough(stream: ReadableStream<Uint8Array>, res: http.ServerResponse): Promise<void> {
     const reader = stream.getReader();
