@@ -103,16 +103,23 @@ export function usageTotals(
  *  separate) — under true OpenAI semantics prompt_tokens >= cached_tokens
  *  always holds, so a violation proves the cached segment is NOT part of
  *  prompt_tokens and must be added back (e.g. {prompt_tokens:6,
- *  cached_tokens:26278} is a real ~26284-token prompt, not 6). */
+ *  cached_tokens:26278} is a real ~26284-token prompt, not 6).
+ *  #790: under split semantics the Anthropic cache-WRITE segment
+ *  (`cache_creation_input_tokens`) is a third additive piece — part of the
+ *  context size, but NOT a cache hit. */
 export function promptInputTotal(
     protocol: WireProtocol | undefined,
     input: number | undefined,
     cached: number | undefined,
+    creation?: number,
 ): number {
     if (input === undefined) return 0;
     const includesCached = protocol === "openai" || protocol === "responses";
     const splitSemantics = !includesCached || (typeof cached === "number" && input < cached);
-    return input + (splitSemantics && typeof cached === "number" ? cached : 0);
+    const additive =
+        (splitSemantics && typeof cached === "number" ? cached : 0) +
+        (splitSemantics && typeof creation === "number" ? creation : 0);
+    return input + additive;
 }
 
 /** Result of inspecting an upstream response for a "context too long" error. */

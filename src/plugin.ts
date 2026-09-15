@@ -563,7 +563,9 @@ export async function handlePluginTool(
     res.end(JSON.stringify({ ok: true, tool, conversationId, result }));
 }
 
-type UsageSample = { inputTokens?: number; cachedTokens?: number; outputTokens?: number };
+// creationTokens = Anthropic cache-write segment (cache_creation_input_tokens):
+// part of the context size, but NOT a cache hit (#790).
+type UsageSample = { inputTokens?: number; cachedTokens?: number; outputTokens?: number; creationTokens?: number };
 
 function num(v: unknown): number | undefined {
     return typeof v === "number" && Number.isFinite(v) ? v : undefined;
@@ -574,9 +576,17 @@ function usageFromSseEvent(obj: Record<string, unknown>): UsageSample | undefine
     if (type === "message_start") {
         const usage = (obj["message"] as Record<string, unknown> | undefined)?.["usage"] as Record<string, unknown> | undefined;
         if (!usage) return undefined;
+        // Per-field snapshot (#790): a zero is a real value here (a fully
+        // cache-hit turn reports input_tokens: 0), so record whatever is
+        // present and let later events overwrite field by field.
+        const sample: UsageSample = {};
         const input = num(usage["input_tokens"]);
-        if (input === undefined) return undefined;
-        return { inputTokens: input, cachedTokens: num(usage["cache_read_input_tokens"]) };
+        if (input !== undefined) sample.inputTokens = input;
+        const read = num(usage["cache_read_input_tokens"]);
+        if (read !== undefined) sample.cachedTokens = read;
+        const creation = num(usage["cache_creation_input_tokens"]);
+        if (creation !== undefined) sample.creationTokens = creation;
+        return Object.keys(sample).length > 0 ? sample : undefined;
     }
     if (type === "message_delta") {
         const usage = obj["usage"] as Record<string, unknown> | undefined;
@@ -584,10 +594,20 @@ function usageFromSseEvent(obj: Record<string, unknown>): UsageSample | undefine
         // Some relays echo `input_tokens: 0` in message_delta (the field is
         // normally absent — message_start is authoritative for the input size,
         // which is fixed within a turn). A 0 here is never a legitimate new
-        // value; merging it would zero acc.inputTokens (set by message_start)
-        // and collapse lastInputTokens to the cached portion only.
+        // value; merging it would zero out acc.inputTokens (set by message_start)
+        // and collapse lastInputTokens to the cached portion only. The same
+        // guard covers the cache segments (#790): a zeroed echo must not
+        // clobber real values carried from message_start.
         const input = num(usage["input_tokens"]);
-        return { inputTokens: input && input > 0 ? input : undefined, outputTokens: num(usage["output_tokens"]) };
+        const read = num(usage["cache_read_input_tokens"]);
+        const creation = num(usage["cache_creation_input_tokens"]);
+        const sample: UsageSample = {};
+        if (input !== undefined && input > 0) sample.inputTokens = input;
+        if (read !== undefined && read > 0) sample.cachedTokens = read;
+        if (creation !== undefined && creation > 0) sample.creationTokens = creation;
+        const output = num(usage["output_tokens"]);
+        if (output !== undefined) sample.outputTokens = output;
+        return Object.keys(sample).length > 0 ? sample : undefined;
     }
     if (type === "response.completed") {
         const usage = (obj["response"] as Record<string, unknown> | undefined)?.["usage"] as Record<string, unknown> | undefined;
@@ -614,15 +634,15 @@ function usageFromSseEvent(obj: Record<string, unknown>): UsageSample | undefine
 export function applyUsageSample(session: Session, sample: UsageSample, protocol?: WireProtocol): void {
     // inputTokens is protocol-native: Anthropic reports it NEW-only (cached
     // separate); OpenAI/Responses report the TOTAL (cached already included).
-    // promptInputTotal adds the cached segment back when it is not part of
-    // inputTokens — including the #408 split-semantics violation on OpenAI
-    // wires (prompt_tokens < cached_tokens → cached is NOT included).
+    // promptInputTotal adds back every segment not part of inputTokens —
+    // cached, plus the Anthropic cache-write segment under split semantics
+    // (#408/#790). Cache writes count toward context size, never toward hits.
     if (sample.cachedTokens !== undefined) {
         session.stats.cachedTokens += sample.cachedTokens;
         session.stats.cacheSamples += 1;
     }
     if (sample.inputTokens !== undefined) {
-        const total = promptInputTotal(protocol, sample.inputTokens, sample.cachedTokens);
+        const total = promptInputTotal(protocol, sample.inputTokens, sample.cachedTokens, sample.creationTokens);
         session.stats.inputTokens += total;
         // Net out pending compress savings (see stream.ts applyRanges): plugin
         // compress tool results shrink the next request, not this report.
@@ -646,6 +666,7 @@ export function applyUsageSample(session: Session, sample: UsageSample, protocol
 function mergeUsageSample(acc: UsageSample, sample: UsageSample): void {
     if (sample.inputTokens !== undefined) acc.inputTokens = sample.inputTokens;
     if (sample.cachedTokens !== undefined) acc.cachedTokens = sample.cachedTokens;
+    if (sample.creationTokens !== undefined) acc.creationTokens = sample.creationTokens;
     if (sample.outputTokens !== undefined) acc.outputTokens = sample.outputTokens;
 }
 
@@ -732,7 +753,7 @@ export async function pipePluginChatWithStrip(
     // before any prose, and dropping it froze lastInputTokens at the previous
     // turn's value, corrupting every later nudge decision.
     const settleUsage = () => {
-        if (session && (acc.inputTokens !== undefined || acc.outputTokens !== undefined || acc.cachedTokens !== undefined)) {
+        if (session && (acc.inputTokens !== undefined || acc.outputTokens !== undefined || acc.cachedTokens !== undefined || acc.creationTokens !== undefined)) {
             applyUsageSample(session, acc, protocol);
             markDirty(session);
         }
@@ -1247,6 +1268,7 @@ export async function pipePluginJson(
                         num(usage["cache_read_input_tokens"]) ??
                         // #779: DeepSeek-style top-level field (openai wire)
                         num(usage["prompt_cache_hit_tokens"]),
+                    creationTokens: num(usage["cache_creation_input_tokens"]),
                 }, protocol);
                 markDirty(session);
             }
