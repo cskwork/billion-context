@@ -19,10 +19,18 @@ import { fetchWithRetry, UpstreamHttpError } from "../fetch-util.js";
 import { proxyDispatcher } from "../upstream-proxy.js";
 import { noteWeakOverflow } from "../weak-overflow.js";
 import { warnCacheCollapse } from "../cache-warn.js";
+import { dumpRejectedBody } from "../error-dump.js";
+import { isStrictReasoningEcho, normalizeStrictEchoBody } from "../strict-echo.js";
 import { log as loggerLog } from "../logger.js";
 import { promptInputTotal, type WireProtocol } from "../util.js";
 
 export const MAX_LOOP_ROUNDS = 10;
+
+// #732: ephemeral continuation prompt appended ONLY to the degenerate-turn
+// retry body — never committed to coreMessages/session state, so it is neither
+// persisted nor replayed on the client's next (client-authored) request.
+const DEGENERATE_RETRY_NUDGE =
+    "[billion-context] Your previous response ended with no visible text and no tool call. Continue now: take your next concrete action.";
 
 function isLoopThinking(m: CoreMessage): boolean {
     return m.contentType === "reasoning" && typeof m.id === "string" && m.id.startsWith("acp_loop_");
@@ -91,8 +99,8 @@ export type ParsedStreamEvent =
     | { kind: "text"; delta: string; raw?: Buffer }
     | { kind: "reasoning"; delta: string; raw?: Buffer; signature?: string; blockEnd?: boolean }
     | { kind: "tool_call"; name: string; callId: string; arguments: string; passthrough?: boolean }
-    | { kind: "usage"; inputTokens?: number; outputTokens?: number; cachedTokens?: number }
-    | { kind: "done"; finishReason?: string; suppressCompletion?: boolean; truncated?: boolean }
+    | { kind: "usage"; inputTokens?: number; outputTokens?: number; cachedTokens?: number; creationTokens?: number }
+    | { kind: "done"; finishReason?: string; suppressCompletion?: boolean; truncated?: boolean; thinking?: boolean }
     | { kind: "meta"; chunk: Buffer; firstRoundOnly?: boolean };
 
 export interface EmitCompletionOpts {
@@ -155,13 +163,13 @@ export function executeProxyTool(
 
 function recordUsage(
     ctx: LoopCtx,
-    usage: { inputTokens?: number; outputTokens?: number; cachedTokens?: number },
+    usage: { inputTokens?: number; outputTokens?: number; cachedTokens?: number; creationTokens?: number },
     round: number,
 ): void {
     const prompt = usage.inputTokens;
     const cached = usage.cachedTokens;
     const out = usage.outputTokens;
-    const total = promptInputTotal(ctx.protocol, prompt, cached);
+    const total = promptInputTotal(ctx.protocol, prompt, cached, usage.creationTokens);
     if (total > 0) ctx.session.stats.inputTokens += total;
     // Net out this turn's compress credit: the post-compress re-request
     // re-sends the unfolded history, so its usage report over-reports the
@@ -197,6 +205,7 @@ export async function* runCompressLoop(
     const coreMessages: CoreMessage[] = [...ctx.messages];
     let degradedRetried = false;
     let truncationRetried = false;
+    let degenerateRetried = false;
 
     const fetchUpstream = (body: Record<string, unknown>) =>
         fetchWithRetry(
@@ -223,6 +232,15 @@ export async function* runCompressLoop(
     // re-submission can never succeed — break early instead of at MAX_LOOP_ROUNDS.
     const failedSignatures = new Set<string>();
 
+    // #762: strict-echo origin for re-request normalization (the learned flag
+    // rides on ctx.session.metadata; mirrors prepareOpenai's static gate).
+    let strictEchoOrigin: string | undefined;
+    try {
+        strictEchoOrigin = new URL(requestOptions.url).origin;
+    } catch {
+        strictEchoOrigin = undefined;
+    }
+
     try {
         for (let round = 1; round <= MAX_LOOP_ROUNDS; round++) {
             if (signal?.aborted) break;
@@ -231,11 +249,12 @@ export async function* runCompressLoop(
             const reasoningSegments: { text: string; signature: string }[] = [];
             let reasoningSealed = true;
             const calls: ToolCallEmit[] = [];
-            let usage: { inputTokens?: number; outputTokens?: number; cachedTokens?: number } = {};
+            let usage: { inputTokens?: number; outputTokens?: number; cachedTokens?: number; creationTokens?: number } = {};
             let finishReason: string | undefined;
             let sawDone = false;
             let suppressCompletion = false;
             let truncatedDone = false;
+            let sawThinking = false;
             let forwardedAny = false;
             const fwd = (chunk: Buffer): Buffer => {
                 forwardedAny = true;
@@ -253,6 +272,7 @@ export async function* runCompressLoop(
                 sawDone = false;
                 suppressCompletion = false;
                 truncatedDone = false;
+                sawThinking = false;
                 forwardedAny = false;
 
                 for await (const ev of adapter.parseStream(currentUpstream, round)) {
@@ -289,12 +309,14 @@ export async function* runCompressLoop(
                             inputTokens: ev.inputTokens,
                             outputTokens: ev.outputTokens,
                             cachedTokens: ev.cachedTokens,
+                            creationTokens: ev.creationTokens,
                         };
                     } else if (ev.kind === "done") {
                         sawDone = true;
                         finishReason = ev.finishReason;
                         suppressCompletion = ev.suppressCompletion === true;
                         truncatedDone = ev.truncated === true;
+                        sawThinking = ev.thinking === true;
                     } else if (ev.kind === "meta") {
                         if (round === 1 || !ev.firstRoundOnly) {
                             yield fwd(ev.chunk);
@@ -337,6 +359,53 @@ export async function* runCompressLoop(
                         } else {
                             ctx.log(`[acp-loop] round ${round}: truncation retry failed (${e instanceof Error ? e.message : String(e)})`);
                         }
+                    }
+                }
+
+                // #732 (completes the auto-retry groundwork of #673/#674): a reasoning model can end a turn with ONLY a thinking block — zero visible text, zero tool calls, status completed — most often right after a post-compress re-request, where it sees the freshly-shrunk context and "wraps up" into a silent thought. The client then receives an empty completed turn and stalls until manually nudged. When NOTHING reached the client yet (forwardedAny=false — true for these rounds on wires whose round>1 framing is suppressed, e.g. Responses), the retry is invisible to the client: re-fetch once with a continuation nudge (a plain re-fetch reproduces the same silent output deterministically). One-shot per request. `sawThinking` is mandatory so a genuinely empty (no-reasoning) terminal turn is left untouched — only the "silent thought" shape retries.
+                if (
+                    !degenerateRetried &&
+                    sawDone &&
+                    sawThinking &&
+                    !truncatedDone &&
+                    !suppressCompletion &&
+                    typeof finishReason === "string" &&
+                    finishReason !== "failed" &&
+                    finishReason !== "incomplete" &&
+                    finishReason !== "error" &&
+                    assistantText.length === 0 &&
+                    calls.length === 0 &&
+                    !forwardedAny &&
+                    !signal?.aborted
+                ) {
+                    degenerateRetried = true;
+                    ctx.log(`[acp-loop] round ${round}: degenerate terminal turn (completed, zero text/tool calls) invisible to client; retrying once with continuation nudge (#732)`);
+                    loggerLog("warn", `[acp-loop] degenerate-turn auto-retry round ${round} (session ${ctx.session.id})`);
+                    const nudge: CoreMessage = {
+                        id: `acp_degenerate_retry_r${round}`,
+                        role: "user",
+                        contentType: "text",
+                        text: DEGENERATE_RETRY_NUDGE,
+                    };
+                    try {
+                        const retryBody = adapter.buildRequest([...coreMessages, nudge], systemPrompt, requestBody);
+                        const respResult = await fetchUpstream(retryBody);
+                        if (!respResult.response.body) {
+                            respResult.clearTimer();
+                            throw new UpstreamHttpError(respResult.response.status, "(empty response body)", 1);
+                        }
+                        currentUpstream = respResult.response.body as ReadableStream<Uint8Array>;
+                        roundBody = retryBody;
+                        if (activeClearTimer) activeClearTimer();
+                        activeClearTimer = respResult.clearTimer;
+                        continue;
+                    } catch (e) {
+                        if (e instanceof UpstreamHttpError) {
+                            ctx.log(`[acp-loop] round ${round}: degenerate retry failed (upstream error ${e.status}: ${e.body.slice(0, 200)}); passing the empty turn through`);
+                        } else {
+                            ctx.log(`[acp-loop] round ${round}: degenerate retry failed (${e instanceof Error ? e.message : String(e)}); passing the empty turn through`);
+                        }
+                        loggerLog("warn", `[acp-loop] degenerate-turn auto-retry failed round ${round}: ${e instanceof Error ? e.message : String(e)}`);
                     }
                 }
                 break;
@@ -580,6 +649,10 @@ export async function* runCompressLoop(
             if (signal?.aborted) break;
 
             let newBody = adapter.buildRequest(coreMessages, systemPrompt, requestBody);
+            // #762: this re-request bypasses prepareOpenai, whose strict-echo
+            // repair never reaches it — the kernel round-trip drops blank
+            // reasoning echoes, so DeepSeek thinking rejects the rebuilt body.
+            newBody = normalizeStrictEchoBody(newBody, isStrictReasoningEcho(ctx.session, strictEchoOrigin), (level, msg) => loggerLog(level, `[acp-loop] ${msg}`), ctx.session.id ?? "unknown");
             if (process.env.ACP_DUMP_BODY === "1") {
                 try {
                     const fs = await import("node:fs");
@@ -632,6 +705,10 @@ export async function* runCompressLoop(
                     ctx.session.metadata.strictReasoningEcho = true;
                     ctx.log(`[acp-loop] 400 mentions reasoning_content — learned strict reasoning echo for this session; #651 reasoning-drop disabled (#684)`);
                     loggerLog("warn", `[acp-loop] learned strictReasoningEcho (session ${ctx.session.id}); reasoning-drop disabled (#684)`);
+                }
+                // #762: persist the exact re-requested body on 4xx (env-gated: BILI_DUMP_4XX=1).
+                if (e.status >= 400 && e.status < 500) {
+                    dumpRejectedBody(e.status, ctx.session.id ?? "unknown", JSON.stringify(newBody));
                 }
                 const suffix = e.attempts > 1 ? ` after ${e.attempts} attempt(s)` : "";
                 ctx.log(`[acp-proxy: compress loop upstream error ${e.status}${suffix}: ${e.body.slice(0, 200)}]`);

@@ -116,6 +116,17 @@ function stripFinishReasonChunk(buf: Buffer): Buffer {
     }
 }
 
+// OpenAI-wire upstreams disagree on where the cached-prompt count lives: the
+// standard field is prompt_tokens_details.cached_tokens, while DeepSeek reports
+// KV-cache hits as top-level prompt_cache_hit_tokens (#779). Both mean "input
+// tokens served from cache", so normalize to one number.
+function openaiCachedTokens(u: Record<string, unknown>): number | undefined {
+    const pd = u.prompt_tokens_details as Record<string, unknown> | undefined;
+    if (typeof pd?.cached_tokens === "number") return pd.cached_tokens;
+    if (typeof u.prompt_cache_hit_tokens === "number") return u.prompt_cache_hit_tokens;
+    return undefined;
+}
+
 export function createOpenaiAdapter(requestBody: Record<string, unknown>, clientSystem?: string, absorbName?: string): CompressLoopAdapter {
     const model = (requestBody.model as string) ?? "unknown";
     let responseId = `chatcmpl-proxy-${Date.now()}`;
@@ -312,7 +323,7 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
                         yield { kind: "meta", chunk: Buffer.from(eventStr + "\n\n", "utf8") } as ParsedStreamEvent;
                     }
                     maybeWarnDegenerate("stop");
-                    yield { kind: "done", finishReason: "stop", ...(sawRealToolCall ? { suppressCompletion: true } : {}) } as ParsedStreamEvent;
+                    yield { kind: "done", finishReason: "stop", thinking: sawReasoning, ...(sawRealToolCall ? { suppressCompletion: true } : {}) } as ParsedStreamEvent;
                     continue;
                 }
                 let parsed: Record<string, unknown>;
@@ -327,12 +338,11 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
                 if (!choice) {
                     if (parsed.usage) {
                         const u = parsed.usage as Record<string, unknown>;
-                        const pd = u.prompt_tokens_details as Record<string, unknown> | undefined;
                         yield {
                             kind: "usage",
                             inputTokens: typeof u.prompt_tokens === "number" ? u.prompt_tokens : undefined,
                             outputTokens: typeof u.completion_tokens === "number" ? u.completion_tokens : undefined,
-                            cachedTokens: typeof pd?.cached_tokens === "number" ? pd.cached_tokens : undefined,
+                            cachedTokens: openaiCachedTokens(u),
                         } as ParsedStreamEvent;
                         // #589: include_usage clients (dsh, OpenAI SDK) read usage
                         // from this trailing empty-choices frame; raw tool-call rounds
@@ -352,12 +362,11 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
                     const hadToolCalls = [...pending.values()].some((tc) => tc.name.length > 0 || tc.id.length > 0);
                     yield* settleToolCalls();
                     const u = parsed.usage as Record<string, unknown> | undefined;
-                    const pd = u?.prompt_tokens_details as Record<string, unknown> | undefined;
                     yield {
                         kind: "usage",
                         inputTokens: typeof u?.prompt_tokens === "number" ? u.prompt_tokens : undefined,
                         outputTokens: typeof u?.completion_tokens === "number" ? u.completion_tokens : undefined,
-                        cachedTokens: typeof pd?.cached_tokens === "number" ? pd.cached_tokens : undefined,
+                        cachedTokens: u ? openaiCachedTokens(u) : undefined,
                     } as ParsedStreamEvent;
                     if (sawRealToolCall) {
                         // The raw finish chunk (provider-measured usage) reaches
@@ -369,13 +378,14 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
                         // bytes after the finish reason).
                         yield { kind: "meta", chunk } as ParsedStreamEvent;
                         maybeWarnDegenerate(finishReason);
-                        yield { kind: "done", finishReason, suppressCompletion: true } as ParsedStreamEvent;
+                        yield { kind: "done", finishReason, suppressCompletion: true, thinking: sawReasoning } as ParsedStreamEvent;
                         continue;
                     } else {
                         maybeWarnDegenerate(finishReason);
                         yield {
                             kind: "done",
                             finishReason: hadToolCalls && finishReason === "stop" ? "tool_calls" : finishReason,
+                            thinking: sawReasoning,
                         } as ParsedStreamEvent;
                     }
                 }
