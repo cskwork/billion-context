@@ -162,6 +162,8 @@ test("install: failed respawn degrades to a direct send and fires onGiveUp", asy
     const saved = globalThis.fetch;
     _resetForTest();
     let failNext = true;
+    let respawns = 0;
+    let giveUps = 0;
     globalThis.fetch = (async (input: RequestInfo | URL) => {
         const url = typeof input === "string" ? input : input instanceof URL ? input.href : (input as Request).url;
         calls.push(url);
@@ -174,7 +176,13 @@ test("install: failed respawn degrades to a direct send and fires onGiveUp", asy
     const state: NativeInterceptState = {
         origin: "http://127.0.0.1:40001",
         ready: Promise.resolve("http://127.0.0.1:40001"),
-        respawn: () => Promise.resolve(undefined),
+        respawn: () => {
+            respawns += 1;
+            return Promise.resolve(undefined);
+        },
+        onGiveUp: () => {
+            giveUps += 1;
+        },
         onDispatch: (_url, action) => dispatches.push(action),
     };
     try {
@@ -187,6 +195,16 @@ test("install: failed respawn degrades to a direct send and fires onGiveUp", asy
         ]);
         assert.deepEqual(dispatches, ["rewrite", "direct"]);
         assert.equal(state.origin, undefined);
+        assert.equal(respawns, 1);
+        assert.equal(giveUps, 1);
+        // The degrade is permanent for the session: later model requests go
+        // direct without re-entering the respawn path.
+        const res2 = await globalThis.fetch("http://127.0.0.1:8199/v1/messages");
+        assert.equal(res2.status, 200);
+        assert.equal(calls[2], "http://127.0.0.1:8199/v1/messages");
+        assert.deepEqual(dispatches, ["rewrite", "direct", "direct"]);
+        assert.equal(respawns, 1);
+        assert.equal(giveUps, 1);
     } finally {
         globalThis.fetch = saved;
         _resetForTest();
