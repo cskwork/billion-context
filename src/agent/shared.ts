@@ -5,6 +5,9 @@
 // source of truth), (3) forwards tool executes, (4) reads status. Same
 // package as the proxy ⇒ same version ⇒ no kernel-skew bug class.
 
+import path from "node:path";
+import { existsSync } from "node:fs";
+
 export type ManifestTool = {
     name: string;
     description?: string;
@@ -183,4 +186,35 @@ export async function probeProxy(proxyBase: string, timeoutMs = STATUS_TIMEOUT_M
     } catch {
         return { connected: false, identityOk: false };
     }
+}
+
+/** Resolve a real Node runtime for spawning the proxy from INSIDE a host process
+ *  (#809/#513). process.execPath is NOT reliable there: under a native host binary
+ *  (e.g. the Mach-O arm64 OpenCode CLI) it points at the host executable, not Node,
+ *  so spawning it with dist/index.js just prints CLI help and exits. Order:
+ *  BILLION_CONTEXT_NODE override -> execPath if it is node -> PATH walk -> undefined
+ *  (caller fails loud-and-inert). Dependency-injectable so every branch is testable.
+ *  REUSE for ALL in-host proxy spawns (omp/dsh native #520/#521) — never assume
+ *  process.execPath is Node. */
+export interface NodeLookupOpts {
+    execPath?: string;
+    pathEnv?: string;
+    exists?: (p: string) => boolean;
+}
+
+export function findNodeRuntime(opts: NodeLookupOpts = {}): string | undefined {
+    const execPath = opts.execPath ?? process.execPath;
+    const pathEnv = opts.pathEnv ?? process.env.PATH ?? "";
+    const exists = opts.exists ?? existsSync;
+    const override = process.env.BILLION_CONTEXT_NODE;
+    if (override && override.length > 0 && exists(override)) return override;
+    if (/^node(\.exe)?$/i.test(path.basename(execPath))) return execPath;
+    for (const dir of pathEnv.split(path.delimiter)) {
+        if (!dir) continue;
+        for (const name of ["node.exe", "node"]) {
+            const candidate = path.join(dir, name);
+            if (exists(candidate)) return candidate;
+        }
+    }
+    return undefined;
 }

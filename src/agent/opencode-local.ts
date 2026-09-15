@@ -10,7 +10,7 @@ import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { probeProxy } from "./shared.js";
+import { findNodeRuntime, probeProxy } from "./shared.js";
 import { createOpencodeV2Setup, isProtocolSupported, pluginDisabled, type EnsureProxyResult, type V2PluginContext } from "./opencode-v2.js";
 
 export const DEFAULT_LOCAL_PORT = 18787;
@@ -56,33 +56,6 @@ export function buildSpawnArgs(packageRoot: string, port: number): string[] {
     // git-checkout guard in update.ts (#580) never fires and a self-updating
     // proxy would race the host mid-request. --host pins loopback explicitly.
     return [path.join(packageRoot, "dist", "index.js"), "start", "--port", String(port), "--host", "127.0.0.1", "--no-auto-update"];
-}
-
-interface NodeLookupOpts {
-    execPath?: string;
-    pathEnv?: string;
-    exists?: (p: string) => boolean;
-}
-
-// process.execPath is NOT reliable here: under a native OpenCode binary (e.g. the
-// Mach-O arm64 CLI on macOS) it points at the host executable, not Node, so
-// spawning it with dist/index.js just prints the CLI help and exits. Resolve a
-// real Node runtime instead; override via BILLION_CONTEXT_NODE for exotic hosts.
-export function findNodeRuntime(opts: NodeLookupOpts = {}): string | undefined {
-    const execPath = opts.execPath ?? process.execPath;
-    const pathEnv = opts.pathEnv ?? process.env.PATH ?? "";
-    const exists = opts.exists ?? existsSync;
-    const override = process.env.BILLION_CONTEXT_NODE;
-    if (override && override.length > 0 && exists(override)) return override;
-    if (/^node(\.exe)?$/i.test(path.basename(execPath))) return execPath;
-    for (const dir of pathEnv.split(path.delimiter)) {
-        if (!dir) continue;
-        for (const name of ["node.exe", "node"]) {
-            const candidate = path.join(dir, name);
-            if (exists(candidate)) return candidate;
-        }
-    }
-    return undefined;
 }
 
 function portOf(proxyBase: string): number {

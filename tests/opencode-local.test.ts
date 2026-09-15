@@ -9,11 +9,11 @@ process.env.NODE_ENV = "test";
 import biliLocalPlugin, {
     DEFAULT_LOCAL_PORT,
     buildSpawnArgs,
-    findNodeRuntime,
     parseLocalOptions,
     resolvePackageRoot,
     rewriteToBili,
 } from "../src/agent/opencode-local.ts";
+import { findNodeRuntime } from "../src/agent/shared.ts";
 
 // Real WHATWG Request (not a plain object): the OpenCode seam hands us a Request
 // whose .url is readonly, so the mock must mirror that or it cannot catch a
