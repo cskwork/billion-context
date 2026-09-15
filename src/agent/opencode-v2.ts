@@ -136,13 +136,14 @@ function stampHeaders(e: V2HttpRequestEvent, state: V2State): void {
 
 // The proxy and this plugin ship as one package, so protocol skew is rare; the
 // check is a safety net for the skew window where a stale cached copy pairs a
-// new proxy with an old plugin (or vice versa). Unknown versions disable native
-// tool registration (the embedded schemas may not match) while still letting
-// header-stamped requests route through the proxy.
+// new proxy with an old plugin (or vice versa). An UNKNOWN or MISSING
+// protocolVersion disables native tool registration (the embedded schemas may
+// not match) while still letting header-stamped requests route through the
+// proxy — fail closed on compatibility we cannot confirm.
 export const SUPPORTED_PROTOCOL_VERSIONS = new Set([1]);
 
 export function isProtocolSupported(version: number | undefined): boolean {
-    return version === undefined || SUPPORTED_PROTOCOL_VERSIONS.has(version);
+    return typeof version === "number" && SUPPORTED_PROTOCOL_VERSIONS.has(version);
 }
 
 export interface EnsureProxyResult {

@@ -189,13 +189,14 @@ export async function probeProxy(proxyBase: string, timeoutMs = STATUS_TIMEOUT_M
 }
 
 /** Resolve a real Node runtime for spawning the proxy from INSIDE a host process
- *  (#809/#513). process.execPath is NOT reliable there: under a native host binary
+ *  (#809). process.execPath is NOT reliable there: under a native host binary
  *  (e.g. the Mach-O arm64 OpenCode CLI) it points at the host executable, not Node,
  *  so spawning it with dist/index.js just prints CLI help and exits. Order:
- *  BILLION_CONTEXT_NODE override -> execPath if it is node -> PATH walk -> undefined
- *  (caller fails loud-and-inert). Dependency-injectable so every branch is testable.
- *  REUSE for ALL in-host proxy spawns (omp/dsh native #520/#521) — never assume
- *  process.execPath is Node. */
+ *  execPath if it is node -> BILLION_CONTEXT_NODE override -> PATH walk -> undefined
+ *  (caller fails loud-and-inert). Preferring an already-running Node keeps the
+ *  launcher path byte-identical regardless of env. Dependency-injectable so every
+ *  branch is testable. REUSE for ALL in-host proxy spawns (pi-native #706 / #519) —
+ *  never assume process.execPath is Node. */
 export interface NodeLookupOpts {
     execPath?: string;
     pathEnv?: string;
@@ -206,9 +207,9 @@ export function findNodeRuntime(opts: NodeLookupOpts = {}): string | undefined {
     const execPath = opts.execPath ?? process.execPath;
     const pathEnv = opts.pathEnv ?? process.env.PATH ?? "";
     const exists = opts.exists ?? existsSync;
+    if (/^node(\.exe)?$/i.test(path.basename(execPath))) return execPath;
     const override = process.env.BILLION_CONTEXT_NODE;
     if (override && override.length > 0 && exists(override)) return override;
-    if (/^node(\.exe)?$/i.test(path.basename(execPath))) return execPath;
     for (const dir of pathEnv.split(path.delimiter)) {
         if (!dir) continue;
         for (const name of ["node.exe", "node"]) {

@@ -1,6 +1,8 @@
 import assert from "node:assert";
+import fs from "node:fs";
 import http from "node:http";
-import { once } from "node:events";
+import { EventEmitter, once } from "node:events";
+import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
@@ -9,11 +11,13 @@ process.env.NODE_ENV = "test";
 import biliLocalPlugin, {
     DEFAULT_LOCAL_PORT,
     buildSpawnArgs,
+    ensureProxyLoopback,
     parseLocalOptions,
     resolvePackageRoot,
     rewriteToBili,
 } from "../src/agent/opencode-local.ts";
 import { findNodeRuntime } from "../src/agent/shared.ts";
+import { isProtocolSupported } from "../src/agent/opencode-v2.ts";
 
 // Real WHATWG Request (not a plain object): the OpenCode seam hands us a Request
 // whose .url is readonly, so the mock must mirror that or it cannot catch a
@@ -220,3 +224,40 @@ test("findNodeRuntime: returns undefined when nothing resolves", () =>
     withEnv({ BILLION_CONTEXT_NODE: undefined }, () => {
         assert.equal(findNodeRuntime({ execPath: "/usr/local/bin/opencode", pathEnv: "/a:/b", exists: () => false }), undefined);
     }));
+
+test("findNodeRuntime: running-under-node wins over BILLION_CONTEXT_NODE override", () =>
+    withEnv({ BILLION_CONTEXT_NODE: "/opt/custom/node" }, () => {
+        assert.equal(findNodeRuntime({ execPath: "/usr/local/bin/node", pathEnv: "" }), "/usr/local/bin/node");
+    }));
+
+test("isProtocolSupported: known version supported", () => {
+    assert.equal(isProtocolSupported(1), true);
+});
+
+test("isProtocolSupported: unknown numeric version fails closed", () => {
+    assert.equal(isProtocolSupported(2), false);
+});
+
+test("isProtocolSupported: missing protocolVersion fails closed", () => {
+    assert.equal(isProtocolSupported(undefined), false);
+});
+
+test("ensureProxyLoopback observes async spawn 'error' and degrades inert instead of crashing the host", async () => {
+    const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "bili-f3-"));
+    try {
+        fs.mkdirSync(path.join(tmpRoot, "dist"), { recursive: true });
+        fs.writeFileSync(path.join(tmpRoot, "dist", "index.js"), "// stub\n");
+        const child = Object.assign(new EventEmitter(), { unref: () => {} });
+        const fakeSpawn = (() => {
+            setTimeout(() => child.emit("error", new Error("spawn ENOENT")), 0);
+            return child;
+        });
+        const result = await ensureProxyLoopback("http://127.0.0.1:18799", {
+            spawn: fakeSpawn as unknown as typeof import("node:child_process").spawn,
+            packageRoot: () => tmpRoot,
+        });
+        assert.deepEqual(result, { connected: false, identityOk: false });
+    } finally {
+        fs.rmSync(tmpRoot, { recursive: true, force: true });
+    }
+});

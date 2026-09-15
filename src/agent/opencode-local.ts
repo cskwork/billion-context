@@ -71,7 +71,13 @@ function sleep(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function ensureProxyLoopback(base: string): Promise<EnsureProxyResult> {
+interface EnsureProxyDeps {
+    spawn?: typeof spawn;
+    packageRoot?: () => string;
+}
+
+export async function ensureProxyLoopback(base: string, deps: EnsureProxyDeps = {}): Promise<EnsureProxyResult> {
+    const spawnFn = deps.spawn ?? spawn;
     const first = await probeProxy(base);
     if (first.connected && first.identityOk) {
         return { connected: true, identityOk: true, protocolSupported: isProtocolSupported(first.protocolVersion), version: first.version };
@@ -80,7 +86,7 @@ async function ensureProxyLoopback(base: string): Promise<EnsureProxyResult> {
         console.error(`[bili-opencode-local] ${base} answered but is not a billion-context proxy — refusing to adopt a foreign service, running inert`);
         return { connected: false, identityOk: false };
     }
-    const packageRoot = resolvePackageRoot();
+    const packageRoot = deps.packageRoot ? deps.packageRoot() : resolvePackageRoot();
     const indexJs = path.join(packageRoot, "dist", "index.js");
     if (!existsSync(indexJs)) {
         console.error(`[bili-opencode-local] cannot start proxy: missing ${indexJs} — running inert`);
@@ -92,8 +98,14 @@ async function ensureProxyLoopback(base: string): Promise<EnsureProxyResult> {
         return { connected: false, identityOk: false };
     }
     try {
-        const child = spawn(node, buildSpawnArgs(packageRoot, portOf(base)), { detached: true, stdio: "ignore", cwd: packageRoot });
-        child.unref();
+        const child = spawnFn(node, buildSpawnArgs(packageRoot, portOf(base)), { detached: true, stdio: "ignore", cwd: packageRoot });
+        // spawn() reports ENOENT/EACCES ASYNCHRONOUSLY via 'error'; an unhandled
+        // 'error' event throws and takes down the host process. Observe it so a
+        // bad runtime degrades to inert (the poll below already times out).
+        child.on?.("error", (err) => {
+            console.error(`[bili-opencode-local] proxy child error: ${err instanceof Error ? err.message : String(err)} — running inert`);
+        });
+        child.unref?.();
     } catch (err) {
         console.error(`[bili-opencode-local] spawn failed: ${err instanceof Error ? err.message : String(err)} — running inert`);
         return { connected: false, identityOk: false };
