@@ -65,7 +65,7 @@ export { isStrictReasoningEcho, normalizeStrictEchoReasoning };
 import { isFakeCompletion, injectFakeCompletionHint, maxFakeCompletionRetries, fakeBufCap } from "./fake-completion.js";
 import { reasoningGuardEngages, runReasoningGuard } from "./reasoning-guard.js";
 import { sanitizeResponsesInputIds, dropWhitespaceResponsesMessages, normalizeResponsesMessageItems } from "./loop/adapter-responses.js";
-import { codexCompactMode, isCodexClient, hasCompactionTrigger, stripBiliCompactionItems, replaceBiliCompactionItems, codexCompactGate, codexCompactGatePre, buildTriggerForgeBody, mergeForgedSummaries } from "./codex-compact.js";
+import { CODEX_COMPACT_HEALTH_RATIO, codexCompactMode, isCodexClient, hasCompactionTrigger, stripBiliCompactionItems, replaceBiliCompactionItems, codexCompactGate, codexCompactGatePre, buildTriggerForgeBody, mergeForgedSummaries } from "./codex-compact.js";
 import { stripAcpPanelMessages, stripAcpPanelResponsesInput } from "./acp-panel.js";
 import { rewriteOpenaiJsonResponse } from "./stream-openai.js";
 import { rewriteResponsesJsonResponse } from "./stream-responses.js";
@@ -2725,6 +2725,9 @@ async function preflightCompressIfNeeded(
 ): Promise<Prepared | PreflightFailFast> {
     const session = prepared.session;
     const limit = config.modelContextLimit;
+    const compressionTarget = prepared.protocol === "responses" && isCodexClient(req.headers) && codexCompactMode() === "intercept"
+        ? limit * CODEX_COMPACT_HEALTH_RATIO
+        : limit;
     // A fresh session (id rotated, e.g. after a model switch) has
     // lastInputTokens = 0 while still carrying a full raw history; size the
     // trigger on the real post-fold payload too.
@@ -2755,7 +2758,8 @@ async function preflightCompressIfNeeded(
     const tokenCount = unknownBaseline
         ? estimateCoreMessagesUpper(prepared.processedMessages) + overheadEstimate + imageTokens
         : Math.max(session.stats.lastInputTokens, payloadEstimate);
-    if (limit <= 0 || !model || tokenCount < limit) return prepared;
+    if (limit <= 0 || !model || tokenCount < compressionTarget) return prepared;
+    const payloadFitsWindow = (unknownBaseline ? tokenCount : payloadEstimate) < limit;
     // #496 forward-once-then-learn: the default image cost (base64/4) matches byte
     // relays (#488) but overestimates pixel-tile upstreams (a 400KB JPEG ≈ 1.6K real
     // tokens, not ~133K), so an image-dominated payload can clear the window on ESTIMATE
@@ -2768,7 +2772,7 @@ async function preflightCompressIfNeeded(
     // the estimate and fall through to fold / fail-fast below.
     const learnedLimit = resolveLearnedLimit(session, model);
     const noOverflowEvidence = session.stats.lastInputTokens < limit && learnedLimit === undefined;
-    if (imageTokens > 0 && textEstimate < limit && noOverflowEvidence) {
+    if (imageTokens > 0 && payloadEstimate >= limit && textEstimate < limit && noOverflowEvidence) {
         log("warn", `[${session.id}] image-dominated payload (~${textEstimate} text + ~${imageTokens} image tokens) exceeds window ${limit} by estimate only, no upstream overflow evidence — forwarding once so the upstream arbitrates billing (#496)`);
         return prepared;
     }
@@ -2790,13 +2794,10 @@ async function preflightCompressIfNeeded(
         return { failFast: true, status, message, retryable, respond: !res.writableEnded };
     };
     if ((prepared.nudge?.compressibleRanges ?? []).length === 0) {
-        // #300: the trigger fired on a stale baseline (lastInputTokens) but the
-        // payload's own estimate fits the window — forwarding as-is is safe.
-        // #553: only a trusted optimistic fit may clear a raw forward; an
-        // unknown-baseline session's true size is unmeasured, so fail fast
-        // instead of gambling a raw forward past the window.
-        if (!unknownBaseline && payloadEstimate < limit) {
-            log("warn", `[${session.id}] preflight trigger fired on a stale baseline (~${tokenCount}) but the payload fits (~${payloadEstimate}/${limit}); forwarding as-is`);
+        // Headroom or a stale baseline can trigger preflight on a fitting payload.
+        // Anonymous sessions need the conservative upper bound to prove that fit.
+        if (payloadFitsWindow) {
+            log("warn", `[${session.id}] preflight target reached (~${tokenCount}) but the payload fits with no compressible ranges (~${payloadEstimate}/${limit}); forwarding as-is`);
             return prepared;
         }
         if (unknownBaseline) {
@@ -2818,6 +2819,7 @@ async function preflightCompressIfNeeded(
     if (deadEnd && typeof deadEnd === "object") {
         const de = deadEnd as Record<string, unknown>;
         if (typeof de.key === "string" && de.key === `${model}\u0000${limit}` && typeof de.until === "number" && de.until > Date.now() && typeof de.message === "string") {
+            if (payloadFitsWindow) return prepared;
             log("warn", `[${session.id}] preflight dead-end cooldown active (${Math.ceil((de.until - Date.now()) / 1000)}s left); failing fast without upstream calls (#726)`);
             return { failFast: true, status: typeof de.status === "number" ? de.status : 502, message: de.message, retryable: de.retryable === true, respond: !res.writableEnded };
         }
@@ -2829,7 +2831,7 @@ async function preflightCompressIfNeeded(
     // nothing is foldable (no summarization call is spent in that case). The
     // old pre-check failed fast here on the normal-config compressibleRanges,
     // which excluded the soft zone — bricking the #330 livelock.
-    log("warn", `[${session.id}] context ${tokenCount} tokens exceeds model window ${limit} (model=${model}); preflight compressing before forward`);
+    log("warn", `[${session.id}] context ${tokenCount} tokens reached preflight target ${compressionTarget} (model window ${limit}, model=${model}); preflight compressing before forward`);
     // #300: stamp the chain marker so a downstream bili skips these
     // summarization calls too (preflight always processes).
     const { upstreamUrl, headers, proxyUrl } = buildForwardTarget(req, opts, route, affinity, instanceId);
@@ -2850,6 +2852,7 @@ async function preflightCompressIfNeeded(
                 core,
                 session,
                 config,
+                compressionTarget,
                 prompts: prepared.prompts ?? defaultPrompts,
                 surface: prepared.surface,
                 protocol: prepared.protocol,
