@@ -99,7 +99,7 @@ export type ParsedStreamEvent =
     | { kind: "text"; delta: string; raw?: Buffer }
     | { kind: "reasoning"; delta: string; raw?: Buffer; signature?: string; blockEnd?: boolean }
     | { kind: "tool_call"; name: string; callId: string; arguments: string; passthrough?: boolean }
-    | { kind: "usage"; inputTokens?: number; outputTokens?: number; cachedTokens?: number }
+    | { kind: "usage"; inputTokens?: number; outputTokens?: number; cachedTokens?: number; creationTokens?: number }
     | { kind: "done"; finishReason?: string; suppressCompletion?: boolean; truncated?: boolean; thinking?: boolean }
     | { kind: "meta"; chunk: Buffer; firstRoundOnly?: boolean };
 
@@ -163,13 +163,13 @@ export function executeProxyTool(
 
 function recordUsage(
     ctx: LoopCtx,
-    usage: { inputTokens?: number; outputTokens?: number; cachedTokens?: number },
+    usage: { inputTokens?: number; outputTokens?: number; cachedTokens?: number; creationTokens?: number },
     round: number,
 ): void {
     const prompt = usage.inputTokens;
     const cached = usage.cachedTokens;
     const out = usage.outputTokens;
-    const total = promptInputTotal(ctx.protocol, prompt, cached);
+    const total = promptInputTotal(ctx.protocol, prompt, cached, usage.creationTokens);
     if (total > 0) ctx.session.stats.inputTokens += total;
     // Net out this turn's compress credit: the post-compress re-request
     // re-sends the unfolded history, so its usage report over-reports the
@@ -249,7 +249,7 @@ export async function* runCompressLoop(
             const reasoningSegments: { text: string; signature: string }[] = [];
             let reasoningSealed = true;
             const calls: ToolCallEmit[] = [];
-            let usage: { inputTokens?: number; outputTokens?: number; cachedTokens?: number } = {};
+            let usage: { inputTokens?: number; outputTokens?: number; cachedTokens?: number; creationTokens?: number } = {};
             let finishReason: string | undefined;
             let sawDone = false;
             let suppressCompletion = false;
@@ -309,6 +309,7 @@ export async function* runCompressLoop(
                             inputTokens: ev.inputTokens,
                             outputTokens: ev.outputTokens,
                             cachedTokens: ev.cachedTokens,
+                            creationTokens: ev.creationTokens,
                         };
                     } else if (ev.kind === "done") {
                         sawDone = true;
