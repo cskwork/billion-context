@@ -40,6 +40,8 @@ export interface PreflightDeps {
     core: CompressionCore;
     session: Session;
     config: Config;
+    /** Best-effort target below the hard window; never relax recent protection for headroom alone. */
+    compressionTarget?: number;
     prompts: Prompts;
     surface?: PackSurface;
     protocol: PreflightProtocol;
@@ -620,6 +622,7 @@ function noEmergencyTruncate(config: Config): Config {
 
 export async function preflightCompress(deps: PreflightDeps, messages: CoreMessage[]): Promise<PreflightResult> {
     const limit = deps.config.modelContextLimit;
+    let target = Math.min(limit, deps.compressionTarget ?? limit);
     const result: PreflightResult = { compressedRanges: 0, savedTokens: 0, payloadEstimate: estimateCoreMessages(messages) + (deps.imageFloor ?? 0) + (deps.wireOverhead ?? 0), fitsWindow: true };
     if (limit <= 0) return result;
     const budget = Math.max(MIN_CHUNK_TOKENS, Math.floor(limit * CHUNK_FRACTION));
@@ -691,7 +694,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
         // (the floor can be stale — see PreflightResult.payloadEstimate).
         result.payloadEstimate = estimateCoreMessages(turn.messages) + (deps.imageFloor ?? 0) + (deps.wireOverhead ?? 0);
         if (startTokens < 0) startTokens = currentTokens;
-        if (currentTokens < limit) break;
+        if (currentTokens < target) break;
         const ranges = viableRanges(turn.nudge?.compressibleRanges ?? []);
         if (ranges.length === 0) {
             // #330: nothing foldable outside the soft-protected recent zone.
@@ -703,6 +706,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             if (!relaxed && result.payloadEstimate >= limit) {
                 activeConfig = relaxedConfig(deps.config);
                 relaxed = true;
+                target = limit;
                 // #575-merge: the summarization budget counts per protection
                 // regime — reset it on relax, else bad summaries burned under
                 // normal protection can starve the relaxed walk entirely and
@@ -718,7 +722,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
         const ordered = [...ranges].sort((a, b) => refNum(a.startRef) - refNum(b.startRef));
         let appliedThisRound = 0;
         for (const range of ordered) {
-            if (currentTokens < limit) break;
+            if (currentTokens < target) break;
             if (deps.signal?.aborted) {
                 failure = ABORTED_FAILURE;
                 break;
@@ -745,7 +749,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             // exactly those cases. Bounded by the per-regime call budget below.
             const spans: Array<[number, number]> = splitChunks(messages, startIdx, endIdx, budget, baselineKnown ? 0 : minChars, countText).slice().reverse();
             while (spans.length > 0) {
-                if (currentTokens < limit) break;
+                if (currentTokens < target) break;
                 if (deps.signal?.aborted) {
                     failure = ABORTED_FAILURE;
                     break;
