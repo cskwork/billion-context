@@ -54,7 +54,7 @@ import { selfPackageRoot, isBiliPiEntry, ompPluginLoadedFrom } from "./plugin-in
 function selfDistFile(name: string): string {
     return path.join(selfPackageRoot(), "dist", name);
 }
-import { nonEmpty, resolvePiHome, resolveOmpHome, resolveDshHome, resolveCodexHome, loadClientConfig, collectModelWindows, type ClientConfig, type CodexConfig, resolveOpencodeConfigFile, type OpencodeConfig, type OpencodeProvider, type HermesConfig, type HermesProvider, qoderIsCnSite, QODER_DEFAULT_MODEL_HOSTS, resolveTraeHome, readTraeConfig, TRAE_DEFAULT_MODEL_HOSTS, JCODE_DEFAULT_MODEL_HOSTS, type TraeConfig, resolveKimiHome, readKimiConfig, parseKimiToml, KIMI_DEFAULT_MODEL_HOSTS, type KimiConfig, type KimiProvider } from "./client-config.js";
+import { nonEmpty, resolvePiHome, resolveOmpHome, resolveDshHome, resolveCodexHome, loadClientConfig, collectModelWindows, type ClientConfig, type CodexConfig, resolveOpencodeConfigFile, readOpencodeConfigRoot, type OpencodeConfig, type OpencodeProvider, type HermesConfig, type HermesProvider, qoderIsCnSite, QODER_DEFAULT_MODEL_HOSTS, resolveTraeHome, readTraeConfig, TRAE_DEFAULT_MODEL_HOSTS, JCODE_DEFAULT_MODEL_HOSTS, type TraeConfig, resolveKimiHome, readKimiConfig, parseKimiToml, KIMI_DEFAULT_MODEL_HOSTS, type KimiConfig, type KimiProvider } from "./client-config.js";
 import { loadRoutes, resolveConfiguredContextLimit, lookupContextLimit, type ProviderRoutes } from "./config.js";
 import { contextFromRegistry } from "./registry.js";
 
@@ -94,6 +94,7 @@ export {
     type TraeConfig,
     resolveOpencodeConfigFile,
     readOpencodeConfig,
+    readOpencodeConfigRoot,
     type OpencodeConfig,
     type OpencodeProvider,
     type CodebuddyConfig,
@@ -1649,16 +1650,16 @@ export function opencodeMajorVersion(command: string): number {
 
 /**
  * opencode counterpart of preparePiHttpRewrite: write a full copy of the user's
- * opencode.json with the discovered providers' baseURL rewritten (HTTP →
- * /bili/ wrap, wrapped-HTTPS → raw https for cert MITM) into a temp dir, and
- * point OPENCODE_CONFIG at it. The real opencode.json is never touched.
- * With pluginDirMode (OpenCode 2.x), the plugin rides as a temp directory whose
- * index.js re-exports pluginPath — 2.x rejects bare file paths in `plugin`.
- * Returns the temp config FILE path (undefined when there is nothing to do or
- * the config can't be parsed).
+ * (JSONC-tolerant, merged) config with the discovered providers' baseURL
+ * rewritten (HTTP → /bili/ wrap, wrapped-HTTPS → raw https for cert MITM) into
+ * a temp dir, and point OPENCODE_CONFIG at it. The real config files are never
+ * touched. With pluginDirMode (OpenCode 2.x), the plugin rides as a temp
+ * directory whose index.js re-exports pluginPath — 2.x rejects bare file paths
+ * in `plugin`. Returns the temp config FILE path (undefined when there is
+ * nothing to do).
  */
 export function prepareOpencodeHttpRewrite(
-    configFile: string,
+    userRoot: Record<string, unknown> | undefined,
     origin: string,
     httpRewrites: HttpRewrite[],
     httpsRewrites: HttpRewrite[],
@@ -1666,16 +1667,9 @@ export function prepareOpencodeHttpRewrite(
     pluginDirMode?: boolean,
 ): string | undefined {
     if (httpRewrites.length === 0 && httpsRewrites.length === 0 && !pluginPath) return undefined;
-    let root: Record<string, unknown> = {};
-    try {
-        const txt = fs.readFileSync(configFile, "utf8");
-        const parsed = JSON.parse(txt);
-        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-            root = { ...(parsed as Record<string, unknown>) };
-        }
-    } catch {
-        // missing or invalid config — still emit a temp config so the plugin rides along
-    }
+    // deep-clone: the rewrite below mutates provider entries, and the caller's
+    // root (a merged read of the user's config) must stay pristine
+    const root: Record<string, unknown> = structuredClone(userRoot ?? {});
     const provRoot = root.provider;
     if (provRoot && typeof provRoot === "object" && !Array.isArray(provRoot)) {
         const providers = provRoot as Record<string, unknown>;
@@ -2362,7 +2356,7 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         const opencodePlugin = selfDistFile("agent/opencode.js");
         const opencodePluginPath = opencodePlugin && fs.existsSync(opencodePlugin) ? opencodePlugin : undefined;
         const ocDirMode = opencodePluginPath !== undefined && opencodeMajorVersion(resolveClientCommand("opencode", process.env).command) >= 2;
-        opencodeTmpFile = prepareOpencodeHttpRewrite(resolveOpencodeConfigFile(process.env), origin, routes.httpRewrites, routes.httpsRewrites, opencodePluginPath, ocDirMode);
+        opencodeTmpFile = prepareOpencodeHttpRewrite(readOpencodeConfigRoot(process.env), origin, routes.httpRewrites, routes.httpsRewrites, opencodePluginPath, ocDirMode);
         if (opencodeTmpFile) env.OPENCODE_CONFIG = opencodeTmpFile;
     } else if (base === "hermes") {
         // #535 phase 2: file-free — no overlay HERMES_HOME, no config.yaml
