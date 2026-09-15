@@ -333,6 +333,29 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
                     continue;
                 }
                 const rawBuf = Buffer.from(eventStr + "\n\n", "utf8");
+                // OpenAI-compatible gateways may report an upstream failure as
+                // an in-band error frame while the HTTP response remains 200.
+                // Do not ignore it just because it has no choices: if parsing
+                // continues to [DONE], the loop would synthesize a successful
+                // empty stop turn and the client could stall or lose retry
+                // semantics. Surface the error through the normal error path,
+                // which emits a protocol error without a fabricated completion.
+                const streamError = parsed.error;
+                if (streamError !== undefined && streamError !== null) {
+                    let message: string;
+                    if (typeof streamError === "string") {
+                        message = streamError;
+                    } else if (typeof streamError === "object") {
+                        const error = streamError as Record<string, unknown>;
+                        const detail = typeof error.message === "string" ? error.message : JSON.stringify(streamError);
+                        const code = typeof error.code === "string" ? error.code : undefined;
+                        message = code && detail ? `${code}: ${detail}` : detail;
+                    } else {
+                        message = String(streamError);
+                    }
+                    yield { kind: "error", message } as ParsedStreamEvent;
+                    return;
+                }
                 const choices = parsed.choices as Array<Record<string, unknown>> | undefined;
                 const choice = choices?.[0];
                 if (!choice) {

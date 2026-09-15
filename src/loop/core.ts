@@ -101,6 +101,7 @@ export type ParsedStreamEvent =
     | { kind: "tool_call"; name: string; callId: string; arguments: string; passthrough?: boolean }
     | { kind: "usage"; inputTokens?: number; outputTokens?: number; cachedTokens?: number; creationTokens?: number }
     | { kind: "done"; finishReason?: string; suppressCompletion?: boolean; truncated?: boolean; thinking?: boolean }
+    | { kind: "error"; message: string }
     | { kind: "meta"; chunk: Buffer; firstRoundOnly?: boolean };
 
 export interface EmitCompletionOpts {
@@ -255,6 +256,7 @@ export async function* runCompressLoop(
             const calls: ToolCallEmit[] = [];
             let usage: { inputTokens?: number; outputTokens?: number; cachedTokens?: number; creationTokens?: number } = {};
             let finishReason: string | undefined;
+            let streamError: string | undefined;
             let sawDone = false;
             let suppressCompletion = false;
             let truncatedDone = false;
@@ -273,6 +275,7 @@ export async function* runCompressLoop(
                 calls.length = 0;
                 usage = {};
                 finishReason = undefined;
+                streamError = undefined;
                 sawDone = false;
                 suppressCompletion = false;
                 truncatedDone = false;
@@ -321,11 +324,24 @@ export async function* runCompressLoop(
                         suppressCompletion = ev.suppressCompletion === true;
                         truncatedDone = ev.truncated === true;
                         sawThinking = ev.thinking === true;
+                    } else if (ev.kind === "error") {
+                        // A 200 SSE response can still carry a provider error.
+                        // Preserve it as an error path; never let the absence of
+                        // choices fall through to a synthetic successful stop.
+                        streamError = ev.message;
                     } else if (ev.kind === "meta") {
                         if (round === 1 || !ev.firstRoundOnly) {
                             yield fwd(ev.chunk);
                         }
                     }
+                }
+
+                // An in-band error has no completion event. Keep it on the
+                // same zero-side-effect retry path as an abruptly truncated
+                // stream; importantly, do not synthesize a successful stop.
+                if (streamError !== undefined) {
+                    ctx.log(`[acp-loop] round ${round}: upstream stream error: ${streamError}`);
+                    loggerLog("warn", `[acp-loop] upstream stream error: ${streamError}`);
                 }
 
                 // #413: zero-side-effect truncation — the client received
@@ -608,7 +624,8 @@ export async function* runCompressLoop(
                 if (!sawDone) {
                     const partialText = assistantText.length;
                     const partialReasoning = assistantReasoning.length;
-                    const msg = `upstream stream truncated (no completion event; round ${round}, ${partialText} text chars + ${partialReasoning} reasoning chars received)`;
+                    const detail = streamError !== undefined ? `upstream stream error: ${streamError}` : "no completion event";
+                    const msg = `upstream stream truncated (${detail}; round ${round}, ${partialText} text chars + ${partialReasoning} reasoning chars received)`;
                     ctx.log(`[acp-loop] round ${round}: ${msg}`);
                     yield adapter.emitError(msg);
                     return;
