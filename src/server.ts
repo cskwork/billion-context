@@ -1796,9 +1796,9 @@ function prepareAnthropic(
         reapOrphanBlocks(session, msgs, deactivateBlock);
         rebuiltMessages = coreToAnthropic(processedMessages as BiliMessage[], cacheControls);
 
-        systemOut = injectSystem(parsed, opts, prompts, loopConfig);
+        systemOut = injectSystem(parsed, opts, prompts, loopConfig, surface);
         if (injectTools) {
-            toolsOut = injectTool(parsed.tools, absorbActive ? ABSORB_TOOL : undefined);
+            toolsOut = injectTool(parsed.tools, absorbActive ? ABSORB_TOOL : undefined, surface?.toolPrompts);
         }
         // Nudge as a separate trailing user message (cache-friendly): the
         // system block stays byte-stable so the prefix cache survives.
@@ -1940,7 +1940,7 @@ function prepareOpenai(
         // avoids double-counting it.
         openaiOutboundSystem = sysParts.join("\n\n");
         if (injectTools) {
-            toolsOut = injectOpenaiTool(parsed.tools, absorbActive ? ABSORB_TOOL_OPENAI : undefined);
+            toolsOut = injectOpenaiTool(parsed.tools, absorbActive ? ABSORB_TOOL_OPENAI : undefined, surface?.toolPrompts);
         }
         // Nudge as a separate trailing user message (cache-friendly). Injected
         // in BOTH modes (#451): plugin agents supply the ACP tools but have no
@@ -2135,8 +2135,8 @@ function prepareResponses(
             rebuiltInput = injectResponsesDeveloperMessage(rebuiltInput, devContent);
             if (!process.env.ACP_NO_INJECT_TOOL && injectTools) {
                 toolsOut = responsesTextProtocol
-                    ? injectResponsesTool(parsed.tools, ACP_READONLY_TOOLS_RESPONSES)
-                    : injectResponsesTool(parsed.tools, absorbActive ? [...ACP_TOOLS_RESPONSES, ABSORB_TOOL_RESPONSES] : ACP_TOOLS_RESPONSES);
+                    ? injectResponsesTool(parsed.tools, ACP_READONLY_TOOLS_RESPONSES, surface?.toolPrompts)
+                    : injectResponsesTool(parsed.tools, absorbActive ? [...ACP_TOOLS_RESPONSES, ABSORB_TOOL_RESPONSES] : ACP_TOOLS_RESPONSES, surface?.toolPrompts);
             }
         } else if (projection.systemParts.length > 0 || forgedSummaries.length > 0) {
             const devContent = [...projection.systemParts, ...forgedSummaries].join("\n\n---\n\n");
