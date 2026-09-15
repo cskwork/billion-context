@@ -156,3 +156,31 @@ export async function fetchProxyVersion(proxyBase: string): Promise<string | und
     const version = (json as { version?: unknown }).version;
     return typeof version === "string" && version.length > 0 ? version : undefined;
 }
+
+/** Identity + protocol probe for lazy local spawn (#809): one manifest GET that
+ *  both confirms the origin is OUR proxy (not a foreign service squatting the
+ *  port) and reads its protocol/version. Soft-fail by design — `connected:false`
+ *  covers both "nothing listening" and "something else answered", so callers can
+ *  distinguish adopt-vs-spawn-vs-stand-down without try/catch. */
+export interface ProxyProbe {
+    connected: boolean;
+    identityOk: boolean;
+    protocolVersion?: number;
+    version?: string;
+}
+
+export async function probeProxy(proxyBase: string, timeoutMs = STATUS_TIMEOUT_MS): Promise<ProxyProbe> {
+    try {
+        const { ok, json } = await fetchJson(`${proxyBase}/__bili/plugin/manifest`, undefined, timeoutMs);
+        if (!ok || !json || typeof json !== "object") return { connected: false, identityOk: false };
+        const data = json as { proxy?: unknown; protocolVersion?: unknown; version?: unknown };
+        return {
+            connected: true,
+            identityOk: data.proxy === "billion-context",
+            protocolVersion: typeof data.protocolVersion === "number" ? data.protocolVersion : undefined,
+            version: typeof data.version === "string" ? data.version : undefined,
+        };
+    } catch {
+        return { connected: false, identityOk: false };
+    }
+}
