@@ -11,7 +11,7 @@ import { resetProxyCache } from "./upstream-proxy.js";
 import { FALLBACK_EFFECTIVE_WINDOW_FLOOR, findRoute, lookupContextLimit, resolveConfiguredContextLimit, resolveCompressProtocol } from "./config.js";
 import { contextFromRegistry, loadRegistry, peekRegistryContext } from "./registry.js";
 import { codexAlignedWindow } from "./codex-models.js";
-import { fetchWithTimeout, MAX_REQUEST_BYTES } from "./fetch-util.js";
+import { fetchWithTimeout, MAX_REQUEST_BYTES, upstreamTimeoutMs } from "./fetch-util.js";
 import { formatUpstreamError, getUpstreamConnectionStatus, recordUpstreamConnection, resolveProxy, resolveProxyDecision, proxyDispatcher, type UpstreamProxyDecision } from "./upstream-proxy.js";
 import { maskHeaderForLog, maskHeadersForLog, maskHostPortForLog, maskUrlForLog, maskUrlsInText } from "./log-mask.js";
 // Protocol codecs live in the kernel now (single source of truth shared with
@@ -339,6 +339,66 @@ export function resolveUpstream(_opts: ProxyOptions, reqUrl: string, req?: http.
     return undefined;
 }
 
+// #806: request-scoped IDLE watchdog. A wedged request (accepted, logged
+// "forward", then never dispatched/answered) had NO deadline of its own —
+// undici timeouts don't apply across CONNECT tunnels and bili's fetch timer
+// only arms once fetchWithTimeout is entered. Armed at ACCEPT (before handle());
+// fires when the response goes silent for the whole budget. IDLE, not total:
+// every res.write re-arms, so long healthy streams survive. Firing aborts the
+// in-flight upstream fetch via the controller forward()/preflight registered on
+// the response — closing the response alone would NOT abort it (the close
+// handler only aborts when !writableEnded), leaving a zombie fetch holding its
+// socket for the full upstream idle timeout.
+const requestAborts = new WeakMap<http.ServerResponse, AbortController>();
+
+function registerRequestAbort(res: http.ServerResponse, ac: AbortController): void {
+    requestAborts.set(res, ac);
+}
+
+export function requestWatchdogBudgetMs(): number {
+    const raw = process.env.BILI_REQUEST_WATCHDOG_MS;
+    if (!raw) return 2 * upstreamTimeoutMs();
+    const v = Number(raw);
+    return Number.isFinite(v) ? Math.floor(v) : 2 * upstreamTimeoutMs();
+}
+
+function armRequestWatchdog(req: http.IncomingMessage, res: http.ServerResponse, log: (level: string, msg: string) => void): void {
+    const budgetMs = requestWatchdogBudgetMs();
+    if (!Number.isFinite(budgetMs) || budgetMs <= 0) return; // operator opted out
+    const startedAt = Date.now();
+    let timer: NodeJS.Timeout | undefined;
+    const fire = (): void => {
+        timer = undefined;
+        if (res.writableEnded || res.destroyed || !res.socket || res.socket.destroyed) return;
+        const secs = Math.round((Date.now() - startedAt) / 1000);
+        log("error", `[watchdog] ${req.method ?? "?"} ${maskUrlForLog(req.url ?? "")} produced no output for ${secs}s (idle budget ${Math.round(budgetMs / 1000)}s) — closing the request so the client can fail fast instead of hanging forever`);
+        requestAborts.get(res)?.abort();
+        try {
+            if (!res.headersSent) {
+                res.writeHead(504, { "content-type": "application/json", "connection": "close" });
+                res.end(JSON.stringify({ error: { type: "gateway_timeout", message: `billion-context watchdog: no output within ${Math.round(budgetMs / 1000)}s; retry the request` } }));
+            } else if (!res.writableEnded) {
+                res.end();
+            }
+        } catch { /* client already gone */ }
+    };
+    const arm = (): void => {
+        if (timer) clearTimeout(timer);
+        timer = setTimeout(fire, budgetMs);
+        timer.unref?.();
+    };
+    // Re-arm on every byte written toward the client. Bind the original so the
+    // patch is transparent to backpressure (returns the same boolean) and works
+    // with any write signature (string/Buffer/Uint8Array, encoding, callback).
+    const origWrite = res.write.bind(res);
+    res.write = ((...args: Parameters<typeof origWrite>) => {
+        arm();
+        return origWrite(...args);
+    }) as typeof res.write;
+    res.on("close", () => { if (timer) clearTimeout(timer); });
+    arm();
+}
+
 export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     // Configure the tee logger (file + stderr) BEFORE any logging so the very
     // first line (persist status) lands in the file too.
@@ -371,6 +431,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     // per-model config. A miss falls back to the prefix table + default.
     void loadRegistry();
     const server = http.createServer(async (req, res) => {
+        armRequestWatchdog(req, res, log);
         try {
             await handle(req, res, opts, core, config, log, instanceId, instanceStartedAt);
         } catch (err) {
@@ -382,6 +443,9 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
             // feeding the context-free [error] AbortError storm.
             const clientAbort = (e?.name === "AbortError" || /abort/i.test(String(e?.message ?? ""))) && (res.destroyed || res.writableEnded);
             if (clientAbort) log("info", `client aborted mid-stream: ${msg}`);
+            // #806: cap-include the stack on hard failures — the bare message
+            // gave no clue where the handler died (wedged-request forensics).
+            else if (err instanceof Error && err.stack) log("error", `${msg}\n${err.stack.split("\n").slice(1, 8).join("\n")}`);
             else log("error", msg);
             if (!res.headersSent) {
                 const status = msg.includes("exceeds") ? 413 : 502;
@@ -1075,6 +1139,22 @@ async function handle(
             parsed = JSON.parse(bodyBuffer.toString("utf8"));
         } catch {
             parsed = null;
+        }
+    }
+    // #806: a parseable body missing the conversation field used to crash the
+    // kernel's conversation-signal fingerprint (body.messages.find on undefined —
+    // top-level arrays included) and surface as an opaque 502. Reject it with the
+    // 400 the real upstream would return instead. Unparseable bodies stay on the
+    // raw-forward path (upstream rejects them itself).
+    if ((protocol === "anthropic" || protocol === "openai") && parsed !== null) {
+        const p = typeof parsed === "object" && !Array.isArray(parsed) ? parsed as Record<string, unknown> : undefined;
+        if (!p || !Array.isArray(p.messages)) {
+            log("warn", `[${protocol}] rejected malformed body (no "messages" array): ${req.method ?? "?"} ${maskUrlForLog(req.url ?? "")}`);
+            res.writeHead(400, { "content-type": "application/json" });
+            res.end(JSON.stringify(protocol === "anthropic"
+                ? { type: "error", error: { type: "invalid_request_error", message: 'request body must include a "messages" array' } }
+                : { error: { message: 'request body must include a "messages" array', type: "invalid_request_error", param: null, code: null } }));
+            return;
         }
     }
     // Capture the CLIENT's raw incoming request (before bili rebuilds) to
@@ -3201,6 +3281,7 @@ async function preflightCompressIfNeeded(
     // summarization calls too (preflight always processes).
     const { upstreamUrl, headers, proxyUrl } = buildForwardTarget(req, opts, route, affinity, instanceId);
     const clientAbort = new AbortController();
+    registerRequestAbort(res, clientAbort);
     res.on("close", () => {
         if (!res.writableEnded) clientAbort.abort();
     });
@@ -3499,6 +3580,7 @@ async function forward(
     // keeps reading upstream and holds the per-session lock. Also passed to
     // the rewriter loop below so fetch and loop stop together.
     const clientAbort = new AbortController();
+    registerRequestAbort(res, clientAbort);
     res.on("close", () => {
         if (!res.writableEnded) clientAbort.abort();
     });
