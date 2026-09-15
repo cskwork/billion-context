@@ -174,8 +174,12 @@ function recordUsage(
     // Net out this turn's compress credit: the post-compress re-request
     // re-sends the unfolded history, so its usage report over-reports the
     // context the NEXT request will actually carry (see stream.ts applyRanges).
-    ctx.session.stats.lastInputTokens = Math.max(0, total - (ctx.session.stats.compressCreditTokens ?? 0));
-    if (typeof cached === "number") {
+    // #793: a zero-total sample (missing or placeholder input) must not
+    // clobber the last trusted value — mirrors applyUsageSample (plugin mode).
+    if (total > 0) {
+        ctx.session.stats.lastInputTokens = Math.max(0, total - (ctx.session.stats.compressCreditTokens ?? 0));
+    }
+    if (typeof cached === "number" && total > 0) {
         ctx.session.stats.cachedTokens += cached;
         ctx.session.stats.cacheSamples += 1;
     }
@@ -186,7 +190,7 @@ function recordUsage(
     const foldNew = ctx.session.stats.pendingFoldUsage === true;
     if (foldNew) ctx.session.stats.pendingFoldUsage = false;
     ctx.log(
-        `[acp-usage] round ${round} input=${total} cached=${cached ?? 0} (cache hit ${hitPct}%)${foldNew ? " fold=new" : ""}`,
+        `[acp-usage] round ${round} input=${total} cached=${cached ?? 0} (cache hit ${hitPct}%)${foldNew ? " fold=new" : ""}${total <= 0 ? " (zero-total: lastInputTokens kept)" : ""}`,
     );
 }
 
