@@ -603,7 +603,9 @@ function usageFromSseEvent(obj: Record<string, unknown>): UsageSample | undefine
         return {
             inputTokens: num(usage["prompt_tokens"]),
             outputTokens: num(usage["completion_tokens"]),
-            cachedTokens: num((usage["prompt_tokens_details"] as Record<string, unknown> | undefined)?.["cached_tokens"]),
+            // DeepSeek-style upstreams report KV-cache hits as top-level
+            // prompt_cache_hit_tokens instead of the standard details field (#779).
+            cachedTokens: num((usage["prompt_tokens_details"] as Record<string, unknown> | undefined)?.["cached_tokens"]) ?? num(usage["prompt_cache_hit_tokens"]),
         };
     }
     return undefined;
@@ -1242,7 +1244,9 @@ export async function pipePluginJson(
                     cachedTokens:
                         num((usage["prompt_tokens_details"] as Record<string, unknown> | undefined)?.["cached_tokens"]) ??
                         num((usage["input_tokens_details"] as Record<string, unknown> | undefined)?.["cached_tokens"]) ??
-                        num(usage["cache_read_input_tokens"]),
+                        num(usage["cache_read_input_tokens"]) ??
+                        // #779: DeepSeek-style top-level field (openai wire)
+                        num(usage["prompt_cache_hit_tokens"]),
                 }, protocol);
                 markDirty(session);
             }

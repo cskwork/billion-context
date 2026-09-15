@@ -8,6 +8,7 @@ import {
     type PackSurface,
 } from "acp-kernel";
 import { buildCompressSystemPrompt, parseCompressInput } from "./compress-tool.js";
+import { IMAGE_PLACEHOLDER, imagePlaceholders } from "./image-note.js";
 import { applyAbsorbView } from "./absorb.js";
 import { applyRanges, type RewriteCtx } from "./stream.js";
 import { fetchWithRetry, UpstreamHttpError } from "./fetch-util.js";
@@ -188,7 +189,16 @@ function renderRange(messages: CoreMessage[], startIdx: number, endIdx: number):
     const parts: string[] = [];
     for (let i = startIdx; i <= endIdx && i < messages.length; i++) {
         const m = messages[i];
-        const text = (m.text ?? "").trim();
+        let text = (m.text ?? "").trim();
+        // #781: images live in BiliMessage sidecars, invisible to m.text — emit
+        // one explicit placeholder each so summaries record them instead of
+        // losing them silently. Replaces the codec's bare "[image]" literal
+        // (anthropic) with the richer media-type/dimension note.
+        const notes = imagePlaceholders(m);
+        if (notes.length > 0) {
+            const note = notes.join(" ");
+            text = text === IMAGE_PLACEHOLDER ? note : text ? `${text}\n${note}` : note;
+        }
         if (!text) continue;
         const label =
             m.contentType === "tool-call"
