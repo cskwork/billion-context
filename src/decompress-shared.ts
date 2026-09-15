@@ -114,10 +114,22 @@ export function resolveDecompress(
             reapTempFiles();
             return `${header}\nContent (${body.length} chars) written to: ${outPath}\nUse the read tool to access it.`;
         } catch (e) {
-            return `${header}\n[Failed to write to ${outPath}: ${String(e)}]\n${body.slice(0, 4000)}...`;
+            return `${header}\n[Failed to write to ${outPath}: ${String(e)}]\n${safePrefix(body, 4000)}...`;
         }
     }
     return `${header}\n${body}`;
+}
+
+// Back off a cut that lands between the two halves of a surrogate pair, so the
+// truncated prefix never ends on a lone high surrogate (#816: strict-UTF-8
+// gateways 500 deterministically on re-encoded request bodies).
+function safePrefix(text: string, n: number): string {
+    let cut = Math.min(n, text.length);
+    if (cut > 0 && cut < text.length) {
+        const c = text.charCodeAt(cut - 1);
+        if (c >= 0xD800 && c <= 0xDBFF) cut -= 1;
+    }
+    return text.slice(0, cut);
 }
 
 /** Shared search_context execution for all wire paths. Distinguishes "no active
@@ -139,7 +151,7 @@ export function executeSearchContext(
     }
     const lines = blocks.map((b) => {
         const topic = b.topic ?? "(no topic)";
-        const preview = b.summary.length > 200 ? b.summary.slice(0, 200) + "..." : b.summary;
+        const preview = b.summary.length > 200 ? safePrefix(b.summary, 200) + "..." : b.summary;
         return `${b.blockId} (T${b.tier}) "${topic}"\n  ${preview}`;
     });
     return `Found ${blocks.length} block(s) for "${query}":\n\n${lines.join("\n\n")}`;
