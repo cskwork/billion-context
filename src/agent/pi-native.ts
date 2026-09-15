@@ -80,6 +80,14 @@ export function singleFlight(fn: () => Promise<string | undefined>): () => Promi
 if (process.env.NODE_TEST_CONTEXT === undefined && shouldBootstrapNative(process.env)) {
     const start = singleFlight(bootstrap);
     state.respawn = start;
+    state.onGiveUp = () => {
+        // We wrote BILLION_CONTEXT_PROXY at successful bootstrap. If the proxy
+        // dies mid-session and the respawn fails, traffic goes direct — clear
+        // the env so event-time ownership checks (session_before_compact
+        // cancel, header stamping) stop claiming compression ownership and
+        // native compaction comes back with the direct traffic.
+        delete process.env.BILLION_CONTEXT_PROXY;
+    };
     state.ready = start();
     installNativeFetchIntercept(state);
 }

@@ -14,6 +14,11 @@ export interface NativeInterceptState {
     ready: Promise<string | undefined>;
     /** Owner hook: re-run the bootstrap (proxy died → respawn). */
     respawn?: () => Promise<string | undefined>;
+    /** Owner hook: fired once when a respawn attempt fails and the session
+     *  degrades to direct sends for good — clear proxy-owned state (e.g. the
+     *  BILLION_CONTEXT_PROXY env) so event-time ownership checks disarm with
+     *  the traffic. */
+    onGiveUp?: () => void;
     /** How long a pre-ready model request waits for the bootstrap before
      *  falling back to a direct (uncompressed) send. */
     readyTimeoutMs?: number;
@@ -91,11 +96,12 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
         const url = fetchUrlOf(input);
         if (url === undefined || !isModelApiUrl(url)) return orig(input, init);
 
-        const dispatch = (target: string, action: "rewrite" | "self" | "retry"): ReturnType<typeof orig> => {
-            state.onDispatch?.(target, action);
-            if (typeof input === "string" || input instanceof URL) return orig(target, init);
-            return orig(new Request(target, input), init);
-        };
+        // Rebuild a Request-object input against the rewritten target. A
+        // caller-side defect here (already-consumed or locked body) must not
+        // reach the proxy-death branch below — respawning would orphan a
+        // fresh proxy for a request that can never be sent.
+        const makeTarget = (target: string): string | URL | Request =>
+            typeof input === "string" || input instanceof URL ? target : new Request(target, input);
 
         const origin = await readyOrigin(state);
         if (origin === undefined) {
@@ -112,8 +118,10 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
             state.onDispatch?.(url, "self");
             return orig(input, init);
         }
+        const first = makeTarget(`${origin}/bili/${url}`);
+        state.onDispatch?.(`${origin}/bili/${url}`, "rewrite");
         try {
-            return await dispatch(`${origin}/bili/${url}`, "rewrite");
+            return await orig(first, init);
         } catch (err) {
             // The spawned proxy can die mid-session (its parent watchdog
             // fires when the FIRST owning pi exits while later sessions
@@ -123,8 +131,21 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
                 state.origin = undefined;
                 state.ready = state.respawn();
                 const again = await readyOrigin(state);
-                if (again !== undefined) return dispatch(`${again}/bili/${url}`, "retry");
+                if (again !== undefined) {
+                    const retried = makeTarget(`${again}/bili/${url}`);
+                    state.onDispatch?.(`${again}/bili/${url}`, "retry");
+                    return await orig(retried, init);
+                }
+                // Respawn failed — this session runs direct for its lifetime.
+                // Degrade exactly like a bootstrap failure: actually send the
+                // request direct, then let the owner clear proxy-owned state.
+                state.onGiveUp?.();
+                if (!warned) {
+                    warned = true;
+                    console.error(`bili-native: proxy respawn failed — model requests go direct (uncompressed): ${url}`);
+                }
                 state.onDispatch?.(url, "direct");
+                return orig(input, init);
             }
             throw err;
         }

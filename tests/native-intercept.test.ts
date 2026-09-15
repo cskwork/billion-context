@@ -155,3 +155,69 @@ test("install: Request-object input is re-dispatched with the rewritten URL", as
     });
     assert.deepEqual(sink, ["http://127.0.0.1:40001/bili/http://127.0.0.1:8199/v1/messages"]);
 });
+
+test("install: failed respawn degrades to a direct send and fires onGiveUp", async () => {
+    const calls: string[] = [];
+    const dispatches: string[] = [];
+    const saved = globalThis.fetch;
+    _resetForTest();
+    let failNext = true;
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+        const url = typeof input === "string" ? input : input instanceof URL ? input.href : (input as Request).url;
+        calls.push(url);
+        if (failNext) {
+            failNext = false;
+            throw new TypeError("fetch failed");
+        }
+        return new Response("{}", { status: 200 });
+    }) as typeof fetch;
+    const state: NativeInterceptState = {
+        origin: "http://127.0.0.1:40001",
+        ready: Promise.resolve("http://127.0.0.1:40001"),
+        respawn: () => Promise.resolve(undefined),
+        onDispatch: (_url, action) => dispatches.push(action),
+    };
+    try {
+        assert.equal(installNativeFetchIntercept(state), true);
+        const res = await globalThis.fetch("http://127.0.0.1:8199/v1/messages");
+        assert.equal(res.status, 200);
+        assert.deepEqual(calls, [
+            "http://127.0.0.1:40001/bili/http://127.0.0.1:8199/v1/messages",
+            "http://127.0.0.1:8199/v1/messages",
+        ]);
+        assert.deepEqual(dispatches, ["rewrite", "direct"]);
+        assert.equal(state.origin, undefined);
+    } finally {
+        globalThis.fetch = saved;
+        _resetForTest();
+    }
+});
+
+test("install: a consumed-body Request throws without triggering a respawn", async () => {
+    const saved = globalThis.fetch;
+    _resetForTest();
+    let respawnCalls = 0;
+    globalThis.fetch = (async () => new Response("{}", { status: 200 })) as typeof fetch;
+    const state: NativeInterceptState = {
+        origin: "http://127.0.0.1:40001",
+        ready: Promise.resolve("http://127.0.0.1:40001"),
+        respawn: () => {
+            respawnCalls += 1;
+            return Promise.resolve("http://127.0.0.1:40001");
+        },
+    };
+    try {
+        assert.equal(installNativeFetchIntercept(state), true);
+        const req = new Request("http://127.0.0.1:8199/v1/messages", {
+            method: "POST",
+            body: ReadableStream.from([new TextEncoder().encode("{}")]),
+            duplex: "half",
+        } as RequestInit & { duplex?: string });
+        await req.arrayBuffer();
+        await assert.rejects(() => globalThis.fetch(req), TypeError);
+        assert.equal(respawnCalls, 0);
+    } finally {
+        globalThis.fetch = saved;
+        _resetForTest();
+    }
+});
