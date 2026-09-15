@@ -3,7 +3,7 @@
 > **来源**：[#801](https://github.com/ranxianglei/billion-context/issues/801)「自动合并材料收集」。
 > **方法**：拉取三个仓库（billion-context / billion-context-pi / acp-kernel）**全部 issue + PR + 评论**（共 1543 项、1072 个 PR、3645 条评论），叠加本仓 `devlog/` 31 条迭代记录、`AGENTS.md` 完整 git 演进史、commit 类型分布，交叉比对得出。
 > **目标**：让 ~90% 的 bugfix 可自动合并，同时守住大方向不偏移。
-> 本文是**材料/建议**，不是规范本身；第 6 节给出可直接并入 `AGENTS.md` 的段落，待 owner 拍板。
+> **状态（更新）**：owner 已拍板——第 2/4/5 节的规则与门槛已并入 `AGENTS.md` 新增的 **§7 Review & Auto-Merge Discipline**。本文现为**证据附录**：保留逐条 issue/PR 引用、重灾区数据分析、以及内核 vs 本仓库的归属判断。范围限定：**本次仅改本仓库**，跨仓库改动暂留人工。
 
 ---
 
@@ -67,6 +67,26 @@ git 安全四禁（禁 force-push master / 禁 merge / 禁 npm publish / 禁打�
 | 7 | **流程卫生** | 范围蔓延、重复劳动、只推分支不开 PR、跨仓顺序 | 单看每个动作都对，组合起来违反流程 |
 | 8 | **面向用户的判断** | 文档措辞/语言/位置、诚实性、UX 默认值 | 工程正确 ≠ 用户视角正确 |
 
+### 3.1 重灾区：二次评论才过的 PR（数据）
+
+对 455 个已合并 PR 统计"人工评论次数"：**229 个 0 次、71 个 1 次、26 个 ≥2 次**——即约 **7%（26/326 有评论者）需要第二轮及以上人工 review 才过**。这些就是"重灾区"；其中属 **bugfix**（非 feat）的，才是自动合并真正要防的对象：
+
+| PR | 主题 | 二次返工原因 |
+|----|------|--------------|
+| #571 | hold client through long preflight | diff-爆炸（#575 同病）、反复 rebase 冲突（#558/#593）、文档放错节 + env 变量只写英文 README、漏 zh/CONFIGURATION.md |
+| #467 | hard backstop plugin-mode overflow | base 落后 43 commits；逐行空格 artifact（1280 off-by-one-space）被挑出 |
+| #517 | reject stale snapshots rollback | 与 #587 重写 `src/persist.ts` 同文件冲突，需语义 rebase |
+| #425 | uncompressed baseline + clamp negative | base 停在 8/31；上条评论承诺的 openai 拆分口径没做完 |
+| #219 | stale context limits + registry-first | 首修漏了"代理网络下 Node fetch 忽略 http(s)_proxy → registry 拉取永久失效"；快照从投影扩成全量 |
+| #428 | re-voice acp_summary as user | 要求确认回归；方案被推翻、移到原 issue |
+| #360 | /acp panel persistent message | 反复冲突；"为啥新搞一个 acp panel?"（方案质疑）；Windows 临时端口范围致 flaky 测试（改 `listen(0)`） |
+| #254 | preflight-compress on model switch | 需真实 A/B 复现验证（非仅单测） |
+| #657 | recover stale shim conversation id | review 才发现残留小问题 |
+
+**两个主导成因**（正是自动合并最危险处，已写入 `AGENTS.md` §7.5）：
+1. **stale-base / 并发文件踩踏**：长命分支偏离快速演进的 master，或与别的 PR 抢同一热文件（`server.ts` / preflight / `persist.ts` / `agent/*` 类型）。信号：分支新鲜度 + 是否与其它 open PR 改同一文件。
+2. **首遍不完整**：只治了报出来的症状，漏了相邻路径/边界、或承诺了却没做完、或方案要重来。信号：修复是否覆盖该 bug 的**所有**路径，而不只是 repro。
+
 ---
 
 ## 4. 自动合并门槛（Gate）— 目标 90% bugfix
@@ -127,9 +147,9 @@ git 安全四禁（禁 force-push master / 禁 merge / 禁 npm publish / 禁打�
 
 ---
 
-## 6. 建议补进 `AGENTS.md` 的具体段落（待 owner 拍板）
+## 6. 已并入 `AGENTS.md` §7 的规则文本（参考副本）
 
-> 以下为可直接并入 `AGENTS.md` 的紧凑规则文本。建议新增一节 **「Review & Auto-Merge Discipline」**，并把第 4 节 Gate 作为 CI 门禁的判定依据（若决定做硬门禁）。
+> 以下即已并入 `AGENTS.md` **§7 Review & Auto-Merge Discipline** 的紧凑规则文本（此处留作参考副本；以 `AGENTS.md` 为准）。第 4 节 Gate 作为自动合并判定依据；若后续升级为 CI 硬门禁，以此为准。
 
 ```markdown
 ### Review & Auto-Merge Discipline
@@ -190,7 +210,14 @@ requires human review.
 
 ---
 
-## 附：待 owner 决定的两件事（来自 #801 回复）
+## 附：owner 拍板结论 + 内核 vs 本仓库归属判断
 
-1. 本材料与颗粒度是否符合预期？第 6 节段落是否按此并入 `AGENTS.md`？
-2. 第 4 节「可自动合并」这套要做成 **CI 硬门禁(gate)**，还是先只作为 **reviewer 清单**？
+**已定**：
+1. ✅ 规则与门槛并入 `AGENTS.md` 新增 **§7 Review & Auto-Merge Discipline**（本次仅改本仓库）。
+2. ✅ 范围限定：**跨仓库改动暂留人工**——自动合并门槛只作用于本仓库；acp-kernel bump / 任何跨仓改动一律人工处理。
+3. 「可自动合并」这套先作为 **reviewer 清单 + AGENTS.md 门槛**；是否再升级为 CI 硬门禁(gate)留待后续单独评估（涉及 CI 改动，属另一件事）。
+
+**内核 vs 本仓库归属判断**（owner 指出"还有一条落下了，需判断优先沉淀到内核还是本仓库"）：
+- 有真正归属歧义的是 **wire / 内核产物保真** 这一条。判定：**格式契约 + id 永不复用保证归 acp-kernel**（它产出并拥有 ACP 压缩标签、block ref、`acp_summary` 结构、ref 空间）；**本仓库只保留 host 侧义务**（忠实消费：不重生成 tool_call id/顺序、不裁剪 ref map、两种压缩模式都要想）。
+- 依据：`AGENTS.md` §2「Kernel Contract」早已把 id-never-reused 记为内核契约的 host 视角；§7.3 的 wire-fidelity 项已明确标注此 split。
+- 处置：因本次限定仅改本仓库、跨仓留人工，**内核侧的正式 spec 沉淀放到 acp-kernel 单独的后续 PR**（此处仅记录判断，本轮不动 acp-kernel）。
