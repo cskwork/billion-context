@@ -32,7 +32,7 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-import { spawn, type StdioOptions } from "node:child_process";
+import { execFileSync, spawn, type StdioOptions } from "node:child_process";
 import { DEFAULT_MITM_DOMAINS } from "./mitm.js";
 import {
     claimStartingMarker,
@@ -1624,11 +1624,36 @@ export function dshArgsWithPatch(args: readonly string[], patchFile: string): st
     return ["--patch", patchFile, ...args];
 }
 
+export function parseOpencodeMajor(output: string): number | undefined {
+    const m = /(\d+)\s*\./.exec(output);
+    return m ? parseInt(m[1], 10) : undefined;
+}
+
+const ocMajorCache = new Map<string, number>();
+
+/** Major version of an OpenCode CLI binary via `--version` (cached per path).
+ *  Probe failure defaults to 1 — the legacy file-path plugin injection that
+ *  OpenCode 1.x understands — so a broken probe can never break a launch. */
+export function opencodeMajorVersion(command: string): number {
+    const hit = ocMajorCache.get(command);
+    if (hit !== undefined) return hit;
+    let major = 1;
+    try {
+        const out = execFileSync(command, ["--version"], { timeout: 5000, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+        const parsed = parseOpencodeMajor(out);
+        if (parsed !== undefined) major = parsed;
+    } catch {}
+    ocMajorCache.set(command, major);
+    return major;
+}
+
 /**
  * opencode counterpart of preparePiHttpRewrite: write a full copy of the user's
  * opencode.json with the discovered providers' baseURL rewritten (HTTP →
  * /bili/ wrap, wrapped-HTTPS → raw https for cert MITM) into a temp dir, and
  * point OPENCODE_CONFIG at it. The real opencode.json is never touched.
+ * With pluginDirMode (OpenCode 2.x), the plugin rides as a temp directory whose
+ * index.js re-exports pluginPath — 2.x rejects bare file paths in `plugin`.
  * Returns the temp config FILE path (undefined when there is nothing to do or
  * the config can't be parsed).
  */
@@ -1638,6 +1663,7 @@ export function prepareOpencodeHttpRewrite(
     httpRewrites: HttpRewrite[],
     httpsRewrites: HttpRewrite[],
     pluginPath?: string,
+    pluginDirMode?: boolean,
 ): string | undefined {
     if (httpRewrites.length === 0 && httpsRewrites.length === 0 && !pluginPath) return undefined;
     let root: Record<string, unknown> = {};
@@ -1666,12 +1692,28 @@ export function prepareOpencodeHttpRewrite(
         rewrite(httpRewrites, true);
         rewrite(httpsRewrites, false);
     }
-    if (pluginPath) {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "bili-opencode-"));
+    let pluginEntry = pluginPath;
+    if (pluginPath && pluginDirMode) {
+        const wrapDir = path.join(tmp, "plugin");
+        fs.mkdirSync(wrapDir);
+        fs.writeFileSync(path.join(wrapDir, "index.js"), `export { default } from ${JSON.stringify(pluginPath)};\n`);
+        pluginEntry = wrapDir;
+    }
+    if (pluginEntry) {
         const plugins = Array.isArray(root.plugin) ? root.plugin.filter((p): p is string => typeof p === "string") : [];
-        if (!plugins.includes(pluginPath)) plugins.push(pluginPath);
+        if (!plugins.includes(pluginEntry)) plugins.push(pluginEntry);
         root.plugin = plugins;
     }
-    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "bili-opencode-"));
+    // ACP owns compression in launcher mode: disable the host's native
+    // auto-compaction so it cannot destroy ACP-tagged context. The key is
+    // unknown (and ignored) on OpenCode 1.x, so this is safe on both
+    // generations; user-set fields (keep/buffer) survive via the merge.
+    const existingCompaction = root.compaction;
+    root.compaction = {
+        ...(existingCompaction && typeof existingCompaction === "object" && !Array.isArray(existingCompaction) ? existingCompaction as Record<string, unknown> : {}),
+        auto: false,
+    };
     const tmpFile = path.join(tmp, "opencode.json");
     fs.writeFileSync(tmpFile, JSON.stringify(root));
     return tmpFile;
@@ -2319,7 +2361,8 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         env = { ...process.env, HTTPS_PROXY: origin, NODE_EXTRA_CA_CERTS: ca, BILLION_CONTEXT_PROXY: origin };
         const opencodePlugin = selfDistFile("agent/opencode.js");
         const opencodePluginPath = opencodePlugin && fs.existsSync(opencodePlugin) ? opencodePlugin : undefined;
-        opencodeTmpFile = prepareOpencodeHttpRewrite(resolveOpencodeConfigFile(process.env), origin, routes.httpRewrites, routes.httpsRewrites, opencodePluginPath);
+        const ocDirMode = opencodePluginPath !== undefined && opencodeMajorVersion(resolveClientCommand("opencode", process.env).command) >= 2;
+        opencodeTmpFile = prepareOpencodeHttpRewrite(resolveOpencodeConfigFile(process.env), origin, routes.httpRewrites, routes.httpsRewrites, opencodePluginPath, ocDirMode);
         if (opencodeTmpFile) env.OPENCODE_CONFIG = opencodeTmpFile;
     } else if (base === "hermes") {
         // #535 phase 2: file-free — no overlay HERMES_HOME, no config.yaml
