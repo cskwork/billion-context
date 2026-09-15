@@ -5,6 +5,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { parse as parseJsonc, type ParseError } from "jsonc-parser";
 
 export interface ClaudeSettings {
     anthropicBaseUrl?: string;
@@ -125,6 +126,30 @@ export interface TraeConfig {
     modelApiHost?: string;
 }
 
+export interface KimiProvider {
+    baseUrl?: string;
+}
+
+export interface KimiConfig {
+    /** Provider base URLs: the explicit `base_url` field, or — when absent —
+     *  a `*_BASE_URL` key from the provider's `[providers.<name>.env]`
+     *  sub-table (kimi's documented credential/base-URL fallback channel). */
+    providers: Record<string, KimiProvider>;
+    /** Per-model endpoint overrides (`[models.<alias>].base_url`) — take
+     *  precedence over their provider's base_url. */
+    modelUrls?: string[];
+    /** Endpoints from env channels that redirect model traffic without
+     *  touching config.toml (KIMI_MODEL_BASE_URL synthetic provider,
+     *  KIMI_CODE_BASE_URL managed-provider override). */
+    envUrls?: string[];
+    /** Per-model context windows keyed by WIRE model id (`[models.<alias>]`
+     *  `model`, falling back to the alias); `[models.<alias>.overrides]`
+     *  max_context_size wins over the top-level value. */
+    models?: ModelWindow[];
+    /** Top-level `default_model` alias. */
+    defaultModel?: string;
+}
+
 export interface ClientConfig {
     claude?: ClaudeSettings;
     codex?: CodexConfig;
@@ -137,6 +162,7 @@ export interface ClientConfig {
     codebuddy?: CodebuddyConfig;
     qoder?: QoderConfig;
     trae?: TraeConfig;
+    kimi?: KimiConfig;
 }
 
 /** qoder's default model-inference hosts, hardcoded in the binary (no config
@@ -419,6 +445,12 @@ export const TRAE_DEFAULT_MODEL_HOSTS = [
     "www.trae.cn",
 ];
 
+/** jcode (Rust harness) default model hosts, cert-MITM'd so `bili jcode`
+ *  compresses the zai leg. Loopback providers stay direct via NO_PROXY. */
+export const JCODE_DEFAULT_MODEL_HOSTS = [
+    "api.z.ai",
+];
+
 /** Trae CLI keeps its config under TRAE_CONFIG_DIR (default ~/.trae):
  *  traecli.yaml, skills, session state. */
 export function resolveTraeHome(env: NodeJS.ProcessEnv): string {
@@ -533,6 +565,118 @@ export function readCodexConfig(codexHome: string): CodexConfig {
         return { providers: {} };
     }
     return parseCodexToml(text);
+}
+
+/** Built-in managed (OAuth-logged-in) model API hosts — absent from
+ *  config.toml entirely, so the launcher falls back to them when the user
+ *  declares no provider/model endpoints at all (qoder/trae precedent). */
+export const KIMI_DEFAULT_MODEL_HOSTS = ["api.kimi.com", "api.kimi.ai"];
+
+/** Split a TOML table header into path parts, honoring quoted segments
+ *  (`[providers."managed:kimi-code"]` → ["providers", "managed:kimi-code"]). */
+function tomlPathParts(header: string): string[] {
+    const parts: string[] = [];
+    let cur = "";
+    let dq = false;
+    let sq = false;
+    for (const ch of header) {
+        if (ch === '"' && !sq) dq = !dq;
+        else if (ch === "'" && !dq) sq = !sq;
+        else if (ch === "." && !dq && !sq) { parts.push(cur); cur = ""; }
+        else cur += ch;
+    }
+    parts.push(cur);
+    return parts.map((p) => p.trim());
+}
+
+interface KimiModelState {
+    modelId?: string;
+    window?: number;
+    windowOverride?: number;
+    baseUrl?: string;
+}
+
+export function parseKimiToml(text: string): KimiConfig {
+    const result: KimiConfig = { providers: {} };
+    const modelState = new Map<string, KimiModelState>();
+    let parts: string[] = [];
+    for (const rawLine of text.split(/\r?\n/)) {
+        const line = rawLine.trim();
+        if (!line || line.startsWith("#")) continue;
+        const tableMatch = /^\[\[?(.+?)\]\]?$/.exec(line);
+        if (tableMatch) {
+            parts = tomlPathParts(tableMatch[1]);
+            continue;
+        }
+        const strMatch = /^([A-Za-z0-9_.-]+)\s*=\s*(?:"([^"]*)"|'([^']*)')/.exec(line);
+        const numMatch = /^([A-Za-z0-9_.-]+)\s*=\s*([0-9]+)\b/.exec(line);
+        if (!strMatch && !numMatch) continue;
+        const key = (strMatch ?? numMatch)![1];
+        const strVal = strMatch ? (strMatch[2] !== undefined ? strMatch[2] : strMatch[3]) : undefined;
+        const numVal = numMatch ? Number(numMatch[2]) : undefined;
+        if (parts.length === 0) {
+            if (key === "default_model" && strVal !== undefined) result.defaultModel = strVal;
+        } else if (parts[0] === "providers") {
+            const name = parts[1];
+            if (!name) continue;
+            const prov = result.providers[name] ??= {};
+            if (parts.length === 2) {
+                if (key === "base_url" && strVal !== undefined) prov.baseUrl = strVal;
+            } else if (parts.length === 3 && parts[2] === "env" && strVal !== undefined && /_BASE_URL$/.test(key)) {
+                if (!prov.baseUrl) prov.baseUrl = strVal;
+            }
+        } else if (parts[0] === "models") {
+            const alias = parts[1];
+            if (!alias) continue;
+            const st = modelState.get(alias) ?? {};
+            if (parts.length === 2) {
+                if (key === "model" && strVal !== undefined) st.modelId = strVal;
+                else if (key === "max_context_size" && numVal !== undefined) st.window = numVal;
+                else if (key === "base_url" && strVal !== undefined) st.baseUrl = strVal;
+            } else if (parts.length === 3 && parts[2] === "overrides") {
+                if (key === "max_context_size" && numVal !== undefined) st.windowOverride = numVal;
+            }
+            modelState.set(alias, st);
+        }
+    }
+    const windows: ModelWindow[] = [];
+    const modelUrls: string[] = [];
+    for (const [alias, st] of modelState) {
+        const win = toModelWindow(st.modelId ?? alias, st.windowOverride ?? st.window);
+        if (win) windows.push(win);
+        if (st.baseUrl) modelUrls.push(st.baseUrl);
+    }
+    if (windows.length > 0) result.models = windows;
+    if (modelUrls.length > 0) result.modelUrls = modelUrls;
+    return result;
+}
+
+export function resolveKimiHome(env: NodeJS.ProcessEnv = process.env): string {
+    return nonEmpty(env.KIMI_CODE_HOME) ? env.KIMI_CODE_HOME : path.join(os.homedir(), ".kimi-code");
+}
+
+export function readKimiConfig(kimiHome: string, env: NodeJS.ProcessEnv = process.env): KimiConfig {
+    const cfgPath = path.join(kimiHome, "config.toml");
+    let text: string;
+    try {
+        text = fs.readFileSync(cfgPath, "utf8");
+    } catch {
+        return { providers: {} };
+    }
+    const config = parseKimiToml(text);
+    // Env channels that redirect model traffic without touching config.toml:
+    // KIMI_MODEL_* synthesizes an in-memory provider (beats default_model),
+    // KIMI_CODE_BASE_URL overrides the managed OAuth provider's base URL.
+    const envUrls: string[] = [];
+    if (nonEmpty(env.KIMI_MODEL_BASE_URL)) envUrls.push(env.KIMI_MODEL_BASE_URL!);
+    if (nonEmpty(env.KIMI_CODE_BASE_URL)) envUrls.push(env.KIMI_CODE_BASE_URL!);
+    if (envUrls.length > 0) config.envUrls = envUrls;
+    if (nonEmpty(env.KIMI_MODEL_NAME)) {
+        const size = parseInt(env.KIMI_MODEL_MAX_CONTEXT_SIZE ?? "", 10);
+        const win = toModelWindow(env.KIMI_MODEL_NAME!, Number.isFinite(size) && size > 0 ? size : 262144);
+        if (win) config.models = [...(config.models ?? []), win];
+    }
+    return config;
 }
 
 export function readPiConfig(piHome: string): PiConfig {
@@ -730,28 +874,84 @@ export function readHermesConfig(hermesHome: string): HermesConfig {
     return parseHermesYaml(text);
 }
 
+export const OPENCODE_CONFIG_FILES = ["opencode.jsonc", "opencode.json", "config.json"] as const;
+
 export function resolveOpencodeConfigFile(env: NodeJS.ProcessEnv): string {
     if (nonEmpty(env.OPENCODE_CONFIG)) return env.OPENCODE_CONFIG;
     const xdg = nonEmpty(env.XDG_CONFIG_HOME) ? env.XDG_CONFIG_HOME : path.join(os.homedir(), ".config");
-    return path.join(xdg, "opencode", "opencode.json");
+    // Mirror opencode's own discovery (globalConfigFile): first existing file, .jsonc preferred.
+    const dir = path.join(xdg, "opencode");
+    for (const file of OPENCODE_CONFIG_FILES) {
+        const candidate = path.join(dir, file);
+        if (fs.existsSync(candidate)) return candidate;
+    }
+    return path.join(dir, "opencode.jsonc");
 }
 
-export function readOpencodeConfig(file: string): OpencodeConfig {
-    let text: string;
-    try {
-        text = fs.readFileSync(file, "utf8");
-    } catch {
-        return { providers: {} };
-    }
+// opencode accepts JSONC (comments, trailing commas) in every config file; a strict
+// JSON.parse silently yields "no config" for .jsonc users.
+export function parseConfigText(text: string): Record<string, unknown> | undefined {
     let parsed: unknown;
     try {
         parsed = JSON.parse(text);
     } catch {
-        return { providers: {} };
+        const errors: ParseError[] = [];
+        parsed = parseJsonc(text, errors, { allowTrailingComma: true });
     }
+    if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) return parsed as Record<string, unknown>;
+    return undefined;
+}
+
+function readConfigFileRoot(file: string): Record<string, unknown> | undefined {
+    try {
+        return parseConfigText(fs.readFileSync(file, "utf8"));
+    } catch {
+        return undefined;
+    }
+}
+
+// Deep merge mirroring opencode's own loader (remeda mergeDeep): plain objects
+// recurse, arrays/primitives are replaced by the later file. Top-level spread
+// would drop earlier files' provider entries whenever a later file also has a
+// top-level provider key.
+function mergeConfigDeep(target: Record<string, unknown>, source: Record<string, unknown>): Record<string, unknown> {
+    const out: Record<string, unknown> = { ...target };
+    for (const [key, value] of Object.entries(source)) {
+        const existing = out[key];
+        out[key] =
+            value !== null && typeof value === "object" && !Array.isArray(value) &&
+            existing !== null && typeof existing === "object" && !Array.isArray(existing)
+                ? mergeConfigDeep(existing as Record<string, unknown>, value as Record<string, unknown>)
+                : value;
+    }
+    return out;
+}
+
+// Mirror opencode's global merge (config.json → opencode.json → opencode.jsonc,
+// later wins). Needed because opencode seeds a near-empty opencode.jsonc when no
+// config exists yet, so single-file reads miss the real config in opencode.json.
+// A user-set OPENCODE_CONFIG is layered ON TOP of that merge — opencode loads
+// the globals first and merges the explicit file over them, it does not replace
+// them — so providers living only in the global files stay visible.
+export function readOpencodeConfigRoot(env: NodeJS.ProcessEnv): Record<string, unknown> | undefined {
+    let root: Record<string, unknown> | undefined;
+    const xdg = nonEmpty(env.XDG_CONFIG_HOME) ? env.XDG_CONFIG_HOME : path.join(os.homedir(), ".config");
+    const dir = path.join(xdg, "opencode");
+    for (const file of ["config.json", "opencode.json", "opencode.jsonc"]) {
+        const next = readConfigFileRoot(path.join(dir, file));
+        if (next !== undefined) root = root === undefined ? next : mergeConfigDeep(root, next);
+    }
+    if (nonEmpty(env.OPENCODE_CONFIG)) {
+        const next = readConfigFileRoot(env.OPENCODE_CONFIG);
+        if (next !== undefined) root = root === undefined ? next : mergeConfigDeep(root, next);
+    }
+    return root;
+}
+
+export function parseOpencodeProviders(parsed: Record<string, unknown> | undefined): OpencodeConfig {
     const providers: Record<string, OpencodeProvider> = {};
-    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-        const root = parsed as Record<string, unknown>;
+    if (parsed !== undefined) {
+        const root = parsed;
         const provRoot = root.provider;
         if (provRoot && typeof provRoot === "object" && !Array.isArray(provRoot)) {
             for (const [name, value] of Object.entries(provRoot)) {
@@ -778,6 +978,10 @@ export function readOpencodeConfig(file: string): OpencodeConfig {
         }
     }
     return { providers };
+}
+
+export function readOpencodeConfig(file: string): OpencodeConfig {
+    return parseOpencodeProviders(readConfigFileRoot(file));
 }
 
 export function parseZcodeConfig(obj: unknown): ZcodeConfig {
@@ -824,12 +1028,13 @@ export function loadClientConfig(env: NodeJS.ProcessEnv, cwd: string): ClientCon
     const zcodeHome = nonEmpty(env.ZCODE_DATA_BASE_DIR) ? env.ZCODE_DATA_BASE_DIR : path.join(home, ".zcode");
     config.zcode = readZcodeConfig(zcodeHome);
     config.omp = readOmpConfig(resolveOmpHome(env));
-    config.opencode = readOpencodeConfig(resolveOpencodeConfigFile(env));
+    config.opencode = parseOpencodeProviders(readOpencodeConfigRoot(env));
     config.hermes = readHermesConfig(resolveHermesHome(env));
     config.dsh = readDshConfig(resolveDshHome(env));
     config.codebuddy = readCodebuddyConfig(resolveCodebuddyHome(env), cwd, env);
     config.qoder = readQoderConfig(resolveQoderHome(env), env);
     config.trae = readTraeConfig(env);
+    config.kimi = readKimiConfig(resolveKimiHome(env), env);
     return config;
 }
 
@@ -837,7 +1042,7 @@ export function loadClientConfig(env: NodeJS.ProcessEnv, cwd: string): ClientCon
  *  launched client's own declarations are authoritative (#436: launching
  *  `bili omp` with omp's models.yml declaring 131072 must not be overridden by
  *  another client's larger declaration for the same model id). */
-export type ModelWindowScope = "claude" | "codex" | "pi" | "omp" | "opencode" | "hermes" | "dsh" | "codebuddy" | "qoder" | "trae";
+export type ModelWindowScope = "claude" | "codex" | "pi" | "omp" | "opencode" | "hermes" | "dsh" | "codebuddy" | "qoder" | "trae" | "jcode" | "kimi";
 
 /** Collect per-model context windows from client configs the launcher can
  *  read (pi models.json, omp models.yml, opencode opencode.json, codex
@@ -860,6 +1065,7 @@ export function collectModelWindows(config: ClientConfig, scope?: ModelWindowSco
         else if (scope === "omp") for (const p of Object.values(config.omp?.providers ?? {})) add(p.models);
         else if (scope === "opencode") for (const p of Object.values(config.opencode?.providers ?? {})) add(p.models);
         else if (scope === "codebuddy") add(config.codebuddy?.models);
+        else if (scope === "kimi") add(config.kimi?.models);
         return out;
     }
     for (const p of Object.values(config.pi?.providers ?? {})) add(p.models);
@@ -867,5 +1073,6 @@ export function collectModelWindows(config: ClientConfig, scope?: ModelWindowSco
     for (const p of Object.values(config.opencode?.providers ?? {})) add(p.models);
     add(config.codex?.modelWindows);
     add(config.codebuddy?.models);
+    add(config.kimi?.models);
     return out;
 }

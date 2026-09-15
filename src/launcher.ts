@@ -12,6 +12,7 @@
  *   bili pi     [-- client args...]   HTTPS_PROXY + NODE_EXTRA_CA_CERTS
  *   bili codex  [-- client args...]   HTTPS_PROXY + SSL_CERT_FILE
  *   bili claude [-- client args...]   HTTPS_PROXY + NODE_EXTRA_CA_CERTS
+ *   bili kimi   [-- client args...]   HTTPS_PROXY + NODE_EXTRA_CA_CERTS (cert-MITM)
  *   bili test pi                      non-polluting pi smoke test
  *
  * The real upstream hosts are DISCOVERED by reading (never editing) the
@@ -31,9 +32,19 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-import { spawn, type StdioOptions } from "node:child_process";
+import { execFileSync, spawn, type StdioOptions } from "node:child_process";
 import { DEFAULT_MITM_DOMAINS } from "./mitm.js";
-import { isProxyInstanceFile, isPidAlive, readProxyInstanceFile, type ProxyInstanceFile } from "./instance.js";
+import {
+    claimStartingMarker,
+    clearStartingMarker,
+    isPidAlive,
+    isProxyInstanceFile,
+    readProxyInstanceFile,
+    readStartingMarker,
+    removeStartingMarker,
+    type ProxyInstanceFile,
+    type ProxyStartingMarker,
+} from "./instance.js";
 import { selfPackageRoot, isBiliPiEntry, ompPluginLoadedFrom } from "./plugin-install.js";
 
 /** Absolute path of a file inside our dist/, resolved via the package root
@@ -43,7 +54,7 @@ import { selfPackageRoot, isBiliPiEntry, ompPluginLoadedFrom } from "./plugin-in
 function selfDistFile(name: string): string {
     return path.join(selfPackageRoot(), "dist", name);
 }
-import { nonEmpty, resolvePiHome, resolveOmpHome, resolveDshHome, resolveCodexHome, loadClientConfig, collectModelWindows, type ClientConfig, type CodexConfig, resolveOpencodeConfigFile, type OpencodeConfig, type OpencodeProvider, type HermesConfig, type HermesProvider, qoderIsCnSite, QODER_DEFAULT_MODEL_HOSTS, resolveTraeHome, readTraeConfig, TRAE_DEFAULT_MODEL_HOSTS, type TraeConfig } from "./client-config.js";
+import { nonEmpty, resolvePiHome, resolveOmpHome, resolveDshHome, resolveCodexHome, loadClientConfig, collectModelWindows, type ClientConfig, type CodexConfig, resolveOpencodeConfigFile, readOpencodeConfigRoot, type OpencodeConfig, type OpencodeProvider, type HermesConfig, type HermesProvider, qoderIsCnSite, QODER_DEFAULT_MODEL_HOSTS, resolveTraeHome, readTraeConfig, TRAE_DEFAULT_MODEL_HOSTS, JCODE_DEFAULT_MODEL_HOSTS, type TraeConfig, resolveKimiHome, readKimiConfig, parseKimiToml, KIMI_DEFAULT_MODEL_HOSTS, type KimiConfig, type KimiProvider } from "./client-config.js";
 import { loadRoutes, resolveConfiguredContextLimit, lookupContextLimit, type ProviderRoutes } from "./config.js";
 import { contextFromRegistry } from "./registry.js";
 
@@ -79,9 +90,11 @@ export {
     resolveTraeHome,
     readTraeConfig,
     TRAE_DEFAULT_MODEL_HOSTS,
+    JCODE_DEFAULT_MODEL_HOSTS,
     type TraeConfig,
     resolveOpencodeConfigFile,
     readOpencodeConfig,
+    readOpencodeConfigRoot,
     type OpencodeConfig,
     type OpencodeProvider,
     type CodebuddyConfig,
@@ -93,17 +106,27 @@ export {
     qoderIsCnSite,
     QODER_DEFAULT_MODEL_HOSTS,
     type QoderConfig,
+    parseKimiToml,
+    readKimiConfig,
+    resolveKimiHome,
+    KIMI_DEFAULT_MODEL_HOSTS,
+    type KimiConfig,
+    type KimiProvider,
 } from "./client-config.js";
 
 export const LAUNCHER_DEFAULT_HOST = "127.0.0.1";
-export const LAUNCH_CLIENTS = ["pi", "codex", "claude", "omp", "opencode", "hermes", "dsh", "codebuddy", "qoder", "trae", "pi-test"] as const;
+export const LAUNCH_CLIENTS = ["pi", "codex", "claude", "omp", "opencode", "hermes", "dsh", "codebuddy", "qoder", "trae", "jcode", "kimi", "pi-test"] as const;
 export type ClientName = (typeof LAUNCH_CLIENTS)[number];
-export type BaseClientName = "claude" | "codex" | "pi" | "omp" | "opencode" | "hermes" | "dsh" | "codebuddy" | "qoder" | "trae";
+export type BaseClientName = "claude" | "codex" | "pi" | "omp" | "opencode" | "hermes" | "dsh" | "codebuddy" | "qoder" | "trae" | "jcode" | "kimi";
 
 const HEALTH_PATH = "/__bili/health";
 const HEALTH_POLL_INTERVAL_MS = 200;
 const SPAWN_WAIT_MS = 20000;
 const PROBE_TIMEOUT_MS = 1500;
+// #707: max age of a starting marker still treated as an in-progress bring-up.
+// A well-behaved starter resolves within SPAWN_WAIT_MS; the slack covers slow
+// disks and client teardown before it clears the marker.
+const STARTING_MARKER_TTL_MS = SPAWN_WAIT_MS + 30_000;
 
 const DEFAULT_MITM_DOMAIN_SET = new Set(DEFAULT_MITM_DOMAINS.map((d) => d.toLowerCase()));
 
@@ -209,9 +232,9 @@ export interface DiscoveredRoutes {
     httpRewrites: HttpRewrite[];
     httpsRewrites: HttpRewrite[];
     // Plaintext-http upstreams routed purely via HTTP_PROXY absolute-form
-    // forward-proxy requests (no URL rewriting). dsh-only today, and never
-    // loopback — dsh bypasses proxy envs for loopback targets unconditionally,
-    // so those ride httpRewrites instead (#535 phase 4).
+    // forward-proxy requests (no URL rewriting). dsh/kimi today, and never
+    // loopback — both bypass proxy envs for loopback targets unconditionally,
+    // so those ride httpRewrites instead (dsh: #535 phase 4; kimi: #757).
     httpEnvRoutes: string[];
 }
 
@@ -412,6 +435,57 @@ export function discoverRoutes(client: ClientName, config: ClientConfig): Discov
                 // Unparseable endpoint: skip.
             }
         }
+    } else if (client === "kimi") {
+        // #757: Kimi Code honors standard proxy envs for all outbound traffic
+        // EXCEPT an unconditional loopback NO_PROXY bypass (verified against
+        // the v0.42.0 binary), so only non-loopback upstreams can ride the
+        // proxy: https → cert MITM (host whitelisted below), plain http →
+        // absolute-form forward-proxy requests (httpEnvRoutes). Loopback
+        // destinations need a manual /bili/ prefix in config.toml — inventory
+        // only here, feeding the banner. Endpoints the user already wrapped
+        // (raw !== real) are skipped so they don't trigger the warning.
+        const kimiSeen = new Set<string>();
+        let anon = 0;
+        const kimiUrls: string[] = [];
+        for (const prov of Object.values(config.kimi?.providers ?? {})) {
+            if (nonEmpty(prov.baseUrl)) kimiUrls.push(prov.baseUrl!);
+        }
+        for (const raw of [...(config.kimi?.modelUrls ?? []), ...(config.kimi?.envUrls ?? [])]) {
+            kimiUrls.push(raw);
+        }
+        for (const raw of kimiUrls) {
+            const real = unwrapUpstream(raw);
+            try {
+                const url = new URL(real);
+                if (url.protocol !== "http:" && url.protocol !== "https:") continue;
+                if (kimiSeen.has(real)) continue;
+                kimiSeen.add(real);
+                if (isLoopbackHost(url.hostname)) {
+                    if (raw !== real) continue;
+                    anon += 1;
+                    rewriteKeys.add(`kimi-${anon}`);
+                    httpRewrites.push({ key: `kimi-${anon}`, realUpstream: real });
+                } else if (url.protocol === "https:") {
+                    const host = url.hostname.toLowerCase();
+                    if (host && !httpsSeen.has(host)) {
+                        httpsSeen.add(host);
+                        httpsDomains.push(host);
+                    }
+                } else if (!httpEnvRoutes.includes(real)) {
+                    httpEnvRoutes.push(real);
+                }
+            } catch {
+                // Unparseable endpoint: skip.
+            }
+        }
+        if (kimiUrls.length === 0) {
+            for (const h of KIMI_DEFAULT_MODEL_HOSTS) {
+                if (!httpsSeen.has(h)) {
+                    httpsSeen.add(h);
+                    httpsDomains.push(h);
+                }
+            }
+        }
     } else if (client === "qoder") {
         // #653: qoder's model endpoint scheme is hardcoded https with no
         // base-URL override env, so /bili/ rewrites cannot reach it — cert
@@ -439,6 +513,18 @@ export function discoverRoutes(client: ClientName, config: ClientConfig): Discov
         for (const h of hosts) {
             // MITM whitelist matches the port-less SNI hostname (isMitmHost), so
             // reduce host:port to its host or the entry never matches.
+            const host = h.split(":", 2)[0]!.toLowerCase();
+            if (host && !httpsSeen.has(host)) {
+                httpsSeen.add(host);
+                httpsDomains.push(host);
+            }
+        }
+    } else if (client === "jcode") {
+        // jcode keeps provider base URLs in ~/.jcode/config.toml; there is no
+        // TOML reader yet (add one for per-provider discovery). Whitelist the
+        // default zai coding endpoint so the proxy compresses that leg;
+        // loopback legs (local model servers, MCP) stay direct via NO_PROXY.
+        for (const h of JCODE_DEFAULT_MODEL_HOSTS) {
             const host = h.split(":", 2)[0]!.toLowerCase();
             if (host && !httpsSeen.has(host)) {
                 httpsSeen.add(host);
@@ -499,6 +585,19 @@ export function buildTraeEnv(origin: string, caPath: string, baseEnv: NodeJS.Pro
     // #655: trae is a Go binary like codex — the CA rides SSL_CERT_FILE (the
     // combined bundle, since it replaces Go's system trust store).
     return { ...baseEnv, HTTPS_PROXY: origin, SSL_CERT_FILE: caPath, BILLION_CONTEXT_PROXY: origin };
+}
+
+export function buildJcodeEnv(origin: string, caPath: string, baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+    // jcode is Rust reqwest: CA rides SSL_CERT_FILE (combined bundle).
+    // NO_PROXY keeps loopback legs (local model endpoints, MCP) direct.
+    return {
+        ...baseEnv,
+        HTTPS_PROXY: origin,
+        SSL_CERT_FILE: caPath,
+        BILLION_CONTEXT_PROXY: origin,
+        NO_PROXY: "localhost,127.0.0.1,::1",
+        no_proxy: "localhost,127.0.0.1,::1",
+    };
 }
 
 export function buildCodexArgs(
@@ -781,9 +880,11 @@ function isPrivateIPv4(host: string): boolean {
  *
  *  codebuddy is always excluded too: its `--mcp-config` compatibility is not
  *  yet verified against a real build, so v1 runs pure wire mode (the proxy
- *  injects the context tools on the wire). */
+ *  injects the context tools on the wire). kimi is excluded as well: its
+ *  mcp.json path is hardcoded in the binary with no ephemeral-config flag,
+ *  so v1 runs pure wire mode (#757). */
 export function launcherInjectMcp(env: NodeJS.ProcessEnv, base: string, codexUpstream?: string): boolean {
-    if (base === "pi" || base === "omp" || base === "opencode" || base === "hermes" || base === "dsh" || base === "codebuddy" || base === "qoder" || base === "trae") return false;
+    if (base === "pi" || base === "omp" || base === "opencode" || base === "hermes" || base === "dsh" || base === "codebuddy" || base === "qoder" || base === "trae" || base === "jcode" || base === "kimi") return false;
     if (env.BILI_LAUNCHER_PLUGIN === "0") return false;
     if (base === "codex" && env.BILI_LAUNCHER_PLUGIN === undefined && codexUpstream !== undefined && isPrivateUpstreamHost(codexUpstream)) {
         return false;
@@ -1528,32 +1629,51 @@ export function dshArgsWithPatch(args: readonly string[], patchFile: string): st
     return ["--patch", patchFile, ...args];
 }
 
+export function parseOpencodeMajor(output: string): number | undefined {
+    const m = /(\d+)\s*\./.exec(output);
+    return m ? parseInt(m[1], 10) : undefined;
+}
+
+const ocMajorCache = new Map<string, number>();
+
+/** Major version of an OpenCode CLI binary via `--version` (cached per path).
+ *  Probe failure defaults to 1 — the legacy file-path plugin injection that
+ *  OpenCode 1.x understands — so a broken probe can never break a launch. */
+export function opencodeMajorVersion(command: string): number {
+    const hit = ocMajorCache.get(command);
+    if (hit !== undefined) return hit;
+    let major = 1;
+    try {
+        const out = execFileSync(command, ["--version"], { timeout: 5000, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+        const parsed = parseOpencodeMajor(out);
+        if (parsed !== undefined) major = parsed;
+    } catch {}
+    ocMajorCache.set(command, major);
+    return major;
+}
+
 /**
  * opencode counterpart of preparePiHttpRewrite: write a full copy of the user's
- * opencode.json with the discovered providers' baseURL rewritten (HTTP →
- * /bili/ wrap, wrapped-HTTPS → raw https for cert MITM) into a temp dir, and
- * point OPENCODE_CONFIG at it. The real opencode.json is never touched.
- * Returns the temp config FILE path (undefined when there is nothing to do or
- * the config can't be parsed).
+ * (JSONC-tolerant, merged) config with the discovered providers' baseURL
+ * rewritten (HTTP → /bili/ wrap, wrapped-HTTPS → raw https for cert MITM) into
+ * a temp dir, and point OPENCODE_CONFIG at it. The real config files are never
+ * touched. With pluginDirMode (OpenCode 2.x), the plugin rides as a temp
+ * directory whose index.js re-exports pluginPath — 2.x rejects bare file paths
+ * in `plugin`. Returns the temp config FILE path (undefined when there is
+ * nothing to do).
  */
 export function prepareOpencodeHttpRewrite(
-    configFile: string,
+    userRoot: Record<string, unknown> | undefined,
     origin: string,
     httpRewrites: HttpRewrite[],
     httpsRewrites: HttpRewrite[],
     pluginPath?: string,
+    pluginDirMode?: boolean,
 ): string | undefined {
     if (httpRewrites.length === 0 && httpsRewrites.length === 0 && !pluginPath) return undefined;
-    let root: Record<string, unknown> = {};
-    try {
-        const txt = fs.readFileSync(configFile, "utf8");
-        const parsed = JSON.parse(txt);
-        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-            root = { ...(parsed as Record<string, unknown>) };
-        }
-    } catch {
-        // missing or invalid config — still emit a temp config so the plugin rides along
-    }
+    // deep-clone: the rewrite below mutates provider entries, and the caller's
+    // root (a merged read of the user's config) must stay pristine
+    const root: Record<string, unknown> = structuredClone(userRoot ?? {});
     const provRoot = root.provider;
     if (provRoot && typeof provRoot === "object" && !Array.isArray(provRoot)) {
         const providers = provRoot as Record<string, unknown>;
@@ -1570,12 +1690,28 @@ export function prepareOpencodeHttpRewrite(
         rewrite(httpRewrites, true);
         rewrite(httpsRewrites, false);
     }
-    if (pluginPath) {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "bili-opencode-"));
+    let pluginEntry = pluginPath;
+    if (pluginPath && pluginDirMode) {
+        const wrapDir = path.join(tmp, "plugin");
+        fs.mkdirSync(wrapDir);
+        fs.writeFileSync(path.join(wrapDir, "index.js"), `export { default } from ${JSON.stringify(pluginPath)};\n`);
+        pluginEntry = wrapDir;
+    }
+    if (pluginEntry) {
         const plugins = Array.isArray(root.plugin) ? root.plugin.filter((p): p is string => typeof p === "string") : [];
-        if (!plugins.includes(pluginPath)) plugins.push(pluginPath);
+        if (!plugins.includes(pluginEntry)) plugins.push(pluginEntry);
         root.plugin = plugins;
     }
-    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "bili-opencode-"));
+    // ACP owns compression in launcher mode: disable the host's native
+    // auto-compaction so it cannot destroy ACP-tagged context. The key is
+    // unknown (and ignored) on OpenCode 1.x, so this is safe on both
+    // generations; user-set fields (keep/buffer) survive via the merge.
+    const existingCompaction = root.compaction;
+    root.compaction = {
+        ...(existingCompaction && typeof existingCompaction === "object" && !Array.isArray(existingCompaction) ? existingCompaction as Record<string, unknown> : {}),
+        auto: false,
+    };
     const tmpFile = path.join(tmp, "opencode.json");
     fs.writeFileSync(tmpFile, JSON.stringify(root));
     return tmpFile;
@@ -1634,6 +1770,12 @@ async function fetchHealthInfoDefault(origin: string): Promise<HealthInfo | unde
     }
 }
 
+/** #707: the marker's owner must still be plausibly mid-bring-up — alive AND
+ *  young. A crashed starter leaves a dead-owner marker; a hung one ages out. */
+function isStartingMarkerActive(marker: ProxyStartingMarker, nowMs: number): boolean {
+    return isPidAlive(marker.pid) && nowMs - marker.startedAt < STARTING_MARKER_TTL_MS;
+}
+
 function instanceCompatible(inst: ProxyInstanceFile, opts: LaunchOptions): boolean {
     if (inst.host !== opts.host || inst.passthrough !== opts.passthrough) return false;
     const wantDomains = opts.mitmDomains ?? [];
@@ -1655,6 +1797,30 @@ async function probeExistingInstance(
     if (!health || !health.ok) return undefined;
     if (health.instanceId !== undefined && health.instanceId !== inst.instanceId) return undefined;
     return inst;
+}
+
+/** #707: wait for another launcher's in-flight bring-up to produce a live
+ *  instance. Bounded by SPAWN_WAIT_MS; breaks early when the starting marker
+ *  disappears (starter gave up / crashed). The final probe closes the
+ *  deadline-boundary sliver: the starter's own poll window ends ~now, and its
+ *  success path clears the marker — indistinguishable from a failure bail
+ *  without one last look. */
+async function waitForStarterInstance(
+    readInstance: () => ProxyInstanceFile | { origin: string } | undefined,
+    fetchHealthInfo: (origin: string) => Promise<HealthInfo | undefined>,
+    now: () => number,
+    sleepImpl: (ms: number) => Promise<void>,
+): Promise<ProxyInstanceFile | undefined> {
+    const deadline = now() + SPAWN_WAIT_MS;
+    let inst: ProxyInstanceFile | undefined;
+    while (now() < deadline) {
+        await sleepImpl(HEALTH_POLL_INTERVAL_MS);
+        inst = await probeExistingInstance(readInstance, fetchHealthInfo);
+        if (inst) break;
+        const still = readStartingMarker();
+        if (!still || !isStartingMarkerActive(still, now())) break;
+    }
+    return inst ?? (await probeExistingInstance(readInstance, fetchHealthInfo));
 }
 
 export function findFreePort(preferred: number, host = LAUNCHER_DEFAULT_HOST): Promise<number> {
@@ -1739,6 +1905,32 @@ export async function ensureProxyRunning(
         return { origin: existing.origin, port: existing.port, attached: true };
     }
 
+    // #707: cross-process startup window — another launcher may be mid-bring-up
+    // right now (its child hasn't bound yet, so no instance record exists and
+    // the attach above saw nothing). Wait for ITS instance instead of spawning
+    // a second writer over the same sessions dir. In-process dedup is separate
+    // (singleFlight, #706); this is the cross-process half.
+    const waitForOtherStarter = async (): Promise<ProxyHandle | undefined> => {
+        console.error("bili: another bili launch is bringing up a proxy — waiting for it instead of spawning a second");
+        const waited = await waitForStarterInstance(readInstance, fetchHealthInfo, now, sleepImpl);
+        if (waited && instanceCompatible(waited, opts)) {
+            console.error(`bili: attaching to running proxy at ${waited.origin} (pid ${waited.pid})`);
+            return { origin: waited.origin, port: waited.port, attached: true };
+        }
+        // starter failed/timed out (or incompatible config) — caller falls
+        // through and spawns itself, as before
+        return undefined;
+    };
+    const marker = readStartingMarker();
+    if (marker) {
+        if (!isStartingMarkerActive(marker, now())) {
+            removeStartingMarker();
+        } else {
+            const attached = await waitForOtherStarter();
+            if (attached) return attached;
+        }
+    }
+
     // #407: no probe-release-rebind. The child binds the preferred port
     // itself and retries on EADDRINUSE, reporting the real origin through
     // the instance file via this launchToken.
@@ -1752,75 +1944,105 @@ export async function ensureProxyRunning(
     if (!script) throw new Error("bili: cannot resolve launcher script path");
     const logPath = path.join(os.tmpdir(), `bili-proxy-${port}.log`);
     const logFd = fs.openSync(logPath, "a");
-    let child: SpawnChild;
+    // #707: publish the starting marker BEFORE spawning so concurrent launches
+    // wait for this bring-up instead of double-spawning. The O_EXCL claim is
+    // the cross-process arbiter: the read above is only a fast path, so a
+    // loser of the claim must re-check and wait instead of spawning blindly.
+    // Cleared on every terminal path below; a hard crash leaves a stale marker
+    // that the dead-owner/TTL check treats as inert.
+    const claimMarker = (): boolean =>
+        claimStartingMarker({ token: launchToken, pid: process.pid, host: opts.host, port, startedAt: now() });
+    let claimed = claimMarker();
+    if (!claimed) {
+        const holder = readStartingMarker();
+        if (holder && isStartingMarkerActive(holder, now())) {
+            // Lost the read→claim race to a live starter — honor its bring-up.
+            const attached = await waitForOtherStarter();
+            if (attached) return attached;
+            claimed = claimMarker();
+        } else {
+            // Stale or unreadable (crash mid-write): safe to remove — while any
+            // marker file exists, O_EXCL bars a newer claimant, so we cannot
+            // clobber a live coordinator. Retry once to take the slot.
+            removeStartingMarker();
+            claimed = claimMarker();
+        }
+        // Still unclaimed (unwritable state dir, or lost the retry race):
+        // degrade to pre-#707 behavior — spawn without coordinating.
+    }
     try {
-        child = spawnImpl(
-            process.execPath,
-            [script, ...proxyStartArgs({ ...opts, port })],
-            {
-                detached: true,
-                stdio: ["ignore", logFd, logFd],
-                env: {
-                    ...stripInheritedProxy(process.env),
-                    BILI_LAUNCH_TOKEN: launchToken,
-                    BILI_PARENT_PID: String(process.pid),
-                    ...(opts.mitmDomains && opts.mitmDomains.length
-                        ? { BILI_MITM_DOMAINS: opts.mitmDomains.join(",") }
-                        : {}),
-                    ...(opts.modelWindows && Object.keys(opts.modelWindows).length > 0
-                        ? { BILI_LAUNCHER_MODEL_WINDOWS: JSON.stringify(opts.modelWindows) }
-                        : {}),
-                },
-            },
-        );
-    } finally {
+        let child: SpawnChild;
         try {
-            fs.closeSync(logFd);
+            child = spawnImpl(
+                process.execPath,
+                [script, ...proxyStartArgs({ ...opts, port })],
+                {
+                    detached: true,
+                    stdio: ["ignore", logFd, logFd],
+                    env: {
+                        ...stripInheritedProxy(process.env),
+                        BILI_LAUNCH_TOKEN: launchToken,
+                        BILI_PARENT_PID: String(process.pid),
+                        ...(opts.mitmDomains && opts.mitmDomains.length
+                            ? { BILI_MITM_DOMAINS: opts.mitmDomains.join(",") }
+                            : {}),
+                        ...(opts.modelWindows && Object.keys(opts.modelWindows).length > 0
+                            ? { BILI_LAUNCHER_MODEL_WINDOWS: JSON.stringify(opts.modelWindows) }
+                            : {}),
+                    },
+                },
+            );
+        } finally {
+            try {
+                fs.closeSync(logFd);
+            } catch {}
+        }
+        try {
+            child.unref?.();
         } catch {}
-    }
-    try {
-        child.unref?.();
-    } catch {}
 
-    // #401/#480: fail fast when OUR spawned child dies before becoming
-    // healthy — otherwise a startup crash (bad config, missing upstream, …)
-    // burns the whole SPAWN_WAIT_MS poll window before erroring.
-    let childExit: { code: number | null; signal: string | null } | undefined;
-    child.on?.("exit", (...rest: unknown[]) => {
-        childExit = {
-            code: typeof rest[0] === "number" ? rest[0] : null,
-            signal: typeof rest[1] === "string" ? rest[1] : null,
-        };
-    });
+        // #401/#480: fail fast when OUR spawned child dies before becoming
+        // healthy — otherwise a startup crash (bad config, missing upstream, …)
+        // burns the whole SPAWN_WAIT_MS poll window before erroring.
+        let childExit: { code: number | null; signal: string | null } | undefined;
+        child.on?.("exit", (...rest: unknown[]) => {
+            childExit = {
+                code: typeof rest[0] === "number" ? rest[0] : null,
+                signal: typeof rest[1] === "string" ? rest[1] : null,
+            };
+        });
 
-    const deadline = now() + SPAWN_WAIT_MS;
-    while (now() < deadline) {
-        if (childExit) break;
-        await sleepImpl(HEALTH_POLL_INTERVAL_MS);
-        const inst = readInstance();
-        if (isProxyInstanceFile(inst) && inst.launchToken === launchToken) {
-            if (await probeHealth(inst.origin, fetchImpl)) {
-                return { origin: inst.origin, port: inst.port, child, logPath };
+        const deadline = now() + SPAWN_WAIT_MS;
+        while (now() < deadline) {
+            if (childExit) break;
+            await sleepImpl(HEALTH_POLL_INTERVAL_MS);
+            const inst = readInstance();
+            if (isProxyInstanceFile(inst) && inst.launchToken === launchToken) {
+                if (await probeHealth(inst.origin, fetchImpl)) {
+                    return { origin: inst.origin, port: inst.port, child, logPath };
+                }
+                continue;
             }
-            continue;
+            // Fallback for a child that cannot write the instance file (broken
+            // state dir) or an old pre-handshake binary: only trust the preferred
+            // origin when NO record vouches for it — a LIVE record's owner owns
+            // the discovery surface and our child is retry-binding elsewhere.
+            // A stale record (dead pid / legacy plain) cannot vouch for anything.
+            const stale = !isProxyInstanceFile(inst) || !isPidAlive(inst.pid);
+            if (stale && (await probeHealth(proxyOrigin(opts.host, port), fetchImpl))) {
+                return { origin: proxyOrigin(opts.host, port), port, child, logPath };
+            }
         }
-        // Fallback for a child that cannot write the instance file (broken
-        // state dir) or an old pre-handshake binary: only trust the preferred
-        // origin when NO record vouches for it — a LIVE record's owner owns
-        // the discovery surface and our child is retry-binding elsewhere.
-        // A stale record (dead pid / legacy plain) cannot vouch for anything.
-        const stale = !isProxyInstanceFile(inst) || !isPidAlive(inst.pid);
-        if (stale && (await probeHealth(proxyOrigin(opts.host, port), fetchImpl))) {
-            return { origin: proxyOrigin(opts.host, port), port, child, logPath };
+        if (childExit) {
+            const detail = childExit.code !== null
+                ? `code ${childExit.code}`
+                : childExit.signal ? `signal ${childExit.signal}` : "unknown reason";
+            throw new Error(`bili: proxy child exited before becoming healthy (${detail}) (log: ${logPath})`);
         }
+        throw new Error(`bili: proxy did not become healthy within ${SPAWN_WAIT_MS}ms (log: ${logPath})`);
+    } finally {
+        if (claimed) clearStartingMarker(launchToken);
     }
-    if (childExit) {
-        const detail = childExit.code !== null
-            ? `code ${childExit.code}`
-            : childExit.signal ? `signal ${childExit.signal}` : "unknown reason";
-        throw new Error(`bili: proxy child exited before becoming healthy (${detail}) (log: ${logPath})`);
-    }
-    throw new Error(`bili: proxy did not become healthy within ${SPAWN_WAIT_MS}ms (log: ${logPath})`);
 }
 
 export function stopProxy(handle: ProxyHandle): void {
@@ -1970,6 +2192,12 @@ export function resolveClientCommand(
             ?? resolveOnPath("trae", env);
         return { command: traeBin ?? "traecli", prefixArgs: [] };
     }
+    if (client === "kimi") {
+        // install.sh / npm postinstall both place the binary at <KIMI_CODE_HOME>/bin/kimi.
+        const resolved = resolveOnPath("kimi", env);
+        if (resolved) return { command: resolved, prefixArgs: [] };
+        return { command: path.join(resolveKimiHome(env), "bin", "kimi"), prefixArgs: [] };
+    }
     const resolved = resolveOnPath(client, env);
     return { command: resolved ?? client, prefixArgs: [] };
 }
@@ -2045,7 +2273,7 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
     const handle = await ensureProxyRunning({ host, port, passthrough, debug, mitmDomains: domains, modelWindows: collectModelWindows(config, base) }, deps);
     console.error(
         `bili: started proxy at ${handle.origin} (MITM domains: ${domains.length ? domains.join(", ") : "defaults"})` +
-            (routes.httpRewrites.length > 0 ? ` (HTTP /bili/ rewrites: ${routes.httpRewrites.length})` : "") +
+            ((base !== "kimi" && routes.httpRewrites.length > 0) ? ` (HTTP /bili/ rewrites: ${routes.httpRewrites.length})` : "") +
             (routes.httpsRewrites.length > 0 ? ` (HTTPS cert rewrites: ${routes.httpsRewrites.length})` : "") +
             (routes.httpEnvRoutes.length > 0 ? ` (HTTP proxy-env routes: ${routes.httpEnvRoutes.length})` : "") +
             (params.client === "pi-test" ? " (no extensions)" : ""),
@@ -2131,7 +2359,8 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         env = { ...process.env, HTTPS_PROXY: origin, NODE_EXTRA_CA_CERTS: ca, BILLION_CONTEXT_PROXY: origin };
         const opencodePlugin = selfDistFile("agent/opencode.js");
         const opencodePluginPath = opencodePlugin && fs.existsSync(opencodePlugin) ? opencodePlugin : undefined;
-        opencodeTmpFile = prepareOpencodeHttpRewrite(resolveOpencodeConfigFile(process.env), origin, routes.httpRewrites, routes.httpsRewrites, opencodePluginPath);
+        const ocDirMode = opencodePluginPath !== undefined && opencodeMajorVersion(resolveClientCommand("opencode", process.env).command) >= 2;
+        opencodeTmpFile = prepareOpencodeHttpRewrite(readOpencodeConfigRoot(process.env), origin, routes.httpRewrites, routes.httpsRewrites, opencodePluginPath, ocDirMode);
         if (opencodeTmpFile) env.OPENCODE_CONFIG = opencodeTmpFile;
     } else if (base === "hermes") {
         // #535 phase 2: file-free — no overlay HERMES_HOME, no config.yaml
@@ -2154,25 +2383,31 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
     } else if (base === "dsh") {
         // #535 phase 4: split by destination (see discoverRoutes). Non-loopback
         // upstreams ride the proxy envs — https via CONNECT + cert MITM
-        // (HTTPS_PROXY + SSL_CERT_FILE), plain-http via absolute-form forward-
-        // proxy requests (HTTP_PROXY). SSL_CERT_FILE gets the COMBINED bundle
-        // because it REPLACES dsh's trust store — system roots must survive for
-        // blind-tunneled hosts (same pattern as codex). The built-in
-        // deepseek-official route stays captured through $DEEPSEEK_BASE_URL
-        // (resolution order: settings baseURL ?? env ?? default, so a user
-        // setting wins and this env is the no-settings fallback). ONLY loopback
-        // destinations take the settings.yaml /bili/ rewrite below (persistent
-        // overlay DSH_HOME ~/.dsh-bili; real ~/.dsh never touched) — dsh
-        // bypasses proxy envs for loopback unconditionally. Proxy envs are set
-        // only when something actually routes through them, so a launch with
-        // no non-loopback custom providers behaves exactly as before.
+        // (HTTPS_PROXY + CA), plain-http via absolute-form forward-proxy
+        // requests (HTTP_PROXY). The COMBINED bundle goes to BOTH SSL_CERT_FILE
+        // (OpenSSL replace-semantics readers) and NODE_EXTRA_CA_CERTS (Node
+        // append-semantics readers): dsh is a Node program, but Windows' official
+        // Node ignores SSL_CERT_FILE and trusts only NODE_EXTRA_CA_CERTS (#710),
+        // so both must be set for the MITM CA to be trusted cross-platform. The
+        // combined bundle carries system roots, so blind-tunneled hosts still
+        // validate under either mechanism. The built-in deepseek-official route
+        // stays captured through $DEEPSEEK_BASE_URL (resolution order: settings
+        // baseURL ?? env ?? default, so a user setting wins and this env is the
+        // no-settings fallback). ONLY loopback destinations take the settings.yaml
+        // /bili/ rewrite below (persistent overlay DSH_HOME ~/.dsh-bili; real
+        // ~/.dsh never touched) — dsh bypasses proxy envs for loopback
+        // unconditionally. Proxy envs are set only when something actually routes
+        // through them, so a launch with no non-loopback custom providers behaves
+        // exactly as before.
         const usesProxyEnv = routes.httpsDomains.length > 0 || routes.httpEnvRoutes.length > 0;
         env = usesProxyEnv ? stripInheritedProxy(process.env) : { ...process.env };
         env.BILLION_CONTEXT_PROXY = origin;
         env.DEEPSEEK_BASE_URL = wrapUpstream(origin, "https://api.deepseek.com");
         if (usesProxyEnv) {
+            const caBundle = resolveCombinedCaPath(process.env);
             env.HTTPS_PROXY = origin;
-            env.SSL_CERT_FILE = resolveCombinedCaPath(process.env);
+            env.SSL_CERT_FILE = caBundle;
+            env.NODE_EXTRA_CA_CERTS = caBundle;
         }
         if (routes.httpEnvRoutes.length > 0) env.HTTP_PROXY = origin;
         // Session identity for the proxy: dsh's pi-ai stack keys its
@@ -2204,6 +2439,37 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         // settings rewrite above), so it exists on every profile dsh boots.
         const dshAcpPatch = writeDshAcpPatch(dshHomeDir);
         if (dshAcpPatch) clientArgs = dshArgsWithPatch(clientArgs, dshAcpPatch);
+    } else if (base === "kimi") {
+        // #757: cert-MITM like hermes/dsh — Kimi Code honors standard proxy
+        // envs for all outbound traffic EXCEPT an unconditional loopback
+        // NO_PROXY bypass (verified against the v0.42.0 binary). Non-loopback
+        // https rides CONNECT + cert MITM; non-loopback plain-http rides
+        // absolute-form forward-proxy requests. The COMBINED bundle goes to
+        // BOTH SSL_CERT_FILE (OpenSSL replace-semantics readers) and
+        // NODE_EXTRA_CA_CERTS (Node append-semantics readers; Windows' official
+        // Node ignores SSL_CERT_FILE, #710). Loopback endpoints are inventoried
+        // only — no rewrite channel exists without editing the user's
+        // config.toml. No budget env: kimi's native auto-compaction fires at
+        // W − reserved_context_size (~95% of window), which ACP compression
+        // (~55% once windows align via BILI_LAUNCHER_MODEL_WINDOWS) precedes.
+        const usesProxyEnv = routes.httpsDomains.length > 0 || routes.httpEnvRoutes.length > 0;
+        env = usesProxyEnv ? stripInheritedProxy(process.env) : { ...process.env };
+        if (usesProxyEnv) {
+            const caBundle = resolveCombinedCaPath(process.env);
+            env.HTTPS_PROXY = origin;
+            env.SSL_CERT_FILE = caBundle;
+            env.NODE_EXTRA_CA_CERTS = caBundle;
+            if (routes.httpEnvRoutes.length > 0) env.HTTP_PROXY = origin;
+        }
+        if (routes.httpRewrites.length > 0) {
+            console.error(
+                `bili: ${routes.httpRewrites.length} loopback endpoint(s) in ${resolveKimiHome(process.env)}/config.toml bypass Kimi Code's unconditional loopback NO_PROXY rule and will NOT go through the proxy — prefix their base_url with ${origin}/bili/ manually to compress them.`,
+            );
+        } else if (!usesProxyEnv) {
+            console.error(
+                `bili: no routable providers found in ${resolveKimiHome(process.env)}/config.toml — traffic will NOT go through the proxy (configure a provider first).`,
+            );
+        }
     } else if (base === "qoder") {
         // #653: cert-MITM only — the model endpoint scheme is hardcoded https
         // (no base-URL override env), so /bili/ rewrites cannot reach it.
@@ -2235,6 +2501,10 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         // proprietary /api/ide/v2/llm_raw_chat, recognized as OpenAI by the
         // proxy.
         env = buildTraeEnv(origin, resolveCombinedCaPath(process.env), stripInheritedProxy(process.env));
+    } else if (base === "jcode") {
+        // Rust reqwest honors HTTPS_PROXY + SSL_CERT_FILE; NO_PROXY keeps the
+        // loopback legs (unsloth endpoint, MCP) out of the proxy.
+        env = buildJcodeEnv(origin, resolveCombinedCaPath(process.env), stripInheritedProxy(process.env));
     } else if (base === "codex") {
         // Per-spawn conversation id for the MCP shell's headless
         // self-registration (codex provides no session id of its own).

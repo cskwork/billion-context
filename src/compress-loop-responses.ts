@@ -8,8 +8,9 @@ import { lastCompressSuffix, type Session } from "./session.js";
 import { parseCompressInput, PROXY_TOOL_NAMES, MUTATING_PROXY_TOOLS, COMPRESS_TOOL_NAME, ACP_TEXT_OPEN, ACP_TEXT_CLOSE } from "./compress-tool.js";
 import { log as loggerLog } from "./logger.js";
 import { applyRanges } from "./stream.js";
-import { resolveDecompress } from "./decompress-shared.js";
+import { executeSearchContext, resolveDecompress } from "./decompress-shared.js";
 import { buildVisibilityMarker } from "./compress-loop.js";
+import { hoistTrappedToolItems, type ToolPairItem } from "./tool-pair-order.js";
 import { MAX_LOOP_ROUNDS } from "./loop/index.js";
 import { stripResponsesText } from "./loop/tag-echo-filter.js";
 import { fetchWithRetry, UpstreamHttpError } from "./fetch-util.js";
@@ -91,17 +92,7 @@ function executeProxyTool(
         return resolveDecompress(args, ctx);
     }
     if (toolName === "search_context") {
-        const query = typeof args.query === "string" ? args.query : "";
-        if (query.length === 0) return "[search_context FAILED: query is required]";
-        const limit = typeof args.limit === "number" && args.limit > 0 ? Math.floor(args.limit) : 5;
-        const blocks = ctx.core.search(query, ctx.session.state).slice(0, limit);
-        if (blocks.length === 0) return `[No blocks matched "${query}"]`;
-        const lines = blocks.map((b) => {
-            const topic = b.topic ?? "(no topic)";
-            const preview = b.summary.length > 200 ? b.summary.slice(0, 200) + "..." : b.summary;
-            return `${b.blockId} (T${b.tier}) "${topic}"\n  ${preview}`;
-        });
-        return `Found ${blocks.length} block(s) for "${query}":\n\n${lines.join("\n\n")}`;
+        return executeSearchContext(args, ctx.core, ctx.session.state);
     }
     if (toolName === "acp_status") {
         return handleAcpStatus(args, ctx);
@@ -173,7 +164,16 @@ function surfaceReadonlyJson(
     }
     if (markers.length === 0) return current;
     const out = Array.isArray(current.output) ? [...(current.output as unknown[])] : [];
-    out.push({ type: "message", id: `msg_acp_ro_${Date.now()}_${markers.length}`, role: "assistant", content: [{ type: "output_text", text: markers.join("\n") }] });
+    const markerItem = { type: "message", id: `msg_acp_ro_${Date.now()}_${markers.length}`, role: "assistant", content: [{ type: "output_text", text: markers.join("\n") }] };
+    // #766: append AFTER a function_call wedges the marker between the call and
+    // its output once the client records it → strict backends reject ("No tool
+    // output found"). Insert before the first tool call so pairs stay adjacent.
+    let insertAt = out.length;
+    for (let i = 0; i < out.length; i++) {
+        const t = (out[i] as { type?: string })?.type;
+        if (t === "function_call" || t === "custom_tool_call") { insertAt = i; break; }
+    }
+    out.splice(insertAt, 0, markerItem);
     return { ...current, output: out };
 }
 
@@ -214,7 +214,7 @@ export async function compressLoopResponsesJson(
             ctx.log(`[acp-proxy: responses JSON ${call.name} → ${result.slice(0, 120).replace(/\n/g, " ")}]`);
             inputItems.push({ type: "message", role: "developer", content: buildVisibilityMarker(call.name, result) });
         }
-        requestBody.input = inputItems;
+        requestBody.input = hoistTrappedToolItems(inputItems as ToolPairItem[]);
         const result = await fetchWithRetry(requestOptions.url, {
             method: "POST",
             headers: requestOptions.headers,

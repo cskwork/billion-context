@@ -1,4 +1,4 @@
-import { test } from "node:test";
+import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import type { PathLike } from "node:fs";
@@ -6,7 +6,13 @@ type SymlinkKind = "dir" | "file" | "junction";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
-import type { ProxyInstanceFile as InstanceFile } from "../src/instance.ts";
+import {
+    claimStartingMarker,
+    readStartingMarker,
+    removeStartingMarker,
+    startingMarkerPath,
+    type ProxyInstanceFile as InstanceFile,
+} from "../src/instance.ts";
 import {
     LAUNCHER_DEFAULT_HOST,
     isLaunchClient,
@@ -22,6 +28,8 @@ import {
     buildClaudeEnv,
     buildCodexArgs,
     prepareOpencodeHttpRewrite,
+    opencodeMajorVersion,
+    parseOpencodeMajor,
     stripInheritedProxy,
     resolvePiHome,
     resolveOmpHome,
@@ -43,6 +51,8 @@ import {
     readTraeConfig,
     buildTraeEnv,
     TRAE_DEFAULT_MODEL_HOSTS,
+    buildJcodeEnv,
+    JCODE_DEFAULT_MODEL_HOSTS,
     resolveDshHome,
     prepareDshHome,
     writeDshAcpPatch,
@@ -52,6 +62,7 @@ import {
     prepareCodexMcpInjection,
     resolveCodexHome,
     readOpencodeConfig,
+    readOpencodeConfigRoot,
     resolveOpencodeConfigFile,
     findFreePort,
     ensureProxyRunning,
@@ -72,6 +83,10 @@ import {
     readCodebuddyConfig,
     parseCodebuddyModelsJson,
     resolveCodebuddyHome,
+    parseKimiToml,
+    readKimiConfig,
+    resolveKimiHome,
+    KIMI_DEFAULT_MODEL_HOSTS,
     type SpawnChild,
     type SpawnFn,
     runLaunch,
@@ -79,6 +94,16 @@ import {
     type HttpRewrite,
 } from "../src/launcher.ts";
 import { _setForTest as registrySetForTest, _resetForTest as registryResetForTest } from "../src/registry.ts";
+
+// ensureProxyRunning coordinates across processes via <state>/proxy-starting (#707)
+// — point the state dir at a throwaway so these tests never touch the real one.
+const prevXdgState = process.env.XDG_STATE_HOME;
+process.env.XDG_STATE_HOME = fs.mkdtempSync(path.join(os.tmpdir(), "bili-launcher-state-"));
+after(() => {
+    removeStartingMarker();
+    if (prevXdgState === undefined) delete process.env.XDG_STATE_HOME;
+    else process.env.XDG_STATE_HOME = prevXdgState;
+});
 
 test("isLaunchClient: pi/claude/codex/omp/opencode/pi-test true, others false", () => {
     assert.equal(isLaunchClient("pi"), true);
@@ -90,6 +115,8 @@ test("isLaunchClient: pi/claude/codex/omp/opencode/pi-test true, others false", 
     assert.equal(isLaunchClient("dsh"), true);
     assert.equal(isLaunchClient("trae"), true);
     assert.equal(isLaunchClient("qoder"), true);
+    assert.equal(isLaunchClient("jcode"), true);
+    assert.equal(isLaunchClient("kimi"), true);
     assert.equal(isLaunchClient("pi-test"), true);
     assert.equal(isLaunchClient("start"), false);
     assert.equal(isLaunchClient(""), false);
@@ -956,6 +983,287 @@ test("ensureProxyRunning: dead recorded pid is ignored (no attach)", async () =>
     assert.equal(spawnCalls, 1);
 });
 
+test("ensureProxyRunning: active starting marker → waits, then attaches instead of spawning (#707)", async () => {
+    try {
+        claimStartingMarker({ token: "starter-a", pid: process.pid, host: "127.0.0.1", port: 8788, startedAt: Date.now() });
+        let reads = 0;
+        const handle = await ensureProxyRunning(
+            { host: "127.0.0.1", port: 8787, passthrough: false, debug: false },
+            {
+                spawnImpl: () => {
+                    throw new Error("double-spawn: another launch was still bringing its proxy up");
+                },
+                fetchImpl: async () => ({ ok: true }),
+                fetchHealthInfo: async () => ({ ok: true, instanceId: "inst-9" }),
+                readInstanceFile: () => (reads++ < 2 ? undefined : recordedInstance({ instanceId: "inst-9", origin: "http://127.0.0.1:8788", port: 8788 })),
+                sleep: () => Promise.resolve(),
+            },
+        );
+        assert.equal(handle.attached, true);
+        assert.equal(handle.origin, "http://127.0.0.1:8788");
+    } finally {
+        removeStartingMarker();
+    }
+});
+
+test("ensureProxyRunning: stale starting marker (dead owner) → removed, then spawns (#707)", async () => {
+    try {
+        claimStartingMarker({ token: "starter-b", pid: 99999999, host: "127.0.0.1", port: 8789, startedAt: Date.now() });
+        let spawnCalls = 0;
+        const handle = await ensureProxyRunning(
+            { host: "127.0.0.1", port: 8787, passthrough: false, debug: false },
+            {
+                spawnImpl: () => {
+                    spawnCalls++;
+                    return makeFakeChild(42451);
+                },
+                fetchImpl: async () => ({ ok: true }),
+                readInstanceFile: () => undefined,
+                sleep: () => Promise.resolve(),
+            },
+        );
+        assert.equal(spawnCalls, 1);
+        assert.ok(handle.child);
+        assert.equal(readStartingMarker(), undefined);
+    } finally {
+        removeStartingMarker();
+    }
+});
+
+test("ensureProxyRunning: expired starting marker (hung owner) → spawns (#707)", async () => {
+    try {
+        claimStartingMarker({ token: "starter-c", pid: process.pid, host: "127.0.0.1", port: 8789, startedAt: Date.now() - 55_000 });
+        let spawnCalls = 0;
+        const handle = await ensureProxyRunning(
+            { host: "127.0.0.1", port: 8787, passthrough: false, debug: false },
+            {
+                spawnImpl: () => {
+                    spawnCalls++;
+                    return makeFakeChild(42452);
+                },
+                fetchImpl: async () => ({ ok: true }),
+                readInstanceFile: () => undefined,
+                sleep: () => Promise.resolve(),
+            },
+        );
+        assert.equal(spawnCalls, 1);
+        assert.ok(handle.child);
+        assert.equal(readStartingMarker(), undefined);
+    } finally {
+        removeStartingMarker();
+    }
+});
+
+test("ensureProxyRunning: waiter bails early when the starter clears its marker (#707)", async () => {
+    try {
+        claimStartingMarker({ token: "starter-d", pid: process.pid, host: "127.0.0.1", port: 8790, startedAt: Date.now() });
+        let sleeps = 0;
+        let spawnCalls = 0;
+        const t0 = Date.now();
+        const handle = await ensureProxyRunning(
+            { host: "127.0.0.1", port: 8787, passthrough: false, debug: false },
+            {
+                spawnImpl: () => {
+                    spawnCalls++;
+                    return makeFakeChild(42453);
+                },
+                fetchImpl: async () => ({ ok: true }),
+                readInstanceFile: () => undefined,
+                sleep: () => {
+                    if (++sleeps === 1) removeStartingMarker();
+                    return Promise.resolve();
+                },
+            },
+        );
+        assert.equal(spawnCalls, 1);
+        assert.ok(handle.child);
+        assert.ok(Date.now() - t0 < 2000, `early bail took ${Date.now() - t0}ms; must not burn the full wait window`);
+    } finally {
+        removeStartingMarker();
+    }
+});
+
+test("ensureProxyRunning: starter claims marker before spawning and clears it when done (#707)", async () => {
+    try {
+        let childToken = "";
+        let markerTokenAtSpawn: string | undefined;
+        const spawnImpl: SpawnFn = (_cmd, _args, options) => {
+            childToken = (options.env?.BILI_LAUNCH_TOKEN as string) ?? "";
+            markerTokenAtSpawn = readStartingMarker()?.token;
+            return makeFakeChild(42454);
+        };
+        const handle = await ensureProxyRunning(
+            { host: "127.0.0.1", port: 8787, passthrough: false, debug: false },
+            {
+                spawnImpl,
+                fetchImpl: async () => ({ ok: true }),
+                readInstanceFile: () => (childToken ? recordedInstance({ launchToken: childToken }) : undefined),
+                sleep: () => new Promise((r) => setTimeout(r, 0)),
+            },
+        );
+        assert.ok(childToken.length > 0);
+        assert.equal(markerTokenAtSpawn, childToken);
+        assert.ok(handle.child);
+        assert.equal(readStartingMarker(), undefined);
+    } finally {
+        removeStartingMarker();
+    }
+});
+
+test("ensureProxyRunning: starter clears marker when the child exits pre-bind (#707)", async () => {
+    try {
+        const child: SpawnChild = {
+            pid: 42455,
+            unref() {},
+            kill() {
+                return true;
+            },
+            on(event, listener) {
+                if (event === "exit") setImmediate(() => listener(1, null));
+                return undefined;
+            },
+        };
+        await assert.rejects(
+            ensureProxyRunning(
+                { host: "127.0.0.1", port: 8787, passthrough: false, debug: false },
+                {
+                    spawnImpl: () => child,
+                    fetchImpl: async () => ({ ok: false }),
+                    fetchHealthInfo: async () => undefined,
+                    readInstanceFile: () => undefined,
+                    sleep: () => new Promise((r) => setTimeout(r, 1)),
+                },
+            ),
+            /exited before becoming healthy/,
+        );
+        assert.equal(readStartingMarker(), undefined);
+    } finally {
+        removeStartingMarker();
+    }
+});
+
+test("ensureProxyRunning: incompatible bring-up (modelWindows) is not attached — spawns anyway (#707)", async () => {
+    try {
+        claimStartingMarker({ token: "starter-g", pid: process.pid, host: "127.0.0.1", port: 8791, startedAt: Date.now() });
+        let spawnCalls = 0;
+        let ticks = 0;
+        await assert.rejects(
+            ensureProxyRunning(
+                { host: "127.0.0.1", port: 8787, passthrough: false, debug: false, modelWindows: { m1: 100000 } },
+                {
+                    spawnImpl: () => {
+                        spawnCalls++;
+                        return makeFakeChild(42456);
+                    },
+                    fetchImpl: async () => ({ ok: false }),
+                    fetchHealthInfo: async () => ({ ok: true, instanceId: "inst-1" }),
+                    readInstanceFile: () => recordedInstance(),
+                    now: () => ticks * 1000,
+                    sleep: () => {
+                        ticks += 10;
+                        return Promise.resolve();
+                    },
+                },
+            ),
+            /did not become healthy/,
+        );
+        assert.equal(spawnCalls, 1);
+    } finally {
+        removeStartingMarker();
+    }
+});
+
+test("ensureProxyRunning: unreadable starting marker is self-healed — removed, slot re-claimed (#707)", async () => {
+    try {
+        fs.writeFileSync(startingMarkerPath(), "{{{garbage");
+        let spawnCalls = 0;
+        let childToken = "";
+        let markerTokenAtSpawn: string | undefined;
+        const spawnImpl: SpawnFn = (_cmd, _args, options) => {
+            spawnCalls++;
+            childToken = (options.env?.BILI_LAUNCH_TOKEN as string) ?? "";
+            markerTokenAtSpawn = readStartingMarker()?.token;
+            return makeFakeChild(42460);
+        };
+        const handle = await ensureProxyRunning(
+            { host: "127.0.0.1", port: 8787, passthrough: false, debug: false },
+            {
+                spawnImpl,
+                fetchImpl: async () => ({ ok: true }),
+                readInstanceFile: () => (childToken ? recordedInstance({ launchToken: childToken }) : undefined),
+                sleep: () => new Promise((r) => setTimeout(r, 0)),
+            },
+        );
+        assert.equal(spawnCalls, 1);
+        assert.ok(handle.child);
+        assert.equal(markerTokenAtSpawn, childToken, "re-claim after garbage removal carries our token");
+        assert.equal(readStartingMarker(), undefined, "marker cleared after success");
+    } finally {
+        removeStartingMarker();
+    }
+});
+
+test("ensureProxyRunning: instance appearing at the wait deadline is attached, not double-spawned (#707)", async () => {
+    try {
+        claimStartingMarker({ token: "starter-h", pid: process.pid, host: "127.0.0.1", port: 8792, startedAt: Date.now() });
+        let ticks = 0;
+        let reads = 0;
+        const handle = await ensureProxyRunning(
+            { host: "127.0.0.1", port: 8787, passthrough: false, debug: false },
+            {
+                spawnImpl: () => {
+                    throw new Error("double-spawn: instance appeared at the deadline");
+                },
+                fetchImpl: async () => ({ ok: true }),
+                fetchHealthInfo: async () => ({ ok: true, instanceId: "inst-b" }),
+                readInstanceFile: () =>
+                    reads++ < 3 ? undefined : recordedInstance({ instanceId: "inst-b", origin: "http://127.0.0.1:8792", port: 8792 }),
+                now: () => ticks * 1000,
+                sleep: () => {
+                    ticks += 10;
+                    return Promise.resolve();
+                },
+            },
+        );
+        assert.equal(handle.attached, true);
+        assert.equal(handle.origin, "http://127.0.0.1:8792");
+    } finally {
+        removeStartingMarker();
+    }
+});
+
+test("ensureProxyRunning: hung starter (marker never clears) is bounded — waits max twice, then spawns (#707)", async () => {
+    try {
+        claimStartingMarker({ token: "starter-j", pid: process.pid, host: "127.0.0.1", port: 8793, startedAt: Date.now() });
+        let spawnCalls = 0;
+        let ticks = 0;
+        await assert.rejects(
+            ensureProxyRunning(
+                { host: "127.0.0.1", port: 8787, passthrough: false, debug: false },
+                {
+                    spawnImpl: () => {
+                        spawnCalls++;
+                        return makeFakeChild(42461);
+                    },
+                    fetchImpl: async () => ({ ok: false }),
+                    fetchHealthInfo: async () => undefined,
+                    readInstanceFile: () => undefined,
+                    now: () => ticks * 1000,
+                    sleep: () => {
+                        ticks += 10;
+                        return Promise.resolve();
+                    },
+                },
+            ),
+            /did not become healthy/,
+        );
+        assert.equal(spawnCalls, 1, "bounded waits end in a spawn attempt, never an infinite loop");
+        assert.equal(readStartingMarker()?.token, "starter-j", "foreign marker left untouched");
+    } finally {
+        removeStartingMarker();
+    }
+});
+
 test("ensureProxyRunning: port 0 (no explicit --port) spawns on an OS-assigned ephemeral port (#446)", async () => {
     let spawnedArgs: string[] | null = null;
     const spawnImpl: SpawnFn = (_cmd, args) => {
@@ -1472,44 +1780,200 @@ test("discoverRoutes(opencode): HTTP baseURL → /bili/ rewrite, HTTPS → MITM 
     assert.deepEqual(routes.httpsDomains, ["open.bigmodel.cn"]);
 });
 
-test("prepareOpencodeHttpRewrite: writes rewritten copy, original untouched", () => {
+test("readOpencodeConfig: parses JSONC (comments + trailing commas)", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "oc-jsonc-"));
+    try {
+        const cfgFile = path.join(dir, "opencode.jsonc");
+        fs.writeFileSync(
+            cfgFile,
+            [
+                "{",
+                "    // opencode accepts JSONC in every config file",
+                '    "provider": {',
+                '        "local": {',
+                '            "options": { "baseURL": "http://127.0.0.1:18081/v1", },',
+                "        },",
+                "    },",
+                "}",
+            ].join("\n"),
+        );
+        const cfg = readOpencodeConfig(cfgFile);
+        assert.deepEqual(cfg.providers["local"], { baseURL: "http://127.0.0.1:18081/v1" });
+    } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("readOpencodeConfigRoot: merges config.json → opencode.json → opencode.jsonc, OPENCODE_CONFIG wins", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "oc-merge-"));
+    try {
+        const ocDir = path.join(dir, "opencode");
+        fs.mkdirSync(ocDir);
+        // opencode seeds a near-empty .jsonc when no config exists — the merge must
+        // still surface the real provider living in opencode.json (#796: single-file
+        // .jsonc-preference would miss it).
+        fs.writeFileSync(path.join(ocDir, "opencode.jsonc"), JSON.stringify({ $schema: "https://opencode.ai/config.json" }));
+        fs.writeFileSync(
+            path.join(ocDir, "opencode.json"),
+            JSON.stringify({
+                provider: {
+                    fromjson: { options: { baseURL: "http://from.json/v1" } },
+                    dup: { options: { baseURL: "http://dup-json/v1" }, models: { m: { limit: 4096 } } },
+                },
+            }),
+        );
+        fs.writeFileSync(path.join(ocDir, "config.json"), JSON.stringify({}));
+
+        const env = { XDG_CONFIG_HOME: dir };
+        const root = readOpencodeConfigRoot(env);
+        assert.ok(root);
+        assert.deepEqual((root.provider as Record<string, { options: { baseURL: string } }> | undefined)?.fromjson, { options: { baseURL: "http://from.json/v1" } } );
+
+        // later files win on conflicting keys; providers from earlier files survive
+        // a later file that also carries a top-level provider key (deep merge, like
+        // opencode's own loader — a top-level spread would drop them)
+        fs.writeFileSync(
+            path.join(ocDir, "opencode.jsonc"),
+            JSON.stringify({
+                provider: { wins: { options: { baseURL: "http://from.jsonc/v1" } }, dup: { options: { baseURL: "http://dup-jsonc/v1" } } },
+                $schema: "https://opencode.ai/config.json",
+            }),
+        );
+        const merged = readOpencodeConfigRoot(env);
+        const providers = (merged?.provider as Record<string, { options: { baseURL: string }; models?: Record<string, { limit: number }> }>) ?? {};
+        assert.equal(providers.wins?.options.baseURL, "http://from.jsonc/v1");
+        assert.equal(providers.fromjson?.options.baseURL, "http://from.json/v1");
+        assert.equal(providers.dup?.options.baseURL, "http://dup-jsonc/v1");
+        assert.deepEqual(providers.dup?.models, { m: { limit: 4096 } });
+
+        // OPENCODE_CONFIG layers over the global merge (opencode loads the globals
+        // first and merges the explicit file on top — it does not replace them)
+        const directFile = path.join(dir, "direct.json");
+        fs.writeFileSync(
+            directFile,
+            JSON.stringify({ provider: { direct: { options: { baseURL: "http://direct/v1" } }, wins: { options: { baseURL: "http://direct-wins/v1" } } } }),
+        );
+        const direct = readOpencodeConfigRoot({ XDG_CONFIG_HOME: dir, OPENCODE_CONFIG: directFile });
+        const directProviders = (direct?.provider as Record<string, { options: { baseURL: string } }>) ?? {};
+        assert.equal(directProviders.direct?.options.baseURL, "http://direct/v1");
+        assert.equal(directProviders.wins?.options.baseURL, "http://direct-wins/v1");
+        assert.equal(directProviders.fromjson?.options.baseURL, "http://from.json/v1");
+
+        assert.equal(readOpencodeConfigRoot({ XDG_CONFIG_HOME: path.join(dir, "empty-xdg") }), undefined);
+    } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("prepareOpencodeHttpRewrite: writes rewritten copy from a JSONC user config, original untouched", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "oc-rw-"));
     try {
-        const cfgFile = path.join(dir, "opencode.json");
-        const original = JSON.stringify({
-            plugin: ["opencode-acp@latest"],
-            provider: { "zhipuai-lb": { options: { baseURL: "http://127.0.0.1:18081/v1" } } },
-        });
+        const cfgFile = path.join(dir, "opencode.jsonc");
+        const original = [
+            "{",
+            "    // plugin list rides along",
+            '    "plugin": ["opencode-acp@latest"],',
+            '    "provider": { "zhipuai-lb": { "options": { "baseURL": "http://127.0.0.1:18081/v1" } } },',
+            "}",
+        ].join("\n");
         fs.writeFileSync(cfgFile, original);
+        // empty-xdg keeps this hermetic: OPENCODE_CONFIG layers over whatever
+        // lives in the global dir, so point that dir somewhere empty
+        const root = readOpencodeConfigRoot({ XDG_CONFIG_HOME: path.join(dir, "empty-xdg"), OPENCODE_CONFIG: cfgFile });
         const rw = [{ key: "zhipuai-lb", realUpstream: "http://127.0.0.1:18081/v1" }];
-        const tmpFile = prepareOpencodeHttpRewrite(cfgFile, "http://127.0.0.1:8787", rw, []);
+        const tmpFile = prepareOpencodeHttpRewrite(root, "http://127.0.0.1:8787", rw, []);
         assert.ok(tmpFile);
         const rewritten = JSON.parse(fs.readFileSync(tmpFile, "utf8"));
         assert.equal(rewritten.provider["zhipuai-lb"].options.baseURL, "http://127.0.0.1:8787/bili/http://127.0.0.1:18081/v1");
         assert.deepEqual(rewritten.plugin, ["opencode-acp@latest"]);
+        assert.deepEqual(rewritten.compaction, { auto: false });
         assert.equal(fs.readFileSync(cfgFile, "utf8"), original);
+        // the caller's merged root must stay pristine (rewrite happens on a clone)
+        assert.deepEqual(root, { plugin: ["opencode-acp@latest"], provider: { "zhipuai-lb": { options: { baseURL: "http://127.0.0.1:18081/v1" } } } });
         fs.rmSync(path.dirname(tmpFile), { recursive: true, force: true });
-        assert.equal(prepareOpencodeHttpRewrite(cfgFile, "http://127.0.0.1:8787", [], []), undefined);
-        const withPlugin = prepareOpencodeHttpRewrite(cfgFile, "http://127.0.0.1:8787", [], [], "/opt/bili/dist/agent/opencode.js");
+        assert.equal(prepareOpencodeHttpRewrite(root, "http://127.0.0.1:8787", [], []), undefined);
+        const withPlugin = prepareOpencodeHttpRewrite(root, "http://127.0.0.1:8787", [], [], "/opt/bili/dist/agent/opencode.js");
         assert.ok(withPlugin);
         const injected = JSON.parse(fs.readFileSync(withPlugin, "utf8"));
         assert.deepEqual(injected.plugin, ["opencode-acp@latest", "/opt/bili/dist/agent/opencode.js"]);
         assert.equal(injected.provider["zhipuai-lb"].options.baseURL, "http://127.0.0.1:18081/v1");
         fs.rmSync(path.dirname(withPlugin), { recursive: true, force: true });
-        const missingCfg = prepareOpencodeHttpRewrite(path.join(dir, "nope.json"), "http://127.0.0.1:8787", [], [], "/opt/bili/dist/agent/opencode.js");
+        const missingCfg = prepareOpencodeHttpRewrite(undefined, "http://127.0.0.1:8787", [], [], "/opt/bili/dist/agent/opencode.js");
         assert.ok(missingCfg);
         const fromEmpty = JSON.parse(fs.readFileSync(missingCfg, "utf8"));
         assert.deepEqual(fromEmpty.plugin, ["/opt/bili/dist/agent/opencode.js"]);
+        assert.deepEqual(fromEmpty.compaction, { auto: false });
         fs.rmSync(path.dirname(missingCfg), { recursive: true, force: true });
     } finally {
         fs.rmSync(dir, { recursive: true, force: true });
     }
 });
 
-test("resolveOpencodeConfigFile: OPENCODE_CONFIG wins, XDG fallback", () => {
+test("prepareOpencodeHttpRewrite: pluginDirMode wraps the plugin in an index.js shim dir", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "oc-rw2-"));
+    try {
+        const tmpFile = prepareOpencodeHttpRewrite({ provider: {} }, "http://127.0.0.1:8787", [], [], "/opt/bili/dist/agent/opencode.js", true);
+        assert.ok(tmpFile);
+        const injected = JSON.parse(fs.readFileSync(tmpFile, "utf8"));
+        const entry = injected.plugin[injected.plugin.length - 1];
+        assert.ok(entry !== "/opt/bili/dist/agent/opencode.js");
+        assert.ok(fs.statSync(entry).isDirectory());
+        const shim = fs.readFileSync(path.join(entry, "index.js"), "utf8");
+        assert.match(shim, /export \{ default \} from "\/opt\/bili\/dist\/agent\/opencode\.js";/);
+        assert.deepEqual(injected.compaction, { auto: false });
+        fs.rmSync(path.dirname(tmpFile), { recursive: true, force: true });
+    } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("opencodeMajorVersion: parses --version output, defaults to 1 on failure", () => {
+    assert.equal(parseOpencodeMajor("opencode v2.0.3"), 2);
+    assert.equal(parseOpencodeMajor("1.14.46"), 1);
+    assert.equal(parseOpencodeMajor("no digits here"), undefined);
+    assert.equal(opencodeMajorVersion("/nonexistent/bili-test-bin"), 1);
+    if (process.platform === "win32") return; // shebang fakes are not executable on Windows
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "oc-ver-"));
+    try {
+        const mk = (name: string, out: string): string => {
+            const f = path.join(dir, name);
+            fs.writeFileSync(f, `#!/bin/sh\necho "${out}"\n`);
+            fs.chmodSync(f, 0o755);
+            return f;
+        };
+        assert.equal(opencodeMajorVersion(mk("oc-v2.sh", "opencode v2.0.3")), 2);
+        assert.equal(opencodeMajorVersion(mk("oc-v1.sh", "1.14.46")), 1);
+    } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("resolveOpencodeConfigFile: OPENCODE_CONFIG wins; first existing file, .jsonc preferred", () => {
     assert.equal(resolveOpencodeConfigFile({ OPENCODE_CONFIG: "/tmp/x.json" }), "/tmp/x.json");
-    const p = resolveOpencodeConfigFile({ XDG_CONFIG_HOME: "/tmp/xdg" });
-    assert.ok(p.endsWith(path.join("opencode", "opencode.json")));
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "oc-res-"));
+    try {
+        const ocDir = path.join(dir, "opencode");
+        fs.mkdirSync(ocDir);
+        const env = { XDG_CONFIG_HOME: dir };
+        // none exists → .jsonc path (opencode's preferred file)
+        assert.ok(resolveOpencodeConfigFile(env).endsWith(path.join("opencode", "opencode.jsonc")));
+        // only .json → .json
+        const jsonFile = path.join(ocDir, "opencode.json");
+        fs.writeFileSync(jsonFile, "{}");
+        assert.equal(resolveOpencodeConfigFile(env), jsonFile);
+        // .jsonc appears → wins
+        const jsoncFile = path.join(ocDir, "opencode.jsonc");
+        fs.writeFileSync(jsoncFile, "{}");
+        assert.equal(resolveOpencodeConfigFile(env), jsoncFile);
+        // config.json is last
+        fs.rmSync(jsoncFile);
+        fs.rmSync(jsonFile);
+        const legacyFile = path.join(ocDir, "config.json");
+        fs.writeFileSync(legacyFile, "{}");
+        assert.equal(resolveOpencodeConfigFile(env), legacyFile);
+    } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
 });
 
 test("parseHermesYaml: v12 providers dict + legacy custom_providers list", () => {
@@ -1959,6 +2423,9 @@ test("runLaunch dsh: non-loopback upstreams ride proxy envs, loopback keeps the 
         // exclusion comes from its built-in policy, not from NO_PROXY.
         assert.equal(seenEnv.HTTPS_PROXY, origin);
         assert.ok(String(seenEnv.SSL_CERT_FILE).endsWith(path.join("billion-context", "ca", "combined-ca.pem")));
+        // #710: Windows official Node ignores SSL_CERT_FILE and reads only
+        // NODE_EXTRA_CA_CERTS — both must carry the combined bundle.
+        assert.ok(String(seenEnv.NODE_EXTRA_CA_CERTS).endsWith(path.join("billion-context", "ca", "combined-ca.pem")));
         assert.equal(seenEnv.HTTP_PROXY, undefined);
         assert.equal(seenEnv.NO_PROXY, undefined);
         // Loopback sglang stays on the /bili/ rewrite path via the persistent
@@ -3081,6 +3548,21 @@ test("buildTraeEnv: HTTPS_PROXY + SSL_CERT_FILE + BILLION_CONTEXT_PROXY, baseEnv
     assert.equal(env.FOO, "bar");
 });
 
+test("buildJcodeEnv: HTTPS_PROXY + SSL_CERT_FILE + BILLION_CONTEXT_PROXY + NO_PROXY loopback, baseEnv preserved", () => {
+    const env = buildJcodeEnv("http://127.0.0.1:8787", "/tmp/ca.pem", { FOO: "bar" });
+    assert.equal(env.HTTPS_PROXY, "http://127.0.0.1:8787");
+    assert.equal(env.SSL_CERT_FILE, "/tmp/ca.pem");
+    assert.equal(env.BILLION_CONTEXT_PROXY, "http://127.0.0.1:8787");
+    assert.equal(env.NO_PROXY, "localhost,127.0.0.1,::1");
+    assert.equal(env.no_proxy, "localhost,127.0.0.1,::1");
+    assert.equal(env.FOO, "bar");
+});
+
+test("discoverRoutes: jcode whitelists the default zai host for cert-MITM", () => {
+    const routes = discoverRoutes("jcode", {});
+    assert.deepEqual(routes.httpsDomains, [...JCODE_DEFAULT_MODEL_HOSTS]);
+});
+
 test("resolveClientCommand: trae resolves `traecli`, falls back to `trae-cli` then `trae`", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-trae-bin-"));
     try {
@@ -3151,6 +3633,210 @@ test("runLaunch trae: cert-MITM envs (SSL_CERT_FILE combined bundle), no budget/
         for (const h of TRAE_DEFAULT_MODEL_HOSTS) {
             assert.ok(mitm.includes(h), `whitelist has ${h}: ${mitm.join(",")}`);
         }
+    } finally {
+        process.exit = prevExit;
+        process.env.HOME = prevHome;
+        if (prevUserProfile === undefined) delete process.env.USERPROFILE;
+        else process.env.USERPROFILE = prevUserProfile;
+        if (prevBin === undefined) delete process.env.BILI_CLIENT_BIN;
+        else process.env.BILI_CLIENT_BIN = prevBin;
+        if (prevNoProxy === undefined) delete process.env.NO_PROXY;
+        else process.env.NO_PROXY = prevNoProxy;
+        fs.rmSync(home, { recursive: true, force: true });
+    }
+});
+
+test("parseKimiToml: providers/models/env channels (quoted names, overrides win, per-model base_url)", () => {
+    const toml = [
+        "# comment",
+        'default_model = "k3"',
+        "",
+        '[providers."managed:kimi-code"]',
+        'type = "kimi"',
+        'base_url = "https://api.kimi.com/coding/v1"',
+        "",
+        "[providers.local]",
+        "type = \"openai\"",
+        'base_url = "http://127.0.0.1:8199/v1"',
+        "",
+        "[providers.envonly]",
+        "type = \"openai\"",
+        "",
+        "[providers.envonly.env]",
+        'OPENAI_BASE_URL = "https://relay.example.com/v1"',
+        "",
+        "[models.k3]",
+        'provider = "managed:kimi-code"',
+        'model = "kimi-for-coding"',
+        "max_context_size = 1048576",
+        "",
+        "[models.k3.overrides]",
+        "max_context_size = 200000",
+        "",
+        "[models.local-m]",
+        'provider = "local"',
+        'model = "qwen3.8-27b"',
+        "max_context_size = 262144",
+        'base_url = "http://10.0.0.5:9000/v1"',
+        "",
+        "[models.nowin]",
+        'model = "x"',
+        "max_context_size = notanumber",
+    ].join("\n");
+    const cfg = parseKimiToml(toml);
+    assert.equal(cfg.defaultModel, "k3");
+    assert.equal(cfg.providers["managed:kimi-code"]?.baseUrl, "https://api.kimi.com/coding/v1");
+    assert.equal(cfg.providers.local?.baseUrl, "http://127.0.0.1:8199/v1");
+    assert.equal(cfg.providers.envonly?.baseUrl, "https://relay.example.com/v1");
+    assert.deepEqual(cfg.modelUrls, ["http://10.0.0.5:9000/v1"]);
+    assert.deepEqual(cfg.models, [
+        { id: "kimi-for-coding", contextWindow: 200000 },
+        { id: "qwen3.8-27b", contextWindow: 262144 },
+    ]);
+});
+
+test("readKimiConfig + resolveKimiHome: KIMI_CODE_HOME override, env channels, synthetic KIMI_MODEL window (#757)", () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-kimi-home-"));
+    try {
+        assert.equal(resolveKimiHome({ KIMI_CODE_HOME: "/tmp/kh" }), "/tmp/kh");
+        assert.ok(resolveKimiHome({}).endsWith(path.join(".kimi-code")));
+        assert.deepEqual(readKimiConfig(home, {}), { providers: {} });
+        fs.writeFileSync(
+            path.join(home, "config.toml"),
+            ['[providers.p]', 'base_url = "https://api.kimi.com/coding/v1"', "", "[models.m]", 'model = "kimi-for-coding"', "max_context_size = 1048576"].join("\n"),
+        );
+        const cfg = readKimiConfig(home, {
+            KIMI_MODEL_NAME: "synthetic-model",
+            KIMI_MODEL_MAX_CONTEXT_SIZE: "999999",
+            KIMI_MODEL_BASE_URL: "http://10.1.1.1:2/v1",
+            KIMI_CODE_BASE_URL: "https://api.kimi.ai/coding/v1",
+        } as NodeJS.ProcessEnv);
+        assert.deepEqual(cfg.envUrls, ["http://10.1.1.1:2/v1", "https://api.kimi.ai/coding/v1"]);
+        assert.deepEqual(cfg.models, [
+            { id: "kimi-for-coding", contextWindow: 1048576 },
+            { id: "synthetic-model", contextWindow: 999999 },
+        ]);
+        const defSize = readKimiConfig(home, { KIMI_MODEL_NAME: "m2" } as NodeJS.ProcessEnv);
+        assert.deepEqual(defSize.models, [
+            { id: "kimi-for-coding", contextWindow: 1048576 },
+            { id: "m2", contextWindow: 262144 },
+        ]);
+    } finally {
+        fs.rmSync(home, { recursive: true, force: true });
+    }
+});
+
+test("discoverRoutes: kimi — loopback inventory, https MITM whitelist, http proxy-env, wrapped skip (#757)", () => {
+    const config: ClientConfig = {
+        kimi: {
+            providers: {
+                local: { baseUrl: "http://127.0.0.1:8199/v1" },
+                remote: { baseUrl: "https://api.kimi.com/coding/v1" },
+                lan: { baseUrl: "http://10.0.0.5:1234/v1" },
+                wrapped: { baseUrl: "http://127.0.0.1:8787/bili/http://127.0.0.1:9999/v1" },
+            },
+            modelUrls: ["https://api.kimi.com/coding/v1", "::::"],
+            envUrls: ["http://10.0.0.5:1234/v1"],
+        },
+    };
+    const routes = discoverRoutes("kimi", config);
+    assert.deepEqual(routes.httpRewrites, [{ key: "kimi-1", realUpstream: "http://127.0.0.1:8199/v1" }]);
+    assert.deepEqual(routes.httpsDomains, ["api.kimi.com"]);
+    assert.deepEqual(routes.httpEnvRoutes, ["http://10.0.0.5:1234/v1"]);
+});
+
+test("discoverRoutes: kimi empty config → managed OAuth fallback hosts (#757)", () => {
+    const routes = discoverRoutes("kimi", {});
+    assert.deepEqual(routes.httpsDomains, KIMI_DEFAULT_MODEL_HOSTS);
+    assert.deepEqual(routes.httpRewrites, []);
+    assert.deepEqual(routes.httpEnvRoutes, []);
+});
+
+test("resolveClientCommand: kimi resolves `kimi` on PATH, falls back to <home>/bin/kimi (#757)", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-kimi-bin-"));
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-kimi-home-"));
+    const prevHome = process.env.HOME;
+    const prevUserProfile = process.env.USERPROFILE;
+    process.env.HOME = home;
+    if (prevUserProfile !== undefined) process.env.USERPROFILE = home;
+    try {
+        const env: NodeJS.ProcessEnv = { PATH: dir };
+        assert.deepEqual(resolveClientCommand("kimi", env), { command: path.join(home, ".kimi-code", "bin", "kimi"), prefixArgs: [] });
+        fs.writeFileSync(path.join(dir, "kimi"), "");
+        assert.deepEqual(resolveClientCommand("kimi", env), { command: path.join(dir, "kimi"), prefixArgs: [] });
+        const emptyDir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-kimi-empty-"));
+        assert.deepEqual(resolveClientCommand("kimi", { PATH: emptyDir, KIMI_CODE_HOME: "/tmp/kh" }), { command: path.join("/tmp/kh", "bin", "kimi"), prefixArgs: [] });
+        fs.rmSync(emptyDir, { recursive: true, force: true });
+    } finally {
+        if (prevHome === undefined) delete process.env.HOME;
+        else process.env.HOME = prevHome;
+        if (prevUserProfile === undefined) delete process.env.USERPROFILE;
+        else process.env.USERPROFILE = prevUserProfile;
+        fs.rmSync(dir, { recursive: true, force: true });
+        fs.rmSync(home, { recursive: true, force: true });
+    }
+});
+
+test("runLaunch kimi: cert-MITM envs (combined CA on SSL_CERT_FILE + NODE_EXTRA_CA_CERTS), discovered host whitelist, model windows (#757)", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-kimi-launch-"));
+    const prevHome = process.env.HOME;
+    const prevUserProfile = process.env.USERPROFILE;
+    const prevBin = process.env.BILI_CLIENT_BIN;
+    const prevNoProxy = process.env.NO_PROXY;
+    fs.mkdirSync(path.join(home, ".kimi-code"));
+    fs.writeFileSync(
+        path.join(home, ".kimi-code", "config.toml"),
+        ['default_model = "k3"', "", '[providers."managed:kimi-code"]', "type = \"kimi\"", 'base_url = "https://api.kimi.com/coding/v1"', "", "[models.k3]", 'model = "kimi-for-coding"', "max_context_size = 1048576"].join("\n"),
+    );
+    process.env.HOME = home;
+    if (prevUserProfile !== undefined) process.env.USERPROFILE = home;
+    const fakeKimi = path.join(home, process.platform === "win32" ? "fake-kimi.exe" : "fake-kimi");
+    fs.writeFileSync(fakeKimi, "");
+    process.env.BILI_CLIENT_BIN = fakeKimi;
+    process.env.NO_PROXY = "localhost,.corp";
+
+    const clientEnvs: (NodeJS.ProcessEnv | undefined)[] = [];
+    const proxyEnvs: (NodeJS.ProcessEnv | undefined)[] = [];
+    const spawnImpl: SpawnFn = (cmd, args, opts) => {
+        const env = (opts as { env?: NodeJS.ProcessEnv } | undefined)?.env;
+        if (cmd === fakeKimi) {
+            clientEnvs.push(env);
+            const child = makeFakeChild(0);
+            const orig = child.on.bind(child);
+            (child as { on: SpawnChild["on"] }).on = (event, listener) => {
+                orig(event, listener);
+                if (event === "exit") setTimeout(() => listener(0, null), 0);
+                return child;
+            };
+            return child;
+        }
+        proxyEnvs.push(env);
+        return makeFakeChild(42425);
+    };
+    const fetchImpl = async () => ({ ok: true });
+    const prevExit = process.exit;
+    process.exit = (() => undefined) as typeof process.exit;
+
+    try {
+        await runLaunch(
+            { client: "kimi", clientArgs: [], overrides: {} },
+            { fetchImpl, spawnImpl, sleep: () => Promise.resolve() },
+        );
+        assert.equal(clientEnvs.length, 1);
+        const seenEnv = clientEnvs[0]!;
+        const origin = seenEnv.HTTPS_PROXY;
+        assert.ok(/^http:\/\/127\.0\.0\.1:\d+$/.test(String(origin)), `origin: ${origin}`);
+        assert.ok(String(seenEnv.SSL_CERT_FILE).endsWith(path.join("billion-context", "ca", "combined-ca.pem")), String(seenEnv.SSL_CERT_FILE));
+        assert.equal(seenEnv.NODE_EXTRA_CA_CERTS, seenEnv.SSL_CERT_FILE, "combined bundle on both CA vars");
+        assert.equal(seenEnv.HTTP_PROXY, undefined, "no plain-http routes → no HTTP_PROXY");
+        assert.equal(seenEnv.NO_PROXY, undefined, "inherited NO_PROXY stripped");
+        assert.equal(seenEnv.BILLION_CONTEXT_PROXY, undefined, "kimi has no agent-side plugin consumer");
+        assert.ok(proxyEnvs.length > 0, "proxy child spawned");
+        const mitm = String(proxyEnvs[0]!.BILI_MITM_DOMAINS).split(",");
+        assert.ok(mitm.includes("api.kimi.com"), `whitelist has api.kimi.com: ${mitm.join(",")}`);
+        assert.ok(!mitm.includes("api.kimi.ai"), "explicit provider present → no managed fallback hosts");
+        const windows = String(proxyEnvs[0]!.BILI_LAUNCHER_MODEL_WINDOWS ?? "");
+        assert.ok(windows.includes("kimi-for-coding"), `windows: ${windows}`);
     } finally {
         process.exit = prevExit;
         process.env.HOME = prevHome;

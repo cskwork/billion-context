@@ -10,6 +10,17 @@ Any agent that can set a base URL — <em>zero per-agent adapter code</em>.
 
 ---
 
+
+## 📄 Paper / Preprint
+
+- **[Model-Driven Incremental Hierarchical Compression: Training-Free Multi-Generational Context Management for Long-Lived Coding Agents](./paper/model-driven-incremental-hierarchical-compression-training-free-multi-generational-context-management-for-long-lived-coding-agents.md)** (English, v0.2)
+
+> 📝 **The paper itself is open-sourced under the MIT License as part of the codebase (`paper/`). It is a living document — anyone may edit it; improvements are welcome via pull request.**
+
+A production-scale longitudinal study: 4.5 months, three hosts, 174,327 model calls, 18.76B cumulative input tokens (~24.7B across all hosts), zero window violations on 204,800-token models, marathon sessions of 8,584–12,049 calls.
+
+---
+
 <p align="center">
 <a href="https://www.npmjs.com/package/billion-context"><img src="https://img.shields.io/npm/v/billion-context.svg?style=flat-square" alt="npm"></a>
 <a href="https://github.com/ranxianglei/billion-context/blob/master/LICENSE"><img src="https://img.shields.io/npm/l/billion-context.svg?style=flat-square" alt="license"></a>
@@ -120,6 +131,17 @@ turn is a semantic mismatch the model tolerates (it is clearly marked
   summaries (their tool call isn't in the agent's history and the agent's view
   skips `acp_summary`) — but that needs the id match above, which doesn't occur.
 
+**Verifying that a compression actually landed.** After executing `compress`,
+the proxy emits a confirmation marker (`📦 [ACP] Compressed …`) as plain
+assistant text — but under sustained context pressure a model was observed
+*writing that marker format itself* without ever calling the tool (#717): 17
+fake "compressions" over ~2 hours while real usage climbed to 89%. A marker
+line visible in the transcript is therefore not proof of persistence — verify
+with `acp_status` (block count increased, compressible-range start advanced)
+before trusting it. As a backstop, the proxy strips any marker-shaped line the
+model emits on its own and logs a `[marker-echo]` warning, and both the nudge
+and the injected prompt state explicitly that markers are proxy-emitted only.
+
 
 ## Which do I need?
 
@@ -128,7 +150,8 @@ Pick by your client:
 | Client | Use |
 |---|---|
 | **pi** | [`billion-context-pi`](https://github.com/ranxianglei/billion-context-pi) (in-process extension) |
-| **opencode** | [`opencode-acp`](https://github.com/ranxianglei/opencode-acp) (in-process extension) |
+| **opencode 1.x** | [`opencode-acp`](https://github.com/ranxianglei/opencode-acp) (in-process extension, V1 plugin API) or `bili opencode` |
+| **opencode 2.0+** | `bili opencode` (built-in V2 plugin — native tools, no separate package) |
 | **omp** | [`billion-context`](https://github.com/ranxianglei/billion-context) via `bili omp` (built-in plugin) |
 | **everything else** (no context hook) | [`billion-context`](https://github.com/ranxianglei/billion-context) — `bili <client>` (launcher, preferred) or `/bili/` prefix |
 
@@ -164,7 +187,7 @@ rewrite until dsh gains a settings-path env or an upstream loopback opt-out.
 Overlay dirs created by older versions are left in place and never merged back
 into the real home.
 
-### Option 1 — Launcher (`bili pi` / `bili codex` / `bili claude` / `bili omp` / `bili opencode` / `bili hermes` / `bili dsh` / `bili codebuddy` / `bili qoder` / `bili trae`)
+### Option 1 — Launcher (`bili pi` / `bili codex` / `bili claude` / `bili omp` / `bili opencode` / `bili hermes` / `bili dsh` / `bili codebuddy` / `bili qoder` / `bili trae` / `bili jcode` / `bili kimi`)
 
 The launcher wraps a client in one command: it starts a proxy on an
 independent port (a fresh instance is always spawned — a port is never
@@ -180,12 +203,14 @@ bili pi                               # launch pi through the proxy — file-fre
 bili codex                            # launch codex through the proxy
 bili claude                           # launch claude through the proxy
 bili omp                              # pi-style, file-free (#535): env + extension registerProvider + compaction cancel, real ~/.omp untouched
-bili opencode                         # MITM for HTTPS + temp opencode.json (/bili/ for HTTP) + thin /acp plugin
+bili opencode                         # MITM for HTTPS + temp opencode.json (/bili/ for HTTP) + thin /acp plugin; OpenCode 2.0+: built-in V2 plugin with native bili tools, native compaction auto-disabled. Reads the user's opencode.jsonc / opencode.json / config.json (JSONC comments accepted, merged the same way opencode itself merges them)
 bili hermes                           # file-free (#535): hermes proxy env (HTTPS_PROXY + HERMES_CA_BUNDLE) — https via CONNECT MITM, http via absolute-form forward proxy; real ~/.hermes untouched
 bili dsh                              # deepseek-harness: non-loopback upstreams ride proxy envs (https MITM, http absolute-form), loopback keeps the overlay DSH_HOME (~/.dsh-bili) rewrite (#535), built-in deepseek route via DEEPSEEK_BASE_URL, native /acp command injected via --patch
 bili codebuddy                        # Tencent CodeBuddy Code CLI: CODEBUDDY_BASE_URL /bili/ rewrite (OpenAI chat completions wire), budget aligned via CODEBUDDY_AUTO_COMPACT_WINDOW; real ~/.codebuddy untouched
 bili qoder                            # qoder: model endpoint is hardcoded https (no /bili/ rewrite possible) — cert-MITM via HTTPS_PROXY + NODE_EXTRA_CA_CERTS, default model hosts whitelisted (#653)
 bili trae                             # Trae CLI (ByteDance, closed Go binary, no base-URL override) — cert-MITM via HTTPS_PROXY + SSL_CERT_FILE, model host from TRAE_CLI_API_HOST or the default enterprise gateway (#655)
+bili jcode                            # jcode (Rust agent harness) — env-only cert-MITM launch: HTTPS_PROXY + SSL_CERT_FILE, model host api.z.ai whitelisted, local loopback providers stay direct via NO_PROXY
+bili kimi                             # Kimi Code CLI (Moonshot): honors standard proxy envs for all traffic EXCEPT an unconditional loopback bypass — non-loopback https via cert-MITM (HTTPS_PROXY + NODE_EXTRA_CA_CERTS/SSL_CERT_FILE), non-loopback http via absolute-form forward proxy; provider/model hosts from ~/.kimi-code/config.toml (KIMI_CODE_HOME respected) or the managed OAuth endpoints when none declared; loopback endpoints inventoried with a manual /bili/ prefix hint (#757)
 bili pi --mitm-domain api.foo.com     # add a domain to the MITM whitelist
 ```
 
@@ -213,6 +238,68 @@ automatically.
 
 For per-client configuration examples (OpenCode, Codex, Pi, login-client
 MITM, …) see the web UI guide at [http://localhost:8787](http://localhost:8787).
+
+### OpenCode 2.0
+
+OpenCode 2.0 ships a new plugin API (`@opencode/plugin`); the standalone
+`opencode-acp` extension is V1-only and does not load under 2.0. Both bili
+modes work on 2.0. The 2.x plugin API surface is still moving between builds
+(adjacent npm `dev`-channel builds expose different `ctx` shapes), so the
+hook/tool details below are version-specific observations, not a stable
+contract:
+
+- **Launcher:** `bili opencode` works unchanged. On a 2.x host it injects the
+  built-in V2 plugin (`dist/agent/opencode.js`) into the temp config as a temp
+  wrapper directory whose `index.js` re-exports the plugin file — 2.x rejects
+  bare file paths in the config `plugin` array (directory entries use
+  `index.js` as entrypoint); 1.x hosts get the bare file path. Host generation
+  is detected with a `--version` probe (a failed probe defaults to the 1.x
+  shape). The V2 plugin registers the bili tools natively in-host — compress /
+  decompress / search_context / acp_status (+ absorb), JSON-Schema inputs — and
+  stamps the proxy headers on every outgoing provider request, so compression
+  runs in plugin mode with no wire-level tool injection. Native auto-compaction
+  is disabled automatically (`compaction.auto: false`). Every registration is
+  defensive (optional chaining): on any 2.x build where a seam is missing or
+  never fires, the plugin stays inert and the session transparently runs in
+  plain proxy mode (wire-level tool injection) instead of breaking — observed
+  on two adjacent `dev` builds (2026-09-13 / 2026-09-14) whose API surfaces
+  differ from each other (#754 review probes); conversely verified end-to-end
+  on `@opencode/cli` 2.0.3 (native `acp_status` executed through the plugin
+  endpoint, zero wire-level injection).
+- **Pure proxy:** point the provider baseURL at the proxy like any other
+  client:
+
+  ```json
+  {
+    "provider": {
+      "myprovider": {
+        "npm": "@ai-sdk/openai-compatible",
+        "options": {
+          "baseURL": "http://localhost:8787/bili/http://upstream.example/v1",
+          "apiKey": "sk-any"
+        }
+      }
+    }
+  }
+  ```
+
+  Note: 2.0 AI-SDK providers require an `apiKey` field even for local
+  endpoints that never check it — set any non-empty value.
+
+Caveats: the 2.x line publishes as npm package `@opencode/cli`. Command
+support is build-dependent: one pre-release exposed only
+list/get/update/remove, while 2.0.x stable lets plugins ADD commands via
+`ctx.command.transform((editor) => editor.add(...))` — invocable in the TUI by
+accepting the slash-menu completion (Tab + Enter); note `opencode run` mode
+dispatches no slash commands at all (they pass through to the model). The
+bundled plugin deliberately registers no commands on either shape — call the
+`acp_status` tool instead of an `/acp` command. The bundled agent file keeps
+the V1 `server()` export alongside the V2 `setup()`, so the same artifact also
+loads on hosts ≥ 1.18.29 that support dual-shape plugins. Design note: the V2 plugin is a thin protocol client (no
+acp-kernel inside) because the proxy stays the single compression authority,
+which eliminates kernel-version drift between agent and proxy — it does not
+rely on the plugin API being unable to mutate context (that capability varies
+by 2.x build).
 
 ### Verify
 

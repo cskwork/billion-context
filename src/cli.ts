@@ -29,31 +29,7 @@ import { runMcpStdio } from "./mcp.js";
 import { PLUGIN_AGENTS, isPluginAgent, pluginInstall, pluginRemove, pluginStatusAll, type PluginAgent } from "./plugin-install.js";
 import { runLaunch, runTestPi, isLaunchClient, type ClientName } from "./launcher.js";
 import { exportSession } from "./export.js";
-import { readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
-import path from "node:path";
-
-const VERSION = (() => {
-    try {
-        // Works in both dev (tsx: src/cli.ts → ../package.json) and bundled
-        // (tsup: dist/index.js → ../package.json).
-        const here = fileURLToPath(import.meta.url);
-        const pkg = path.join(path.dirname(here), "..", "package.json");
-        return (JSON.parse(readFileSync(pkg, "utf8")).version as string) ?? "dev";
-    } catch {
-        return "dev";
-    }
-})();
-
-const PACKAGE_NAME = (() => {
-    try {
-        const here = fileURLToPath(import.meta.url);
-        const pkg = path.join(path.dirname(here), "..", "package.json");
-        return (JSON.parse(readFileSync(pkg, "utf8")).name as string) ?? "billion-context";
-    } catch {
-        return "billion-context";
-    }
-})();
+import { VERSION, PACKAGE_NAME } from "./version.js";
 
 const HELP = `bili ${VERSION} — billion-context proxy
 
@@ -70,6 +46,8 @@ Usage:
   bili codebuddy [opts --] [args]  start a proxy + launch codebuddy against it (/bili/ rewrite)
   bili qoder [opts --] [args]      start a proxy + launch qoder against it (cert-MITM)
   bili trae [opts --] [args]       start a proxy + launch Trae CLI against it (cert-MITM)
+  bili jcode [opts --] [args]      start a proxy + launch jcode against it (cert-MITM)
+  bili kimi [opts --] [args]       start a proxy + launch Kimi Code against it (cert-MITM)
   bili test pi                     non-polluting pi smoke test through the proxy
   bili export [session] [--full]   list sessions / export one as a Markdown handoff
                                     (--full includes original messages; --output FILE)
@@ -84,12 +62,12 @@ Usage:
   bili --version                   print version
   bili --help                      show this help
 
-Launcher (bili pi / bili codex / bili claude / bili omp / bili opencode / bili hermes / bili dsh / bili codebuddy / bili qoder / bili trae):
+Launcher (bili pi / bili codex / bili claude / bili omp / bili opencode / bili hermes / bili dsh / bili codebuddy / bili qoder / bili trae / bili jcode / bili kimi):
   Brings up a proxy on an independent port (a fresh instance every launch), then runs the client pointed at it via HTTPS_PROXY + the proxy's
   MITM CA — no config-file edits. Discovered HTTPS upstream domains are
   auto-whitelisted for MITM so the proxy TLS-terminates exactly the hosts the
   client uses; HTTP / localhost providers go direct. pi/claude/qoder trust the CA
-  via NODE_EXTRA_CA_CERTS, codex/trae via SSL_CERT_FILE. Proxy killed on client exit.
+  via NODE_EXTRA_CA_CERTS, codex/trae/jcode via SSL_CERT_FILE. Proxy killed on client exit.
   bili flags (-F, --mitm-domain, --port, ...) must precede the client name;
   everything after the client name is passed through to the client.
     bili pi                               # launch pi through the proxy
@@ -103,6 +81,8 @@ Launcher (bili pi / bili codex / bili claude / bili omp / bili opencode / bili h
     bili codebuddy                        # launch codebuddy through the proxy (CODEBUDDY_BASE_URL /bili/ rewrite)
     bili qoder                            # launch qoder through the proxy (cert-MITM; model endpoint is hardcoded https, so no /bili/ rewrite)
     bili trae                             # launch Trae CLI through the proxy (cert-MITM; model host via TRAE_CLI_API_HOST or --mitm-domain)
+    bili jcode                            # launch jcode through the proxy (cert-MITM; zai leg whitelisted by default)
+    bili kimi                             # launch Kimi Code through the proxy (cert-MITM; provider/model hosts from ~/.kimi-code/config.toml or the managed OAuth endpoints)
     bili test pi                          # quick end-to-end check of the pi path
     bili --mitm-domain api.foo.com pi     # add a domain to the MITM whitelist (flags precede the client)
     bili -F http://127.0.0.1:7897 codex   # route bili's upstream through a proxy (gost-style -F)

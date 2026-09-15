@@ -6,6 +6,8 @@ import { log as loggerLog } from "./logger.js";
 import { validateHttpProxy, type ProxyFallbackOptions } from "./upstream-proxy.js";
 
 import { parseCompatRoles } from "./compat-roles.js";
+import type { ImageBillingMode } from "./image-tokens.js";
+import type { ReasoningGuardConfig } from "./reasoning-guard.js";
 
 export function safeReadJson(path: string): unknown {
     try {
@@ -56,6 +58,12 @@ export type ProviderRoute = {
      *  verbatim, no session state. For upstreams whose anti-cheat fingerprints
      *  the request body (e.g. ZCode 405/3012). */
     passthrough?: boolean;
+    /** Per-provider image billing mode (#767): "bytes" = ceil(base64/4)
+     *  (conservative, matches byte-counting relays); "pixels" = dimension-
+     *  based tile estimate (matches first-party pixel-tile upstreams);
+     *  "auto" (default) classifies known first-party pixel hosts. Wins over
+     *  the global `imageBilling`; env BILI_IMAGE_BILLING wins over both. */
+    imageBilling?: ImageBillingMode;
 };
 export type ProviderRoutes = Record<string, ProviderRoute>; // key = upstream URL prefix (the /bili/<this> string)
 
@@ -124,13 +132,21 @@ export type CompressSettings = {
      *  fields are LOAD-BEARING: the kernel rules were tuned in production and
      *  overriding them can degrade summary quality (lost paths / signatures /
      *  decisions → broken retrieval). Ignored unless `acknowledgePromptsRisk`
-     *  is also true at the winning level. Same three-level merge as the other
+     *  resolves to `true` after the merge (the flag merges independently,
+     *  deepest defined level wins — no co-location with this block required).
+     *  Same three-level merge as the other
      *  fields, but the object is merged via kernel `resolvePrompts` (non-string
      *  fields silently dropped), not a raw pass-through. */
     prompts?: Partial<Prompts>;
     /** Must be true for `prompts` overrides to take effect. Acknowledges the
      *  summary-quality risk documented on `prompts`. */
     acknowledgePromptsRisk?: boolean;
+    /** Named prompt pack (kernel pack registry): a curated surface preset —
+     *  tool descriptions, system-prompt sections, nudge sections — resolved
+     *  from [project `./.billion-context/packs` > user `<configDir>/packs` >
+     *  builtin (`default`, `lean`)]. Deepest-wins like every other field;
+     *  unknown names fall back to the identity surface. Kernel >= 0.0.66. */
+    promptPack?: string;
     /** Instant tool-result absorption (kernel absorb API, acp-kernel >= 0.0.54).
      *  When `enabled`, eligible large tool results carry a forced [ACP absorb]
      *  instruction and the model distills them via the injected `absorb` tool;
@@ -181,6 +197,15 @@ export type CompressSettings = {
          *  dropped (default 2048). */
         threshold?: number;
     };
+    /** [#739] Opt-in guard against gpt-5.x/gpt-6.x "lattice" reasoning truncation
+     *  (reasoning stops at exactly base*n+offset tokens, default 518n-2 -> 516,
+     *  1034, ..., mid-thought). When engaged on a matched-model terminal round that
+     *  hits the lattice AND carries an encrypted_content blob, bili buffers the
+     *  response, replays its own reasoning plus a continue nudge (up to maxContinue
+     *  rounds), and folds to ONE response with true summed usage. Merged sub-field-wise
+     *  across the three levels like `absorb`/`reasoning`; off unless enabled at some
+     *  level. See src/reasoning-guard.ts. */
+    reasoningGuard?: ReasoningGuardConfig;
 };
 export type PromptCacheRouting = "auto" | "enabled" | "disabled";
 export type UpstreamProxyMode = "auto" | "manual" | "direct";
@@ -211,8 +236,16 @@ const CONTEXT_LIMIT_TABLE: Array<{ match: RegExp; limit: number }> = [
 
 export function lookupContextLimit(model: string | undefined): number | undefined {
     if (!model) return undefined;
-    for (const entry of CONTEXT_LIMIT_TABLE) {
-        if (entry.match.test(model)) return entry.limit;
+    // Relay/vLLM deployments serve models under "prefix/name" ids that miss
+    // every ^-anchored pattern ("meta-llama/Llama-4" vs /^llama-/i). Try the
+    // bare basename too; the full name keeps precedence (#736).
+    const roots = [model];
+    const slash = model.lastIndexOf("/");
+    if (slash > 0 && slash < model.length - 1) roots.push(model.slice(slash + 1));
+    for (const root of roots) {
+        for (const entry of CONTEXT_LIMIT_TABLE) {
+            if (entry.match.test(root)) return entry.limit;
+        }
     }
     return undefined;
 }
@@ -304,6 +337,9 @@ export type ProxyOptions = {
      *  forwarded body for upstreams without the developer role (#552). Empty =
      *  byte-for-byte transparent. */
     compat: { roles: Record<string, string> };
+    /** Global-level image billing mode (#767); per-provider route entries
+     *  override it, env BILI_IMAGE_BILLING overrides both. undefined = auto. */
+    imageBilling?: ImageBillingMode;
     sessionHeader: string;
     log: boolean;
     debug: boolean;
@@ -316,15 +352,6 @@ export type ProxyOptions = {
     autoUpdate: boolean;
     /** Dist-tag channel the auto-updater follows (default "latest"). */
     updateTag: string;
-    /** #408 host-usage backfill mode. "auto" (default) = the uncompressed-
-     *  baseline backfill is armed for plain proxy clients (the bili-launched
-     *  pi/omp extensions are exempted — their host compaction is cancelled, so
-     *  the baseline drives nothing on the host side). "off" = never backfill —
-     *  the usage reported to the host is the actually-forwarded (folded)
-     *  request, matching [acp-usage] input= (#648: plain anthropic proxy
-     *  clients like ZCode otherwise show a cumulative, drifting baseline that
-     *  overstates real context pressure). */
-    hostUsageCredit: "auto" | "off";
     logFile?: string;
     /** MITM transparent-proxy mode. When enabled, an HTTP CONNECT handler is
      *  attached so clients that only know how to set HTTP_PROXY (ZCode with a
@@ -455,6 +482,7 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
             routing: parsePromptCacheRouting(env.ACP_PROMPT_CACHE_ROUTING ?? fileConfig.promptCache?.routing),
         },
         compat: { roles: parseCompatRoles(fileConfig.compat?.roles) ?? {} },
+        imageBilling: parseImageBilling(fileConfig.imageBilling),
         sessionHeader: env.ACP_SESSION_HEADER ?? fileConfig.sessionHeader ?? "x-acp-session",
         log: env.ACP_LOG !== "0" && fileConfig.log !== false,
         debug: (env.ACP_DEBUG ?? (fileConfig.debug ? "1" : "0")) === "1",
@@ -462,7 +490,6 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
         passthrough: passthrough.enabled,
         passthroughSource: passthrough.source,
         autoUpdate: (env.ACP_AUTO_UPDATE ?? (fileConfig.autoUpdate === false ? "0" : "1")) !== "0",
-        hostUsageCredit: parseHostUsageCredit(env.BILI_HOST_USAGE_CREDIT ?? fileConfig.hostUsageCredit),
         updateTag: (env.ACP_UPDATE_TAG ?? fileConfig.updateTag ?? "latest").trim() || "latest",
         logFile: env.ACP_LOG_FILE !== undefined ? (env.ACP_LOG_FILE || undefined) : fileConfig.logFile,
         mitm: {
@@ -497,7 +524,6 @@ type FileConfig = {
     autoUpdate?: boolean;
     /** Dist-tag channel the auto-updater follows (default "latest"). */
     updateTag?: string;
-    hostUsageCredit?: "auto" | "off";
     upstreamProxy?: string;
     upstreamProxyMode?: string;
     logFile?: string;
@@ -512,6 +538,10 @@ type FileConfig = {
      *  upstreams accept (e.g. `{"developer":"system"}`) — applied to the
      *  final forwarded body for openai/responses requests (#552). */
     compat?: { roles?: Record<string, string> };
+    /** Global image billing mode (#767): "auto" | "pixels" | "bytes".
+     *  Per-provider `imageBilling` overrides it; env BILI_IMAGE_BILLING wins
+     *  over both. See ProviderRoute.imageBilling. */
+    imageBilling?: string;
 };
 
 function nonEmpty(value: string | undefined): string | undefined {
@@ -586,7 +616,7 @@ export function parseRouteEntry(v: unknown): ProviderRoute | undefined {
     // is the KEY in the providers map (identical to the /bili/<url> string),
     // so it is NOT repeated inside the value.
     if (v && typeof v === "object" && !Array.isArray(v)) {
-        const obj = v as { models?: Record<string, ModelEntry>; proxy?: string; compressProtocol?: string; compress?: CompressSettings; compat?: { roles?: unknown }; passthrough?: boolean };
+        const obj = v as { models?: Record<string, ModelEntry>; proxy?: string; compressProtocol?: string; compress?: CompressSettings; compat?: { roles?: unknown }; passthrough?: boolean; imageBilling?: unknown };
         const route: ProviderRoute = { models: obj.models };
         if (typeof obj.proxy === "string") route.proxy = obj.proxy;
         if (obj.compressProtocol === "marker" || obj.compressProtocol === "tools") route.compressProtocol = obj.compressProtocol;
@@ -594,11 +624,17 @@ export function parseRouteEntry(v: unknown): ProviderRoute | undefined {
         const compatRoles = parseCompatRoles(obj.compat?.roles);
         if (compatRoles) route.compat = { roles: compatRoles };
         if (typeof obj.passthrough === "boolean") route.passthrough = obj.passthrough;
+        const imageBilling = parseImageBilling(obj.imageBilling);
+        if (imageBilling) route.imageBilling = imageBilling;
         return route;
     }
     // A bare value (e.g. null) means "this upstream exists, no overrides".
     if (v === null) return {};
     return undefined;
+}
+
+export function parseImageBilling(value: unknown): ImageBillingMode | undefined {
+    return value === "auto" || value === "pixels" || value === "bytes" ? value : undefined;
 }
 
 export function parsePromptCacheRouting(value: string | undefined): PromptCacheRouting {
@@ -607,10 +643,6 @@ export function parsePromptCacheRouting(value: string | undefined): PromptCacheR
 
 export function parseUpstreamProxyMode(value: string | undefined): UpstreamProxyMode {
     return value === "manual" || value === "auto" ? value : "direct";
-}
-
-export function parseHostUsageCredit(value: string | undefined): "auto" | "off" {
-    return value === "off" ? "off" : "auto";
 }
 
 export function parseCompressSettings(v: unknown): (CompressSettings & { injectTool?: boolean; injectNudge?: boolean }) | undefined {
@@ -702,6 +734,37 @@ export function parseCompressSettings(v: unknown): (CompressSettings & { injectT
                 (cleaned as Record<string, string>)[key] = value;
             }
             if (ok) out.prompts = cleaned;
+        }
+    }
+    if ("promptPack" in obj && obj.promptPack !== undefined) {
+        if (typeof obj.promptPack !== "string" || obj.promptPack.trim().length === 0) ok = false;
+        else out.promptPack = obj.promptPack.trim();
+    }
+    if ("reasoningGuard" in obj && obj.reasoningGuard !== undefined) {
+        const rg = obj.reasoningGuard;
+        if (!rg || typeof rg !== "object" || Array.isArray(rg)) {
+            ok = false;
+        } else {
+            const rgo = rg as Record<string, unknown>;
+            const cleaned: ReasoningGuardConfig = {};
+            for (const key of ["enabled", "maxContinue", "maxTierN", "markerText", "base", "offset", "debugLog"] as const) {
+                if (!(key in rgo)) continue;
+                const v = rgo[key];
+                if (key === "enabled") {
+                    if (typeof v !== "boolean") { ok = false; continue; }
+                    cleaned.enabled = v;
+                } else if (key === "debugLog") {
+                    if (typeof v !== "boolean") { ok = false; continue; }
+                    cleaned.debugLog = v;
+                } else if (key === "markerText") {
+                    if (typeof v !== "string" || v.trim().length === 0) { ok = false; continue; }
+                    cleaned.markerText = v.trim();
+                } else {
+                    if (typeof v !== "number" || !Number.isFinite(v)) { ok = false; continue; }
+                    (cleaned as Record<string, unknown>)[key] = v;
+                }
+            }
+            if (ok) out.reasoningGuard = cleaned;
         }
     }
     if (!ok) return undefined;

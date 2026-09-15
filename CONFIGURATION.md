@@ -122,11 +122,18 @@ Top-level keys that control how the proxy listens and behaves globally.
 - **Status:** ACTIVE
 - **Description:** Upstream HTTP proxy (`http://host:port`) used for the proxy's **own** outbound connections to model providers. SOCKS5 is not supported. A per-URL `proxy` set inside a `providers` entry overrides this for that provider. An empty string means "explicitly direct" — it disables any environment/system proxy fallback for all providers.
 
+### `imageBilling`
+
+- **Type:** `"auto" | "pixels" | "bytes"`
+- **Default:** `"auto"`
+- **Status:** ACTIVE
+- **Description:** How inline (base64) images are charged by the preflight size gate and output clamp (#488/#496/#767). `"bytes"` charges each image at `base64 length / 4` tokens — conservative, and correct for byte-billing relays. `"pixels"` parses the image header (PNG/JPEG/WebP/GIF/BMP) without decoding the body and charges first-party pixel-tile billing (OpenAI high-detail model: 512px tiles, short side scaled up to 768px, long side capped at 2048px → 765–2805 tokens per image; unparsable formats fall back to a flat 16384). Remote (`https://`) images always charge a flat 4096 in either mode. A per-provider `providers.<url>.imageBilling` wins over this global, and the `BILI_IMAGE_BILLING` env var wins over both (live-read, no restart).
+
 ---
 
 ## Providers
 
-The `providers` block maps **upstream URLs** to per-provider configuration. Each key is a URL prefix; each value can declare model context windows, a per-provider proxy, a compression protocol, compression overrides, and a per-route passthrough.
+The `providers` block maps **upstream URLs** to per-provider configuration. Each key is a URL prefix; each value can declare model context windows, a per-provider proxy, a compression protocol, compression overrides, an image billing mode, and a per-route passthrough.
 
 ```jsonc
 {
@@ -197,6 +204,21 @@ A shallow key (`https://open.bigmodel.cn`) matches every path on that host. A de
   {
     "providers": {
       "mitm://zcode.z.ai": { "passthrough": true }
+    }
+  }
+  ```
+
+### `imageBilling`
+
+- **Type:** `"auto" | "pixels" | "bytes"`
+- **Default:** *(global `imageBilling`, then `"auto"`)*
+- **Status:** ACTIVE
+- **Description:** Per-route override of how inline images are charged by the size gate (#767). Set `"pixels"` for official Codex/OpenAI/Anthropic endpoints (pixel-tile billing) and keep `"bytes"` for byte-counting relays — under byte billing, a stale over-window baseline plus large base64 screenshots fails preflight with 502 forever even though the images bill only a few thousand tokens upstream. When unset at both levels, billing is auto-selected from the upstream host: hosts ending in `openai.com`, `openai.azure.com`, `chatgpt.com`, or `api.anthropic.com` → `pixels`; everything else → `bytes`. The `BILI_IMAGE_BILLING` env var overrides both config levels:
+
+  ```jsonc
+  {
+    "providers": {
+      "https://chatgpt.com/backend-api/codex": { "imageBilling": "pixels" }
     }
   }
   ```
@@ -284,14 +306,21 @@ For each request, the proxy resolves the settings by longest-URL-prefix match (t
 - **Type:** `object` (`{ compressPhilosophy?, howToCompressRules?, tier2DistillRules?, tier3CondenseRules? }`, all strings)
 - **Default:** *(kernel defaults — see `acp-kernel` `defaultPrompts`)*
 - **Status:** ACTIVE
-- **Description:** Override the compression prompt text injected into the system prompt and nudge messages. Every field is **load-bearing**: the kernel rules were tuned over months of production use, and overriding them can degrade summary quality (lost paths / signatures / decisions → broken retrieval). Overrides only take effect when `acknowledgePromptsRisk: true` is set at the same (winning) level; otherwise they are ignored and a one-time warning is logged. Non-string fields are silently dropped (a malformed partial never clobbers a good default). Useful mainly for non-English or small-model tuning — see issue #156.
+- **Description:** Override the compression prompt text injected into the system prompt and nudge messages. Every field is **load-bearing**: the kernel rules were tuned over months of production use, and overriding them can degrade summary quality (lost paths / signatures / decisions → broken retrieval). Overrides only take effect when `acknowledgePromptsRisk` resolves to `true` after the three-level merge — the flag resolves independently at its own deepest defined level and gates **all** `prompts` overrides regardless of which level each piece lives at (a global-level flag activates model-level `prompts`); otherwise they are ignored and a one-time warning is logged. Non-string fields are silently dropped (a malformed partial never clobbers a good default). Useful mainly for non-English or small-model tuning — see issue #156.
 
 #### `acknowledgePromptsRisk`
 
 - **Type:** `boolean`
 - **Default:** `false`
 - **Status:** ACTIVE
-- **Description:** Must be `true` for `prompts` overrides to take effect. Setting it acknowledges the summary-quality risk documented above.
+- **Description:** Must be `true` for `prompts` overrides to take effect. Resolves like every other field (deepest defined level wins) and gates all `prompts` overrides regardless of which level each piece lives at — it does not need to sit in the same block as the `prompts` it unlocks. Setting it acknowledges the summary-quality risk documented above.
+
+#### `promptPack`
+
+- **Type:** `string` (pack name, e.g. `"lean"`)
+- **Default:** `default` *(unset is equivalent — identity surface, kernel defaults everywhere)*
+- **Status:** ACTIVE
+- **Description:** Select a named prompt pack — a curated surface preset covering tool descriptions, compress system-prompt sections, and nudge sections — resolved from the kernel's pack chain: **project** `./.billion-context/packs/<name>.json` → **user** `<configDir>/packs/<name>.json` → **builtin** (`default`, `lean`). Built-in `lean` swaps the four ACP tool descriptions for one-liners (no snippet/guideline chrome) while keeping the compression rules default. Unknown names fall back to the identity surface with a one-time warning. Same three-level merge as the other fields; pack-surface sections (tool/section overrides) apply directly, without the `acknowledgePromptsRisk` gate — that gate governs only inline `compress.prompts` rule-text overrides. Note a pack's `prompts` block is ignored by this proxy: rule-text overrides are possible only via inline `compress.prompts`. Requires `acp-kernel` >= 0.0.66.
 
 #### `absorb`
 
@@ -317,6 +346,25 @@ For each request, the proxy resolves the settings by longest-URL-prefix match (t
     "providers": { "https://api.deepseek.com": { "compress": { "reasoning": { "drop": false } } } }
     ```
   - `threshold: number` — character gate; runs **strictly greater** than this are dropped (`0` = drop any non-empty run). Invalid values fall back to the default instead of throwing.
+
+#### `reasoningGuard`
+
+- **Type:** `object` (`{ enabled?, maxContinue?, maxTierN?, markerText?, base?, offset?, debugLog? }`)
+- **Default:** *(disabled — off unless you set `enabled: true` at some level)*
+- **Status:** ACTIVE
+- **Description:** Opt-in guard against gpt-5.x/gpt-6.x **"lattice" reasoning truncation** (issue #739; upstream [openai/codex#30364](https://github.com/openai/codex/issues/30364)). These models intermittently stop at exactly `base*n + offset` reasoning tokens (default `518n−2` → 516, 1034, 1552, …) mid-thought, then answer from a half-finished thought. When an in-scope terminal round hits the lattice **and** carries an `encrypted_content` blob, bili buffers the response, re-sends it replaying its own reasoning plus a continue nudge (up to `maxContinue` continuation rounds), and folds everything into ONE response whose usage is the true summed total. Reasoning streams live to the client during the fold (no full buffering); only the final clean round's non-reasoning output is passed through. Applies to Responses/SSE streaming requests only (bili is SSE-only); compress-injected turns are exempt (the loop owns those). Sub-fields (merged deepest-wins like every other CompressSettings field):
+  - `enabled: boolean` — master switch; anything other than `true` keeps the guard fully off. Scope is set by **where** this block sits in the three-level tree (global / provider / model) — there is no separate model list. The strict signature (exact lattice hit + `encrypted_content` + no tool calls) limits which rounds actually trigger recovery.
+  - `maxContinue: number` — max continuation rounds after the initial round (default `3`).
+  - `maxTierN: number` — highest lattice tier `n` allowed to continue (default `6`); `0` = unlimited. Raise for rare deep-tier truncations (e.g. an `n=11` hit observed on gpt-6-astra).
+  - `markerText: string` — nudge text appended as a commentary message each continued round (default `"Continue thinking..."`).
+  - `base: number` / `offset: number` — the lattice signature `tokens == base*n + offset` (defaults `518` / `-2`). Override if another model family truncates on a different lattice.
+  - `debugLog: boolean` — verbose per-round logging (default `false`).
+  ```jsonc
+  // enable globally
+  { "compress": { "reasoningGuard": { "enabled": true } } }
+   // tune per provider (placement scopes it to that provider's traffic)
+   { "providers": { "https://your-relay.example": { "compress": { "reasoningGuard": { "enabled": true, "maxContinue": 2 } } } } }
+  ```
 
 #### `stripImages`
 
@@ -412,7 +460,8 @@ Environment variables take precedence over the config file. They are useful for 
 | `ACP_COMPRESS_TOOL` | Set to `0` to disable tool injection (same as `"compress.injectTool": false`). |
 | `ACP_COMPRESS_NUDGE` | Set to `0` to disable nudge injection (same as `"compress.injectNudge": false`). |
 | `ACP_MODEL_CONTEXT_LIMIT` | Override the context limit globally (absolute token count). |
-| `BILI_IMAGE_TOKEN_CAP` | Cap the per-image token estimate used by the preflight size gate and output clamp (#488/#496). By default an inline `data:` image counts as `base64 length / 4` tokens with **no cap** — correct for byte-billing relays, but a large over-estimate for pixel-tile upstreams (official Anthropic/OpenAI), which bill each image at roughly 1.1K–1.6K tokens regardless of byte size. Set this to your upstream's per-image tile cost so the gate reflects real billing; unset = no cap (current default). |
+| `BILI_IMAGE_TOKEN_CAP` | Cap the per-image token estimate used by the preflight size gate and output clamp (#488/#496). By default an inline `data:` image counts as `base64 length / 4` tokens with **no cap** — correct for byte-billing relays, but a large over-estimate for pixel-tile upstreams (official Anthropic/OpenAI). For pixel-tile upstreams prefer [`imageBilling`](#imagebilling) (`"pixels"`, or `BILI_IMAGE_BILLING=pixels`) which charges real tile billing instead of capping the byte estimate; the cap still applies on top of both billing modes as a blanket ceiling. Unset = no cap (default). |
+| `BILI_IMAGE_BILLING` | Override the image billing mode used by the preflight size gate and output clamp (#767): `pixels` or `bytes`. Live-read per request (no restart); beats the global `imageBilling` and every per-provider `providers.<url>.imageBilling`. Use `bytes` to force conservative billing on a route configured `"pixels"` (e.g. a byte-counting relay behind an OpenAI lookalike host), or `pixels` to enable tile billing process-wide without editing config. See [`imageBilling`](#imagebilling). |
 | `BILI_PREFLIGHT_HOLD_MS` | Grace period (ms) before a long preflight compression starts holding the client with keep-alive bytes (default `30000`; see #568 / README "Preflight hold"). |
 | `BILI_CONFIG_FILE` | Override the config file path (point at any JSON file). |
 | `ACP_PORT` / `PORT` | Override the listen port. |
@@ -421,7 +470,7 @@ Environment variables take precedence over the config file. They are useful for 
 | `ACP_LOG` | Set to `0` to disable request logging. |
 | `ACP_AUTO_UPDATE` | Set to `0` to disable auto-update checks. |
 | `ACP_UPDATE_TAG` | Dist-tag channel the auto-updater follows (default `latest`, e.g. `dev`). File-config key: `updateTag`. A `pr-N` preview tag is only followed when explicitly configured. |
-| `BILI_HOST_USAGE_CREDIT` | `#408` host-usage backfill mode (file-config key: `hostUsageCredit`). `auto` (default) = the uncompressed-baseline backfill is armed for plain proxy clients (the bili-launched pi/omp extensions are exempted — their host-side compaction is cancelled, so the baseline drives nothing there). `off` = never backfill — the usage reported to the host is the actually-forwarded (folded) request, matching `[acp-usage] input=`. Use `off` for plain anthropic proxy clients (e.g. ZCode) whose UI would otherwise show the cumulative, drifting baseline as inflated context (#648). |
+| ~~`BILI_HOST_USAGE_CREDIT`~~ / ~~`hostUsageCredit`~~ | **Removed in #660.** Used to select the host-facing usage mode. The #408 uncompressed-baseline backfill is gone entirely — every host now reports the actually-forwarded (post-fold) request as provider-measured (matches `[acp-usage] input=`). Old values left in env or the config file are ignored; remove them. See the "Bug history lesson" section of PR #691. |
 | `ACP_PROVIDERS` | Path to an external `providers.json` (legacy / shared file). |
 | `BILI_REPLAY_RETRY_BASE_MS` | Base backoff delay (ms) for acp-loop replay retries after a transient upstream rejection (default `1500`; set `0` to disable the delay). See #189. |
 | `BILI_REPLAY_RETRY_MAX` | Total attempts for acp-loop replay retries (default `3`; set `1` to disable retries entirely — legacy fail-fast behavior). See #189. |
@@ -439,6 +488,7 @@ Environment variables take precedence over the config file. They are useful for 
 | `BILI_TUNNEL_ALLOWED_HOSTS` | `/bili/<absolute-url>` tunnel admission for **remote clients** (#409): comma-separated `host` or `host:port` entries that unlock loopback/private destinations (e.g. a LAN relay or the machine's own sglang) for non-loopback clients. The proxy itself and link-local/metadata addresses are always denied; local (loopback) clients always pass. |
 | `BILI_MAX_SESSIONS` | Max sessions held in memory (default `256`; LRU eviction — disk is the source of truth). |
 | `BILI_SESSIONS_DIR` | Directory for persisted session state (default XDG data dir). |
+| `BILI_ENCRYPTION_KEY` | Encrypt session files at rest (#708) for deployments on untrusted nodes. Exactly 32 bytes, hex (64 chars) or base64; unset = plain JSON files (default behavior, unchanged). When set: every session file is written as `BILIENC1` AES-256-GCM over zstd-compressed JSON (zstd on Node ≥ 22.15, raw body on older runtimes) — compression also shrinks the file ~5–10×. Existing unencoded files are taken over once at boot: each is re-encoded and atomically replaced in place (the rename IS the old-file deletion; a crash mid-migration self-heals on next boot). The key comes ONLY from this environment variable — never written to disk or logs — so keep it out of the same filesystem's reach. Invalid values abort startup (fail fast, never silently unencrypted). Booting with the wrong key skips the affected sessions as corrupt (logged, no crash). Losing the key makes encrypted sessions permanently unreadable. Symmetric by design (the same process encrypts and decrypts). Threat model (#708, owner-confirmed): it defends against **offline/mechanical** file acquisition — provider disk swaps, offline disk snapshots after node-image drift, stolen volumes, leaked backups, cloud-synced state dirs — where an offline third party cannot read the content without the key. It does NOT defend against targeted adversaries with live access to the node; for that tier move the trust root out of the proxy (KMS / TEE / confidential VMs, hardened permissions) instead of solving it inside the proxy — at that level far more than the key is exposed, so proxy-level key handling is not the boundary to hold (`BILI_PERSIST=0` disables persistence entirely). Double-encrypting the key with a second key from the same process/environment adds nothing: in every offline-theft scenario the attacker lacks exactly one artifact — your off-disk secret — whether it is called the data key or the wrapping key; only a wrapping key in a different trust domain (KMS/TPM/TEE) raises the bar, and that is scenario 2 above. |
 | `BILLION_CONTEXT_PROXY` | Exported by the launcher; client-side bili plugins/extensions detect it and self-disable their own compression (no double compression). |
 | `BILLION_CONTEXT_PLUGIN` | Set `0` to disable plugin mode entirely (wire-level tool injection resumes). |
 | `BILI_LAUNCHER_MODEL_WINDOWS` | Internal: the launcher hands the client's own per-model context windows (pi `models.json`, omp `models.yml`, opencode `models.<id>.limit`, codex `model_context_window`) to the spawned proxy as JSON, so the nudge denominator matches the real window for self-hosted models. Only the launcher sets it — no user configuration. |
@@ -467,6 +517,8 @@ Full command surface (`bili --help` prints an abridged version). Precedence ever
 | `bili codebuddy [opts --] [args]` | Proxy + **codebuddy** (Tencent CodeBuddy Code CLI) — `CODEBUDDY_BASE_URL` `/bili/` rewrite, OpenAI chat-completions wire; budget via `CODEBUDDY_AUTO_COMPACT_WINDOW` (#640) |
 | `bili qoder [opts --] [args]` | Proxy + **qoder** — cert-MITM via `HTTPS_PROXY` + `NODE_EXTRA_CA_CERTS`; model endpoint hardcoded https so no `/bili/` rewrite (default host map whitelisted) (#653) |
 | `bili trae [opts --] [args]` | Proxy + **Trae CLI** (ByteDance, closed Go binary) — cert-MITM via `HTTPS_PROXY` + `SSL_CERT_FILE`; model host from `TRAE_CLI_API_HOST` or the default enterprise gateway (#655) |
+| `bili jcode [opts --] [args]` | Proxy + **jcode** (Rust agent harness) — env-only cert-MITM launch via `HTTPS_PROXY` + `SSL_CERT_FILE`; hosted model host (`api.z.ai`) whitelisted, local loopback providers stay direct via `NO_PROXY` |
+| `bili kimi [opts --] [args]` | Proxy + **Kimi Code** (Moonshot CLI) — cert-MITM via `HTTPS_PROXY` + `NODE_EXTRA_CA_CERTS`/`SSL_CERT_FILE`; provider/model hosts from `~/.kimi-code/config.toml` (`KIMI_CODE_HOME` respected) or the managed OAuth endpoints when none declared; loopback endpoints inventoried with a manual `/bili/` prefix hint (#757) |
 | `bili test pi` | Non-polluting end-to-end smoke test of the pi path |
 | `bili export [session] [--full] [--output FILE]` | List persisted sessions / export one as a Markdown handoff — see [Sessions & Migration](#sessions--migration) |
 | `bili update` | Check for & install a newer version now (bypasses the 3-minute throttle) |

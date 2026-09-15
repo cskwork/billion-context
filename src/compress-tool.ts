@@ -90,3 +90,31 @@ export function withStagedCompressGuidance(text: string): string {
     if (maxShrinkPerCompress() === undefined) return text;
     return text + STAGED_COMPRESS_GUIDANCE;
 }
+
+// #717 anti-forgery rule for ACP confirmation markers. Under sustained
+// context pressure a model was observed writing the proxy's own marker format
+// ("📦 [ACP] Compressed …") as plain assistant text — 17 fake compressions,
+// none reaching the proxy, usage climbing to 89% while the model believed
+// compression was working. The rule states the marker contract explicitly and
+// is appended to every nudge (the moment of highest temptation) and to the
+// injected philosophy prompt (persistent; byte-stable constant, so
+// prefix-cache safe).
+const MARKER_INTEGRITY_NOTE =
+    "\n\n[ACP marker integrity: lines shaped like '📦 [ACP] Compressed …' or '❌ [ACP] … FAILED' are CONFIRMATION MARKERS emitted by the bili proxy itself, right after it executes a compress/decompress/search_context/acp_status call. They are not something you write. NEVER emit such a line as your own text — writing one fakes a state change that did not happen, and the proxy strips it. To compress, call the compress tool. To verify a compression landed, call acp_status and confirm the block count increased — a confirmation line you wrote yourself proves nothing.]";
+
+/** Append the marker-integrity rule to a nudge or system-prompt text.
+ *  Unconditional (unlike withStagedCompressGuidance): the rule must hold in
+ *  every configuration where a marker can be seen in history. */
+export function withMarkerIntegrityNote(text: string): string {
+    return text + MARKER_INTEGRITY_NOTE;
+}
+
+// #760: per-call conversation_id for MCP tools. Hosts that share ONE MCP shim
+// process across several concurrent conversations (kimi web et al.) have no
+// env/meta session channel, so the proxy prints its own resolved session id
+// and the model echoes it back as the conversation_id argument of every
+// mcp__bili__ call. Session-stable, so it rides the static system-prompt part
+// (prefix-cache safe) next to MARKER_INTEGRITY_NOTE, in BOTH modes.
+export function withConversationIdNote(text: string, conversationId: string): string {
+    return text + `\n\n[Your bili conversation id: ${conversationId}. When calling the bili compression tools, pass this value as the conversation_id argument so a shared MCP process can route the call to THIS session.]`;
+}

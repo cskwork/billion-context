@@ -1,4 +1,5 @@
 import { createInitialState, type CompressionState, type CoreMessage } from "acp-kernel";
+import { createHash } from "node:crypto";
 import { getStore } from "./persist.js";
 
 export type BlockView = { text: string; count: number };
@@ -57,6 +58,12 @@ export type Session = {
          *  (truncated). Lets the web UI show "Fix auth bug" instead of a hash.
          *  Set once on the first request that has a user message. */
         title?: string;
+        /** Effective compress prompt pack for the most recent request
+         *  ("default" when none). Route/model can change it mid-session, so
+         *  this is stamped per request (latest wins) — persisted so post-hoc
+         *  forensics can tell which surface served the session without config
+         *  archaeology. */
+        activePack?: string;
     };
     /** Cumulative usage stats, summed across all requests. Each sample =
      *  one upstream usage report. Persisted; survives restart. */
@@ -146,19 +153,6 @@ export type Session = {
      *  retry callbacks to correlate a transient upstream rejection with the
      *  rewrite that preceded it (#189). A fresh process has none. */
     lastCompress?: LastCompressInfo;
-    /** In-memory only (NOT persisted): tokens folded out of THIS request's
-     *  forwarded view vs the host's own (unfolded) view, computed in prepare*
-     *  as est(originalMessages) − est(processedMessages). Usage recorders add
-     *  this back into the input-side usage field before forwarding to the host,
-     *  so the host's usage anchor carries the uncompressed baseline instead of
-     *  the post-fold value (#408). Overwritten each prepare(); 0 when nothing
-     *  was folded this request. */
-    hostCreditTokens?: number;
-    /** In-memory only (NOT persisted): last input-side usage total reported to
-     *  the host AFTER the hostCreditTokens backfill (uncompressed baseline).
-     *  Feeds the /acp panel tokenCount so it matches what the host footer
-     *  shows (#408). 0/undefined until the first backfilled usage lands. */
-    hostContextTokens?: number;
     /** Promise chain for per-session serialization. Two concurrent requests
      *  sharing a session id would interleave processTurn / stream-rewriter
      *  mutations on session.state, corrupting it. withSessionLock chains each
@@ -287,6 +281,48 @@ export function peekSession(id: string): Session | undefined {
     return sessions.get(id);
 }
 
+// #760b: unified canonical session id. Every session exposes a stable pfa-* id
+// that MCP tools route by, independent of what the client calls itself.
+// Anonymous sessions already ARE pfa-* (PFA-minted session.id), so their
+// canonical id is session.id itself. Legacy (client-id) sessions derive a
+// stable pfa-* from their session id — deterministic, so the value survives even
+// if the persisted copy is lost. It is materialized onto metadata.canonicalId
+// (persisted) on first use so lookups are cheap and the value is inspectable.
+function derivedLegacyCanonicalId(sessionId: string): string {
+    return `pfa-${createHash("sha256").update(`legacy:${sessionId}`).digest("hex").slice(0, 16)}`;
+}
+
+/** Pure: the session's canonical id (always pfa-*). Never mutates. */
+function canonicalIdOf(session: Session): string {
+    if (session.id.startsWith("pfa-")) return session.id;
+    const c = session.metadata.canonicalId;
+    if (typeof c === "string" && c.length > 0) return c;
+    return derivedLegacyCanonicalId(session.id);
+}
+
+/** Materialize + persist the session's canonical id (idempotent) and return it.
+ *  Called where the id is surfaced to the model (wire notes) so the exact value
+ *  shown is the one persisted and routable. Anonymous sessions are a no-op
+ *  (canonical id already equals session.id). */
+export function ensureCanonicalId(session: Session): string {
+    const id = canonicalIdOf(session);
+    if (!session.id.startsWith("pfa-") && session.metadata.canonicalId !== id) {
+        session.metadata.canonicalId = id;
+        markDirty(session);
+    }
+    return id;
+}
+
+/** Read-only reverse lookup: the resident session whose canonical id matches.
+ *  Scans the in-memory pool (≤ MAX_SESSIONS); always consistent with the live
+ *  session set — no separate index to desync on evict/load. */
+export function findSessionByCanonicalId(canonicalId: string): Session | undefined {
+    for (const s of sessions.values()) {
+        if (canonicalIdOf(s) === canonicalId) return s;
+    }
+    return undefined;
+}
+
 /** Overwrite the session's full-conversation snapshot with the latest client
  *  raw request messages (originalMessages from prepare*). One array per
  *  session, replaced every request — bounded, always the newest state. Empty
@@ -314,8 +350,6 @@ export function resetSessionCompression(session: Session): void {
     session.blockContents.clear();
     session.stats.lastInputTokens = 0;
     session.stats.contextTokens = 0;
-    session.hostCreditTokens = 0;
-    session.hostContextTokens = 0;
     session.metadata.nativeCompactionAt = Date.now();
     markDirty(session);
 }

@@ -1,5 +1,7 @@
-import { DEFAULT_ABSORB_CONFIG, defaultPrompts, resolvePrompts, type AbsorbConfig, type Config, type Prompts } from "acp-kernel";
+import { DEFAULT_ABSORB_CONFIG, defaultPrompts, resolvePrompts, createPackResolver, defaultPackSources, isValidPackName, type AbsorbConfig, type Config, type PackSurface, type Prompts } from "acp-kernel";
+import * as path from "node:path";
 import { findRoute, type CompressSettings, type ProviderRoutes } from "./config.js";
+import { configDir } from "./paths.js";
 import { log as loggerLog } from "./logger.js";
 
 /** Resolve a raw `contextLimit` value to an absolute token count.
@@ -52,6 +54,7 @@ export function mergeCompress(
     // provider-level excludeTools.
     const absorbLevels = [global?.absorb, provider?.absorb, model?.absorb].filter(Boolean) as NonNullable<CompressSettings["absorb"]>[];
     const reasoningLevels = [global?.reasoning, provider?.reasoning, model?.reasoning].filter(Boolean) as NonNullable<CompressSettings["reasoning"]>[];
+    const reasoningGuardLevels = [global?.reasoningGuard, provider?.reasoningGuard, model?.reasoningGuard].filter(Boolean) as NonNullable<CompressSettings["reasoningGuard"]>[];
     return {
         modelContextLimit: pick("modelContextLimit"),
         maxContextLimit: pick("maxContextLimit"),
@@ -71,6 +74,8 @@ stripImages: pick("stripImages"),
         // exactly like `absorb`/`prompts`: a model-level `threshold` must not
         // discard a provider-level `drop: false`.
         reasoning: reasoningLevels.length > 0 ? Object.assign({}, ...reasoningLevels) : undefined,
+        reasoningGuard: reasoningGuardLevels.length > 0 ? Object.assign({}, ...reasoningGuardLevels) : undefined,
+        promptPack: pick("promptPack"),
     };
 }
 
@@ -91,8 +96,10 @@ export function resolveCompress(
 let warnedPromptsRisk = false;
 
 /** Resolve the effective compression prompts from merged settings. `prompts`
- *  overrides only take effect with `acknowledgePromptsRisk: true` at the
- *  winning level (the kernel rules are load-bearing; see Prompts docs). When
+ *  overrides only take effect when `acknowledgePromptsRisk` resolves to `true`
+ *  in the merged settings — the flag merges independently (deepest defined
+ *  level wins) and gates all prompt pieces regardless of their own level (the
+ *  kernel rules are load-bearing; see Prompts docs). When
  *  ignored, a one-time warning is logged so the misconfiguration is visible.
  *  Non-string fields inside `prompts` are silently dropped by the kernel's
  *  resolvePrompts (a malformed partial never clobbers a good default). */
@@ -110,6 +117,54 @@ export function resolveCompressPrompts(s: CompressSettings): Prompts {
     } catch {
         return defaultPrompts;
     }
+}
+
+let warnedUnknownPack = new Set<string>();
+
+export interface SurfaceResolution {
+    surface: PackSurface;
+    /** Effective pack name — "default" when unset/invalid/unresolvable
+     *  (the surface that actually serves requests). Feeds status-report
+     *  surface meta and the session audit stamp. */
+    packName: string;
+    /** Pack-declared version, when the resolved pack carries one. */
+    packVersion?: string;
+}
+
+/** Resolve the pack surface for one request: `promptPack` names a pack in the
+ *  kernel's resolver chain [project `./.billion-context/packs` > user
+ *  `<configDir>/packs` > builtin registry]. Unknown names fall back to the
+ *  identity surface ({} — kernel defaults everywhere) with a one-time-per-name
+ *  warning, so a typo never degrades the compression prompts. Directory
+ *  layout is host policy; resolution/sanitization is the kernel's. */
+export function resolveCompressSurfaceDetailed(
+    s: CompressSettings,
+    dirs?: { projectDir?: string; userDirs?: readonly string[] },
+): SurfaceResolution {
+    const name = s.promptPack;
+    if (typeof name !== "string" || name === "default" || !isValidPackName(name)) return { surface: {}, packName: "default" };
+    const resolver = createPackResolver(
+        defaultPackSources({
+            projectDir: dirs?.projectDir ?? path.join(process.cwd(), ".billion-context", "packs"),
+            userDirs: dirs?.userDirs ?? [path.join(configDir(), "packs")],
+        }),
+    );
+    const pack = resolver.resolve(name);
+    if (!pack) {
+        if (!warnedUnknownPack.has(name)) {
+            warnedUnknownPack.add(name);
+            loggerLog("warn", `[compress] promptPack "${name}" not found (project/user/builtin); using default surface`);
+        }
+        return { surface: {}, packName: "default" };
+    }
+    return { surface: pack.surface, packName: name, packVersion: pack.version };
+}
+
+export function resolveCompressSurface(
+    s: CompressSettings,
+    dirs?: { projectDir?: string; userDirs?: readonly string[] },
+): PackSurface {
+    return resolveCompressSurfaceDetailed(s, dirs).surface;
 }
 
 /** True when a CompressSettings carries at least one configured field (i.e. it

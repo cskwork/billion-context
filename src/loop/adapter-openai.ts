@@ -1,10 +1,10 @@
 import type { CoreMessage } from "acp-kernel";
 import { coreToOpenai, injectOpenaiSystem } from "acp-kernel/wire";
 import { buildVisibilityMarker } from "../compress-loop.js";
-import { createTagEchoFilter } from "./tag-echo-filter.js";
+import { composeStreamFilters, createMarkerLineFilter, createTagEchoFilter } from "./tag-echo-filter.js";
 import { degenerateTurnWarning } from "../degenerate-turn.js";
 import { log as loggerLog } from "../logger.js";
-import { systemToUser } from "../util.js";
+import { hardenOpenaiAssistantContent, systemToUser } from "../util.js";
 
 import type {
     CompressLoopAdapter,
@@ -116,28 +116,18 @@ function stripFinishReasonChunk(buf: Buffer): Buffer {
     }
 }
 
-function patchUsageChunk(eventStr: string, parsed: Record<string, unknown>, u: Record<string, unknown>, hostCredit: number): Buffer {
-    const pu = typeof u.prompt_tokens === "number" ? u.prompt_tokens : undefined;
-    const tu = typeof u.total_tokens === "number" ? u.total_tokens : undefined;
-    if (hostCredit > 0 && (pu !== undefined || tu !== undefined)) {
-        const patched = {
-            ...parsed,
-            usage: {
-                ...u,
-                ...(pu !== undefined ? { prompt_tokens: pu + hostCredit } : {}),
-                ...(tu !== undefined ? { total_tokens: tu + hostCredit } : {}),
-            },
-        };
-        const out = eventStr
-            .split("\n")
-            .map((l) => (l.startsWith("data:") ? `data: ${JSON.stringify(patched)}` : l))
-            .join("\n");
-        return Buffer.from(out + "\n\n", "utf8");
-    }
-    return Buffer.from(eventStr + "\n\n", "utf8");
+// OpenAI-wire upstreams disagree on where the cached-prompt count lives: the
+// standard field is prompt_tokens_details.cached_tokens, while DeepSeek reports
+// KV-cache hits as top-level prompt_cache_hit_tokens (#779). Both mean "input
+// tokens served from cache", so normalize to one number.
+function openaiCachedTokens(u: Record<string, unknown>): number | undefined {
+    const pd = u.prompt_tokens_details as Record<string, unknown> | undefined;
+    if (typeof pd?.cached_tokens === "number") return pd.cached_tokens;
+    if (typeof u.prompt_cache_hit_tokens === "number") return u.prompt_cache_hit_tokens;
+    return undefined;
 }
 
-export function createOpenaiAdapter(requestBody: Record<string, unknown>, clientSystem?: string, hostCredit = 0, absorbName?: string): CompressLoopAdapter {
+export function createOpenaiAdapter(requestBody: Record<string, unknown>, clientSystem?: string, absorbName?: string): CompressLoopAdapter {
     const model = (requestBody.model as string) ?? "unknown";
     let responseId = `chatcmpl-proxy-${Date.now()}`;
     let toolIndex = 0;
@@ -212,7 +202,7 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
             // runtime state), so coreMessages no longer carries it — re-inject
             // the CLIENT's original system ahead of the compress prompt,
             // mirroring the anthropic adapter's anthropicSystem path.
-            const messages = systemToUser(coreToOpenai(coreMessages));
+            const messages = systemToUser(hardenOpenaiAssistantContent(coreToOpenai(coreMessages)));
             const withSys = injectOpenaiSystem(messages, [clientSystem, systemPrompt].filter((p): p is string => typeof p === "string" && p.length > 0));
             return { ...body, messages: withSys };
         },
@@ -221,9 +211,14 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
             const pending = new Map<number, ToolCallBuffer>();
             // #206: strip model-imitated render tags from content deltas; the
             // filter may hold back a short tail, flushed at finish/[DONE].
-            const tagFilter = createTagEchoFilter((snippet) => {
-                loggerLog("warn", `[tag-echo] stripped model-emitted render tag: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
-            });
+            const tagFilter = composeStreamFilters(
+                createTagEchoFilter((snippet) => {
+                    loggerLog("warn", `[tag-echo] stripped model-emitted render tag: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
+                }),
+                createMarkerLineFilter((snippet) => {
+                    loggerLog("warn", `[marker-echo] stripped model-emitted ACP confirmation marker: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
+                }),
+            );
             const flushFilter = function* (): Generator<ParsedStreamEvent> {
                 const tail = tagFilter.flush();
                 if (tail.length > 0) {
@@ -328,7 +323,7 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
                         yield { kind: "meta", chunk: Buffer.from(eventStr + "\n\n", "utf8") } as ParsedStreamEvent;
                     }
                     maybeWarnDegenerate("stop");
-                    yield { kind: "done", finishReason: "stop", ...(sawRealToolCall ? { suppressCompletion: true } : {}) } as ParsedStreamEvent;
+                    yield { kind: "done", finishReason: "stop", thinking: sawReasoning, ...(sawRealToolCall ? { suppressCompletion: true } : {}) } as ParsedStreamEvent;
                     continue;
                 }
                 let parsed: Record<string, unknown>;
@@ -338,24 +333,46 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
                     continue;
                 }
                 const rawBuf = Buffer.from(eventStr + "\n\n", "utf8");
+                // OpenAI-compatible gateways may report an upstream failure as
+                // an in-band error frame while the HTTP response remains 200.
+                // Do not ignore it just because it has no choices: if parsing
+                // continues to [DONE], the loop would synthesize a successful
+                // empty stop turn and the client could stall or lose retry
+                // semantics. Surface the error through the normal error path,
+                // which emits a protocol error without a fabricated completion.
+                const streamError = parsed.error;
+                if (streamError !== undefined && streamError !== null) {
+                    let message: string;
+                    if (typeof streamError === "string") {
+                        message = streamError;
+                    } else if (typeof streamError === "object") {
+                        const error = streamError as Record<string, unknown>;
+                        const detail = typeof error.message === "string" ? error.message : JSON.stringify(streamError);
+                        const code = typeof error.code === "string" ? error.code : undefined;
+                        message = code && detail ? `${code}: ${detail}` : detail;
+                    } else {
+                        message = String(streamError);
+                    }
+                    yield { kind: "error", message } as ParsedStreamEvent;
+                    return;
+                }
                 const choices = parsed.choices as Array<Record<string, unknown>> | undefined;
                 const choice = choices?.[0];
                 if (!choice) {
                     if (parsed.usage) {
                         const u = parsed.usage as Record<string, unknown>;
-                        const pd = u.prompt_tokens_details as Record<string, unknown> | undefined;
                         yield {
                             kind: "usage",
                             inputTokens: typeof u.prompt_tokens === "number" ? u.prompt_tokens : undefined,
                             outputTokens: typeof u.completion_tokens === "number" ? u.completion_tokens : undefined,
-                            cachedTokens: typeof pd?.cached_tokens === "number" ? pd.cached_tokens : undefined,
+                            cachedTokens: openaiCachedTokens(u),
                         } as ParsedStreamEvent;
                         // #589: include_usage clients (dsh, OpenAI SDK) read usage
                         // from this trailing empty-choices frame; raw tool-call rounds
-                        // must forward it (with the prepare-time credit), not swallow
-                        // it into the internal ledger.
+                        // must forward it verbatim, not swallow it into the internal
+                        // ledger.
                         if (sawRealToolCall) {
-                            yield { kind: "meta", chunk: patchUsageChunk(eventStr, parsed, u, hostCredit) } as ParsedStreamEvent;
+                            yield { kind: "meta", chunk: rawBuf } as ParsedStreamEvent;
                         }
                     }
                     continue;
@@ -368,32 +385,30 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
                     const hadToolCalls = [...pending.values()].some((tc) => tc.name.length > 0 || tc.id.length > 0);
                     yield* settleToolCalls();
                     const u = parsed.usage as Record<string, unknown> | undefined;
-                    const pd = u?.prompt_tokens_details as Record<string, unknown> | undefined;
                     yield {
                         kind: "usage",
                         inputTokens: typeof u?.prompt_tokens === "number" ? u.prompt_tokens : undefined,
                         outputTokens: typeof u?.completion_tokens === "number" ? u.completion_tokens : undefined,
-                        cachedTokens: typeof pd?.cached_tokens === "number" ? pd.cached_tokens : undefined,
+                        cachedTokens: u ? openaiCachedTokens(u) : undefined,
                     } as ParsedStreamEvent;
                     if (sawRealToolCall) {
-                        // #408: this raw finish chunk (with the provider's
-                        // post-fold usage) reaches the host verbatim — add the
-                        // prepare-time credit back so the host anchors on the
-                        // uncompressed baseline.
-                        const chunk = patchUsageChunk(eventStr, parsed, u ?? {}, hostCredit);
+                        // The raw finish chunk (provider-measured usage) reaches
+                        // the host verbatim — no rewriting.
+                        const chunk = rawBuf;
                         // This verbatim chunk IS the round's authoritative completion
                         // (suppressCompletion); write it once and never fall through
                         // to the text/reasoning branches (which would re-emit the same
                         // bytes after the finish reason).
                         yield { kind: "meta", chunk } as ParsedStreamEvent;
                         maybeWarnDegenerate(finishReason);
-                        yield { kind: "done", finishReason, suppressCompletion: true } as ParsedStreamEvent;
+                        yield { kind: "done", finishReason, suppressCompletion: true, thinking: sawReasoning } as ParsedStreamEvent;
                         continue;
                     } else {
                         maybeWarnDegenerate(finishReason);
                         yield {
                             kind: "done",
                             finishReason: hadToolCalls && finishReason === "stop" ? "tool_calls" : finishReason,
+                            thinking: sawReasoning,
                         } as ParsedStreamEvent;
                     }
                 }

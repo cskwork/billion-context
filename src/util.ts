@@ -51,7 +51,9 @@ export type WireProtocol = "anthropic" | "openai" | "responses";
  *     (`cache_read_input_tokens`) and cache-write (`cache_creation_input_tokens`)
  *     portions are reported as separate fields.
  *   - OpenAI Chat: `prompt_tokens` is the TOTAL — it ALREADY includes the
- *     `prompt_tokens_details.cached_tokens` subset.
+ *     `prompt_tokens_details.cached_tokens` subset (DeepSeek-style upstreams
+ *     carry that subset as top-level `prompt_cache_hit_tokens`; both are
+ *     normalized here, #779).
  *   - Responses: `input_tokens` is the TOTAL — it ALREADY includes the
  *     `input_tokens_details.cached_tokens` subset.
  *
@@ -79,7 +81,9 @@ export function usageTotals(
     }
     if (protocol === "openai") {
         const prompt = num(usage["prompt_tokens"]);
-        const cached = num((usage["prompt_tokens_details"] as Record<string, unknown> | undefined)?.["cached_tokens"]);
+        // #779: DeepSeek-style upstreams carry the cached subset as top-level
+        // prompt_cache_hit_tokens instead of prompt_tokens_details.cached_tokens.
+        const cached = num((usage["prompt_tokens_details"] as Record<string, unknown> | undefined)?.["cached_tokens"]) ?? num(usage["prompt_cache_hit_tokens"]);
         return {
             total: prompt !== undefined ? promptInputTotal("openai", prompt, cached) : undefined,
             cached,
@@ -99,44 +103,23 @@ export function usageTotals(
  *  separate) — under true OpenAI semantics prompt_tokens >= cached_tokens
  *  always holds, so a violation proves the cached segment is NOT part of
  *  prompt_tokens and must be added back (e.g. {prompt_tokens:6,
- *  cached_tokens:26278} is a real ~26284-token prompt, not 6). */
+ *  cached_tokens:26278} is a real ~26284-token prompt, not 6).
+ *  #790: under split semantics the Anthropic cache-WRITE segment
+ *  (`cache_creation_input_tokens`) is a third additive piece — part of the
+ *  context size, but NOT a cache hit. */
 export function promptInputTotal(
     protocol: WireProtocol | undefined,
     input: number | undefined,
     cached: number | undefined,
+    creation?: number,
 ): number {
     if (input === undefined) return 0;
     const includesCached = protocol === "openai" || protocol === "responses";
     const splitSemantics = !includesCached || (typeof cached === "number" && input < cached);
-    return input + (splitSemantics && typeof cached === "number" ? cached : 0);
-}
-
-/** #408: add the prepare-time fold credit back into a usage object's
- *  input-side fields, in place, so the host's usage anchor reports the
- *  uncompressed baseline instead of the post-fold value the provider measured.
- *  Field names per protocol: Anthropic/Responses `input_tokens` (TOTAL there),
- *  OpenAI `prompt_tokens` (+ `total_tokens` to keep the sum consistent).
- *  Returns true when anything was patched. */
-export function backfillHostUsage(
-    protocol: WireProtocol,
-    usage: Record<string, unknown>,
-    credit: number,
-): boolean {
-    if (!Number.isFinite(credit) || credit <= 0) return false;
-    let patched = false;
-    const add = (key: string): void => {
-        if (typeof usage[key] === "number" && Number.isFinite(usage[key])) {
-            usage[key] = (usage[key] as number) + credit;
-            patched = true;
-        }
-    };
-    if (protocol === "openai") {
-        add("prompt_tokens");
-        add("total_tokens");
-    } else {
-        add("input_tokens");
-    }
-    return patched;
+    const additive =
+        (splitSemantics && typeof cached === "number" ? cached : 0) +
+        (splitSemantics && typeof creation === "number" ? creation : 0);
+    return input + additive;
 }
 
 /** Result of inspecting an upstream response for a "context too long" error. */
@@ -267,6 +250,25 @@ export function systemToUser<T extends { role: string }>(messages: T[]): T[] {
             ? ({ ...m, role: "user" } as T)
             : m
     );
+}
+
+/** #719: Some OpenAI-compatible backends (DeepSeek) reject assistant messages
+ * whose `content` is null — they require a string content (possibly "") or
+ * tool_calls ("Invalid assistant message: content or tool_calls must be set").
+ * coreToOpenai emits `content: null` for reasoning-only assistant turns (an
+ * upstream stream truncated before any completion event leaves 0 text chars +
+ * N reasoning chars; openaiToCore drops empty text, so both `content:""` and
+ * `content:null` inputs rebuild as null). Force an empty string so the rebuilt
+ * wire payload is always accepted; no-op when content is already a string or
+ * an array of parts. Deterministic across turns → prefix-cache stable.
+ */
+export function hardenOpenaiAssistantContent<T extends { role: string }>(messages: T[]): T[] {
+    return messages.map((m) => {
+        if (m.role !== "assistant") return m;
+        const c = (m as { content?: unknown }).content;
+        if (c === null || c === undefined) return { ...m, content: "" } as T;
+        return m;
+    });
 }
 
 /**
