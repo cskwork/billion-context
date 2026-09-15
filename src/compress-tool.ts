@@ -4,9 +4,8 @@
  * The schemas, prompt builders, text tags and parseCompressInput moved to
  * acp-kernel `src/compress-tools.ts` verbatim; this module keeps the proxy's
  * historical import paths and names stable:
- *  - MUTATING_PROXY_TOOLS / READONLY_PROXY_TOOLS alias the kernel's ACP_* names
- *    ("proxy" is a misnomer once shared); PROXY_TOOL_NAMES is a filtered copy
- *    of kernel ACP_TOOL_NAMES — see UNADOPTED_KERNEL_TOOLS below;
+ *  - PROXY_TOOL_NAMES / MUTATING_PROXY_TOOLS / READONLY_PROXY_TOOLS alias the
+ *    kernel's ACP_* names ("proxy" is a misnomer once shared);
  *  - parseCompressInput wires the kernel's onWarn hook into the proxy logger.
  *    (The #603 single-quote salvage lives in the kernel ladder since 0.0.59;
  *    this wrapper only surfaces its diagnostics.)
@@ -22,8 +21,6 @@ import {
     ACP_TOOLS_OPENAI,
     ACP_TOOLS_RESPONSES,
     ACP_READONLY_TOOLS_RESPONSES,
-    ACP_CACHE_TOOL_NAME,
-    ACP_TOOL_NAMES,
 } from "acp-kernel";
 import { log as loggerLog } from "./logger.js";
 import { maxShrinkPerCompress } from "./fetch-util.js";
@@ -66,14 +63,7 @@ export {
     buildAbsorbSystemPrompt,
 } from "acp-kernel";
 export type { ParsedRange, AbsorbConfig } from "acp-kernel";
-// #800: acp-kernel >=0.0.75 ships acp_cache (prompt-cache reconciliation report)
-// but this proxy has no execution path for it yet — executeProxyTool would answer
-// a call with "[Unknown proxy tool: acp_cache]" reported as success. Keep it off
-// every wire surface until adoption lands (kernel constants are shared and never
-// mutated; the filtered copies below are the single choke point all injection consumes).
-export const UNADOPTED_KERNEL_TOOLS: ReadonlySet<string> = new Set([ACP_CACHE_TOOL_NAME]);
-export const PROXY_TOOL_NAMES: ReadonlySet<string> = new Set([...ACP_TOOL_NAMES].filter((n) => !UNADOPTED_KERNEL_TOOLS.has(n)));
-export { ACP_MUTATING_TOOLS as MUTATING_PROXY_TOOLS, ACP_READONLY_TOOLS as READONLY_PROXY_TOOLS } from "acp-kernel";
+export { ACP_TOOL_NAMES as PROXY_TOOL_NAMES, ACP_MUTATING_TOOLS as MUTATING_PROXY_TOOLS, ACP_READONLY_TOOLS as READONLY_PROXY_TOOLS } from "acp-kernel";
 
 // #841: host-side conversation_id extension of search_context. Kernel constants
 // are shared and never mutated; ALL wire-mode injection points must use these
@@ -112,10 +102,10 @@ export const BILI_SEARCH_CONTEXT_TOOL_RESPONSES = {
     parameters: withConversationId(SEARCH_CONTEXT_TOOL_RESPONSES.parameters),
 };
 
-export const BILI_ACP_TOOLS_ANTHROPIC = ACP_TOOLS_ANTHROPIC.filter((t) => !UNADOPTED_KERNEL_TOOLS.has(t.name)).map((t) => (t.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL : t));
-export const BILI_ACP_TOOLS_OPENAI = ACP_TOOLS_OPENAI.filter((t) => !UNADOPTED_KERNEL_TOOLS.has(t.function.name)).map((t) => (t.function.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL_OPENAI : t));
-export const BILI_ACP_TOOLS_RESPONSES = ACP_TOOLS_RESPONSES.filter((t) => !UNADOPTED_KERNEL_TOOLS.has(t.name)).map((t) => (t.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL_RESPONSES : t));
-export const BILI_ACP_READONLY_TOOLS_RESPONSES = ACP_READONLY_TOOLS_RESPONSES.filter((t) => !UNADOPTED_KERNEL_TOOLS.has(t.name)).map((t) => (t.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL_RESPONSES : t));
+export const BILI_ACP_TOOLS_ANTHROPIC = ACP_TOOLS_ANTHROPIC.map((t) => (t.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL : t));
+export const BILI_ACP_TOOLS_OPENAI = ACP_TOOLS_OPENAI.map((t) => (t.function.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL_OPENAI : t));
+export const BILI_ACP_TOOLS_RESPONSES = ACP_TOOLS_RESPONSES.map((t) => (t.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL_RESPONSES : t));
+export const BILI_ACP_READONLY_TOOLS_RESPONSES = ACP_READONLY_TOOLS_RESPONSES.map((t) => (t.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL_RESPONSES : t));
 
 // The kernel ships no Responses-format absorb const (the four ACP tools have
 // *_RESPONSES variants; absorb is host-registered opt-in). Synthesize it in
