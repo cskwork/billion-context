@@ -706,12 +706,20 @@ export function applyUsageSample(session: Session, sample: UsageSample, protocol
     // promptInputTotal adds back every segment not part of inputTokens —
     // cached, plus the Anthropic cache-write segment under split semantics
     // (#408/#790). Cache writes count toward context size, never toward hits.
-    if (sample.cachedTokens !== undefined) {
+    const total = sample.inputTokens !== undefined ? promptInputTotal(protocol, sample.inputTokens, sample.cachedTokens, sample.creationTokens) : 0;
+    // #793: a zero-total input sample carries no information — every real
+    // request has input tokens, so this is a gateway placeholder (message_start
+    // 0s) or a relay echo settled before the authoritative usage arrived
+    // (typically on client abort mid-stream). Adopting it would clobber the
+    // last trusted lastInputTokens with 0 and freeze nudge at 0%.
+    if (sample.inputTokens !== undefined && total <= 0) {
+        loggerLog("warn", `[${session.id}] [plugin] skipped zero-total usage sample (placeholder/echo) — keeping lastInputTokens=${session.stats.lastInputTokens}`);
+    }
+    if (sample.cachedTokens !== undefined && total > 0) {
         session.stats.cachedTokens += sample.cachedTokens;
         session.stats.cacheSamples += 1;
     }
-    if (sample.inputTokens !== undefined) {
-        const total = promptInputTotal(protocol, sample.inputTokens, sample.cachedTokens, sample.creationTokens);
+    if (sample.inputTokens !== undefined && total > 0) {
         session.stats.inputTokens += total;
         // Net out pending compress savings (see stream.ts applyRanges): plugin
         // compress tool results shrink the next request, not this report.
@@ -719,7 +727,7 @@ export function applyUsageSample(session: Session, sample: UsageSample, protocol
         warnCacheCollapse(session, total, sample.cachedTokens ?? 0);
         // #695: per-request parity with the wire path's [acp-usage] — without
         // this, post-fold cache cliffs cannot be attributed from logs.
-        const hit = sample.cachedTokens === undefined || total <= 0 ? undefined : Math.round((100 * (sample.cachedTokens ?? 0)) / total);
+        const hit = sample.cachedTokens === undefined ? undefined : Math.round((100 * (sample.cachedTokens ?? 0)) / total);
         const foldNew = session.stats.pendingFoldUsage === true;
         if (foldNew) session.stats.pendingFoldUsage = false;
         loggerLog("info", `[${session.id}] [plugin] [acp-usage] input=${total} cached=${sample.cachedTokens ?? "n/a"}${hit === undefined ? "" : ` (cache hit ${hit}%)`}${foldNew ? " fold=new" : ""}`);
