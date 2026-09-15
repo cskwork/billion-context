@@ -9,13 +9,16 @@ process.env.NODE_ENV = "test";
 import biliLocalPlugin, {
     DEFAULT_LOCAL_PORT,
     buildSpawnArgs,
+    findNodeRuntime,
     parseLocalOptions,
     resolvePackageRoot,
     rewriteToBili,
 } from "../src/agent/opencode-local.ts";
 
-type HdrStore = { set: (k: string, v: string) => void };
-type HookEvent = { sessionID?: unknown; model?: unknown; request?: { url?: unknown; headers?: HdrStore } };
+// Real WHATWG Request (not a plain object): the OpenCode seam hands us a Request
+// whose .url is readonly, so the mock must mirror that or it cannot catch a
+// regression that writes .url directly.
+type HookEvent = { sessionID?: unknown; model?: unknown; request?: Request };
 type HookCb = (e: HookEvent) => void | Promise<void>;
 type AddedTool = { name: string; input: unknown; options?: Record<string, unknown> };
 
@@ -41,11 +44,16 @@ function makeLocalFakeCtx() {
             model: { list: async () => ({ data: [{ providerID: "qwen", id: "m1", limit: { context: 262144 } }] }) },
         },
     };
-    const fire = async (url: string, sessionID: string, model?: { providerID?: unknown; id?: unknown }): Promise<{ headers: Record<string, string>; url: string }> => {
-        const store: Record<string, string> = {};
-        const request = { url, headers: { set: (k: string, v: string) => { store[k] = v; } } };
-        await cb!({ sessionID, model, request });
-        return { headers: store, url: request.url };
+    const fire = async (input: string | Request, sessionID: string, model?: { providerID?: unknown; id?: unknown }): Promise<{ headers: Record<string, string>; url: string; before: Request; after: Request | null; swapped: boolean }> => {
+        const before = typeof input === "string"
+            ? new Request(input, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" })
+            : input;
+        const evt: HookEvent = { sessionID, model, request: before };
+        await cb!(evt);
+        const out: Record<string, string> = {};
+        const h = evt.request?.headers;
+        if (h) for (const [k, v] of h.entries()) out[k] = v;
+        return { headers: out, url: evt.request?.url ?? "", before, after: evt.request ?? null, swapped: evt.request !== before };
     };
     return { ctx, fire, addedTools, hookNames };
 }
@@ -162,3 +170,53 @@ test("local mode stands down inert when the kill switch is set", async () => {
         cleanup();
     });
 });
+
+test("local mode routes via request-reference swap on a real WHATWG Request (never writes readonly .url)", async () => {
+    const server = http.createServer((req, res) => {
+        if ((req.url ?? "") === "/__bili/plugin/manifest" && req.method === "GET") {
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: true, protocolVersion: 1, proxy: "billion-context", version: "99.0.0-test" }));
+            return;
+        }
+        res.writeHead(404);
+        res.end("{}");
+    });
+    server.listen(0, "127.0.0.1");
+    await once(server, "listening");
+    const port = (server.address() as { port: number }).port;
+    const base = `http://127.0.0.1:${port}`;
+    const fake = makeLocalFakeCtx();
+    const cleanup = await biliLocalPlugin.setup(fake.ctx as never, { port });
+    try {
+        const r = await fake.fire("https://api.openai.com/v1/chat/completions", "s1");
+        assert.ok(r.swapped, "hook replaced the request reference instead of writing readonly .url");
+        assert.notStrictEqual(r.after, r.before);
+        assert.equal(r.after!.url, `${base}/bili/https://api.openai.com/v1/chat/completions`);
+        assert.equal(r.before.method, "POST");
+    } finally {
+        cleanup();
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+});
+
+test("findNodeRuntime: BILLION_CONTEXT_NODE override wins when it exists", () =>
+    withEnv({ BILLION_CONTEXT_NODE: "/opt/custom/node" }, () => {
+        assert.equal(findNodeRuntime({ execPath: "/usr/bin/opencode", pathEnv: "", exists: (p) => p === "/opt/custom/node" }), "/opt/custom/node");
+    }));
+
+test("findNodeRuntime: uses process.execPath when it is node", () =>
+    withEnv({ BILLION_CONTEXT_NODE: undefined }, () => {
+        assert.equal(findNodeRuntime({ execPath: "/usr/local/bin/node", pathEnv: "" }), "/usr/local/bin/node");
+    }));
+
+test("findNodeRuntime: walks PATH for node when execPath is a native binary", () =>
+    withEnv({ BILLION_CONTEXT_NODE: undefined }, () => {
+        const dirs = ["/opt/a", "/opt/b"];
+        const hit = path.join(dirs[1], "node");
+        assert.equal(findNodeRuntime({ execPath: "/usr/local/bin/opencode", pathEnv: dirs.join(path.delimiter), exists: (p) => p === hit }), hit);
+    }));
+
+test("findNodeRuntime: returns undefined when nothing resolves", () =>
+    withEnv({ BILLION_CONTEXT_NODE: undefined }, () => {
+        assert.equal(findNodeRuntime({ execPath: "/usr/local/bin/opencode", pathEnv: "/a:/b", exists: () => false }), undefined);
+    }));

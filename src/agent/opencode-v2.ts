@@ -46,14 +46,14 @@ import { forwardTool, reportCompactionBoundary } from "./shared.js";
 
 export type V2Registration = { dispose?: () => void | Promise<void> };
 
-export interface V2Headers {
-    set(name: string, value: string): void;
-}
-
+// e.request is a WHATWG Request at runtime (OpenCode 2.0.x http.request seam):
+// its .url is a readonly getter, so routing rewrites the request REFERENCE
+// (which the seam allows swapping wholesale) rather than writing .url (which
+// throws TypeError in strict/ESM and fails every session through the hook).
 export interface V2HttpRequestEvent {
     sessionID?: unknown;
     model?: { providerID?: unknown; id?: unknown };
-    request?: { url?: unknown; headers?: V2Headers | null };
+    request?: Request;
 }
 
 export interface V2ToolEditor {
@@ -201,18 +201,35 @@ export function createOpencodeV2Setup(config: OpencodeV2Config): (ctx: V2PluginC
 
         const httpRequestHook = async (e: V2HttpRequestEvent): Promise<void> => {
             if (pluginDisabled()) return;
-            const url = e.request?.url;
-            if (typeof url !== "string") return;
-            if (!state.proxyBase && config.lazyResolveProxyBase) {
-                state.proxyBase = config.lazyResolveProxyBase(url);
+            try {
+                const url = e.request?.url;
+                if (typeof url !== "string") return;
+                if (!state.proxyBase && config.lazyResolveProxyBase) {
+                    state.proxyBase = config.lazyResolveProxyBase(url);
+                }
+                if (!state.proxyBase) return;
+                if (config.rewriteRequestUrl) {
+                    const next = config.rewriteRequestUrl(url, state.proxyBase);
+                    // Swap the request REFERENCE to one targeting the proxy; never
+                    // write e.request.url (readonly getter -> TypeError -> dead session).
+                    // method/headers/body carry over from the original Request.
+                    if (next && next !== url && e.request) {
+                        try {
+                            e.request = new Request(next, e.request);
+                        } catch {
+                            // body not reconstructible (e.g. consumed stream) — leave
+                            // the request untouched so it proceeds direct (uncompressed)
+                            // rather than crashing the host session.
+                        }
+                    }
+                }
+                refreshWindows(ctx, state);
+                stampHeaders(e, state);
+            } catch {
+                // A throwing hook rejects the host's outgoing request and fails the
+                // whole session. billion-context must never take the host down —
+                // swallow and let the request proceed uncompressed.
             }
-            if (!state.proxyBase) return;
-            if (config.rewriteRequestUrl) {
-                const next = config.rewriteRequestUrl(url, state.proxyBase);
-                if (next && next !== url && e.request) e.request.url = next;
-            }
-            refreshWindows(ctx, state);
-            stampHeaders(e, state);
         };
 
         const hookReg = await ctx.session?.hook?.("http.request", httpRequestHook);
