@@ -1810,12 +1810,17 @@ test("readOpencodeConfigRoot: merges config.json → opencode.json → opencode.
         const ocDir = path.join(dir, "opencode");
         fs.mkdirSync(ocDir);
         // opencode seeds a near-empty .jsonc when no config exists — the merge must
-        // still surface the real provider living in opencode.json (#: single-file
+        // still surface the real provider living in opencode.json (#796: single-file
         // .jsonc-preference would miss it).
         fs.writeFileSync(path.join(ocDir, "opencode.jsonc"), JSON.stringify({ $schema: "https://opencode.ai/config.json" }));
         fs.writeFileSync(
             path.join(ocDir, "opencode.json"),
-            JSON.stringify({ provider: { fromjson: { options: { baseURL: "http://from.json/v1" } } } }),
+            JSON.stringify({
+                provider: {
+                    fromjson: { options: { baseURL: "http://from.json/v1" } },
+                    dup: { options: { baseURL: "http://dup-json/v1" }, models: { m: { limit: 4096 } } },
+                },
+            }),
         );
         fs.writeFileSync(path.join(ocDir, "config.json"), JSON.stringify({}));
 
@@ -1824,22 +1829,35 @@ test("readOpencodeConfigRoot: merges config.json → opencode.json → opencode.
         assert.ok(root);
         assert.deepEqual((root.provider as Record<string, { options: { baseURL: string } }> | undefined)?.fromjson, { options: { baseURL: "http://from.json/v1" } } );
 
-        // later files win on conflicting keys
+        // later files win on conflicting keys; providers from earlier files survive
+        // a later file that also carries a top-level provider key (deep merge, like
+        // opencode's own loader — a top-level spread would drop them)
         fs.writeFileSync(
             path.join(ocDir, "opencode.jsonc"),
-            JSON.stringify({ provider: { wins: { options: { baseURL: "http://from.jsonc/v1" } } }, $schema: "https://opencode.ai/config.json" }),
+            JSON.stringify({
+                provider: { wins: { options: { baseURL: "http://from.jsonc/v1" } }, dup: { options: { baseURL: "http://dup-jsonc/v1" } } },
+                $schema: "https://opencode.ai/config.json",
+            }),
         );
         const merged = readOpencodeConfigRoot(env);
-        const providers = (merged?.provider as Record<string, { options: { baseURL: string } }>) ?? {};
+        const providers = (merged?.provider as Record<string, { options: { baseURL: string }; models?: Record<string, { limit: number }> }>) ?? {};
         assert.equal(providers.wins?.options.baseURL, "http://from.jsonc/v1");
+        assert.equal(providers.fromjson?.options.baseURL, "http://from.json/v1");
+        assert.equal(providers.dup?.options.baseURL, "http://dup-jsonc/v1");
+        assert.deepEqual(providers.dup?.models, { m: { limit: 4096 } });
 
-        // OPENCODE_CONFIG bypasses the global dir entirely
+        // OPENCODE_CONFIG layers over the global merge (opencode loads the globals
+        // first and merges the explicit file on top — it does not replace them)
         const directFile = path.join(dir, "direct.json");
-        fs.writeFileSync(directFile, JSON.stringify({ provider: { direct: { options: { baseURL: "http://direct/v1" } } } }));
-        const direct = readOpencodeConfigRoot({ OPENCODE_CONFIG: directFile });
-        const directProviders = (direct?.provider as Record<string, unknown>) ?? {};
-        assert.ok("direct" in directProviders);
-        assert.equal(directProviders.wins, undefined);
+        fs.writeFileSync(
+            directFile,
+            JSON.stringify({ provider: { direct: { options: { baseURL: "http://direct/v1" } }, wins: { options: { baseURL: "http://direct-wins/v1" } } } }),
+        );
+        const direct = readOpencodeConfigRoot({ XDG_CONFIG_HOME: dir, OPENCODE_CONFIG: directFile });
+        const directProviders = (direct?.provider as Record<string, { options: { baseURL: string } }>) ?? {};
+        assert.equal(directProviders.direct?.options.baseURL, "http://direct/v1");
+        assert.equal(directProviders.wins?.options.baseURL, "http://direct-wins/v1");
+        assert.equal(directProviders.fromjson?.options.baseURL, "http://from.json/v1");
 
         assert.equal(readOpencodeConfigRoot({ XDG_CONFIG_HOME: path.join(dir, "empty-xdg") }), undefined);
     } finally {
@@ -1859,7 +1877,9 @@ test("prepareOpencodeHttpRewrite: writes rewritten copy from a JSONC user config
             "}",
         ].join("\n");
         fs.writeFileSync(cfgFile, original);
-        const root = readOpencodeConfigRoot({ OPENCODE_CONFIG: cfgFile });
+        // empty-xdg keeps this hermetic: OPENCODE_CONFIG layers over whatever
+        // lives in the global dir, so point that dir somewhere empty
+        const root = readOpencodeConfigRoot({ XDG_CONFIG_HOME: path.join(dir, "empty-xdg"), OPENCODE_CONFIG: cfgFile });
         const rw = [{ key: "zhipuai-lb", realUpstream: "http://127.0.0.1:18081/v1" }];
         const tmpFile = prepareOpencodeHttpRewrite(root, "http://127.0.0.1:8787", rw, []);
         assert.ok(tmpFile);
@@ -1868,6 +1888,8 @@ test("prepareOpencodeHttpRewrite: writes rewritten copy from a JSONC user config
         assert.deepEqual(rewritten.plugin, ["opencode-acp@latest"]);
         assert.deepEqual(rewritten.compaction, { auto: false });
         assert.equal(fs.readFileSync(cfgFile, "utf8"), original);
+        // the caller's merged root must stay pristine (rewrite happens on a clone)
+        assert.deepEqual(root, { plugin: ["opencode-acp@latest"], provider: { "zhipuai-lb": { options: { baseURL: "http://127.0.0.1:18081/v1" } } } });
         fs.rmSync(path.dirname(tmpFile), { recursive: true, force: true });
         assert.equal(prepareOpencodeHttpRewrite(root, "http://127.0.0.1:8787", [], []), undefined);
         const withPlugin = prepareOpencodeHttpRewrite(root, "http://127.0.0.1:8787", [], [], "/opt/bili/dist/agent/opencode.js");

@@ -910,17 +910,40 @@ function readConfigFileRoot(file: string): Record<string, unknown> | undefined {
     }
 }
 
+// Deep merge mirroring opencode's own loader (remeda mergeDeep): plain objects
+// recurse, arrays/primitives are replaced by the later file. Top-level spread
+// would drop earlier files' provider entries whenever a later file also has a
+// top-level provider key.
+function mergeConfigDeep(target: Record<string, unknown>, source: Record<string, unknown>): Record<string, unknown> {
+    const out: Record<string, unknown> = { ...target };
+    for (const [key, value] of Object.entries(source)) {
+        const existing = out[key];
+        out[key] =
+            value !== null && typeof value === "object" && !Array.isArray(value) &&
+            existing !== null && typeof existing === "object" && !Array.isArray(existing)
+                ? mergeConfigDeep(existing as Record<string, unknown>, value as Record<string, unknown>)
+                : value;
+    }
+    return out;
+}
+
 // Mirror opencode's global merge (config.json → opencode.json → opencode.jsonc,
 // later wins). Needed because opencode seeds a near-empty opencode.jsonc when no
 // config exists yet, so single-file reads miss the real config in opencode.json.
+// A user-set OPENCODE_CONFIG is layered ON TOP of that merge — opencode loads
+// the globals first and merges the explicit file over them, it does not replace
+// them — so providers living only in the global files stay visible.
 export function readOpencodeConfigRoot(env: NodeJS.ProcessEnv): Record<string, unknown> | undefined {
-    if (nonEmpty(env.OPENCODE_CONFIG)) return readConfigFileRoot(env.OPENCODE_CONFIG);
+    let root: Record<string, unknown> | undefined;
     const xdg = nonEmpty(env.XDG_CONFIG_HOME) ? env.XDG_CONFIG_HOME : path.join(os.homedir(), ".config");
     const dir = path.join(xdg, "opencode");
-    let root: Record<string, unknown> | undefined;
     for (const file of ["config.json", "opencode.json", "opencode.jsonc"]) {
         const next = readConfigFileRoot(path.join(dir, file));
-        if (next !== undefined) root = root === undefined ? next : { ...root, ...next };
+        if (next !== undefined) root = root === undefined ? next : mergeConfigDeep(root, next);
+    }
+    if (nonEmpty(env.OPENCODE_CONFIG)) {
+        const next = readConfigFileRoot(env.OPENCODE_CONFIG);
+        if (next !== undefined) root = root === undefined ? next : mergeConfigDeep(root, next);
     }
     return root;
 }
