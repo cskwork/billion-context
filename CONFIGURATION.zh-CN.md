@@ -163,6 +163,8 @@
 - **状态：** ACTIVE
 - **说明：** 将模型名映射到其上下文窗口声明。LLM 的 `/models` 端点**不会**返回上下文窗口大小（已在 OpenAI、Anthropic、zhipu、comfly 上验证），因此代理无法在运行时发现它们 —— 你必须在此声明。`context` 是模型的上下文窗口（以 token 为单位）；`output` 是最大输出大小。当模型未声明时，代理回退到内置上下文表或 models.dev 注册表。每个模型条目还可以携带按模型的 `compress` 块（见[压缩调优](#压缩调优)）。
 
+  内置上下文表是随每个版本发布的静态数据，可能过期 —— 例如 DeepSeek 的规范请求 id `deepseek-flash` 在 models.dev 上没有以该名列出（其窗口列在 `deepseek-v4-flash` 名下），因此只有兜底表能回答它（#852）。日志会为每个模型记录一次胜出来源（`[window] ... fallback=true` 表示值来自内置表）。若解析出的窗口不对，按上文声明 `models.<name>.context`（它优先于注册表和内置表），或固定 `compress.modelContextLimit`；注意 provider 键必须带流量的 scheme（MITM 登录态客户端流量用 `mitm://<host>`，`/bili/` 流量用 `https://<host>`）。
+
 ### `proxy`
 
 - **类型：** `string`
@@ -196,7 +198,7 @@
 - **类型：** `boolean`
 - **默认值：** *（无 —— 压缩开启）*
 - **状态：** ACTIVE
-- **说明：** 按路由覆盖全局 [`passthrough`](#passthrough) 设置。设为 `true` 时，匹配该路由的所有请求**逐字节转发**：不走 kernel 往返（不重序列化 messages、不注入 ACP 渲染标签、不删除 `prompt_cache_key`），响应原样 pipe，该路由不建立 session 状态。用于上游反作弊会拒绝 bili 改写后请求体的场景 —— 例如 ZCode 对 kernel 重建的 `messages` 请求体返回 `405 / 3012`（"request has been blocked due to unusual activity"，#661）。`mitm://` 键只命中该 host 的 MITM（登录态客户端）流量，普通 `https://` 键则同时覆盖 MITM 与 `/bili/`（API key）流量：
+- **说明：** 按路由覆盖全局 [`passthrough`](#passthrough) 设置。设为 `true` 时，匹配该路由的所有请求**逐字节转发**：不走 kernel 往返（不重序列化 messages、不注入 ACP 渲染标签、不删除 `prompt_cache_key`），响应原样 pipe，该路由不建立 session 状态。用于上游反作弊会拒绝 bili 改写后请求体的场景 —— 例如 ZCode 对 kernel 重建的 `messages` 请求体返回 `405 / 3012`（"request has been blocked due to unusual activity"，#661）。`mitm://` 键只命中该 host 的 MITM（登录态客户端）流量，普通 `https://` 键只命中 `/bili/`（API key）流量 —— 两种 scheme 互不重叠：
 
   ```jsonc
   {

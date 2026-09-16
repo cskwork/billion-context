@@ -227,7 +227,9 @@ const CONTEXT_LIMIT_TABLE: Array<{ match: RegExp; limit: number }> = [
     { match: /^glm-4\.6/i, limit: 128_000 },
     { match: /^glm-5/i, limit: 1_000_000 },
     { match: /^glm-/i, limit: 128_000 },
-    { match: /^deepseek/i, limit: 128_000 },
+    // DeepSeek: flagship line (chat/reasoner/v4*/flash) is 1M on models.dev; only legacy r1/v3/ocr stay ~128k (#852).
+    { match: /^deepseek-(r1|v3|ocr)/i, limit: 128_000 },
+    { match: /^deepseek/i, limit: 1_000_000 },
     { match: /^minimax/i, limit: 204_800 },
     { match: /^qwen/i, limit: 128_000 },
     { match: /^kimi/i, limit: 128_000 },

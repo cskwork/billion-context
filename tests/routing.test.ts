@@ -75,12 +75,23 @@ test("lookupContextLimit returns known windows", () => {
     assert.equal(lookupContextLimit("gemini-2.5-pro"), 1_000_000);
     assert.equal(lookupContextLimit("glm-4.6"), 128_000);
     assert.equal(lookupContextLimit("glm-4.5-air"), 128_000);
-    assert.equal(lookupContextLimit("deepseek-chat"), 128_000);
-    assert.equal(lookupContextLimit("deepseek-reasoner"), 128_000);
+    assert.equal(lookupContextLimit("deepseek-chat"), 1_000_000);
+    assert.equal(lookupContextLimit("deepseek-reasoner"), 1_000_000);
     assert.equal(lookupContextLimit("MiniMax-M2.1"), 204_800);
     assert.equal(lookupContextLimit("minimax-m2"), 204_800);
     assert.equal(lookupContextLimit("qwen-max"), 128_000);
     assert.equal(lookupContextLimit("kimi-k2"), 128_000);
+});
+
+test("lookupContextLimit keeps DeepSeek flagship at 1M and legacy r1/v3/ocr at 128k (#852)", () => {
+    assert.equal(lookupContextLimit("deepseek-flash"), 1_000_000);
+    assert.equal(lookupContextLimit("deepseek-v4-flash"), 1_000_000);
+    assert.equal(lookupContextLimit("deepseek-v4-pro"), 1_000_000);
+    assert.equal(lookupContextLimit("deepseek-r1"), 128_000);
+    assert.equal(lookupContextLimit("deepseek-r1-distill-qwen-32b"), 128_000);
+    assert.equal(lookupContextLimit("deepseek-v3"), 128_000);
+    assert.equal(lookupContextLimit("deepseek-v3.2"), 128_000);
+    assert.equal(lookupContextLimit("deepseek-ocr-2"), 128_000);
 });
 
 test("lookupContextLimit matches relay/vLLM 'prefix/name' ids via the bare basename (#736)", () => {
@@ -156,8 +167,8 @@ test("model not in route falls through to lookup table", () => {
     const routes = {
         "https://open.bigmodel.cn": { models: { "glm-5.2": { context: 1000000 } } },
     };
-    // glm-5.2 not in this route's models, but in the built-in table (1000000)
-    assert.equal(resolveContextLimit(routes, "https://api.deepseek.com", "deepseek-chat"), 128000);
+    // deepseek-chat is not declared on this route -> falls through to the built-in table (#852)
+    assert.equal(resolveContextLimit(routes, "https://api.deepseek.com", "deepseek-chat"), 1_000_000);
 });
 
 test("configured context lookup stays separate from registry/built-in fallbacks", () => {

@@ -165,6 +165,8 @@ A shallow key (`https://open.bigmodel.cn`) matches every path on that host. A de
 
   **Resolution order (first match wins):** (1) per-request sources — the client's `anthropic-beta` larger-context negotiation, a cooperative plugin's report, and the launcher's per-model windows; (2) this per-model `context` declaration; (3) the **warm** models.dev registry cache, when the model is listed (relay/private hosts match the bare model name against the registry's provider-prefixed entries); (4) the built-in context table. So this per-model `context` declaration **outranks the registry** — set it to the window your relay/private deployment actually serves, and it wins even when models.dev lists a different (usually larger) window for the model. `compress.modelContextLimit` remains the highest-priority source (always wins) when you want to pin the window across every route. Each model entry may also carry a per-model `compress` block (see [Compression Tuning](#compression-tuning)).
 
+  The built-in context table (step 4) is static data shipped with each release and can go stale — e.g. DeepSeek's canonical request id `deepseek-flash` is not listed on models.dev under that name (its window is listed under `deepseek-v4-flash`), so only the table answered for it (#852). The log records which source won, once per model per process (`[window] ... fallback=true` means the value came from the built-in table). If the resolved window looks wrong, declare `models.<name>.context` as above — it outranks both the registry and the table — or pin `compress.modelContextLimit`; and remember the provider key must carry the traffic's scheme (`mitm://<host>` for MITM login-client traffic, `https://<host>` for `/bili/` traffic).
+
 ### `proxy`
 
 - **Type:** `string`
@@ -198,7 +200,7 @@ A shallow key (`https://open.bigmodel.cn`) matches every path on that host. A de
 - **Type:** `boolean`
 - **Default:** *(none — compression active)*
 - **Status:** ACTIVE
-- **Description:** Per-route override of the global [`passthrough`](#passthrough) setting. When `true`, every request matching this route is forwarded **byte-for-byte**: no kernel round-trip (no message re-serialization, no ACP render tags, no `prompt_cache_key` removal), the response is piped through untouched, and no session state is created for that route. Use this for upstreams whose anti-fraud fingerprinting rejects bili's rewritten bodies — e.g. ZCode's `405 / 3012` ("request has been blocked due to unusual activity") on the kernel-rebuilt `messages` body (#661). A `mitm://` key targets only the MITM (login-client) traffic of that host, while a plain `https://` key covers both MITM and `/bili/` (API-key) traffic:
+- **Description:** Per-route override of the global [`passthrough`](#passthrough) setting. When `true`, every request matching this route is forwarded **byte-for-byte**: no kernel round-trip (no message re-serialization, no ACP render tags, no `prompt_cache_key` removal), the response is piped through untouched, and no session state is created for that route. Use this for upstreams whose anti-fraud fingerprinting rejects bili's rewritten bodies — e.g. ZCode's `405 / 3012` ("request has been blocked due to unusual activity") on the kernel-rebuilt `messages` body (#661). A `mitm://` key targets only the MITM (login-client) traffic of that host, while a plain `https://` key targets only `/bili/` (API-key) traffic — the two schemes never overlap:
 
   ```jsonc
   {
