@@ -889,9 +889,11 @@ async function withCodexHarness(fn: (h: { proxy: http.Server; upstream: http.Ser
         port: 0,
         host: "127.0.0.1",
         upstream: "http://127.0.0.1",
-        routes: { [`http://127.0.0.1:${upstreamPort}`]: { models: { "gpt-resp": { context: 10_000 } } } },
-        modelContextLimit: 10_000,
-        kernelConfig: defaultConfig(10_000),
+        // #829: 15k clears the rebuilt payload (conversation + developer item
+        // carrying the injected compress prompt + ACP tools); setup must not fail-fast.
+        routes: { [`http://127.0.0.1:${upstreamPort}`]: { models: { "gpt-resp": { context: 15_000 } } } },
+        modelContextLimit: 15_000,
+        kernelConfig: defaultConfig(15_000),
         compress: { injectTool: true, injectNudge: false },
         promptCache: { routing: "auto" },
         sessionHeader: "x-acp-session",

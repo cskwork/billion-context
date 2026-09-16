@@ -32,8 +32,9 @@ function completed(inputTokens: number): string {
 
 // 7 messages × ~4400 chars (~1100 tokens each, ~7700 total). Above the
 // kernel's 5000-token recent-tail protection so m00001/m00002 stay
-// compressible (a tier-1 pending range for the nudge), but below the 10k
-// window so preflight never fires.
+// compressible (a tier-1 pending range for the nudge), but below the 15k
+// window so preflight never fires (#829: the window must clear the rebuilt
+// payload — conversation + developer item with injected prompts + ACP tools).
 function conversation() {
     const input: { type: string; role: string; content: string }[] = [];
     for (let i = 0; i < 7; i++) {
@@ -51,8 +52,8 @@ test("e2e #280r2 (Responses): trailing compaction_trigger stays final — nudge 
             const raw = Buffer.concat(chunks).toString("utf8");
             bodies.push(raw);
             res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
-            // 9000/10000 = 90% usage arms the OVER-LIMIT nudge from turn 2 on.
-            res.write(completed(9000));
+            // 13500/15000 = 90% usage arms the OVER-LIMIT nudge from turn 2 on.
+            res.write(completed(13500));
             res.end();
         });
     });
@@ -66,9 +67,9 @@ test("e2e #280r2 (Responses): trailing compaction_trigger stays final — nudge 
         port: 0,
         host: "127.0.0.1",
         upstream: "http://127.0.0.1",
-        routes: { [`http://127.0.0.1:${upstreamPort}`]: { models: { "gpt-resp": { context: 10_000 } } } },
-        modelContextLimit: 10_000,
-        kernelConfig: defaultConfig(10_000),
+        routes: { [`http://127.0.0.1:${upstreamPort}`]: { models: { "gpt-resp": { context: 15_000 } } } },
+        modelContextLimit: 15_000,
+        kernelConfig: defaultConfig(15_000),
         compress: { injectTool: true, injectNudge: true },
         promptCache: { routing: "auto" },
         sessionHeader: "x-acp-session",
@@ -95,7 +96,7 @@ test("e2e #280r2 (Responses): trailing compaction_trigger stays final — nudge 
         await r1.text();
         const s = listSessions().find((x) => x.meta.label === "trig-sess");
         assert.ok(s, "session exists");
-        assert.equal(s!.stats.lastInputTokens, 9000, "usage report arms the nudge for the next turn");
+        assert.equal(s!.stats.lastInputTokens, 13500, "usage report arms the nudge for the next turn");
 
         // Turn 2: Codex's native remote-compact request — the conversation
         // plus a trailing compaction_trigger. The nudge is armed (90% usage)

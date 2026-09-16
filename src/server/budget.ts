@@ -68,6 +68,31 @@ export function estimateWireOverhead(protocol: "anthropic" | "openai" | "respons
             .join("\n");
         sysText = sysText ? `${sysText}\n${hoisted}` : hoisted;
     }
+    // responses: codex sends its whole system prompt as role=developer items
+    // inside input[] (top-level instructions stays empty). The kernel hoists
+    // those out of the counted message view (projection.systemParts) and the
+    // rebuild moves them back into input[] as a developer message while
+    // stripping instructions — so the whole system prompt is invisible to
+    // estimateCoreMessages AND to the instructions-only read above (#829).
+    // Count the developer/system items in input[] (mirrors the openai branch);
+    // content may be a plain string or an array of input_text/output_text parts.
+    if (protocol === "responses" && Array.isArray(parsed.input)) {
+        const hoisted = (parsed.input as Array<Record<string, unknown>>)
+            .filter((item) => item.role === "system" || item.role === "developer")
+            .map((item) => {
+                const c = item.content;
+                if (typeof c === "string") return c;
+                if (Array.isArray(c)) {
+                    return c
+                        .map((p) => (p && typeof p === "object" && typeof (p as { text?: unknown }).text === "string" ? (p as { text: string }).text : ""))
+                        .join("\n");
+                }
+                return "";
+            })
+            .filter((t) => t.length > 0)
+            .join("\n");
+        if (hoisted) sysText = sysText ? `${sysText}\n${hoisted}` : hoisted;
+    }
     return defaultCountTokens(sysText) + defaultCountTokens(JSON.stringify(parsed.tools ?? []));
 }
 
