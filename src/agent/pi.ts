@@ -275,23 +275,41 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
         }
         // #535: cancel the host's NATIVE compaction so its summarizer never
         // fires alongside bili's ACP compression — the in-extension
-        // replacement for the old compaction-off config injection. pi's event
-        // carries `reason`: cancel only threshold + overflow so manual
-        // /compact stays user-owned. omp's event has no reason field, so omp
-        // cancels ALL compaction — under bili, manual native /compact is
-        // equally harmful (the native summarizer would destroy the
-        // ACP-tagged context), the host shows "Compaction cancelled", and
-        // the user should reach for /acp instead. Only armed under `bili`
-        // launch: plain pi/omp with the plugin installed stays fully native.
+        // replacement for the old compaction-off config injection. Only
+        // armed under `bili` launch: plain pi/omp with the plugin installed
+        // stays fully native.
+        // pi: the event carries `reason`; cancel only threshold + overflow so
+        // manual /compact stays user-owned.
+        // omp (#851): session_before_compact carries NO reason field, so at
+        // hook level manual compaction (/compact, plan-mode "Approve and
+        // compact context") is indistinguishable from auto — but every auto
+        // pass announces itself first via auto_compaction_start (reason
+        // threshold|overflow|idle|incomplete), which omp emits (awaited)
+        // before the hook fires; manual paths never do. Track the
+        // announcement: announced passes stay cancelled, unannounced ones
+        // are left user-owned. A surviving native compaction is safe: the
+        // proxy archives the unreachable blocks on session_compact (#395).
         if ((agent === "pi" || agent === "omp") && process.env.BILLION_CONTEXT_PROXY !== undefined) {
-            pi.on("session_before_compact", (event) => {
-                if (agent === "pi") {
+            if (agent === "pi") {
+                pi.on("session_before_compact", (event) => {
                     const reason = (event as unknown as { reason?: unknown }).reason;
                     if (reason === "threshold" || reason === "overflow") return { cancel: true };
                     return undefined;
-                }
-                return { cancel: true };
-            });
+                });
+            } else {
+                let autoPending = false;
+                pi.on("auto_compaction_start", () => {
+                    autoPending = true;
+                });
+                pi.on("auto_compaction_end", () => {
+                    autoPending = false;
+                });
+                pi.on("session_before_compact", () => {
+                    if (!autoPending) return undefined;
+                    autoPending = false;
+                    return { cancel: true };
+                });
+            }
         }
         // #535 omp-only: omp resolves modelRoles.default into options.model
         // from the PRE-extension static catalog (main.ts: "scope is resolved
