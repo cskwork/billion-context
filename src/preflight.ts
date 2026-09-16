@@ -30,6 +30,13 @@ const CHUNK_FRACTION = 0.6;
 const MIN_CHUNK_TOKENS = 2000;
 const MIN_SUMMARY_CHARS = 50;
 const MAX_SUMMARY_OUTPUT_TOKENS = 8192;
+// #853: a thinking-on-by-default model can spend its entire shared max_tokens
+// budget on chain-of-thought before emitting any answer, so the summary call
+// returns HTTP 200 with finish_reason:"length" and content:"". Splitting the
+// chunk smaller cannot recover these (the thinking overhead is per-call), so on
+// that signature we retry once with a doubled budget before giving up. Kept
+// under typical model max-output caps.
+const MAX_SUMMARY_OUTPUT_TOKENS_RETRY = 16384;
 // #574: bound on upstream summarization calls per invocation — the multi-range
 // walk can otherwise spend a call per viable range in a block-dense history.
 const MAX_SUMMARY_CALLS_PER_PREFLIGHT = 8;
@@ -247,19 +254,19 @@ function splitChunks(
     return chunks;
 }
 
-function summaryPayload(protocol: PreflightProtocol, model: string, system: string, content: string, stream: boolean, includeMaxOutputTokens: boolean): Record<string, unknown> {
+function summaryPayload(protocol: PreflightProtocol, model: string, system: string, content: string, stream: boolean, includeMaxOutputTokens: boolean, maxOutputTokens: number = MAX_SUMMARY_OUTPUT_TOKENS): Record<string, unknown> {
     if (protocol === "anthropic") {
-        return { model, max_tokens: MAX_SUMMARY_OUTPUT_TOKENS, system, messages: [{ role: "user", content }], stream };
+        return { model, max_tokens: maxOutputTokens, system, messages: [{ role: "user", content }], stream };
     }
     if (protocol === "openai") {
-        return { model, max_tokens: MAX_SUMMARY_OUTPUT_TOKENS, messages: [{ role: "system", content: system }, { role: "user", content }], stream };
+        return { model, max_tokens: maxOutputTokens, messages: [{ role: "system", content: system }, { role: "user", content }], stream };
     }
     // #488: codex relays reject Responses calls without store:false ("Store must be set to false").
     // #663: max_output_tokens is optional — omit it once the upstream has
     // rejected the parameter (learned per URL+model); the model's default
     // output cap then applies.
     const payload: Record<string, unknown> = { model, instructions: system, input: [{ role: "user", content }], stream, store: false };
-    if (includeMaxOutputTokens) payload.max_output_tokens = MAX_SUMMARY_OUTPUT_TOKENS;
+    if (includeMaxOutputTokens) payload.max_output_tokens = maxOutputTokens;
     return payload;
 }
 
@@ -499,6 +506,28 @@ function diagnoseReasoningExhaustion(json: unknown): string | null {
     return `the model spent its output budget on reasoning/thinking and returned no summary text (${signal}; reasoning_content=${reasoning.length} chars, content empty). Raise the preflight max_tokens or disable the model's thinking mode; this is a budget limit, not an upstream failure`;
 }
 
+// #853: definitive trigger for a budget retry — deliberately narrower than
+// diagnoseReasoningExhaustion (which also fires with no finish_reason). Raising
+// the budget only helps when the upstream explicitly reports the completion was
+// truncated by the output limit (finish_reason:"length") AND nothing usable came
+// back in content AND the model did produce reasoning; for other empty-content
+// shapes more budget would not help.
+function isReasoningBudgetExhausted(json: unknown): boolean {
+    if (!json || typeof json !== "object") return false;
+    const choices = (json as Record<string, unknown>).choices;
+    if (!Array.isArray(choices) || choices.length === 0) return false;
+    const choice = choices[0] as Record<string, unknown>;
+    if (choice.finish_reason !== "length") return false;
+    const msg = choice.message;
+    if (!msg || typeof msg !== "object") return false;
+    const m = msg as Record<string, unknown>;
+    const content = m.content;
+    const hasContent = typeof content === "string" ? content.length > 0 : Array.isArray(content) && content.length > 0;
+    if (hasContent) return false;
+    const reasoning = typeof m.reasoning_content === "string" ? m.reasoning_content : typeof m.reasoning === "string" ? m.reasoning : "";
+    return reasoning.length > 0;
+}
+
 export function diagnoseEmptySummary(text: string, json?: unknown): string {
     let parsed: unknown = json;
     if (parsed === undefined && text.trimStart().startsWith("{")) {
@@ -651,29 +680,40 @@ async function requestSummaryBody(deps: PreflightDeps, body: string): Promise<st
 }
 
 async function requestSummary(deps: PreflightDeps, system: string, content: string, stream: boolean, includeMaxOutputTokens: boolean): Promise<SummaryOutcome> {
-    const text = await requestSummaryBody(deps, JSON.stringify(summaryPayload(deps.protocol, deps.model, system, content, stream, includeMaxOutputTokens)));
-    let json: unknown;
-    try {
-        json = JSON.parse(text);
-    } catch {
-        json = null;
+    // #853: at most one budget escalation — start at the normal cap and, if the
+    // first attempt comes back reasoning-exhausted, retry once with the doubled
+    // cap. The guard below keeps this to exactly two upstream calls per range.
+    let maxOutputTokens = MAX_SUMMARY_OUTPUT_TOKENS;
+    for (;;) {
+        const text = await requestSummaryBody(deps, JSON.stringify(summaryPayload(deps.protocol, deps.model, system, content, stream, includeMaxOutputTokens, maxOutputTokens)));
+        let json: unknown;
+        try {
+            json = JSON.parse(text);
+        } catch {
+            json = null;
+        }
+        // Streaming bodies are SSE, but a non-conforming upstream may answer a
+        // stream:true call with plain JSON — accept either shape.
+        const summary = (json && typeof json === "object"
+            ? extractSummaryText(deps.protocol, json as Record<string, unknown>)
+            : stream
+                ? extractSummaryFromSse(deps.protocol, text)
+                : "").trim();
+        if (!json && !stream) {
+            deps.log("warn", `[preflight] summary response was not JSON: ${text.slice(0, 200)}`);
+        }
+        if (summary.length < MIN_SUMMARY_CHARS) {
+            const diagnosis = diagnoseEmptySummary(text, json);
+            deps.log("warn", `[preflight] summary too short (${summary.length} chars): ${diagnosis}`);
+            if (!stream && maxOutputTokens < MAX_SUMMARY_OUTPUT_TOKENS_RETRY && isReasoningBudgetExhausted(json)) {
+                maxOutputTokens = MAX_SUMMARY_OUTPUT_TOKENS_RETRY;
+                deps.log("warn", `[preflight] budget-insufficient retry (#853): thinking exhausted the summary output budget; raising max_tokens ${MAX_SUMMARY_OUTPUT_TOKENS} -> ${maxOutputTokens} and retrying once`);
+                continue;
+            }
+            return { unusable: diagnosis };
+        }
+        return { summary };
     }
-    // Streaming bodies are SSE, but a non-conforming upstream may answer a
-    // stream:true call with plain JSON — accept either shape.
-    const summary = (json && typeof json === "object"
-        ? extractSummaryText(deps.protocol, json as Record<string, unknown>)
-        : stream
-            ? extractSummaryFromSse(deps.protocol, text)
-            : "").trim();
-    if (!json && !stream) {
-        deps.log("warn", `[preflight] summary response was not JSON: ${text.slice(0, 200)}`);
-    }
-    if (summary.length < MIN_SUMMARY_CHARS) {
-        const diagnosis = diagnoseEmptySummary(text, json);
-        deps.log("warn", `[preflight] summary too short (${summary.length} chars): ${diagnosis}`);
-        return { unusable: diagnosis };
-    }
-    return { summary };
 }
 
 const ABORTED_FAILURE: PreflightFailure = { kind: "aborted", detail: "the client disconnected during preflight compression" };
