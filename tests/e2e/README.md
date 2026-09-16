@@ -50,7 +50,11 @@ prints codex version, dist path, and an upstream `/models` probe.
 
 - Full isolation: `CODEX_HOME`, `XDG_{CONFIG,CACHE,STATE}_HOME` and the work
   dir (`tmp/e2e-codex-*` in the repo — **not** `/tmp`, codex refuses TMPDIR
-  homes) are throwaway.
+  homes) are throwaway. Codex's **spawn cwd** is deliberately OUTSIDE the repo
+  tree (`$TMPDIR/billion-context-e2e*`): codex discovers `AGENTS.md` by walking
+  up from its cwd, so an in-repo cwd folds the entire repo doc into every
+  request payload and couples CI to doc size (#815). A stub `AGENTS.md` does
+  NOT help — codex concatenates every level on the way up.
 - The bili window is forced via the `BILI_LAUNCHER_MODEL_WINDOWS` env
   (per-model override; wins over registry peek) so compression triggers
   deterministically on every run, independent of the upstream's advertised
