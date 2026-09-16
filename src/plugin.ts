@@ -3,7 +3,7 @@ import { buildStatusPanel } from "acp-kernel/panel";
 import { fileURLToPath } from "node:url";
 import fs from "node:fs";
 import path from "node:path";
-import { acquireInFlight, findSessionByCanonicalId, listSessions, markCompactionBoundary, markDirty, peekSession, releaseInFlight, withSessionLock, type Session } from "./session.js";
+import { acquireInFlight, effectiveConfig, findSessionByCanonicalId, listSessions, markCompactionBoundary, markDirty, peekSession, releaseInFlight, withSessionLock, type Session } from "./session.js";
 import { ABSORB_TOOL, ABSORB_TOOL_NAME, ABSORB_TOOL_OPENAI, ABSORB_TOOL_RESPONSES, ACP_TOOLS_ANTHROPIC, ACP_TOOLS_OPENAI, ACP_TOOLS_RESPONSES, PROXY_TOOL_NAMES } from "./compress-tool.js";
 import { effectiveAbsorbConfig, isProxyToolFor } from "./absorb.js";
 import { executeProxyTool } from "./loop/core.js";
@@ -482,10 +482,13 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
     try {
         const messages = mem ? (mem.processed.length > 0 ? mem.processed : mem.original) : [];
         if (messages.length > 0) {
+            // #833: base kernelConfig carries no file/provider/model compress
+            // settings — render from the session's last resolved Config so the
+            // panel matches actual injection behavior.
             nudge = deps.core.processTurn({
                 messages,
                 state: session.state,
-                config: deps.config,
+                config: effectiveConfig(session, deps.config),
                 tokenCount: session.stats.lastInputTokens,
                 renderTags: "none",
             }).nudge;
@@ -604,7 +607,9 @@ export async function handlePluginTool(
             const messages = mem ? (mem.processed.length > 0 ? mem.processed : mem.original) : [];
             return executeProxyTool(tool, args, {
                 core: deps.core,
-                config: deps.config,
+                // #833: run proxy tools under the session's last resolved Config
+                // (same values the wire path used), not the base kernelConfig.
+                config: effectiveConfig(session, deps.config),
                 messages,
                 session,
                 log: (m) => deps.log("info", `[${session.id}] [plugin] ${m}`),
