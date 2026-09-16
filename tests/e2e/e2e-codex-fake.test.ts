@@ -1,6 +1,7 @@
 import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import net from "node:net";
+import os from "node:os";
 import path from "node:path";
 import { strict as assert } from "node:assert";
 import { test } from "node:test";
@@ -12,6 +13,10 @@ const TMO = Number(process.env.E2E_TMO ?? 120_000);
 const FAKE_UPSTREAM = path.join(import.meta.dirname, "fake-upstream.mjs");
 const WORK_ROOT = path.join(process.cwd(), "tmp");
 fs.mkdirSync(WORK_ROOT, { recursive: true });
+// codex discovers AGENTS.md by walking UP from its spawn cwd (#815): keep the
+// cwd outside the repo tree or the whole repo doc leaks into every request.
+const CWD_ROOT = path.join(os.tmpdir(), "billion-context-e2e");
+fs.mkdirSync(CWD_ROOT, { recursive: true });
 
 function codexAvailable(): boolean {
 	try { return spawnSync(CODEX_BIN, ["--version"], { timeout: 15_000 }).status === 0; } catch { return false; }
@@ -61,6 +66,7 @@ function windowEnv(contextWindow: number): Record<string, string> {
 
 type Ctx = {
 	work: string;
+	codexCwd: string;
 	codexHome: string;
 	xdg: { config: string; cache: string; state: string };
 	port: number;
@@ -76,6 +82,7 @@ async function startCtx(contextWindow: number): Promise<Ctx> {
 	const work = fs.mkdtempSync(path.join(WORK_ROOT, "e2e-codex-fake-"));
 	const ctx: Ctx = {
 		work,
+		codexCwd: fs.mkdtempSync(path.join(CWD_ROOT, "cwd-")),
 		codexHome: path.join(work, "codex-home"),
 		xdg: { config: path.join(work, "xdg-config"), cache: path.join(work, "xdg-cache"), state: path.join(work, "xdg-state") },
 		port: await freePort(),
@@ -161,7 +168,7 @@ function turn(ctx: Ctx, prompt: string): Promise<{ code: number; last: string }>
 	args.push(prompt);
 	return new Promise((resolve, reject) => {
 		const child = spawn(CODEX_BIN, args, {
-			cwd: ctx.work,
+			cwd: ctx.codexCwd,
 			env: { ...process.env, CODEX_HOME: ctx.codexHome, E2E_UPSTREAM_KEY: "fake", RUST_LOG: "error" },
 			stdio: ["ignore", "ignore", "pipe"],
 		});
@@ -179,7 +186,12 @@ function turn(ctx: Ctx, prompt: string): Promise<{ code: number; last: string }>
 }
 
 test("overflow: compression really happens in codex; bulk folded, sentinels retained", { skip: skipReason }, async (t) => {
-	const ctx = await startCtx(12_000);
+	// 10k: hermetic cwd removed the repo AGENTS.md from the payload (#815),
+	// dropping the baseline to ~14k reported tokens; 10k puts the window below
+	// the baseline so preflight engages from the second load turn and keeps the
+	// forwarded payload bounded (assertion below), like the original 12k did
+	// against the AGENTS.md-inflated baseline.
+	const ctx = await startCtx(10_000);
 	t.after(() => teardown(ctx));
 
 	const planted = [4781, 2903, 6577];

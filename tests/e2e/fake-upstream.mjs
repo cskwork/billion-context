@@ -66,11 +66,11 @@ function isSummaryRequest(parsed) {
 	return /must be compressed because the session context exceeds|Write a \*?\*?(tier-1|\d+-tier) compression summary/.test(ins);
 }
 
-function messageEvents(text) {
+function messageEvents(text, inTok) {
 	const id = uid();
 	const msgId = `msg_${id}`;
 	const msg = { type: "message", id: msgId, role: "assistant", content: [{ type: "output_text", text }] };
-	const inTok = 1, outTok = estOut(text);
+	const outTok = estOut(text);
 	return [
 		["response.created", { type: "response.created", response: { id, status: "in_progress", output: [] } }],
 		["response.output_item.added", { type: "response.output_item.added", output_index: 0, item: { type: "message", id: msgId, role: "assistant", content: [] } }],
@@ -119,7 +119,7 @@ const server = http.createServer((req, res) => {
 					fs.appendFileSync(REQLOG, JSON.stringify({ t: Date.now(), model: parsed.model, stream: !!parsed.stream, isSummary: summary, inputLen: raw.length, input: parsed.input }) + "\n");
 				} catch { /* noop */ }
 				const inTok = estIn(raw);
-				if (parsed.stream) sse(res, messageEvents(text));
+				if (parsed.stream) sse(res, messageEvents(text, inTok));
 				else jsonResponse(res, text, inTok);
 			});
 			return;
