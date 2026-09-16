@@ -92,6 +92,10 @@ import {
     runLaunch,
     type ClientConfig,
     type HttpRewrite,
+    type DiscoveredRoutes,
+    opencodeEffectiveCwd,
+    opencodeProjectBypassWarnings,
+    readOpencodeProjectLayer,
 } from "../src/launcher.ts";
 import { _setForTest as registrySetForTest, _resetForTest as registryResetForTest } from "../src/registry.ts";
 
@@ -3911,4 +3915,105 @@ test("runLaunch kimi: cert-MITM envs (combined CA on SSL_CERT_FILE + NODE_EXTRA_
         else process.env.NO_PROXY = prevNoProxy;
         fs.rmSync(home, { recursive: true, force: true });
     }
+});
+
+test("readOpencodeProjectLayer: git-bounded walk, nearest wins, .opencode dir, jsonc", () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), "oc-proj-"));
+    try {
+        const repo = path.join(base, "repo");
+        const deep = path.join(repo, "a", "b");
+        fs.mkdirSync(deep, { recursive: true });
+        fs.mkdirSync(path.join(repo, ".git"), { recursive: true });
+        fs.writeFileSync(
+            path.join(base, "opencode.json"),
+            JSON.stringify({ provider: { outer: { options: { baseURL: "http://127.0.0.1:1/outer" } } } }),
+        );
+        fs.writeFileSync(
+            path.join(repo, "opencode.json"),
+            JSON.stringify({
+                provider: {
+                    shared: { options: { baseURL: "http://127.0.0.1:2/root" } },
+                    onlyRoot: { options: { baseURL: "http://127.0.0.1:3/root" } },
+                },
+            }),
+        );
+        fs.mkdirSync(path.join(repo, ".opencode"), { recursive: true });
+        fs.writeFileSync(
+            path.join(repo, ".opencode", "opencode.json"),
+            JSON.stringify({ provider: { dotdir: { options: { baseURL: "http://127.0.0.1:4/dot" } } } }),
+        );
+        fs.writeFileSync(
+            path.join(deep, "opencode.jsonc"),
+            '// line comment\n/* block */\n{"provider":{"shared":{"options":{"baseURL":"http://127.0.0.1:5/deep"}}},}',
+        );
+        const layer = readOpencodeProjectLayer(deep);
+        assert.equal(layer.providers["outer"], undefined, "walk stops at the git root");
+        assert.deepEqual(layer.providers["shared"], { baseURL: "http://127.0.0.1:5/deep", file: path.join(deep, "opencode.jsonc") });
+        assert.deepEqual(layer.providers["onlyRoot"], { baseURL: "http://127.0.0.1:3/root", file: path.join(repo, "opencode.json") });
+        assert.deepEqual(layer.providers["dotdir"], { baseURL: "http://127.0.0.1:4/dot", file: path.join(repo, ".opencode", "opencode.json") });
+        const sibling = path.join(repo, "empty");
+        fs.mkdirSync(sibling);
+        const layer2 = readOpencodeProjectLayer(sibling);
+        assert.deepEqual(Object.keys(layer2.providers).sort(), ["dotdir", "onlyRoot", "shared"]);
+    } finally {
+        fs.rmSync(base, { recursive: true, force: true });
+    }
+});
+
+test("readOpencodeProjectLayer: outside a repo walks all ancestor levels", () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), "oc-nogit-"));
+    try {
+        const top = path.join(base, "top");
+        const mid = path.join(top, "mid");
+        const leaf = path.join(mid, "leaf");
+        fs.mkdirSync(leaf, { recursive: true });
+        fs.writeFileSync(
+            path.join(top, "opencode.json"),
+            JSON.stringify({ provider: { topP: { options: { baseURL: "http://127.0.0.1:6/top" } } } }),
+        );
+        fs.writeFileSync(
+            path.join(mid, "opencode.json"),
+            JSON.stringify({ provider: { midP: { options: { baseURL: "http://127.0.0.1:7/mid" } } } }),
+        );
+        const layer = readOpencodeProjectLayer(leaf);
+        assert.deepEqual(layer.providers["topP"], { baseURL: "http://127.0.0.1:6/top", file: path.join(top, "opencode.json") });
+        assert.deepEqual(layer.providers["midP"], { baseURL: "http://127.0.0.1:7/mid", file: path.join(mid, "opencode.json") });
+    } finally {
+        fs.rmSync(base, { recursive: true, force: true });
+    }
+});
+
+test("opencodeEffectiveCwd: honors --dir, defaults to process.cwd()", () => {
+    assert.equal(opencodeEffectiveCwd([]), process.cwd());
+    assert.equal(opencodeEffectiveCwd(["run"]), process.cwd());
+    assert.equal(opencodeEffectiveCwd(["--dir", "/x/y"]), "/x/y");
+    assert.equal(opencodeEffectiveCwd(["--dir=/x/y"]), "/x/y");
+    assert.equal(opencodeEffectiveCwd(["--dir", "rel/z"]), path.resolve("rel/z"));
+});
+
+test("opencodeProjectBypassWarnings: override + project-only warn, routed values silent", () => {
+    const routes: DiscoveredRoutes = {
+        httpsDomains: ["open.bigmodel.cn"],
+        httpRewrites: [{ key: "local-lb", realUpstream: "http://127.0.0.1:8199/v1" }],
+        httpsRewrites: [{ key: "bigmodel", realUpstream: "https://open.bigmodel.cn/api/v4" }],
+        httpEnvRoutes: [],
+    };
+    const F = "/proj/opencode.json";
+    let w = opencodeProjectBypassWarnings({ providers: { "local-lb": { baseURL: "http://127.0.0.1:9999/a", file: F } } }, routes);
+    assert.equal(w.length, 1);
+    assert.match(w[0], /redefines provider "local-lb"/);
+    assert.match(w[0], /will NOT go through the proxy/);
+    assert.match(w[0], new RegExp(F.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+    w = opencodeProjectBypassWarnings({ providers: { ghost: { baseURL: "http://127.0.0.1:7777/p", file: F } } }, routes);
+    assert.equal(w.length, 1);
+    assert.match(w[0], /defined only in opencode's project layer/);
+    w = opencodeProjectBypassWarnings({ providers: { "local-lb": { baseURL: "http://127.0.0.1:8787/bili/http://127.0.0.1:8199/v1", file: F } } }, routes);
+    assert.deepEqual(w, [], "already /bili/-wrapped → routed");
+    w = opencodeProjectBypassWarnings({ providers: { bigmodel: { baseURL: "https://open.bigmodel.cn/api/v4", file: F } } }, routes);
+    assert.deepEqual(w, [], "https host already MITM-routed");
+    w = opencodeProjectBypassWarnings({ providers: { "local-lb": { file: F } } }, routes);
+    assert.deepEqual(w, [], "no explicit baseURL → inherits delivered value via deep merge");
+    w = opencodeProjectBypassWarnings({ providers: { "local-lb": { baseURL: "http://127.0.0.1:9/a", file: F }, ghost: { baseURL: "http://127.0.0.1:7/b", file: F } } }, routes);
+    assert.equal(w.length, 2);
+    assert.deepEqual(opencodeProjectBypassWarnings({ providers: {} }, routes), []);
 });
