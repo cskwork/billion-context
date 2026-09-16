@@ -905,6 +905,36 @@ test("ensureProxyRunning: throws when never healthy within deadline", async () =
     );
 });
 
+test("ensureProxyRunning: async spawn 'error' fails fast without killing the host (#835)", async () => {
+    const subscribed: string[] = [];
+    const child: SpawnChild = {
+        pid: 42460,
+        unref() {},
+        kill() {
+            return true;
+        },
+        on(event, listener) {
+            subscribed.push(event);
+            if (event === "error") setImmediate(() => listener(new Error("spawn /bad/node EACCES")));
+            return undefined;
+        },
+    };
+    await assert.rejects(
+        ensureProxyRunning(
+            { host: "127.0.0.1", port: 8791, passthrough: false, debug: false },
+            {
+                spawnImpl: () => child,
+                fetchImpl: async () => ({ ok: false }),
+                readInstanceFile: () => undefined,
+                sleep: () => new Promise((r) => setTimeout(r, 1)),
+            },
+        ),
+        /spawn failed/,
+    );
+    assert.ok(subscribed.includes("exit"));
+    assert.ok(subscribed.includes("error"), "an 'error' handler was registered on the spawned proxy child");
+});
+
 function recordedInstance(over: Partial<InstanceFile> = {}): InstanceFile {
     return {
         origin: "http://127.0.0.1:8787",
