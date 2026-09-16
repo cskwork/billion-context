@@ -415,6 +415,13 @@ test("#853 diagnoseEmptySummary: thinking-budget exhaustion names the cause, not
     const noFinish = JSON.stringify({ choices: [{ message: { role: "assistant", content: "", reasoning_content: "thinking then thinking some more here" } }] });
     assert.match(diagnoseEmptySummary(noFinish), /spent its output budget on reasoning\/thinking/);
 
+    // A plain stop with empty content and no reasoning is a different fault, not
+    // budget exhaustion — it keeps the generic message, not the max_tokens advice.
+    assert.match(
+        diagnoseEmptySummary(JSON.stringify({ choices: [{ finish_reason: "stop", message: { role: "assistant", content: "" } }] })),
+        /non-SSE body with no summary text/,
+    );
+
     // A real (short) summary in content is not a budget-exhaustion case.
     assert.doesNotMatch(
         diagnoseEmptySummary(JSON.stringify({ choices: [{ finish_reason: "stop", message: { content: "ok" } }] })),

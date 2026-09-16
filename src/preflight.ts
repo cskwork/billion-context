@@ -501,7 +501,10 @@ function diagnoseReasoningExhaustion(json: unknown): string | null {
     if (hasContent) return null;
     const reasoning = typeof m.reasoning_content === "string" ? m.reasoning_content : typeof m.reasoning === "string" ? m.reasoning : "";
     const finishReason = typeof choice.finish_reason === "string" ? choice.finish_reason : "";
-    if (reasoning.length === 0 && finishReason === "") return null;
+    // Name it budget exhaustion only when the body shows truncation
+    // (finish_reason:"length") or visible thinking — a plain stop with empty
+    // content is a different fault and keeps the generic diagnosis.
+    if (reasoning.length === 0 && finishReason !== "length") return null;
     const signal = finishReason !== "" ? `finish_reason=${finishReason}` : "no finish_reason";
     return `the model spent its output budget on reasoning/thinking and returned no summary text (${signal}; reasoning_content=${reasoning.length} chars, content empty). Raise the preflight max_tokens or disable the model's thinking mode; this is a budget limit, not an upstream failure`;
 }
