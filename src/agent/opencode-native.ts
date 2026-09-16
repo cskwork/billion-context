@@ -41,7 +41,7 @@
 // src/launcher.ts prepareOpencodeHttpRewrite).
 
 import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST } from "../launcher.js";
-import { nativeBootstrapGate, nativeProxyScriptPath, singleFlight } from "./native-bootstrap.js";
+import { markNativeHost, nativeBootstrapGate, nativeProxyScriptPath, singleFlight } from "./native-bootstrap.js";
 import { isModelApiUrl, readyOrigin, type NativeInterceptState } from "./native-intercept.js";
 import { createOpencodeV2Setup, type V2HttpRequestEvent, type V2State } from "./opencode-v2.js";
 
@@ -156,7 +156,10 @@ async function bootstrap(): Promise<string | undefined> {
     }
 }
 
-if (process.env.NODE_TEST_CONTEXT === undefined && shouldBootstrapNativeOpencode(process.env)) {
+const nativeActive = shouldBootstrapNativeOpencode(process.env);
+if (nativeActive) markNativeHost(process.env, "opencode");
+
+if (process.env.NODE_TEST_CONTEXT === undefined && nativeActive) {
     const start = singleFlight(bootstrap);
     state.respawn = start;
     state.onGiveUp = () => {

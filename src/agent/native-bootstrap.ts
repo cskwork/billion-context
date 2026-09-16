@@ -25,6 +25,21 @@ export function nativeBootstrapGate(env: NodeJS.ProcessEnv, optOutKey: string): 
     return true;
 }
 
+/** Coexistence marker (#820): tells standalone in-process bili extensions
+ *  (billion-context-pi / opencode-acp) that a host-native entry owns THIS
+ *  process so they back off instead of double-compressing. Set synchronously
+ *  at module evaluation — before any await — because those extensions check
+ *  BILLION_CONTEXT_PROXY at load time (our bootstrap writes it only after the
+ *  proxy is up) and their /bili/ baseUrl check never sees our fetch-layer
+ *  rewrite. First writer wins: one process hosts one native entry. Callers
+ *  gate on their own shouldBootstrap*() so opt-outs and launches where a bili
+ *  launcher already manages the proxy leave the marker unset. */
+export function markNativeHost(env: NodeJS.ProcessEnv, host: string): void {
+    if (env.BILLION_CONTEXT_NATIVE === undefined || env.BILLION_CONTEXT_NATIVE.length === 0) {
+        env.BILLION_CONTEXT_NATIVE = host;
+    }
+}
+
 /** Concurrent callers share one in-flight bootstrap — a burst of failures
  *  (the proxy died mid-session) must not spawn one proxy per failing request:
  *  ensureProxyRunning has no in-flight dedup of its own. */

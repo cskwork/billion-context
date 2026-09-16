@@ -12,6 +12,7 @@ import { ACP_TOOLS_OPENAI, ABSORB_TOOL_OPENAI } from "../src/compress-tool.ts";
 
 const { shouldBootstrapNativeOpencode, createNativeRoute } = await import("../src/agent/opencode-native.ts");
 const { createOpencodeV2Setup } = await import("../src/agent/opencode-v2.ts");
+const { markNativeHost } = await import("../src/agent/native-bootstrap.ts");
 const nativeDefault = (await import("../src/agent/opencode-native.ts")).default;
 
 const EXPECTED_TOOLS = [...ACP_TOOLS_OPENAI.map((t) => t.function.name), ABSORB_TOOL_OPENAI.function.name];
@@ -36,6 +37,24 @@ test("shouldBootstrapNativeOpencode: false when a bili launch already owns a pro
 test("native entry exports an OpenCode 2.x plugin object", () => {
     assert.equal(nativeDefault.id, "billion-context-opencode-native");
     assert.equal(typeof nativeDefault.setup, "function");
+});
+
+// #820 coexistence: the standalone opencode-acp extension must see this marker
+// at its action-time check even though our bootstrap writes BILLION_CONTEXT_PROXY
+// only later (async) and its /bili/ baseUrl check never sees our rewrite.
+test("module evaluation marks the process as a native opencode host", () => {
+    assert.equal(process.env.BILLION_CONTEXT_NATIVE, "opencode");
+});
+
+test("markNativeHost: sets when unset, first writer wins", () => {
+    const env: NodeJS.ProcessEnv = {};
+    markNativeHost(env, "pi");
+    assert.equal(env.BILLION_CONTEXT_NATIVE, "pi");
+    markNativeHost(env, "opencode");
+    assert.equal(env.BILLION_CONTEXT_NATIVE, "pi");
+    const blank: NodeJS.ProcessEnv = { BILLION_CONTEXT_NATIVE: "" };
+    markNativeHost(blank, "omp");
+    assert.equal(blank.BILLION_CONTEXT_NATIVE, "omp");
 });
 
 test("route: healthy origin rewrites the request reference and records proxyBase", async () => {

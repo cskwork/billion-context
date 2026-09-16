@@ -5,6 +5,13 @@ import { pathToFileURL } from "node:url";
 import { shouldBootstrapNative, nativeProxyScriptPath, singleFlight } from "../src/agent/pi-native.ts";
 import { ensureProxyRunning, type SpawnChild, type SpawnFn } from "../src/launcher.ts";
 
+// #820 coexistence: standalone billion-context-pi checks env at load time, so
+// the marker must be set synchronously during module evaluation (before our
+// async bootstrap writes BILLION_CONTEXT_PROXY) for its action-time back-off.
+test("module evaluation marks the process as a native pi host", () => {
+    assert.equal(process.env.BILLION_CONTEXT_NATIVE, "pi");
+});
+
 test("shouldBootstrapNative: true in a bare host with no bili env", () => {
     assert.equal(shouldBootstrapNative({}), true);
 });
