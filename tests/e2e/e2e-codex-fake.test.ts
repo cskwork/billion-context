@@ -179,7 +179,10 @@ function turn(ctx: Ctx, prompt: string): Promise<{ code: number; last: string }>
 }
 
 test("overflow: compression really happens in codex; bulk folded, sentinels retained", { skip: skipReason }, async (t) => {
-	const ctx = await startCtx(12_000);
+	// Window must clear the real codex warmup floor — system prompt + tools +
+	// injected prompts ≈ 18.4k once input[] developer items are counted (#829) —
+	// while per-turn filler still crosses it within a couple of load turns.
+	const ctx = await startCtx(24_000);
 	t.after(() => teardown(ctx));
 
 	const planted = [4781, 2903, 6577];
