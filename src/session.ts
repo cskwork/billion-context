@@ -1,4 +1,4 @@
-import { createInitialState, type CompressionState, type CoreMessage } from "acp-kernel";
+import { createInitialState, type CompressionState, type Config, type CoreMessage } from "acp-kernel";
 import { createHash } from "node:crypto";
 import { getStore } from "./persist.js";
 
@@ -159,6 +159,23 @@ export type Session = {
      *  critical section onto the previous one so they run strictly in order. */
     lockChain?: Promise<unknown>;
 };
+
+// #833: wire paths resolve the kernel Config per request (global → provider →
+// model compress settings + self-heal + output headroom), while the plugin
+// status/tool API reads sessions with no request context and was falling back
+// to the base kernelConfig — which carries NO file/provider/model compress
+// settings — so the panel Nudge line showed kernel defaults regardless of user
+// config. Same pattern as absorb.ts's effectiveAbsorb: stamp the last resolved
+// Config per session (latest wins), read it with fallback to the base.
+export function storeEffectiveConfig(session: Session, config: Config): void {
+    session.metadata["effectiveConfig"] = config;
+}
+
+export function effectiveConfig(session: Session | undefined, fallback: Config): Config {
+    const stored = session?.metadata["effectiveConfig"];
+    if (stored && typeof stored === "object") return { ...fallback, ...(stored as Partial<Config>) };
+    return fallback;
+}
 
 const sessions = new Map<string, Session>();
 
