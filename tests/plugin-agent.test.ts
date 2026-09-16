@@ -1000,6 +1000,32 @@ test("plugin install refuses to touch broken or non-object configs", async () =>
     fs.rmSync(home, { recursive: true, force: true });
 });
 
+// #836 (found in #809 N4): a non-object `mcp` (e.g. bare string) made
+// `"bili" in mcp` throw — crashing remove (stranding a half-install) and
+// surfacing "error:" from status. All three opencode sites must degrade
+// gracefully instead of throwing.
+test("plugin opencode survives a non-object mcp (issue #836 / #809 N4)", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-plugin-home-"));
+    const piAgentDir = path.join(home, ".pi/agent");
+    await withEnv(hintEnv(home, piAgentDir), async () => {
+        const ocDir = path.join(home, ".config/opencode");
+        fs.mkdirSync(ocDir, { recursive: true });
+        const ocFile = path.join(ocDir, "opencode.json");
+        const malformed = JSON.stringify({ mcp: "bogus-string", other: 1 });
+        fs.writeFileSync(ocFile, malformed);
+
+        assert.doesNotThrow(() => pluginRemove("opencode"));
+        assert.match(pluginRemove("opencode"), /not installed/);
+        assert.equal(pluginStatusAll().find((r) => r.agent === "opencode")!.status, "not installed");
+        assert.equal(fs.readFileSync(ocFile, "utf8"), malformed);
+
+        assert.doesNotThrow(() => pluginInstall("opencode"));
+        assert.match(pluginInstall("opencode"), /skipped/i);
+        assert.equal(fs.readFileSync(ocFile, "utf8"), malformed);
+    });
+    fs.rmSync(home, { recursive: true, force: true });
+});
+
 test("plugin list survives a broken host config (per-row error, no crash)", async () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-plugin-home-"));
     const piAgentDir = path.join(home, ".pi/agent");
