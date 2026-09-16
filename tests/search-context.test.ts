@@ -21,7 +21,21 @@ function makeSession(): Session {
     };
 }
 
-function makeSessionWithBlock(): { core: ReturnType<typeof createCore>; state: CompressionState } {
+function hasUnpairedSurrogate(s: string): boolean {
+    for (let i = 0; i < s.length; i++) {
+        const c = s.charCodeAt(i);
+        if (c >= 0xd800 && c <= 0xdbff) {
+            const n = s.charCodeAt(i + 1);
+            if (!(n >= 0xdc00 && n <= 0xdfff)) return true;
+            i++;
+        } else if (c >= 0xdc00 && c <= 0xdfff) {
+            return true;
+        }
+    }
+    return false;
+}
+
+function makeSessionWithBlock(summary?: string): { core: ReturnType<typeof createCore>; state: CompressionState } {
     const session = makeSession();
     const core = createCore();
     const config = defaultConfig(200000);
@@ -32,7 +46,7 @@ function makeSessionWithBlock(): { core: ReturnType<typeof createCore>; state: C
     const { msgs } = anthropicToCore(body);
     const turn = core.processTurn({ messages: msgs, state: session.state, config, tokenCount: 9999, renderTags: "text-only" });
     const res = core.applyCompression({
-        ranges: [{ startRef: "m00001", endRef: "m00015", summary: "auth token exchange and refresh design decisions".repeat(3) }],
+        ranges: [{ startRef: "m00001", endRef: "m00015", summary: summary ?? "auth token exchange and refresh design decisions".repeat(3) }],
         state: turn.state,
         config,
         messages: turn.messages,
@@ -91,4 +105,28 @@ test("executeSearchContext: matching block → Found listing with id/topic/previ
     assert.match(out, /^Found \d+ block\(s\) for "auth token":/);
     assert.ok(out.includes("(T"), "tier present");
     assert.ok(out.includes("auth token exchange"), "summary preview present");
+});
+
+test("executeSearchContext: clamp cut straddling an astral char leaves no lone surrogate (#816)", () => {
+    const straddle = "a".repeat(199) + "\u{1F980}" + "tail";
+    assert.equal(straddle.length, 205);
+    assert.equal(straddle.charCodeAt(199), 0xd83e, "high half sits exactly on the 200-unit cut");
+    const { core, state } = makeSessionWithBlock(straddle);
+    const out = executeSearchContext({ query: "aaaa" }, core, state);
+    assert.match(out, /^Found 1 block\(s\)/);
+    assert.ok(!hasUnpairedSurrogate(out), "no unpaired surrogate anywhere in the result");
+    const previewLine = out.split("\n").find((l) => l.startsWith("  ")) ?? "";
+    assert.ok(previewLine.length > 0, "preview line present");
+    assert.ok(previewLine.endsWith("..."), "clamp marker kept");
+    assert.ok(!hasUnpairedSurrogate(previewLine), "no lone high surrogate at the cut");
+});
+
+test("executeSearchContext: astral char fully inside the prefix is kept (#816 control)", () => {
+    const inside = "a".repeat(197) + "\u{1F980}" + "b".repeat(20);
+    assert.equal(inside.length, 219);
+    const { core, state } = makeSessionWithBlock(inside);
+    const out = executeSearchContext({ query: "aaaa" }, core, state);
+    const previewLine = out.split("\n").find((l) => l.startsWith("  ")) ?? "";
+    assert.ok(previewLine.includes("\u{1F980}"), "intact pair survives the clamp");
+    assert.ok(!hasUnpairedSurrogate(out));
 });
