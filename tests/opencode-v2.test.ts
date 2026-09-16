@@ -42,6 +42,11 @@ function startFakeProxyV2(): Promise<{ origin: string; toolCalls: Array<{ conver
             });
             return;
         }
+        if ((req.url ?? "").startsWith("/__bili/plugin/status")) {
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: true, panel: "ACP-PANEL-OK" }));
+            return;
+        }
         res.writeHead(404);
         res.end("{}");
     });
@@ -62,12 +67,20 @@ interface FakeAddedTool {
     execute: (input: Record<string, unknown>, ctx: { sessionID: string }) => Promise<{ content: string }>;
 }
 
+interface FakeAddedCommand {
+    name: string;
+    description?: string;
+    execute: (input: Record<string, unknown>) => Promise<void>;
+}
+
 function makeFakeCtx() {
     const eventQueue: Array<{ type?: unknown; data?: Record<string, unknown> }> = [];
     let wake: (() => void) | undefined;
     let closed = false;
     let signal: AbortSignal | undefined;
     const addedTools: FakeAddedTool[] = [];
+    const addedCommands: FakeAddedCommand[] = [];
+    const syntheticCalls: Array<{ sessionID: string; text: string }> = [];
     let modelRequestCb: ((e: Record<string, unknown>) => void | Promise<void>) | undefined;
     const disposed: number[] = [];
 
@@ -78,11 +91,21 @@ function makeFakeCtx() {
                 modelRequestCb = cb;
                 return { dispose: () => { disposed.push(1); } };
             },
+            synthetic: async (input: { sessionID: string; text: string }) => {
+                syntheticCalls.push(input);
+                return {};
+            },
         },
         tool: {
             transform: async (cb: (editor: { add: (t: FakeAddedTool) => void }) => void) => {
                 cb({ add: (t) => addedTools.push(t) });
                 return { dispose: () => { disposed.push(2); } };
+            },
+        },
+        command: {
+            transform: async (cb: (editor: { add: (c: FakeAddedCommand) => void }) => void) => {
+                cb({ add: (c) => addedCommands.push(c) });
+                return { dispose: () => { disposed.push(3); } };
             },
         },
         event: {
@@ -126,6 +149,8 @@ function makeFakeCtx() {
         },
         pushEvent: (evt: { type?: unknown; data?: Record<string, unknown> }) => { eventQueue.push(evt); wake?.(); },
         get addedTools() { return addedTools; },
+        get addedCommands() { return addedCommands; },
+        get syntheticCalls() { return syntheticCalls; },
         get disposed() { return disposed; },
     };
 }
@@ -314,6 +339,44 @@ test("v2 setup: cleanup aborts event subscription and disposes registrations", a
     } finally {
         await proxy.close();
     }
+});
+
+test("v2 setup: /acp command registered and renders proxy status panel via synthetic", async () => {
+    const proxy = await startFakeProxyV2();
+    const fake = makeFakeCtx();
+    try {
+        await withEnv({ BILLION_CONTEXT_PROXY: proxy.origin, BILLION_CONTEXT_PLUGIN: undefined }, async () => {
+            const cleanup = await biliOpencodePlugin.setup(fake.ctx as never);
+            try {
+                const acp = fake.addedCommands.find((c) => c.name === "acp");
+                assert.ok(acp, "/acp command registered");
+                assert.equal(typeof acp!.execute, "function");
+                await acp!.execute({ sessionID: "ses_acp_1" });
+                await until(() => fake.syntheticCalls.length === 1);
+                assert.equal(fake.syntheticCalls[0].sessionID, "ses_acp_1");
+                assert.match(fake.syntheticCalls[0].text, /ACP-PANEL-OK/);
+            } finally {
+                cleanup();
+            }
+        });
+    } finally {
+        await proxy.close();
+    }
+});
+
+test("v2 setup: /acp reports no proxy detected via synthetic when no proxy", async () => {
+    const fake = makeFakeCtx();
+    await withEnv({ BILLION_CONTEXT_PROXY: undefined, BILLION_CONTEXT_PLUGIN: undefined }, async () => {
+        const cleanup = await biliOpencodePlugin.setup(fake.ctx as never);
+        try {
+            const acp = fake.addedCommands.find((c) => c.name === "acp")!;
+            await acp.execute({ sessionID: "s_nopx" });
+            await until(() => fake.syntheticCalls.length === 1);
+            assert.match(fake.syntheticCalls[0].text, /no proxy detected/);
+        } finally {
+            cleanup();
+        }
+    });
 });
 
 test("fetchManifest openai format maps parameters to inputSchema", async () => {
