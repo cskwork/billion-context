@@ -168,4 +168,15 @@ if (process.env.NODE_TEST_CONTEXT === undefined && nativeActive) {
     state.ready = start();
 }
 
-export default { id: "billion-context-opencode-native", setup: createOpencodeV2Setup({ route: createNativeRoute(state) }) };
+// #840: gate the traffic-touching route on nativeActive — mirroring pi's gated
+// fetch intercept (src/agent/pi-native.ts). Under a `bili opencode` launch the
+// launcher owns the proxy; an idle route would probe nothing, never rewrite,
+// and still fire the spurious "proxy unavailable" warning on HTTPS (cert-MITM)
+// launches where the launcher's proxy compresses fine. Without the route the
+// shared setup degrades to launcher-mode detection (/bili/ URL or
+// BILLION_CONTEXT_PROXY env) — the same shape as src/agent/opencode.ts.
+const v2Setup = nativeActive
+    ? createOpencodeV2Setup({ route: createNativeRoute(state) })
+    : createOpencodeV2Setup();
+
+export default { id: "billion-context-opencode-native", setup: v2Setup };
