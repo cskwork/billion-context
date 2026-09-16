@@ -945,6 +945,31 @@ test("plugin install opencode without a live proxy: MCP shell skipped, native pl
     }
 });
 
+test("plugin install/remove/status survive a non-object mcp in opencode.json (#809/N4)", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-oc-badmcp-"));
+    const ocFile = path.join(home, ".config/opencode/opencode.json");
+    fs.mkdirSync(path.dirname(ocFile), { recursive: true });
+    try {
+        await withEnv({ OPENCODE_CONFIG: ocFile, BILI_MCP_PROXY: undefined, XDG_STATE_HOME: path.join(home, "state") }, async () => {
+            fs.writeFileSync(ocFile, JSON.stringify({ mcp: "totally-broken-string" }));
+            const msg = pluginInstall("opencode");
+            assert.match(msg, /installed/);
+            let data = JSON.parse(fs.readFileSync(ocFile, "utf8")) as Record<string, unknown>;
+            assert.deepEqual(data.plugin, [path.join(home, ".config/opencode/plugins/billion-context")]);
+            assert.deepEqual(data.compaction, { auto: false });
+            assert.equal(pluginStatusAll().find((r) => r.agent === "opencode")?.status, "installed");
+            assert.doesNotThrow(() => pluginRemove("opencode"));
+            data = JSON.parse(fs.readFileSync(ocFile, "utf8")) as Record<string, unknown>;
+            assert.equal(data.plugin, undefined);
+            assert.equal(data.compaction, undefined);
+            assert.ok(!fs.existsSync(path.join(home, ".config/opencode/plugins/billion-context/index.js")));
+            assert.equal(pluginStatusAll().find((r) => r.agent === "opencode")?.status, "not installed");
+        });
+    } finally {
+        fs.rmSync(home, { recursive: true, force: true });
+    }
+});
+
 test("omp plugin: scoped matching, existence check, overlay redirect (issue #392)", async () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-plugin-omp-"));
     const root = selfPackageRoot();

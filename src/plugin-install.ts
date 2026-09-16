@@ -441,6 +441,13 @@ function opencodePluginDir(configFile: string): string {
     return path.join(path.dirname(configFile), "plugins", "billion-context");
 }
 
+// #809/N4: opencode.json may carry a non-object `mcp` (e.g. a bare string);
+// `"bili" in <non-object>` throws TypeError. Guard so install/remove/status
+// degrade gracefully instead of crashing (a crashing remove leaves no cleanup).
+function isPlainMcpObject(v: unknown): v is Record<string, unknown> {
+    return v !== null && typeof v === "object" && !Array.isArray(v);
+}
+
 function opencodeInstall(): string {
     const file = opencodeJson();
     const data = readJson(file);
@@ -451,12 +458,17 @@ function opencodeInstall(): string {
     try {
         const mcpJs = path.join(selfPackageRoot(), "dist", "mcp.js");
         requireDistFile(mcpJs);
-        const mcp = (data.mcp as Record<string, unknown> | undefined) ?? {};
-        if ("bili" in mcp) notes.push("mcp.bili present");
-        else {
-            mcp.bili = { type: "local", command: [process.execPath, mcpJs], environment: { BILI_MCP_PROXY: proxyOriginForInstall() }, enabled: true };
-            data.mcp = mcp;
-            notes.push("mcp.bili written");
+        const rawMcp = data.mcp;
+        if (rawMcp != null && !isPlainMcpObject(rawMcp)) {
+            notes.push('mcp.bili skipped (opencode.json "mcp" is not an object)');
+        } else {
+            const mcp = (rawMcp as Record<string, unknown> | undefined) ?? {};
+            if ("bili" in mcp) notes.push("mcp.bili present");
+            else {
+                mcp.bili = { type: "local", command: [process.execPath, mcpJs], environment: { BILI_MCP_PROXY: proxyOriginForInstall() }, enabled: true };
+                data.mcp = mcp;
+                notes.push("mcp.bili written");
+            }
         }
     } catch (err) {
         notes.push(`mcp.bili skipped (${err instanceof Error ? err.message : String(err)})`);
@@ -495,8 +507,8 @@ function opencodeRemove(): string {
     const data = readJson(file);
     const notes: string[] = [];
 
-    const mcp = data.mcp as Record<string, unknown> | undefined;
-    if (mcp && "bili" in mcp) {
+    const mcp = data.mcp;
+    if (isPlainMcpObject(mcp) && "bili" in mcp) {
         delete mcp.bili;
         if (Object.keys(mcp).length === 0) delete data.mcp;
         notes.push("mcp.bili removed");
@@ -542,9 +554,9 @@ function opencodeRemove(): string {
 function opencodeStatus(): string {
     const file = opencodeJson();
     const data = readJson(file);
-    const mcp = data.mcp as Record<string, unknown> | undefined;
+    const mcp = data.mcp;
     const plugins = Array.isArray(data.plugin) ? (data.plugin as unknown[]).filter((x): x is string => typeof x === "string") : [];
-    return (mcp !== undefined && "bili" in mcp) || plugins.includes(opencodePluginDir(file)) ? "installed" : "not installed";
+    return (isPlainMcpObject(mcp) && "bili" in mcp) || plugins.includes(opencodePluginDir(file)) ? "installed" : "not installed";
 }
 
 // — dispatch ————————————————————————————————————————————————————————————

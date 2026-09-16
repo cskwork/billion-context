@@ -2036,16 +2036,23 @@ export async function ensureProxyRunning(
         // healthy — otherwise a startup crash (bad config, missing upstream, …)
         // burns the whole SPAWN_WAIT_MS poll window before erroring.
         let childExit: { code: number | null; signal: string | null } | undefined;
+        // #809/D: an async spawn failure (EACCES/ENOENT on the resolved runtime)
+        // emits 'error', not 'exit'. Unhandled, it becomes an uncaughtException
+        // that kills the host process; capture it so we fail fast with the cause.
+        let childError: unknown;
         child.on?.("exit", (...rest: unknown[]) => {
             childExit = {
                 code: typeof rest[0] === "number" ? rest[0] : null,
                 signal: typeof rest[1] === "string" ? rest[1] : null,
             };
         });
+        child.on?.("error", (...rest: unknown[]) => {
+            childError = rest[0];
+        });
 
         const deadline = now() + SPAWN_WAIT_MS;
         while (now() < deadline) {
-            if (childExit) break;
+            if (childExit || childError !== undefined) break;
             await sleepImpl(HEALTH_POLL_INTERVAL_MS);
             const inst = readInstance();
             if (isProxyInstanceFile(inst) && inst.launchToken === launchToken) {
@@ -2063,6 +2070,10 @@ export async function ensureProxyRunning(
             if (stale && (await probeHealth(proxyOrigin(opts.host, port), fetchImpl))) {
                 return { origin: proxyOrigin(opts.host, port), port, child, logPath };
             }
+        }
+        if (childError !== undefined) {
+            const detail = childError instanceof Error ? childError.message : String(childError);
+            throw new Error(`bili: proxy spawn failed (${detail}) (log: ${logPath})`);
         }
         if (childExit) {
             const detail = childExit.code !== null
