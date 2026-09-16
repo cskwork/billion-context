@@ -25,6 +25,24 @@ export function nativeBootstrapGate(env: NodeJS.ProcessEnv, optOutKey: string): 
     return true;
 }
 
+/** External-proxy attach signal (#809): when BILLION_CONTEXT_ATTACH holds a
+ *  valid http(s) origin, a host-native entry routes model traffic THROUGH that
+ *  pre-existing proxy instead of spawning its own — no ownership, no respawn,
+ *  fail-closed on its death. Returns the normalized origin (trailing slash
+ *  stripped) or undefined when unset/blank/malformed/non-http(s). */
+export function nativeAttachOrigin(env: NodeJS.ProcessEnv): string | undefined {
+    const raw = env.BILLION_CONTEXT_ATTACH;
+    if (raw === undefined) return undefined;
+    const url = raw.trim();
+    if (url.length === 0 || !/^https?:\/\//i.test(url)) return undefined;
+    try {
+        new URL(url);
+    } catch {
+        return undefined;
+    }
+    return url.replace(/\/+$/, "");
+}
+
 /** Coexistence marker (#820): tells standalone in-process bili extensions
  *  (billion-context-pi / opencode-acp) that a host-native entry owns THIS
  *  process so they back off instead of double-compressing. Set synchronously

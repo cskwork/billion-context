@@ -10,9 +10,9 @@ import type { NativeInterceptState } from "../src/agent/native-intercept.ts";
 import type { V2HttpRequestEvent, V2PluginContext, V2State } from "../src/agent/opencode-v2.ts";
 import { ACP_TOOLS_OPENAI, ABSORB_TOOL_OPENAI } from "../src/compress-tool.ts";
 
-const { shouldBootstrapNativeOpencode, createNativeRoute } = await import("../src/agent/opencode-native.ts");
+const { shouldBootstrapNativeOpencode, createNativeRoute, planNativeOpencode } = await import("../src/agent/opencode-native.ts");
 const { createOpencodeV2Setup } = await import("../src/agent/opencode-v2.ts");
-const { markNativeHost } = await import("../src/agent/native-bootstrap.ts");
+const { markNativeHost, nativeAttachOrigin } = await import("../src/agent/native-bootstrap.ts");
 const nativeDefault = (await import("../src/agent/opencode-native.ts")).default;
 
 const EXPECTED_TOOLS = [...ACP_TOOLS_OPENAI.map((t) => t.function.name), ABSORB_TOOL_OPENAI.function.name];
@@ -258,4 +258,95 @@ test("setup(route): kill switch keeps the hook fully inert", async () => {
         delete process.env.BILLION_CONTEXT_PLUGIN;
         cleanup();
     }
+});
+
+test("nativeAttachOrigin: unset/blank/malformed/non-http(s) all resolve to undefined", () => {
+    assert.equal(nativeAttachOrigin({}), undefined);
+    assert.equal(nativeAttachOrigin({ BILLION_CONTEXT_ATTACH: "" }), undefined);
+    assert.equal(nativeAttachOrigin({ BILLION_CONTEXT_ATTACH: "   " }), undefined);
+    assert.equal(nativeAttachOrigin({ BILLION_CONTEXT_ATTACH: "not a url" }), undefined);
+    assert.equal(nativeAttachOrigin({ BILLION_CONTEXT_ATTACH: "ftp://127.0.0.1:21" }), undefined);
+});
+
+test("nativeAttachOrigin: normalizes a valid http(s) origin (trailing slash stripped)", () => {
+    assert.equal(nativeAttachOrigin({ BILLION_CONTEXT_ATTACH: "http://127.0.0.1:8787" }), "http://127.0.0.1:8787");
+    assert.equal(nativeAttachOrigin({ BILLION_CONTEXT_ATTACH: "http://127.0.0.1:8787///" }), "http://127.0.0.1:8787");
+    assert.equal(nativeAttachOrigin({ BILLION_CONTEXT_ATTACH: "  https://proxy.example.com/ " }), "https://proxy.example.com");
+});
+
+test("planNativeOpencode: default is spawn; opt-out and launcher-owned are off", () => {
+    assert.deepEqual(planNativeOpencode({}), { mode: "spawn" });
+    assert.deepEqual(planNativeOpencode({ BILLION_CONTEXT_PLUGIN: "0" }), { mode: "off" });
+    assert.deepEqual(planNativeOpencode({ BILI_NATIVE_OPENCODE: "0" }), { mode: "off" });
+    assert.deepEqual(planNativeOpencode({ BILLION_CONTEXT_PROXY: "http://127.0.0.1:36485" }), { mode: "off" });
+});
+
+test("planNativeOpencode: attach wins over spawn when no launcher owns the proxy", () => {
+    assert.deepEqual(
+        planNativeOpencode({ BILLION_CONTEXT_ATTACH: "http://10.0.0.5:9000/" }),
+        { mode: "attach", attachOrigin: "http://10.0.0.5:9000" },
+    );
+    assert.deepEqual(planNativeOpencode({ BILLION_CONTEXT_ATTACH: "garbage" }), { mode: "spawn" });
+});
+
+test("planNativeOpencode: a launcher-owned proxy stands down even over an explicit attach", () => {
+    assert.deepEqual(
+        planNativeOpencode({ BILLION_CONTEXT_PROXY: "http://127.0.0.1:36485", BILLION_CONTEXT_ATTACH: "http://10.0.0.5:9000" }),
+        { mode: "off" },
+    );
+});
+
+test("native route: attach mode routes model traffic through the external proxy", async () => {
+    const origin = "http://10.0.0.5:9000";
+    let respawnCalls = 0;
+    const state: NativeInterceptState = {
+        attach: true,
+        origin,
+        ready: Promise.resolve(origin),
+        respawn: async () => {
+            respawnCalls++;
+            return undefined;
+        },
+    };
+    const s: V2State = {};
+    const route = createNativeRoute(state, { probe: async () => true });
+    const e: V2HttpRequestEvent = { sessionID: "ses_a", request: new Request(MODEL_URL, { method: "POST" }) };
+    await route(e, s);
+    assert.equal((e.request as Request).url, `${origin}/bili/${MODEL_URL}`);
+    assert.equal(s.proxyBase, origin);
+    assert.equal(respawnCalls, 0);
+});
+
+test("native route: attach mode FAILS CLOSED when the external proxy is down", async () => {
+    const origin = "http://10.0.0.5:9000";
+    const state: NativeInterceptState = { attach: true, origin, ready: Promise.resolve(origin) };
+    const s: V2State = {};
+    const warns: string[] = [];
+    const origErr = console.error;
+    console.error = (...a: unknown[]) => {
+        warns.push(a.join(" "));
+    };
+    try {
+        const route = createNativeRoute(state, { probe: async () => false });
+        await route({ sessionID: "ses_b", request: new Request(MODEL_URL, { method: "POST" }) }, s);
+        const second: V2HttpRequestEvent = { sessionID: "ses_b", request: new Request(MODEL_URL, { method: "POST" }) };
+        await route(second, s);
+        assert.equal((second.request as Request).url, `${origin}/bili/${MODEL_URL}`);
+        assert.ok(warns.some((w) => w.includes("unreachable")), "expected an unreachable diagnostic");
+        assert.ok(warns.filter((w) => w.includes("unreachable")).length === 1, "expected exactly one warning");
+    } finally {
+        console.error = origErr;
+    }
+});
+
+test("native route: attach mode leaves non-model requests untouched", async () => {
+    const origin = "http://10.0.0.5:9000";
+    const state: NativeInterceptState = { attach: true, origin, ready: Promise.resolve(origin) };
+    const s: V2State = {};
+    const route = createNativeRoute(state, { probe: async () => true });
+    const req = new Request("https://api.anthropic.com/v1/models", { method: "GET" });
+    const e: V2HttpRequestEvent = { sessionID: "ses_c", request: req };
+    await route(e, s);
+    assert.equal(e.request, req);
+    assert.equal(s.proxyBase, undefined);
 });

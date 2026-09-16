@@ -41,13 +41,24 @@
 // src/launcher.ts prepareOpencodeHttpRewrite).
 
 import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST } from "../launcher.js";
-import { markNativeHost, nativeBootstrapGate, nativeProxyScriptPath, singleFlight } from "./native-bootstrap.js";
+import { markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, singleFlight } from "./native-bootstrap.js";
 import { isModelApiUrl, readyOrigin, type NativeInterceptState } from "./native-intercept.js";
 import { createOpencodeV2Setup, type V2HttpRequestEvent, type V2State } from "./opencode-v2.js";
 
 /** Decides whether the native bootstrap should run in this process. */
 export function shouldBootstrapNativeOpencode(env: NodeJS.ProcessEnv): boolean {
     return nativeBootstrapGate(env, "BILI_NATIVE_OPENCODE");
+}
+
+/** Decide this process's native posture (#809). Precedence off > attach >
+ *  spawn: a launcher-owned proxy or an opt-out stands us down entirely (even
+ *  over an explicit attach); otherwise attach to BILLION_CONTEXT_ATTACH when
+ *  given, else spawn our own watchdog proxy. */
+export function planNativeOpencode(env: NodeJS.ProcessEnv): { mode: "off" | "attach" | "spawn"; attachOrigin?: string } {
+    if (!shouldBootstrapNativeOpencode(env)) return { mode: "off" };
+    const attachOrigin = nativeAttachOrigin(env);
+    if (attachOrigin !== undefined) return { mode: "attach", attachOrigin };
+    return { mode: "spawn" };
 }
 
 const HEALTH_TIMEOUT_MS = 1500;
@@ -75,6 +86,7 @@ export function createNativeRoute(state: NativeInterceptState, deps: OpencodeNat
     const probe = deps.probe ?? probeHealth;
     const respawnCooldownMs = deps.respawnCooldownMs ?? RESPAWN_COOLDOWN_MS;
     let warned = false;
+    let attachWarned = false;
     let lastRespawn = 0;
 
     const healthyOrigin = async (): Promise<string | undefined> => {
@@ -100,26 +112,13 @@ export function createNativeRoute(state: NativeInterceptState, deps: OpencodeNat
         return undefined;
     };
 
-    return async (e, s) => {
-        const url = typeof e.request?.url === "string" ? e.request.url : undefined;
-        if (url === undefined) return;
-        if (!isModelApiUrl(url)) return;
-        const target = await healthyOrigin();
-        if (target === undefined) {
-            if (!warned) {
-                warned = true;
-                console.error("bili-native-opencode: proxy unavailable — model requests go direct (uncompressed)");
-            }
-            return;
-        }
-        warned = false;
-        s.proxyBase = target;
+    const rewriteToProxy = (ev: V2HttpRequestEvent, target: string, url: string): void => {
         try {
-            e.request = new Request(`${target}/bili/${url}`, e.request as unknown as Request);
+            ev.request = new Request(`${target}/bili/${url}`, ev.request as unknown as Request);
         } catch {
             // undici refuses to copy a body-bearing Request without explicit
             // duplex — reconstruct with the body stream passed explicitly.
-            const old = e.request as unknown as { method?: unknown; headers?: Iterable<readonly [string, string]> | null; body?: ReadableStream<Uint8Array> | null };
+            const old = ev.request as unknown as { method?: unknown; headers?: Iterable<readonly [string, string]> | null; body?: ReadableStream<Uint8Array> | null };
             try {
                 const init: RequestInit & { duplex?: "half" } = { method: typeof old.method === "string" ? old.method : "GET" };
                 const pairs: [string, string][] = [];
@@ -131,11 +130,49 @@ export function createNativeRoute(state: NativeInterceptState, deps: OpencodeNat
                     init.body = old.body as RequestInit["body"];
                     init.duplex = "half";
                 }
-                e.request = new Request(`${target}/bili/${url}`, init);
+                ev.request = new Request(`${target}/bili/${url}`, init);
             } catch {
                 // replacement impossible (exotic body) — request goes direct
             }
         }
+    };
+
+    return async (e, s) => {
+        const url = typeof e.request?.url === "string" ? e.request.url : undefined;
+        if (url === undefined) return;
+        if (!isModelApiUrl(url)) return;
+
+        // Attach mode (#809): route through the user's external proxy. We do
+        // NOT own it — no spawn, no respawn. Fail-closed by construction: we
+        // always rewrite toward the target and never fall back to direct, so a
+        // dead target surfaces as a client-visible connection error (plus one
+        // loud diagnostic), never as silent uncompressed traffic.
+        if (state.attach) {
+            const target = state.origin;
+            if (target === undefined) return;
+            const up = await probe(target);
+            if (!up && !attachWarned) {
+                attachWarned = true;
+                console.error(`bili-native-opencode: external proxy ${target} unreachable — model requests will fail (compression unavailable)`);
+            } else if (up) {
+                attachWarned = false;
+            }
+            s.proxyBase = target;
+            rewriteToProxy(e, target, url);
+            return;
+        }
+
+        const target = await healthyOrigin();
+        if (target === undefined) {
+            if (!warned) {
+                warned = true;
+                console.error("bili-native-opencode: proxy unavailable — model requests go direct (uncompressed)");
+            }
+            return;
+        }
+        warned = false;
+        s.proxyBase = target;
+        rewriteToProxy(e, target, url);
     };
 }
 
@@ -156,16 +193,26 @@ async function bootstrap(): Promise<string | undefined> {
     }
 }
 
-const nativeActive = shouldBootstrapNativeOpencode(process.env);
-if (nativeActive) markNativeHost(process.env, "opencode");
-
-if (process.env.NODE_TEST_CONTEXT === undefined && nativeActive) {
-    const start = singleFlight(bootstrap);
-    state.respawn = start;
-    state.onGiveUp = () => {
-        delete process.env.BILLION_CONTEXT_PROXY;
-    };
-    state.ready = start();
+const plan = planNativeOpencode(process.env);
+if (plan.mode !== "off") {
+    markNativeHost(process.env, "opencode");
+    if (process.env.NODE_TEST_CONTEXT === undefined) {
+        if (plan.mode === "attach") {
+            state.attach = true;
+            state.origin = plan.attachOrigin;
+            // Tools / compaction discover the proxy through this env path, as
+            // in self-spawn; no respawn/onGiveUp — the external proxy isn't
+            // ours to restart or clean up.
+            process.env.BILLION_CONTEXT_PROXY = plan.attachOrigin;
+        } else {
+            const start = singleFlight(bootstrap);
+            state.respawn = start;
+            state.onGiveUp = () => {
+                delete process.env.BILLION_CONTEXT_PROXY;
+            };
+            state.ready = start();
+        }
+    }
 }
 
 export default { id: "billion-context-opencode-native", setup: createOpencodeV2Setup({ route: createNativeRoute(state) }) };
