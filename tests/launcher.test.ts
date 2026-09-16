@@ -3986,8 +3986,13 @@ test("readOpencodeProjectLayer: outside a repo walks all ancestor levels", () =>
 test("opencodeEffectiveCwd: honors --dir, defaults to process.cwd()", () => {
     assert.equal(opencodeEffectiveCwd([]), process.cwd());
     assert.equal(opencodeEffectiveCwd(["run"]), process.cwd());
-    assert.equal(opencodeEffectiveCwd(["--dir", "/x/y"]), "/x/y");
-    assert.equal(opencodeEffectiveCwd(["--dir=/x/y"]), "/x/y");
+    const abs = fs.mkdtempSync(path.join(os.tmpdir(), "oc-dir-"));
+    try {
+        assert.equal(opencodeEffectiveCwd(["--dir", abs]), abs);
+        assert.equal(opencodeEffectiveCwd(["--dir=" + abs]), abs);
+    } finally {
+        fs.rmSync(abs, { recursive: true, force: true });
+    }
     assert.equal(opencodeEffectiveCwd(["--dir", "rel/z"]), path.resolve("rel/z"));
 });
 
