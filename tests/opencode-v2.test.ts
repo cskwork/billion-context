@@ -379,6 +379,106 @@ test("v2 setup: /acp reports no proxy detected via synthetic when no proxy", asy
     });
 });
 
+test("v2 /acp: host omits sessionID → warn once, render nothing (never an empty-id synthetic)", async () => {
+    const warns: string[] = [];
+    const origWarn = console.warn;
+    console.warn = (msg?: unknown) => { warns.push(String(msg)); };
+    try {
+        for (const plugin of ["0", undefined]) {
+            const f = makeFakeCtx();
+            await withEnv({ BILLION_CONTEXT_PROXY: undefined, BILLION_CONTEXT_PLUGIN: plugin }, async () => {
+                const cleanup = await biliOpencodePlugin.setup(f.ctx as never);
+                try {
+                    const acp = f.addedCommands.find((c) => c.name === "acp")!;
+                    await acp.execute({});
+                    await new Promise((r) => setTimeout(r, 20));
+                    assert.equal(f.syntheticCalls.length, 0, `no synthetic for missing sessionID (BILLION_CONTEXT_PLUGIN=${String(plugin)})`);
+                } finally {
+                    cleanup();
+                }
+            });
+        }
+        assert.equal(warns.filter((w) => w.includes("sessionID")).length, 2, "one warning per no-sessionID invocation");
+    } finally {
+        console.warn = origWarn;
+    }
+});
+
+test("v2 /acp: disabled + valid session still renders the 'disabled' notice", async () => {
+    const fake = makeFakeCtx();
+    await withEnv({ BILLION_CONTEXT_PROXY: undefined, BILLION_CONTEXT_PLUGIN: "0" }, async () => {
+        const cleanup = await biliOpencodePlugin.setup(fake.ctx as never);
+        try {
+            const acp = fake.addedCommands.find((c) => c.name === "acp")!;
+            await acp.execute({ sessionID: "ses_dis" });
+            await until(() => fake.syntheticCalls.length === 1);
+            assert.match(fake.syntheticCalls[0].text, /disabled/);
+            assert.equal(fake.syntheticCalls[0].sessionID, "ses_dis");
+        } finally {
+            cleanup();
+        }
+    });
+});
+
+test("v2 /acp: surfaces status.error when the proxy returns no panel", async () => {
+    const server = http.createServer((req, res) => {
+        if ((req.url ?? "").startsWith("/__bili/plugin/status")) {
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: true, error: "backend-busy" }));
+            return;
+        }
+        res.writeHead(404);
+        res.end("{}");
+    });
+    server.listen(0, "127.0.0.1");
+    await once(server, "listening");
+    const origin = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+    const fake = makeFakeCtx();
+    try {
+        await withEnv({ BILLION_CONTEXT_PROXY: origin, BILLION_CONTEXT_PLUGIN: undefined }, async () => {
+            const cleanup = await biliOpencodePlugin.setup(fake.ctx as never);
+            try {
+                const acp = fake.addedCommands.find((c) => c.name === "acp")!;
+                await acp.execute({ sessionID: "ses_err" });
+                await until(() => fake.syntheticCalls.length === 1);
+                assert.match(fake.syntheticCalls[0].text, /no status panel/);
+                assert.match(fake.syntheticCalls[0].text, /backend-busy/);
+            } finally {
+                cleanup();
+            }
+        });
+    } finally {
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+});
+
+test("v2 /acp: a throwing command editor degrades to no-/acp without killing setup", async () => {
+    const fake = makeFakeCtx();
+    const ctxObj = fake.ctx as unknown as { command?: unknown };
+    ctxObj.command = {
+        transform: async (cb: (editor: { add: (c: unknown) => void }) => void) => {
+            cb({ add: () => { throw new Error("command editor has no add"); } });
+            return { dispose: () => {} };
+        },
+    };
+    const warns: string[] = [];
+    const origWarn = console.warn;
+    console.warn = (msg?: unknown) => { warns.push(String(msg)); };
+    try {
+        await withEnv({ BILLION_CONTEXT_PROXY: undefined, BILLION_CONTEXT_PLUGIN: undefined }, async () => {
+            const cleanup = await biliOpencodePlugin.setup(fake.ctx as never);
+            try {
+                assert.ok(typeof cleanup === "function", "setup resolved despite the command editor throwing");
+            } finally {
+                cleanup();
+            }
+        });
+        assert.ok(warns.some((w) => w.includes("/acp")), "degradation logged");
+    } finally {
+        console.warn = origWarn;
+    }
+});
+
 test("fetchManifest openai format maps parameters to inputSchema", async () => {
     const MANIFEST_OPENAI = [
         { name: "compress", description: "Compress a range", parameters: { type: "object", properties: { content: { type: "array" } }, required: ["content"] } },

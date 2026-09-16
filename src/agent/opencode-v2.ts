@@ -41,7 +41,7 @@
 // available on all observed surfaces.
 
 import { ACP_TOOLS_OPENAI, ABSORB_TOOL_OPENAI } from "../compress-tool.js";
-import { fetchProxyVersion, forwardTool, proxyBaseFromEnv, proxyBaseFromUrl, reportCompactionBoundary } from "./shared.js";
+import { fetchProxyVersion, fetchStatus, forwardTool, proxyBaseFromEnv, proxyBaseFromUrl, reportCompactionBoundary } from "./shared.js";
 
 type V2Registration = { dispose?: () => void | Promise<void> };
 
@@ -211,54 +211,62 @@ export function createOpencodeV2Setup(options: OpencodeV2SetupOptions = {}): (ct
         // /acp status command (#809): registered via the V2 command editor where
         // supported (2.0.x stable; inert-safe otherwise) and rendered as a
         // synthetic non-model-turn message; TUI-only (`run` dispatches no slash cmds).
-        const commandReg = await ctx.command?.transform?.((editor) => {
-            editor.add({
-                name: "acp",
-                description: "Show ACP status (billion-context proxy)",
-                execute: async (input) => {
-                    const sid = typeof input.sessionID === "string" ? input.sessionID : "";
-                    let text: string;
-                    if (pluginDisabled()) {
-                        text = "bili: disabled (BILLION_CONTEXT_PLUGIN=0)";
-                    } else if (!sid) {
-                        return;
-                    } else {
-                        const base = state.proxyBase ?? proxyBaseFromEnv();
-                        if (!base) {
-                            text = "bili: no proxy detected (launch opencode through `bili opencode`, or point the provider baseURL at the bili proxy)";
+        try {
+            const commandReg = await ctx.command?.transform?.((editor) => {
+                editor.add({
+                    name: "acp",
+                    description: "Show ACP status (billion-context proxy)",
+                    execute: async (input) => {
+                        const sid = typeof input.sessionID === "string" ? input.sessionID : "";
+                        if (!sid) {
+                            console.warn("[bili-opencode] /acp invoked without a sessionID; cannot render ACP status");
+                            return;
+                        }
+                        let text: string;
+                        if (pluginDisabled()) {
+                            text = "bili: disabled (BILLION_CONTEXT_PLUGIN=0)";
                         } else {
-                            try {
-                                const res = await fetch(`${base}/__bili/plugin/status?conversationId=${encodeURIComponent(sid)}&fallback=latest`);
-                                const status = (await res.json()) as { ok?: boolean; panel?: string; error?: string };
-                                if (typeof status.panel === "string" && status.panel.length > 0) {
-                                    text = status.panel;
-                                } else if (status.ok === false) {
-                                    let version: string | undefined;
-                                    try {
-                                        version = await fetchProxyVersion(base);
-                                    } catch {
-                                        version = undefined;
+                            const base = state.proxyBase ?? proxyBaseFromEnv();
+                            if (!base) {
+                                text = "bili: no proxy detected (set BILLION_CONTEXT_PROXY or point the provider at the proxy's /bili/ URL, then run /acp again)";
+                            } else {
+                                try {
+                                    const status = await fetchStatus(base, sid);
+                                    if (status && typeof status.panel === "string" && status.panel.length > 0) {
+                                        text = status.panel;
+                                    } else if (status && status.ok === false) {
+                                        let version: string | undefined;
+                                        try {
+                                            version = await fetchProxyVersion(base);
+                                        } catch {
+                                            version = undefined;
+                                        }
+                                        text = version !== undefined
+                                            ? `billion-context@${version} — proxy connected, no ACP session yet. Send a model request, then run /acp again.`
+                                            : "bili: no ACP session yet (send a model request first, then run /acp)";
+                                    } else {
+                                        const errText = status?.error;
+                                        text = typeof errText === "string" && errText.length > 0
+                                            ? `bili: proxy returned no status panel (${errText})`
+                                            : "bili: proxy returned no status panel";
                                     }
-                                    text = version !== undefined
-                                        ? `billion-context@${version} — proxy connected, no ACP session yet. Send a model request, then run /acp again.`
-                                        : "bili: no ACP session yet (send a model request first, then run /acp)";
-                                } else {
-                                    text = "bili: proxy returned no status panel";
+                                } catch (err) {
+                                    text = `bili: /acp failed (${err instanceof Error ? err.message : String(err)})`;
                                 }
-                            } catch (err) {
-                                text = `bili: /acp failed (${err instanceof Error ? err.message : String(err)})`;
                             }
                         }
-                    }
-                    try {
-                        await ctx.session?.synthetic?.({ sessionID: sid, text });
-                    } catch (err) {
-                        console.error(`[bili-opencode] /acp render failed: ${err instanceof Error ? err.message : String(err)}`);
-                    }
-                },
+                        try {
+                            await ctx.session?.synthetic?.({ sessionID: sid, text });
+                        } catch (err) {
+                            console.error(`[bili-opencode] /acp render failed: ${err instanceof Error ? err.message : String(err)}`);
+                        }
+                    },
+                });
             });
-        });
-        if (commandReg) registrations.push(commandReg);
+            if (commandReg) registrations.push(commandReg);
+        } catch (err) {
+            console.warn(`[bili-opencode] /acp command registration unavailable; continuing without it: ${err instanceof Error ? err.message : String(err)}`);
+        }
 
         const subscription = ctx.event?.subscribe?.({ signal: ac.signal });
         if (subscription && typeof subscription[Symbol.asyncIterator] === "function") {
