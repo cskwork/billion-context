@@ -476,10 +476,43 @@ function extractStreamError(o: Record<string, unknown>): string | null {
     return null;
 }
 
+// #853: a thinking-on-by-default model can spend its entire shared max_tokens
+// budget on chain-of-thought before emitting any answer, so the summary call
+// returns HTTP 200 with finish_reason:"length", content:"" and a non-empty
+// reasoning_content. No usable summary exists in that body; the generic
+// fallback below would blame the upstream. Detect and name the real cause.
+function diagnoseReasoningExhaustion(json: unknown): string | null {
+    if (!json || typeof json !== "object") return null;
+    const choices = (json as Record<string, unknown>).choices;
+    if (!Array.isArray(choices) || choices.length === 0) return null;
+    const choice = choices[0] as Record<string, unknown>;
+    const msg = choice.message;
+    if (!msg || typeof msg !== "object") return null;
+    const m = msg as Record<string, unknown>;
+    const content = m.content;
+    const hasContent = typeof content === "string" ? content.length > 0 : Array.isArray(content) && content.length > 0;
+    if (hasContent) return null;
+    const reasoning = typeof m.reasoning_content === "string" ? m.reasoning_content : typeof m.reasoning === "string" ? m.reasoning : "";
+    const finishReason = typeof choice.finish_reason === "string" ? choice.finish_reason : "";
+    if (reasoning.length === 0 && finishReason === "") return null;
+    const signal = finishReason !== "" ? `finish_reason=${finishReason}` : "no finish_reason";
+    return `the model spent its output budget on reasoning/thinking and returned no summary text (${signal}; reasoning_content=${reasoning.length} chars, content empty). Raise the preflight max_tokens or disable the model's thinking mode; this is a budget limit, not an upstream failure`;
+}
+
 export function diagnoseEmptySummary(text: string, json?: unknown): string {
-    if (json && typeof json === "object") {
-        const err = extractStreamError(json as Record<string, unknown>);
+    let parsed: unknown = json;
+    if (parsed === undefined && text.trimStart().startsWith("{")) {
+        try {
+            parsed = JSON.parse(text);
+        } catch {
+            parsed = null;
+        }
+    }
+    if (parsed && typeof parsed === "object") {
+        const err = extractStreamError(parsed as Record<string, unknown>);
         if (err) return err;
+        const exhausted = diagnoseReasoningExhaustion(parsed);
+        if (exhausted) return exhausted;
     }
     let sseEvents = 0;
     let halfLines = 0;

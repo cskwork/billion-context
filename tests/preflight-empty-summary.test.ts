@@ -397,6 +397,33 @@ test("#726 diagnoseEmptySummary: extracts terminal error signals from 200 bodies
     );
 });
 
+test("#853 diagnoseEmptySummary: thinking-budget exhaustion names the cause, not the upstream", () => {
+    // A thinking-on-by-default model burns its shared max_tokens on
+    // reasoning_content before emitting any answer: HTTP 200, finish_reason
+    // "length", content "", reasoning_content populated. Must NOT read like an
+    // upstream/gateway fault.
+    const lengthTruncated = JSON.stringify({
+        id: "chatcmpl-x",
+        object: "chat.completion",
+        choices: [{ index: 0, finish_reason: "length", message: { role: "assistant", content: "", reasoning_content: "let me work out how to summarize this segment step by step" } }],
+    });
+    assert.match(diagnoseEmptySummary(lengthTruncated), /spent its output budget on reasoning\/thinking/);
+    assert.match(diagnoseEmptySummary(lengthTruncated), /finish_reason=length/);
+    assert.match(diagnoseEmptySummary(lengthTruncated), /not an upstream failure/i);
+    assert.doesNotMatch(diagnoseEmptySummary(lengthTruncated), /non-SSE body with no summary text/);
+
+    const noFinish = JSON.stringify({ choices: [{ message: { role: "assistant", content: "", reasoning_content: "thinking then thinking some more here" } }] });
+    assert.match(diagnoseEmptySummary(noFinish), /spent its output budget on reasoning\/thinking/);
+
+    // A real (short) summary in content is not a budget-exhaustion case.
+    assert.doesNotMatch(
+        diagnoseEmptySummary(JSON.stringify({ choices: [{ finish_reason: "stop", message: { content: "ok" } }] })),
+        /spent its output budget/,
+    );
+    // An unrelated non-SSE body keeps the generic message.
+    assert.match(diagnoseEmptySummary('{"unrelated":"body"}'), /non-SSE body with no summary text/);
+});
+
 test("#780 truncated summary stream is unusable: diagnosis names truncation, bounded calls, cooldown arms, nothing forwarded", async () => {
     const calls: Call[] = [];
     const upstream = makeUpstream(calls, 0, 800, true);
