@@ -41,7 +41,8 @@ test("dumpsDir: respects XDG_STATE_HOME", () => {
     try {
         delete process.env.ACP_DUMP_DIR;
         process.env.XDG_STATE_HOME = "/custom/state";
-        assert.equal(dumpsDir(), path.join("/custom/state", "billion-context", "dumps"));
+        // mirrors stateDir()'s path.resolve of the env override; a bare path.join disagrees on win32 (drive-relative fixture)
+        assert.equal(dumpsDir(), path.join(path.resolve("/custom/state"), "billion-context", "dumps"));
         assert.equal(dumpsDir(), path.join(stateDir(), "dumps"), "co-located with bili.log state dir");
     } finally {
         restoreEnv(prev);
