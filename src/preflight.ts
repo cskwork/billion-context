@@ -903,7 +903,19 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             failure = { kind: "exhausted", detail: `the compress budget was exhausted after ${MAX_PREFLIGHT_ROUNDS} rounds${unusableNote}` };
         }
     }
-    if (result.compressedRanges > 0) deps.session.stats.lastInputTokens = currentTokens;
+    if (result.compressedRanges > 0) {
+        // #857: never persist the IMAGE FLOOR into the usage baseline — images
+        // are billed by the upstream and every fit/clamp gate adds their
+        // estimate separately, so the baseline must stay usage-semantics
+        // (text + overhead only). A bytes-mode floor (b64/4) overestimates
+        // pixel-billing upstreams ~100× and would poison the upward window
+        // self-heal and close the #496 escape hatch permanently.
+        const textBaseline = result.payloadEstimate - (deps.imageFloor ?? 0);
+        if (textBaseline > deps.session.stats.lastInputTokens) {
+            deps.session.stats.lastInputTokens = textBaseline;
+            deps.session.stats.lastInputTokensSource = "estimate";
+        }
+    }
     result.savedTokens = Math.max(0, startTokens - currentTokens);
     if (currentTokens >= limit) result.failure = failure;
     result.fitsWindow = baselineKnown ? result.payloadEstimate < limit : finalUpper < limit;

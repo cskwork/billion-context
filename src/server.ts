@@ -1352,12 +1352,16 @@ async function handle(
             // a larger (e.g. beta) window is not evidence. Fires only on a
             // low-confidence fallback (nativeFromFallback) — an authoritative
             // window is never second-guessed from one turn. lastInputTokens is a
-            // lower bound on the real window, so raising to it is safe (overshoot
-            // self-corrects via the overflow path).
+            // lower bound on the real window ONLY when it came from an upstream
+            // usage report (#857: an estimate-derived baseline — preflight
+            // write-back, #604 failure arming — can exceed the window without
+            // the upstream ever accepting it); absent provenance on legacy
+            // files is untrusted. With a usage-grounded value, raising to it is
+            // safe (overshoot self-corrects via the overflow path).
             const prevInput = session.stats.lastInputTokens ?? 0;
             const prevWindow = session.metadata.lastTurnWindow as number | undefined;
             const resolved = reqConfig.modelContextLimit;
-            if (prevWindow !== undefined && prevInput > prevWindow && prevInput > resolved && prevInput >= 1000) {
+            if (session.stats.lastInputTokensSource === "usage" && prevWindow !== undefined && prevInput > prevWindow && prevInput > resolved && prevInput >= 1000) {
                 // #570: a successful turn's reported input is grounded evidence
                 // (the upstream accepted it), so it lands in the CONFIRMED
                 // fields — a later weak-overflow heuristic must not clobber it.
@@ -1496,6 +1500,7 @@ async function handle(
                         opts,
                         core,
                         reqConfig,
+                        nativeWindow,
                         (parsed as { model?: string }).model,
                         route,
                         affinity,
@@ -2794,6 +2799,7 @@ async function preflightCompressIfNeeded(
     opts: ProxyOptions,
     core: CompressionCore,
     config: Config,
+    configuredWindow: number,
     model: string | undefined,
     route: ReturnType<typeof resolveUpstream>,
     affinity: string | undefined,
@@ -2842,14 +2848,23 @@ async function preflightCompressIfNeeded(
     // relays (#488) but overestimates pixel-tile upstreams (a 400KB JPEG ≈ 1.6K real
     // tokens, not ~133K), so an image-dominated payload can clear the window on ESTIMATE
     // alone. When images are the sole over-window component (text fits) and we hold no
-    // upstream overflow evidence (measured baseline under window + no learned limit for
-    // this model), forward once and let the upstream arbitrate billing: tile upstreams
-    // accept it; byte relays reject it (400) → forward()'s self-heal learns the window
-    // (it counts rejected image tokens) → later requests fail-fast. #488's 400 loop stays
-    // broken (exactly one rejected forward). With either evidence signal present we trust
-    // the estimate and fall through to fold / fail-fast below.
+    // upstream overflow evidence, forward once and let the upstream arbitrate billing:
+    // tile upstreams accept it; byte relays reject it (400) → forward()'s self-heal
+    // learns the window (it counts rejected image tokens) → later requests fail-fast.
+    // #488's 400 loop stays broken (exactly one rejected forward). Evidence signals:
+    // (1) a usage-grounded baseline ≥ window — an estimate-derived or legacy-unmarked
+    // baseline does NOT count (#857: preflight used to write image estimates back into
+    // lastInputTokens, which permanently closed this hatch on pixel-billing upstreams);
+    // (2) a GOVERNING learned limit (≤ the configured window — an above-window learned
+    // value never applied via the downward self-heal, so it has not observed this
+    // payload overflowing). Compared against the CONFIGURED window (pre output-
+    // headroom reservation): a limit equal to it is still upstream-stated
+    // evidence (#767), while an above-configured value is #857's upward-self-heal
+    // residue and never applied. With either present we trust the estimate and
+    // fall through to fold / fail-fast below.
     const learnedLimit = resolveLearnedLimit(session, model);
-    const noOverflowEvidence = session.stats.lastInputTokens < limit && learnedLimit === undefined;
+    const governingLearned = learnedLimit !== undefined && learnedLimit <= configuredWindow ? learnedLimit : undefined;
+    const noOverflowEvidence = (session.stats.lastInputTokens < limit || session.stats.lastInputTokensSource !== "usage") && governingLearned === undefined;
     if (imageTokens > 0 && payloadEstimate >= limit && textEstimate < limit && noOverflowEvidence) {
         log("warn", `[${session.id}] image-dominated payload (~${textEstimate} text + ~${imageTokens} image tokens) exceeds window ${limit} by estimate only, no upstream overflow evidence — forwarding once so the upstream arbitrates billing (#496)`);
         return prepared;
@@ -3033,6 +3048,10 @@ function armFailureShrink(prepared: Prepared, log: (level: string, msg: string) 
     if (!Number.isFinite(est) || est <= 0) return;
     if (est > s.stats.lastInputTokens) {
         s.stats.lastInputTokens = est;
+        // #857: the body includes base64 images, so this estimate carries the
+        // same b64/4 over-count as the preflight image floor — tag it so the
+        // evidence-grade consumers (self-heal, #496 gate, retraction) skip it.
+        s.stats.lastInputTokensSource = "estimate";
         markDirty(s);
         log("warn", `[${s.id}] ${reason} with no usage report — armed emergency shrink with local estimate ${est} tokens`);
     }
@@ -3429,15 +3448,22 @@ async function forward(
                 // that failure's size for a success and delete the window we
                 // just learned. Without one, keep the max-floor (a real usage
                 // report from the next successful turn overwrites either way).
+                // #857: these values are window numbers stated by the upstream
+                // (or derived from such), not content estimates — trusted
+                // provenance for the self-heal / #496-evidence consumers.
                 if (info.window) {
                     s.stats.lastInputTokens = info.window;
+                    s.stats.lastInputTokensSource = "usage";
                 } else {
                     const floor =
                         (reqModel ? confirmedMap[reqModel] : undefined) ??
                         (s.metadata.confirmedContextLimit as number | undefined) ??
                         (s.metadata.effectiveContextLimit as number | undefined) ??
                         0;
-                    if (floor > 0) s.stats.lastInputTokens = Math.max(s.stats.lastInputTokens, floor);
+                    if (floor > 0 && floor > s.stats.lastInputTokens) {
+                        s.stats.lastInputTokens = floor;
+                        s.stats.lastInputTokensSource = "usage";
+                    }
                 }
                 // The learned window (metadata) and the armed emergency
                 // (lastInputTokens) live in memory only until scheduled —
@@ -3809,6 +3835,7 @@ async function forward(
                         0,
                         total - (prepared.session.stats.compressCreditTokens ?? 0),
                     );
+                    prepared.session.stats.lastInputTokensSource = "usage";
                     if (typeof cached === "number") {
                         prepared.session.stats.cachedTokens += cached;
                         prepared.session.stats.cacheSamples += 1;

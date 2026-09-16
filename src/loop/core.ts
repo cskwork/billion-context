@@ -179,6 +179,7 @@ function recordUsage(
     // clobber the last trusted value — mirrors applyUsageSample (plugin mode).
     if (total > 0) {
         ctx.session.stats.lastInputTokens = Math.max(0, total - (ctx.session.stats.compressCreditTokens ?? 0));
+        ctx.session.stats.lastInputTokensSource = "usage";
     }
     if (typeof cached === "number" && total > 0) {
         ctx.session.stats.cachedTokens += cached;

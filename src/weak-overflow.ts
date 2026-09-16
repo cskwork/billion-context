@@ -94,6 +94,11 @@ export function resolveLearnedLimit(session: Session, model?: string): number | 
 export function retractStaleLearnedLimits(session: Session, model?: string): boolean {
     const x = session.stats?.lastInputTokens ?? 0;
     if (!(x > 0)) return false;
+    // #857: retraction's premise is "a later turn SUCCEEDED with reported
+    // input above" — only a usage-grounded measurement can prove that. An
+    // estimate-derived (or legacy-unmarked) baseline exceeding a REAL
+    // confirmed window is #857's poison pattern, not staleness evidence.
+    if (session.stats?.lastInputTokensSource !== "usage") return false;
     const stale = (v: unknown): v is number =>
         typeof v === "number" && v > 0 && x - v >= Math.max(RETRACT_MIN_DELTA, v * RETRACT_MARGIN_PCT);
     const md = (session.metadata ?? {}) as Record<string, unknown>;
@@ -182,8 +187,13 @@ export function noteWeakOverflow(
             loggerLog("warn", `[${session.id}] weak overflow confirmed (${MIN_EVENTS}× high-usage failures, ${opts.reason}) — conservative window ${input} not below learned ${prev}; arming emergency shrink only`);
         }
     }
-    if (!session.stats) session.stats = { lastInputTokens: armInput } as Session["stats"];
-    else session.stats.lastInputTokens = Math.max(session.stats.lastInputTokens, armInput);
+    if (!session.stats) session.stats = { lastInputTokens: armInput, lastInputTokensSource: "estimate" } as Session["stats"];
+    else if (armInput > session.stats.lastInputTokens) {
+        // #857: armInput is an upper bound on the failing request's input size,
+        // not an upstream usage report — tag it so evidence-grade consumers skip it.
+        session.stats.lastInputTokens = armInput;
+        session.stats.lastInputTokensSource = "estimate";
+    }
     markDirty(session);
 }
 
