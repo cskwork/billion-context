@@ -74,13 +74,13 @@ test("lookupContextLimit returns known windows", () => {
     assert.equal(lookupContextLimit("o1-preview"), 200_000);
     assert.equal(lookupContextLimit("gemini-2.5-pro"), 1_000_000);
     assert.equal(lookupContextLimit("glm-4.6"), 128_000);
-    assert.equal(lookupContextLimit("glm-4.5-air"), 128_000);
+    assert.equal(lookupContextLimit("glm-4.5-air"), 200_000);
     assert.equal(lookupContextLimit("deepseek-chat"), 1_000_000);
     assert.equal(lookupContextLimit("deepseek-reasoner"), 1_000_000);
     assert.equal(lookupContextLimit("MiniMax-M2.1"), 204_800);
     assert.equal(lookupContextLimit("minimax-m2"), 204_800);
-    assert.equal(lookupContextLimit("qwen-max"), 128_000);
-    assert.equal(lookupContextLimit("kimi-k2"), 128_000);
+    assert.equal(lookupContextLimit("qwen-max"), 200_000);
+    assert.equal(lookupContextLimit("kimi-k2"), 200_000);
 });
 
 test("lookupContextLimit keeps DeepSeek flagship at 1M and legacy r1/v3/ocr at 128k (#852)", () => {
@@ -95,8 +95,8 @@ test("lookupContextLimit keeps DeepSeek flagship at 1M and legacy r1/v3/ocr at 1
 });
 
 test("lookupContextLimit matches relay/vLLM 'prefix/name' ids via the bare basename (#736)", () => {
-    assert.equal(lookupContextLimit("meta-llama/Llama-4-Maverick"), 128_000);
-    assert.equal(lookupContextLimit("qwen/qwen3.8-27b"), 128_000);
+    assert.equal(lookupContextLimit("meta-llama/Llama-4-Maverick"), 200_000);
+    assert.equal(lookupContextLimit("qwen/qwen3.8-27b"), 200_000);
     assert.equal(lookupContextLimit("unknown-org/unknown-model"), undefined);
 });
 

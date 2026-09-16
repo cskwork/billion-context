@@ -214,7 +214,10 @@ export type UpstreamProxyMode = "auto" | "manual" | "direct";
  *  prefix. This is a FALLBACK used when the per-route model declaration in
  *  providers.json does not cover a model. The per-route declaration (which
  *  the user controls) always wins, because the same model name can have
- *  different windows behind different relays. */
+ *  different windows behind different relays. Generic family guesses (no
+ *  specific known window) default to 200k, not 128k — a too-small guess
+ *  strands the session in the preflight fail-fast loop while a too-large
+ *  one self-heals on the first upstream overflow (#852). */
 const CONTEXT_LIMIT_TABLE: Array<{ match: RegExp; limit: number }> = [
     { match: /^claude-/i, limit: 200_000 },
     { match: /^gpt-5/i, limit: 400_000 },
@@ -226,14 +229,14 @@ const CONTEXT_LIMIT_TABLE: Array<{ match: RegExp; limit: number }> = [
     { match: /^gemini-1\.5/i, limit: 1_000_000 },
     { match: /^glm-4\.6/i, limit: 128_000 },
     { match: /^glm-5/i, limit: 1_000_000 },
-    { match: /^glm-/i, limit: 128_000 },
+    { match: /^glm-/i, limit: 200_000 },
     // DeepSeek: flagship line (chat/reasoner/v4*/flash) is 1M on models.dev; only legacy r1/v3/ocr stay ~128k (#852).
     { match: /^deepseek-(r1|v3|ocr)/i, limit: 128_000 },
     { match: /^deepseek/i, limit: 1_000_000 },
     { match: /^minimax/i, limit: 204_800 },
-    { match: /^qwen/i, limit: 128_000 },
-    { match: /^kimi/i, limit: 128_000 },
-    { match: /^llama-/i, limit: 128_000 },
+    { match: /^qwen/i, limit: 200_000 },
+    { match: /^kimi/i, limit: 200_000 },
+    { match: /^llama-/i, limit: 200_000 },
 ];
 
 export function lookupContextLimit(model: string | undefined): number | undefined {
