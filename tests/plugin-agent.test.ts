@@ -1026,6 +1026,26 @@ test("plugin opencode survives a non-object mcp (issue #836 / #809 N4)", async (
     fs.rmSync(home, { recursive: true, force: true });
 });
 
+// #839 (found while reviewing #837): same bug class as #836 on the claude side
+// — a non-object `mcpServers` in .claude.json made `"bili" in mcpServers` throw
+// in claudeStatus(), crashing remove (which calls status first) and surfacing
+// "error:" from status.
+test("plugin claude survives a non-object mcpServers (issue #839)", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-plugin-home-"));
+    const piAgentDir = path.join(home, ".pi/agent");
+    await withEnv(hintEnv(home, piAgentDir), async () => {
+        const cFile = path.join(home, ".claude.json");
+        const malformed = JSON.stringify({ mcpServers: "bogus-string", other: 1 });
+        fs.writeFileSync(cFile, malformed);
+
+        assert.doesNotThrow(() => pluginRemove("claude"));
+        assert.match(pluginRemove("claude"), /not installed/);
+        assert.equal(pluginStatusAll().find((r) => r.agent === "claude")!.status, "not installed");
+        assert.equal(fs.readFileSync(cFile, "utf8"), malformed);
+    });
+    fs.rmSync(home, { recursive: true, force: true });
+});
+
 test("plugin list survives a broken host config (per-row error, no crash)", async () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-plugin-home-"));
     const piAgentDir = path.join(home, ".pi/agent");
