@@ -151,9 +151,11 @@ Pick by your client:
 |---|---|
 | **pi** | [`billion-context-pi`](https://github.com/ranxianglei/billion-context-pi) (in-process extension) |
 | **opencode 1.x** | [`opencode-acp`](https://github.com/ranxianglei/opencode-acp) (in-process extension, V1 plugin API) or `bili opencode` |
-| **opencode 2.0+** | `bili opencode` (built-in V2 plugin — native tools, no separate package) |
+| **opencode 2.0+** | `bili opencode` (built-in V2 plugin — native tools, no separate package) or `bili plugin install opencode` (self-spawning native plugin, no launcher) |
 | **omp** | [`billion-context`](https://github.com/ranxianglei/billion-context) via `bili omp` (built-in plugin) |
 | **everything else** (no context hook) | [`billion-context`](https://github.com/ranxianglei/billion-context) — `bili <client>` (launcher, preferred) or `/bili/` prefix |
+
+**Native mode vs standalone extensions.** The host-native plugins (`bili plugin install pi` / `opencode` — they spawn the proxy inside the host process) and the standalone in-process extensions (`billion-context-pi`, `opencode-acp`) are **mutually exclusive**: both active means double compression. The installer makes the switch (`bili plugin install pi` replaces the legacy `npm:billion-context-pi` entry). As a runtime safety net for manual installs, the native entries set `BILLION_CONTEXT_NATIVE=<host>` synchronously at load so a standalone extension can stand down at action time — its own load-time `BILLION_CONTEXT_PROXY` check cannot see a proxy that native mode spawns asynchronously, and its `/bili/` baseUrl check never sees the fetch-layer rewrite.
 
 ## Install
 
@@ -263,9 +265,22 @@ contract:
   never fires, the plugin stays inert and the session transparently runs in
   plain proxy mode (wire-level tool injection) instead of breaking — observed
   on two adjacent `dev` builds (2026-09-13 / 2026-09-14) whose API surfaces
-  differ from each other (#754 review probes); conversely verified end-to-end
-  on `@opencode/cli` 2.0.3 (native `acp_status` executed through the plugin
-  endpoint, zero wire-level injection).
+   differ from each other (#754 review probes); conversely verified end-to-end
+   on `@opencode/cli` 2.0.3 (native `acp_status` executed through the plugin
+   endpoint, zero wire-level injection).
+- **Native (no launcher):** with the package installed from npm, run
+  `bili plugin install opencode` — it writes a self-spawning plugin into your
+  real opencode config (`<configDir>/plugins/billion-context/index.js` →
+  `dist/agent/opencode-native.js`) and sets `compaction.auto: false`, after
+  which plain `opencode` works as-is. At load the plugin bootstraps its own
+  proxy (attaches to a healthy instance instead of doubling; parent-pid
+  watchdog kills it when opencode exits), routes model-API traffic through the
+  `http.request` hook to `<proxy>/bili/<upstream-url>`, and exposes the same
+  native bili tools as launcher mode — no fixed port, no env var, no launcher.
+  Opt-out: `BILI_NATIVE_OPENCODE=0`. If no proxy can be made healthy, requests
+  go direct (uncompressed) with a one-time warning and recover automatically.
+  Under a `bili opencode` launch this entry is skipped entirely (the launcher
+  owns the proxy).
 - **Pure proxy:** point the provider baseURL at the proxy like any other
   client:
 

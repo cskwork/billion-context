@@ -19,6 +19,10 @@ export interface NativeInterceptState {
      *  BILLION_CONTEXT_PROXY env) so event-time ownership checks disarm with
      *  the traffic. */
     onGiveUp?: () => void;
+    /** Attach mode (#809): route through a user-supplied external proxy at
+     *  state.origin instead of a spawned one — no respawn, fail-closed on
+     *  death. Set by the host entry when BILLION_CONTEXT_ATTACH is present. */
+    attach?: boolean;
     /** How long a pre-ready model request waits for the bootstrap before
      *  falling back to a direct (uncompressed) send. */
     readyTimeoutMs?: number;
@@ -79,7 +83,7 @@ async function withTimeout(p: Promise<string | undefined>, ms: number): Promise<
     }
 }
 
-async function readyOrigin(state: NativeInterceptState): Promise<string | undefined> {
+export async function readyOrigin(state: NativeInterceptState): Promise<string | undefined> {
     if (state.origin !== undefined) return state.origin;
     return withTimeout(state.ready, state.readyTimeoutMs ?? 15000);
 }
