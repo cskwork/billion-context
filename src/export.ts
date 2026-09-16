@@ -1,6 +1,6 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
-import { matchSession as matchSessionKernel, renderHandoff as renderHandoffKernel, type HandoffBlockFull } from "acp-kernel";
+import { matchSession as matchSessionKernel, renderHandoff as renderHandoffKernel } from "acp-kernel";
 import type { Session } from "./session.js";
 import { SessionStore } from "./persist.js";
 
@@ -47,26 +47,48 @@ function latestBlockTime(s: Session): number {
     return latest;
 }
 
+/** Unified per-block handoff section (#841): guarantees every active block's
+ *  summary appears at least once in the doc. A summary already rendered inside
+ *  the conversation view (a recent block that survived the persisted tail
+ *  window) is not repeated; --full recovers the originals dropped from a
+ *  folded snapshot under the same block entry. */
+function renderBlockSection(s: Session, viewedText: string, full: boolean, folded: boolean): string[] {
+    const lines: string[] = [];
+    const recoverOriginals = full && folded;
+    for (const b of s.state.blocks) {
+        if (!b.active) continue;
+        const content = s.blockContents.get(b.blockId);
+        const summary = b.summary.trim();
+        const summaryInView = summary.length > 0 && viewedText.includes(summary);
+        if (summaryInView && !(recoverOriginals && content)) continue;
+        lines.push(`### Block ${b.blockId}${b.topic ? ` — ${b.topic}` : ""}`);
+        lines.push("");
+        lines.push(`tier ${b.tier} · ~${b.compressedTokens} tokens compressed · ${fmtDate(b.createdAt)}`);
+        lines.push("");
+        if (!summaryInView) {
+            lines.push(summary);
+            lines.push("");
+        }
+        if (recoverOriginals && content) {
+            lines.push(`#### Original messages (${content.full.count})`);
+            lines.push("");
+            lines.push(content.full.text.trim());
+            lines.push("");
+        }
+    }
+    if (lines.length === 0) return lines;
+    return ["## Compressed block summaries", "", ...lines];
+}
+
 export function renderHandoff(s: Session, full: boolean): string {
     const messages = s.lastMessages;
     if (messages && messages.length > 0) {
         const folded = s.lastMessagesFolded === true;
-        const blocksFull: HandoffBlockFull[] | undefined =
-            full && folded
-                ? s.state.blocks
-                      .filter((b) => b.active)
-                      .map((b): HandoffBlockFull | undefined => {
-                          const content = s.blockContents.get(b.blockId);
-                          return content ? { blockId: b.blockId, topic: b.topic, count: content.full.count, fullText: content.full.text } : undefined;
-                      })
-                      .filter((x) => x !== undefined)
-                : undefined;
-        return renderHandoffKernel({
+        const kernelMd = renderHandoffKernel({
             coreMessages: messages,
             state: s.state,
             full,
             folded,
-            blocksFull,
             meta: {
                 title: s.meta.title,
                 label: s.meta.label,
@@ -79,6 +101,8 @@ export function renderHandoff(s: Session, full: boolean): string {
                 ],
             },
         });
+        const section = renderBlockSection(s, kernelMd, full, folded);
+        return section.length > 0 ? `${kernelMd}\n${section.join("\n")}` : kernelMd;
     }
 
     // v2 fallback: no snapshot persisted. Block summaries (+ originals with
@@ -100,21 +124,7 @@ export function renderHandoff(s: Session, full: boolean): string {
         lines.push("No active compression blocks and no persisted conversation snapshot (v2 session file). Original messages are only persisted when they are compressed into a block, so this session's conversation content is not available for export.");
         lines.push("");
     }
-    for (const b of active) {
-        lines.push(`## Block ${b.blockId}${b.topic ? ` — ${b.topic}` : ""}`);
-        lines.push("");
-        lines.push(`tier ${b.tier} · ~${b.compressedTokens} tokens compressed · ${fmtDate(b.createdAt)}`);
-        lines.push("");
-        lines.push(b.summary.trim());
-        lines.push("");
-        const content = s.blockContents.get(b.blockId);
-        if (full && content) {
-            lines.push(`### Original messages (${content.full.count})`);
-            lines.push("");
-            lines.push(content.full.text.trim());
-            lines.push("");
-        }
-    }
+    lines.push(...renderBlockSection(s, "", full, true));
     if (active.length > 0) {
         lines.push("---");
         lines.push("");
