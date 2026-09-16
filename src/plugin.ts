@@ -724,6 +724,7 @@ export function applyUsageSample(session: Session, sample: UsageSample, protocol
         // Net out pending compress savings (see stream.ts applyRanges): plugin
         // compress tool results shrink the next request, not this report.
         session.stats.lastInputTokens = Math.max(0, total - (session.stats.compressCreditTokens ?? 0));
+        session.stats.lastInputTokensSource = "usage";
         warnCacheCollapse(session, total, sample.cachedTokens ?? 0);
         // #695: per-request parity with the wire path's [acp-usage] — without
         // this, post-fold cache cliffs cannot be attributed from logs.

@@ -95,6 +95,7 @@ interface PersistedSession {
         outputTokens?: number;
         cacheSamples?: number;
         lastInputTokens?: number;
+        lastInputTokensSource?: string;
         contextTokens?: number;
     };
     /** Free-form escape hatch (v2+). */
@@ -612,6 +613,9 @@ function buildSession(parsed: PersistedSession): Session {
             // guard existed) which would otherwise revive after upgrade and
             // feed the /acp panel + web stats as negative percentages.
             lastInputTokens: Math.max(0, stats.lastInputTokens ?? parsed.lastInputTokens ?? 0),
+            // #857: provenance — legacy files lack it; absent stays absent and
+            // evidence-grade consumers treat absent as untrusted.
+            lastInputTokensSource: stats.lastInputTokensSource === "usage" || stats.lastInputTokensSource === "estimate" ? stats.lastInputTokensSource : undefined,
             // In-memory only — a fresh process has no pending compress fold.
             compressCreditTokens: 0,
             contextTokens: Math.max(0, stats.contextTokens ?? parsed.contextTokens ?? 0),
