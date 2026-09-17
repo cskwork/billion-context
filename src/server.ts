@@ -1315,6 +1315,7 @@ async function handle(
                         },
                     }));
                 }
+                logRequestCost(log, session.id, inboundMsgs, inboundBytes, reqT0);
                 return;
             }
             log("info", `[${session.id}] side request (max_tokens<=${SIDE_REQUEST_MAX_TOKENS}) → passthrough + tag strip only, kernel state untouched`);
@@ -1328,7 +1329,7 @@ async function handle(
                 compressInjected: false,
                 sidePassthrough: true,
             };
-            logRequestCost(log, session.id, inboundMsgs, inboundBytes, reqT0);
+            logRequestCost(log, session.id, inboundMsgs, inboundBytes, reqT0, bodyBuffer);
             await forward(req, res, opts, bodyBuffer, sidePrepared, core, reqConfig, log, route, instanceId, affinity);
             return;
         }
@@ -1492,7 +1493,7 @@ async function handle(
                     const gatePre = codexCompactGatePre(session, reqConfig.modelContextLimit);
                     if (mode === "intercept" && gatePre) prepared = runPrepare();
                     if (prepared?.codexForge) {
-                        logRequestCost(log, session.id, inboundMsgs, inboundBytes, reqT0);
+                        logRequestCost(log, session.id, inboundMsgs, inboundBytes, reqT0, prepared.body);
                         await forward(req, res, opts, prepared.body, prepared, core, reqConfig, log, route, instanceId, affinity);
                         rememberPluginMessages(sessionId, prepared.processedMessages, prepared.originalMessages, prepared.nudge);
                         return;
@@ -1506,7 +1507,7 @@ async function handle(
                     const forwardBody = normalized ? Buffer.from(JSON.stringify({ ...original, input: items })) : bodyBuffer;
                     const why = mode !== "intercept" ? "BILI_CODEX_COMPACT=pass" : !gatePre ? "gate preconditions not met" : "transform/forge failed";
                     log("info", `[${session.id}] codex compaction_trigger request not intercepted (${why}) — forwarding ${normalized ? `with bili summaries normalized (replaced=${replaced}, dropped=${dropped})` : "verbatim"} (no preflight, no rebuild, no window clamp)`);
-                    logRequestCost(log, session.id, inboundMsgs, inboundBytes, reqT0);
+                    logRequestCost(log, session.id, inboundMsgs, inboundBytes, reqT0, forwardBody);
                     await forward(req, res, opts, forwardBody, null, core, reqConfig, log, route, instanceId, affinity);
                     return;
                 }
@@ -1575,7 +1576,7 @@ async function handle(
                     }
                     prepared = outcome;
                 }
-                logRequestCost(log, session.id, inboundMsgs, inboundBytes, reqT0);
+                logRequestCost(log, session.id, inboundMsgs, inboundBytes, reqT0, prepared!.body);
                 await forward(req, res, opts, prepared!.body, prepared!, core, reqConfig, log, route, instanceId, affinity);
                 // Remember for ALL modes (not just plugin): wire clients (dsh,
                 // hermes, unplug'd pi) read the same panel via /__bili/plugin/status
@@ -4031,10 +4032,15 @@ function formatBytes(n: number): string {
 
 // #903: per-request local-cost line, logged at every point where bili finishes
 // its own processing and hands the request off (upstream forward, forged local
-// response, or fail-fast error) — see handle().
-function logRequestCost(log: (level: string, msg: string) => void, sessionId: string, msgs: number | null, inboundBytes: number, t0: number): void {
+// response, or fail-fast error) — see handle(). outbound is the exact body value
+// handed to forward() (string OR Buffer — Prepared.body is string|Buffer); wire
+// bytes are counted with Buffer.byteLength since undici sends UTF-8 bytes even
+// for string bodies (.length would count UTF-16 chars and undercount any
+// non-ASCII injection). Omitted on paths that fail fast without forwarding.
+function logRequestCost(log: (level: string, msg: string) => void, sessionId: string, msgs: number | null, inboundBytes: number, t0: number, outbound?: string | Buffer): void {
     const ms = Math.max(0, Math.round(performance.now() - t0));
-    log("info", `[${sessionId}] request: ${msgs ?? "?"} msgs, inbound=${formatBytes(inboundBytes)}, local=${ms}ms`);
+    const outboundField = outbound !== undefined ? `, outbound=${formatBytes(Buffer.byteLength(outbound))}` : "";
+    log("info", `[${sessionId}] request: ${msgs ?? "?"} msgs, inbound=${formatBytes(inboundBytes)}${outboundField}, local=${ms}ms`);
 }
 
 /** Thrown by readBody when the request body exceeds MAX_REQUEST_BYTES.
