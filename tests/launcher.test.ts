@@ -3719,6 +3719,9 @@ test("runLaunch opencode: inherited proxy vars stripped so traffic cannot bypass
         https_proxy: process.env.https_proxy,
         all_proxy: process.env.all_proxy,
         HTTP_PROXY: process.env.HTTP_PROXY,
+        HTTPS_PROXY: process.env.HTTPS_PROXY,
+        ALL_PROXY: process.env.ALL_PROXY,
+        no_proxy: process.env.no_proxy,
         NO_PROXY: process.env.NO_PROXY,
     };
     const prevMarker = process.env.BILI_TEST_MARKER;
@@ -3728,9 +3731,11 @@ test("runLaunch opencode: inherited proxy vars stripped so traffic cannot bypass
     process.env.https_proxy = "http://corp-proxy.example:8080";
     process.env.all_proxy = "socks5://corp-proxy.example:1080";
     process.env.HTTP_PROXY = "http://corp-proxy.example:8080";
+    process.env.ALL_PROXY = "socks5://corp-proxy.example:1080";
+    process.env.no_proxy = "localhost,.corp";
     process.env.NO_PROXY = "localhost,.corp";
     process.env.BILI_TEST_MARKER = "keep";
-    const fakeOc = path.join(home, "fake-opencode");
+    const fakeOc = path.join(home, process.platform === "win32" ? "fake-opencode.exe" : "fake-opencode");
     fs.writeFileSync(fakeOc, "");
     process.env.BILI_CLIENT_BIN = fakeOc;
 
@@ -3763,12 +3768,14 @@ test("runLaunch opencode: inherited proxy vars stripped so traffic cannot bypass
         const seenEnv = clientEnvs[0]!;
         const origin = seenEnv.BILLION_CONTEXT_PROXY;
         assert.ok(/^http:\/\/127\.0\.0\.1:\d+$/.test(String(origin)), `origin: ${origin}`);
-        assert.equal(seenEnv.HTTPS_PROXY, origin);
         assert.ok(String(seenEnv.NODE_EXTRA_CA_CERTS).endsWith(path.join("billion-context", "ca", "root-ca.pem")), String(seenEnv.NODE_EXTRA_CA_CERTS));
         assert.equal(seenEnv.http_proxy, undefined, "inherited http_proxy stripped");
         assert.equal(seenEnv.https_proxy, undefined, "inherited https_proxy stripped");
         assert.equal(seenEnv.all_proxy, undefined, "inherited all_proxy stripped");
         assert.equal(seenEnv.HTTP_PROXY, undefined, "inherited HTTP_PROXY stripped");
+        assert.equal(seenEnv.HTTPS_PROXY, origin, "inherited HTTPS_PROXY replaced by bili origin");
+        assert.equal(seenEnv.ALL_PROXY, undefined, "inherited ALL_PROXY stripped");
+        assert.equal(seenEnv.no_proxy, undefined, "inherited no_proxy stripped");
         assert.equal(seenEnv.NO_PROXY, undefined, "inherited NO_PROXY stripped");
         assert.equal(seenEnv.BILI_TEST_MARKER, "keep", "unrelated env vars preserved");
     } finally {
