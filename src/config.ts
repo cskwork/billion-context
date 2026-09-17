@@ -140,6 +140,12 @@ export type CompressSettings = {
     minCompressRange?: number;
     /** Enable multi-tier (T2/T3) distillation (kernel `tiers.enabled`). */
     tiers?: boolean;
+    /** Emit 📦/❌ ACP visibility markers after proxy tool executions
+     *  (compress / decompress / search_context / acp_status) — both the marker
+     *  line streamed to the client and the marker message re-injected into
+     *  rebuilt history. `false` suppresses them entirely, for deployments where
+     *  models imitate or narrate around the markers (#862). Default `true`. */
+    visibilityMarkers?: boolean;
     /** Override the kernel's compression prompt text (compressPhilosophy /
      *  howToCompressRules / tier2DistillRules / tier3CondenseRules). All four
      *  fields are LOAD-BEARING: the kernel rules were tuned in production and
@@ -708,6 +714,10 @@ export function parseCompressSettings(v: unknown): (CompressSettings & { injectT
     if ("stripImages" in obj) {
         if (typeof obj.stripImages !== "boolean") ok = false;
         else out.stripImages = obj.stripImages;
+    }
+    if ("visibilityMarkers" in obj) {
+        if (typeof obj.visibilityMarkers !== "boolean") ok = false;
+        else out.visibilityMarkers = obj.visibilityMarkers;
     }
     // Injection toggles are file-level fields (FileConfig.compress) honored by
     // loadOptions via `=== false`; the web UI shows them from the raw file

@@ -63,6 +63,9 @@ interface CompressLoopResponsesCtx {
     /** Resolved upstream proxy URL (http://host:port) or undefined for direct. */
     proxyUrl?: string;
     textProtocol?: boolean;
+    /** #862: when `false`, suppress 📦/❌ visibility markers (same contract as
+     *  LoopCtx.visibilityMarkers). Default (undefined) keeps markers on. */
+    visibilityMarkers?: boolean;
 }
 
 interface RequestOptions {
@@ -160,7 +163,7 @@ function surfaceReadonlyJson(
             result = `\u274c [ACP] ${call.name} FAILED: ${String(e)}`;
             ctx.log(`[acp-proxy: responses JSON ${call.name} (read-only) FAILED: ${String(e)}]`);
         }
-        markers.push(buildVisibilityMarker(call.name, result));
+        if (ctx.visibilityMarkers !== false) markers.push(buildVisibilityMarker(call.name, result));
     }
     if (markers.length === 0) return current;
     const out = Array.isArray(current.output) ? [...(current.output as unknown[])] : [];
@@ -212,7 +215,7 @@ export async function compressLoopResponsesJson(
             }
             const result = executeProxyTool(call.name, args, ctx);
             ctx.log(`[acp-proxy: responses JSON ${call.name} → ${result.slice(0, 120).replace(/\n/g, " ")}]`);
-            inputItems.push({ type: "message", role: "developer", content: buildVisibilityMarker(call.name, result) });
+            if (ctx.visibilityMarkers !== false) inputItems.push({ type: "message", role: "developer", content: buildVisibilityMarker(call.name, result) });
         }
         requestBody.input = hoistTrappedToolItems(inputItems as ToolPairItem[]);
         const result = await fetchWithRetry(requestOptions.url, {

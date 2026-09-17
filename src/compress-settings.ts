@@ -71,6 +71,7 @@ export function mergeCompress(
 
 stripImages: pick("stripImages"),
         stripImagesKeepRecent: pick("stripImagesKeepRecent"),
+        visibilityMarkers: pick("visibilityMarkers"),
         // `reasoning` is a third nested-object field merged sub-field-wise
         // exactly like `absorb`/`prompts`: a model-level `threshold` must not
         // discard a provider-level `drop: false`.

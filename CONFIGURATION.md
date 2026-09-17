@@ -389,6 +389,13 @@ For each request, the proxy resolves the settings by longest-URL-prefix match (t
 - **Status:** ACTIVE
 - **Description:** With `stripImages: true`, how many trailing messages keep their images verbatim. Ignored unless `stripImages` is enabled.
 
+#### `visibilityMarkers`
+
+- **Type:** `boolean`
+- **Default:** `true`
+- **Status:** ACTIVE
+- **Description:** Controls the 📦/❌ ACP visibility markers emitted after the proxy executes a proxy tool call (`compress` / `decompress` / `search_context` / `acp_status`). When on, each execution appends a marker line to the response stream and/or re-injects a marker message into that round's rebuilt history so the model can see what happened on later turns. Set `false` to suppress both artifacts — for deployments where models imitate or narrate around the markers (outputting their own confirmation lines or commentary; see issue #862). The tool executions themselves are unaffected: calls still run, and paired tool-call/tool-result messages are still recorded as usual; only the marker line/message is omitted. Same three-level merge as every other field. The #717 anti-forgery stripping of model-emitted fake markers is independent of this flag and stays active.
+
 ### Injection toggles (global only)
 
 These two toggles are honoured only at the **global** level. Setting them inside a per-provider or per-model `compress` block has no effect.
