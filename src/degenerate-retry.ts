@@ -1,4 +1,5 @@
 import { fetchWithTimeout } from "./fetch-util.js";
+import { hasCompactionTrigger } from "./codex-compact.js";
 import { proxyDispatcher } from "./upstream-proxy.js";
 import type { WireProtocol } from "./util.js";
 import { appendTrailingUserText } from "./wire-body.js";
@@ -46,6 +47,22 @@ export interface ContinuationRetryOpts {
 export function makeContinuationRefetch(opts: ContinuationRetryOpts): () => Promise<ReadableStream<Uint8Array> | null> {
     return async () => {
         if (opts.signal.aborted) return null;
+        // A body whose final input item is a compaction trigger must never be
+        // re-issued: appending the nudge after it breaks the wire shape (#283:
+        // the trigger stays the last input item), and the trigger's terminal is
+        // decided by the compaction flow, not by an empty-turn retry. Parsed
+        // here, at retry time, so healthy turns pay nothing.
+        if (opts.protocol === "responses") {
+            try {
+                const parsed = JSON.parse(typeof opts.body === "string" ? opts.body : opts.body.toString("utf8")) as Record<string, unknown>;
+                if (hasCompactionTrigger(parsed["input"])) {
+                    opts.log("warn", `[${opts.label}] [plugin] degenerate-terminal retry skipped: request ends on a compaction trigger`);
+                    return null;
+                }
+            } catch {
+                /* unparseable body: injectContinuationNudge below reports and skips */
+            }
+        }
         const retryBody = injectContinuationNudge(opts.protocol, opts.body);
         if (retryBody === null) {
             opts.log("warn", `[${opts.label}] [plugin] degenerate-terminal retry skipped: request body carries no turn array`);

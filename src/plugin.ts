@@ -795,12 +795,15 @@ export async function pipePluginChatWithStrip(
     let decoder = new TextDecoder("utf-8");
     let buf = "";
     const acc: UsageSample = {};
+    let sawStrippedEcho = false;
     const onTagDrop = (snippet: string) => {
         droppedTagInFrame = true;
+        sawStrippedEcho = true;
         loggerLog("warn", `[tag-echo] stripped model-emitted render tag (plugin passthrough): ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
         log?.(`[tag-echo] stripped model-emitted render tag from plugin passthrough text`);
     };
     const onMarkerDrop = (snippet: string) => {
+        sawStrippedEcho = true;
         loggerLog("warn", `[marker-echo] stripped model-emitted ACP confirmation marker (plugin passthrough): ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
         log?.(`[marker-echo] stripped model-emitted ACP confirmation marker from plugin passthrough text`);
     };
@@ -868,6 +871,11 @@ export async function pipePluginChatWithStrip(
             emitStreamError(res, protocol, "the turn degenerated again after the continuation nudge");
             return true;
         }
+        // A turn the model left genuinely bare — no thought, no stripped echo,
+        // no released markup — is the upstream's own empty answer, not a stall:
+        // re-issuing it double-bills an empty completion (#732/#821 keep the
+        // same boundary in the compress loop).
+        if (!sawThinking && !sawStrippedEcho && releasedMarkupChars === 0) return false;
         degenerateRetried = true;
         log?.("[plugin] degenerate terminal turn (no usable output); retrying once with a continuation nudge (#732/#821)");
         let next: ReadableStream<Uint8Array> | null = null;
@@ -1282,6 +1290,9 @@ export async function pipePluginResponsesWithStrip(
     // #673: turn-level observability for degenerate terminal turns.
     let sawFunctionCall = false;
     let sawReasoning = false;
+    /** The model emitted markup the filter stripped (or would strip): proof the
+     *  turn produced output, even when none survived to be visible. */
+    let sawStrippedEcho = false;
     let responseStatus: string | undefined;
     // Degenerate-turn retry (#732/#821 for this pipe). The first attempt's
     // done-family events are HELD until its completion event decides the turn:
@@ -1419,6 +1430,11 @@ export async function pipePluginResponsesWithStrip(
         if (visibleTextChars > 0 || heldVisibleChars > 0 || sawFunctionCall) return false;
         if (status !== "completed") return false;
         if (res.destroyed || res.writableEnded) return false;
+        // A turn the model left genuinely bare — no reasoning, no stripped
+        // echo — is the upstream's own empty answer, not a stall: re-issuing it
+        // double-bills an empty completion (#732/#821 keep the same boundary in
+        // the compress loop).
+        if (!sawReasoning && !sawStrippedEcho) return false;
         degenerateRetried = true;
         log?.("[plugin] degenerate terminal turn (no visible output); retrying once with a continuation nudge (#732/#821)");
         let next: ReadableStream<Uint8Array> | null = null;
@@ -1506,8 +1522,10 @@ export async function pipePluginResponsesWithStrip(
                         // retryEmptyTurn): releasing it earlier would hand the
                         // client the echo's own text exactly when the retry is
                         // about to replace it.
+                        const hadEchoText = containsRenderTagText(jsonStr) || containsMarkerLineText(jsonStr);
+                        if (hadEchoText) sawStrippedEcho = true;
                         let evOut = ev;
-                        let rebuild = containsRenderTagText(jsonStr) || containsMarkerLineText(jsonStr) || retryRewritePending();
+                        let rebuild = hadEchoText || retryRewritePending();
                         if (rebuild) evOut = stripResponsesText(ev);
                         rewriteRetryIds(evOut);
                         heldVisibleChars += responsesEventTextLength(evOut);
@@ -1552,7 +1570,10 @@ export async function pipePluginResponsesWithStrip(
                             heldItemId = ev["item_id"];
                             heldOutputIndex = ev["output_index"];
                         }
-                        if (clean.length === 0) continue;
+                        if (clean.length === 0) {
+                            sawStrippedEcho = true;
+                            continue;
+                        }
                         visibleTextChars += clean.length;
                         if (clean === delta && !retryRewritePending()) {
                             await write(rawEvent + "\n\n");
