@@ -8,19 +8,17 @@ import { preflightCompress, type PreflightDeps } from "../src/preflight.ts";
 import { _liveUpstreamTimersForTest, _resetFetchUtilForTest } from "../src/fetch-util.ts";
 import { getSession } from "../src/session.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
-import { modelOutputLimit } from "../src/model-output-limits.ts";
-import snapshot from "../src/models-dev-snapshot.json" with { type: "json" };
+import { _resetForTest as resetRegistryForTest, _setForTest as setRegistryForTest } from "../src/registry.ts";
 
 process.env.NODE_ENV = "test";
 _setStoreForTest(new SessionStore({ enabled: false }));
-
-const LIMITS = (snapshot as { limits: Record<string, number> }).limits;
 
 const SUMMARY = "SUMMARY: keep the task goal, exact acceptance criteria and next step; the repeated fixture output is disposable.";
 
 afterEach(() => {
     assert.equal(_liveUpstreamTimersForTest(), 0, "each attempt releases its upstream idle timer");
     _resetFetchUtilForTest();
+    resetRegistryForTest();
 });
 
 // #853 end-to-end: the summary call carries the raised 32k default output cap
@@ -28,13 +26,18 @@ afterEach(() => {
 // content:"" + finish_reason:"length" on deepseek-flash), and clamps it down
 // to the model's known models.dev ceiling when that is smaller.
 test("#853 summary output cap: 32k default, clamped to known model ceiling", async () => {
-    // A live capped entry, so the assertion survives snapshot regeneration.
-    const cappedId = Object.keys(LIMITS).find((id) => LIMITS[id] === 8192 && !id.includes("/"))!;
-    assert.equal(modelOutputLimit(cappedId), 8192);
+    // A live capped entry in the bundled models.dev snapshot, so the
+    // assertion survives snapshot regeneration. The relay-style bare name
+    // resolves through the registry's cross-provider scan.
+    setRegistryForTest({
+        "swiss-ai/apertus-8b": { limit: { context: 65536, output: 8192 } },
+        "deepseek/deepseek-v4-flash": { limit: { context: 1000000, output: 384000 } },
+    });
 
     for (const [model, expectedCap, label] of [
         ["test-model", 32768, "unknown model gets the full 32k default"],
-        [cappedId, 8192, "known-ceiling model is clamped to its cap"],
+        ["deepseek-v4-flash", 32768, "high-ceiling model keeps the full 32k default"],
+        ["apertus-8b", 8192, "known-ceiling model is clamped to its cap"],
     ] as const) {
         const bodies: Record<string, unknown>[] = [];
         const server = http.createServer((req, res) => {

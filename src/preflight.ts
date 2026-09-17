@@ -14,7 +14,7 @@ import { applyRanges, type RewriteCtx } from "./stream.js";
 import { fetchWithTimeout, isTransientUpstreamError, replayMaxAttempts, replayBackoffMs, sleep, UpstreamHttpError } from "./fetch-util.js";
 import { proxyDispatcher } from "./upstream-proxy.js";
 import { lastCompressSuffix, type Session } from "./session.js";
-import { modelOutputLimit } from "./model-output-limits.js";
+import { peekRegistryOutputLimit } from "./registry.js";
 
 // #247: proactive pre-forward compression. When the session's real context
 // (previous turn's upstream input_tokens) exceeds the current model's window
@@ -35,9 +35,9 @@ const MIN_SUMMARY_CHARS = 50;
 // deepseek-flash, whose real output ceiling is 384k) — the old 8192 cap
 // guaranteed content:"" + finish_reason:"length". 32k leaves ~3x headroom
 // over the observed reasoning while still bounding runaway output.
-// summaryPayload() clamps this per model against known ceilings (see
-// model-output-limits.ts / npm run models-dev:snapshot) so models with a
-// smaller real cap are not over-asked.
+// summaryPayload() clamps this per model against known models.dev ceilings
+// (peekRegistryOutputLimit — warm cache first, bundled snapshot floor) so
+// models with a smaller real cap are not over-asked.
 const MAX_SUMMARY_OUTPUT_TOKENS = 32768;
 // #574: bound on upstream summarization calls per invocation — the multi-range
 // walk can otherwise spend a call per viable range in a block-dense history.
@@ -258,13 +258,23 @@ function splitChunks(
 
 // #853: the summary max_tokens for a model — the 32k default, clamped down to
 // the model's known output ceiling when models.dev reports a smaller one.
-function summaryOutputTokens(model: string): number {
-    const known = modelOutputLimit(model);
-    return known === null ? MAX_SUMMARY_OUTPUT_TOKENS : Math.min(MAX_SUMMARY_OUTPUT_TOKENS, known);
+// Host comes from the upstream URL so a known provider's namespaced entry
+// wins over the cross-provider scan; the registry cache is pre-warmed with
+// the bundled snapshot at module load, so this never fetches or blocks.
+function safeHost(url: string): string | undefined {
+    try {
+        return new URL(url).host;
+    } catch {
+        return undefined;
+    }
+}
+function summaryOutputTokens(model: string, host?: string): number {
+    const known = peekRegistryOutputLimit(model, host);
+    return known === undefined ? MAX_SUMMARY_OUTPUT_TOKENS : Math.min(MAX_SUMMARY_OUTPUT_TOKENS, known);
 }
 
-function summaryPayload(protocol: PreflightProtocol, model: string, system: string, content: string, stream: boolean, includeMaxOutputTokens: boolean): Record<string, unknown> {
-    const maxOutputTokens = summaryOutputTokens(model);
+function summaryPayload(protocol: PreflightProtocol, model: string, system: string, content: string, stream: boolean, includeMaxOutputTokens: boolean, host?: string): Record<string, unknown> {
+    const maxOutputTokens = summaryOutputTokens(model, host);
     if (protocol === "anthropic") {
         return { model, max_tokens: maxOutputTokens, system, messages: [{ role: "user", content }], stream };
     }
@@ -635,7 +645,7 @@ async function requestSummaryBody(deps: PreflightDeps, body: string): Promise<st
 }
 
 async function requestSummary(deps: PreflightDeps, system: string, content: string, stream: boolean, includeMaxOutputTokens: boolean): Promise<SummaryOutcome> {
-    const text = await requestSummaryBody(deps, JSON.stringify(summaryPayload(deps.protocol, deps.model, system, content, stream, includeMaxOutputTokens)));
+    const text = await requestSummaryBody(deps, JSON.stringify(summaryPayload(deps.protocol, deps.model, system, content, stream, includeMaxOutputTokens, safeHost(deps.url))));
     let json: unknown;
     try {
         json = JSON.parse(text);
