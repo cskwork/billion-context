@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { createHash } from "node:crypto";
 import { ACP_READONLY_TOOLS_RESPONSES, ACP_TOOLS_ANTHROPIC, ACP_TOOLS_OPENAI, ACP_TOOLS_RESPONSES, SEARCH_CONTEXT_TOOL_NAME, createCore, createInitialState, defaultConfig } from "acp-kernel";
 import { anthropicToCore, type AnthropicRequestBody } from "acp-kernel/wire";
-import { BILI_ACP_READONLY_TOOLS_RESPONSES, BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_OPENAI, BILI_ACP_TOOLS_RESPONSES } from "../src/compress-tool.ts";
+import { BILI_ACP_READONLY_TOOLS_RESPONSES, BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_OPENAI, BILI_ACP_TOOLS_RESPONSES, UNADOPTED_KERNEL_TOOLS } from "../src/compress-tool.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _resetSessionsForTest, getSession, type Session } from "../src/session.ts";
 import { executeSearchContext, executeSearchContextTarget } from "../src/decompress-shared.ts";
@@ -78,8 +78,16 @@ test("#841 schema: BILI arrays add optional conversation_id to search_context on
         const kernelProps = paramsOf(kernelEntry!).properties as Record<string, unknown>;
         assert.equal(kernelProps.conversation_id, undefined, "kernel constant must not be mutated");
 
+        // The kernel may ship tools the host has not adopted yet (acp_cache, #800);
+        // those are intentionally absent from the BILI arrays, so drop them from the
+        // kernel side only — a BILI-side leak of an unadopted tool must still fail.
+        const adoptedInKernel = (t: unknown): boolean => {
+            const e = t as FlatTool;
+            const name = shape === "openai" ? e.function?.name : e.name;
+            return !UNADOPTED_KERNEL_TOOLS.has(name as string);
+        };
         const biliRest = bili.filter((t) => t !== entry);
-        const kernelRest = kernel.filter((t) => t !== kernelEntry);
+        const kernelRest = kernel.filter((t) => t !== kernelEntry && adoptedInKernel(t));
         assert.deepEqual(biliRest, kernelRest, "no other tool may change");
     }
     const ro = searchEntry(BILI_ACP_READONLY_TOOLS_RESPONSES, "flat")!;

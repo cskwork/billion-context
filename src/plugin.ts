@@ -5,7 +5,7 @@ import type { ServerResponse } from "node:http";
 import fs from "node:fs";
 import path from "node:path";
 import { acquireInFlight, effectiveConfig, findSessionByCanonicalId, listSessions, markCompactionBoundary, markDirty, peekSession, releaseInFlight, withSessionLock, type Session } from "./session.js";
-import { ABSORB_TOOL, ABSORB_TOOL_NAME, ABSORB_TOOL_OPENAI, ABSORB_TOOL_RESPONSES, ACP_TOOLS_ANTHROPIC, ACP_TOOLS_OPENAI, ACP_TOOLS_RESPONSES, PROXY_TOOL_NAMES, SEARCH_CONTEXT_CONVERSATION_ID_PARAM, SEARCH_CONTEXT_TOOL_NAME } from "./compress-tool.js";
+import { ABSORB_TOOL, ABSORB_TOOL_NAME, ABSORB_TOOL_OPENAI, ABSORB_TOOL_RESPONSES, BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_OPENAI, BILI_ACP_TOOLS_RESPONSES, PROXY_TOOL_NAMES, SEARCH_CONTEXT_CONVERSATION_ID_PARAM, SEARCH_CONTEXT_TOOL_NAME } from "./compress-tool.js";
 import { effectiveAbsorbConfig, isProxyToolFor } from "./absorb.js";
 import { executeProxyTool } from "./loop/core.js";
 import { normalizeSseLineEndings } from "./sse-util.js";
@@ -405,9 +405,9 @@ export function handlePluginManifest(res: import("node:http").ServerResponse): v
         // manifest has no request context to know which route will win.
         toolNames: [...PROXY_TOOL_NAMES, ABSORB_TOOL_NAME],
         tools: {
-            anthropic: withSearchContextConversationDescription([...ACP_TOOLS_ANTHROPIC, ABSORB_TOOL].map(withConversationIdParam)),
-            openai: withSearchContextConversationDescription([...ACP_TOOLS_OPENAI, ABSORB_TOOL_OPENAI].map(withConversationIdParam)),
-            responses: withSearchContextConversationDescription([...ACP_TOOLS_RESPONSES, ABSORB_TOOL_RESPONSES].map(withConversationIdParam)),
+            anthropic: withSearchContextConversationDescription([...BILI_ACP_TOOLS_ANTHROPIC, ABSORB_TOOL].map(withConversationIdParam)),
+            openai: withSearchContextConversationDescription([...BILI_ACP_TOOLS_OPENAI, ABSORB_TOOL_OPENAI].map(withConversationIdParam)),
+            responses: withSearchContextConversationDescription([...BILI_ACP_TOOLS_RESPONSES, ABSORB_TOOL_RESPONSES].map(withConversationIdParam)),
         },
         headers: { agent: PLUGIN_AGENT_HEADER, conversation: PLUGIN_CONVERSATION_HEADER, contextWindow: PLUGIN_CONTEXT_WINDOW_HEADER },
         toolEndpoint: "/__bili/plugin/tool",
