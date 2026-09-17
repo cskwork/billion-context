@@ -43,6 +43,11 @@
 import { ACP_TOOLS_OPENAI, ABSORB_TOOL_OPENAI } from "../compress-tool.js";
 import { fetchProxyVersion, fetchStatus, forwardTool, proxyBaseFromEnv, proxyBaseFromUrl, reportCompactionBoundary } from "./shared.js";
 
+// OpenCode V2 TUI renders a synthetic message as a visible Notice row only when its display text fits the
+// timeline cap (~1KB): longer text renders nothing (#880). Panels go to description verbatim under the cap.
+import { V2_SYNTHETIC_TEXT } from "./shared.js";
+const V2_SYNTHETIC_VISIBLE_MAX = 1024;
+
 type V2Registration = { dispose?: () => void | Promise<void> };
 
 interface V2Headers {
@@ -258,7 +263,12 @@ export function createOpencodeV2Setup(options: OpencodeV2SetupOptions = {}): (ct
                         try {
                             // resume:false — OpenCode V2 defaults to delivery "steer" + execution.wake(), which would
                             // start a model turn on every /acp invocation with no user input (spurious empty turns).
-                            await ctx.session?.synthetic?.({ sessionID: sid, text, resume: false });
+                            // Short panels become the visible description verbatim; long ones keep their leading
+                            // lines plus a marker so the model-facing body never repeats the whole panel.
+                            const description = text.length > V2_SYNTHETIC_VISIBLE_MAX
+                                ? text.slice(0, V2_SYNTHETIC_VISIBLE_MAX - 20) + "\n\n[panel truncated]"
+                                : text;
+                            await ctx.session?.synthetic?.({ sessionID: sid, text: V2_SYNTHETIC_TEXT, description, resume: false });
                         } catch (err) {
                             console.error(`[bili-opencode] /acp render failed: ${err instanceof Error ? err.message : String(err)}`);
                         }
