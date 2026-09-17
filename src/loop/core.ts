@@ -617,7 +617,11 @@ export async function* runCompressLoop(
                 // overflow signal (sglang-style backends accept an oversized
                 // prompt then die mid-stream). Both shapes: !sawDone (chat /
                 // anthropic) and truncatedDone (responses synthetic failed done).
-                if ((!sawDone || truncatedDone) && streamError === undefined) {
+                // A client abort breaks the parse loop at the signal check with
+                // !sawDone && no streamError too — that is the user cancelling,
+                // not the upstream truncating; counting it would let three ESCs
+                // in 15min learn a shrunken window (weak-overflow MIN_EVENTS=3).
+                if ((!sawDone || truncatedDone) && streamError === undefined && !signal?.aborted) {
                     const reqModel = typeof requestBody["model"] === "string" ? requestBody["model"] : undefined;
                     noteWeakOverflow(ctx.session, {
                         inputTokens: usage.inputTokens,

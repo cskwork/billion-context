@@ -386,7 +386,13 @@ export function createOpencodeLocalHost(): OpencodeLocalHost {
             const sys = e.system;
             if (Array.isArray(sys)) {
                 const prompt = withLocalTagFormatNote(withConversationIdNote(withMarkerIntegrityNote(buildCompressSystemPrompt(defaultPrompts)), ensureCanonicalId(session)));
-                sys.push({ type: "text", text: prompt });
+                // Replace-style, never in-place push: if the host ever reuses
+                // the same system array across requests (or fires the hook twice
+                // per request, e.g. provider fallback), a push would append one
+                // full copy of the compress prompt per request and grow the
+                // window linearly. Only this host touches e.system in the repo,
+                // so the array identity guarantee is ours to make.
+                e.system = [...sys, { type: "text", text: prompt }];
             }
         },
 

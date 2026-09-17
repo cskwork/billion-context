@@ -228,3 +228,51 @@ test("#413 T6: round-2 truncation (after proxy tool) retries with the round-2 bo
         mock.restore();
     }
 });
+
+// #887: a client abort breaks the parse loop at the signal check with
+// !sawDone && streamError === undefined — the same shape as a truncation.
+// The user cancelling must NOT feed weak-overflow learning: three ESCs in
+// 15min would otherwise arm a shrunken window (MIN_EVENTS=3) and permanently
+// throttle the session below its true window (#570 false-positive family).
+
+function highUsageStart(inputTokens: number): string {
+    return ev("message_start", {
+        type: "message_start",
+        message: {
+            id: "msg_hi", type: "message", role: "assistant", model: "claude",
+            content: [], stop_reason: null, stop_sequence: null,
+            usage: { input_tokens: inputTokens, output_tokens: 0 },
+        },
+    });
+}
+
+test("#887 T1: client abort mid-stream → NOT counted as weak overflow (control: same cut without abort IS)", async () => {
+    const run = async (signal?: AbortSignal): Promise<string[]> => {
+        const captured: { level: string; msg: string }[] = [];
+        setLogCapture((level, msg) => captured.push({ level, msg }));
+        const ctx = makeCtx("abort-wo");
+        (ctx.session.metadata as Record<string, unknown>).learnedContextLimit = 1000;
+        // A cut stream yields no usage event; noteWeakOverflow falls back to the
+        // last known input size — 950/1000 = 95% usage, past MIN_USAGE(0.9), so an
+        // unguarded abort path WOULD count.
+        ctx.session.stats.lastInputTokens = 950;
+        const cut = [highUsageStart(950), textStart(0), textDelta(0, "partial")].join("");
+        const mock = mockFetch(() => new Response("{}", { status: 200 }));
+        try {
+            const adapter = createAnthropicAdapter(ANTHROPIC_BODY);
+            const chunks: Buffer[] = [];
+            for await (const chunk of runCompressLoop(new Response(cut, { status: 200 }).body!, ctx, ANTHROPIC_BODY, { url: "http://mock", headers: {} }, adapter, buildCompressSystemPrompt(), signal)) {
+                chunks.push(chunk);
+            }
+            return captured.filter((l) => l.msg.includes("weak overflow signal")).map((l) => l.msg);
+        } finally {
+            mock.restore();
+            setLogCapture(null);
+        }
+    };
+
+    const abortHits = await run(AbortSignal.abort());
+    assert.equal(abortHits.length, 0, `aborted cut must not count as weak overflow (got: ${JSON.stringify(abortHits)})`);
+    const controlHits = await run(undefined);
+    assert.ok(controlHits.length >= 1 && controlHits[0].includes("1/3"), `control: same cut WITHOUT abort must be counted (got: ${JSON.stringify(controlHits)})`);
+});
