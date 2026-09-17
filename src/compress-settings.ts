@@ -57,6 +57,7 @@ export function mergeCompress(
     const reasoningGuardLevels = [global?.reasoningGuard, provider?.reasoningGuard, model?.reasoningGuard].filter(Boolean) as NonNullable<CompressSettings["reasoningGuard"]>[];
     return {
         modelContextLimit: pick("modelContextLimit"),
+        outputHeadroomMaxPct: pick("outputHeadroomMaxPct"),
         maxContextLimit: pick("maxContextLimit"),
         emergencyThresholdPercent: pick("emergencyThresholdPercent"),
         nudgeGrowthTokens: pick("nudgeGrowthTokens"),

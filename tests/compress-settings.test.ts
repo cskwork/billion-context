@@ -10,6 +10,7 @@ import {
     resolveCompressPrompts,
 } from "../src/compress-settings.ts";
 import { parseCompressSettings, parseRouteEntry, type ProviderRoutes } from "../src/config.ts";
+import { resolveOutputHeadroomCap } from "../src/util.ts";
 
 test("mergeCompress: model beats provider beats global, per field", () => {
     const merged = mergeCompress(
@@ -256,6 +257,53 @@ test("parseCompressSettings: parses stripImages (bool) + stripImagesKeepRecent (
     // Malformed types are rejected (whole object discarded).
     assert.equal(parseCompressSettings({ stripImages: "yes" }), undefined);
     assert.equal(parseCompressSettings({ stripImagesKeepRecent: "many" }), undefined);
+});
+
+test("mergeCompress: outputHeadroomMaxPct cascades deepest-wins per field (#896)", () => {
+    const merged = mergeCompress(
+        { outputHeadroomMaxPct: 1 },
+        { outputHeadroomMaxPct: "50%" },
+        { outputHeadroomMaxPct: 0.25 },
+    );
+    assert.equal(merged.outputHeadroomMaxPct, 0.25);
+    // Absent at a deeper level does not clear a shallower value.
+    assert.equal(mergeCompress({ outputHeadroomMaxPct: 0.25 }, undefined, undefined).outputHeadroomMaxPct, 0.25);
+    assert.equal(mergeCompress(undefined, { outputHeadroomMaxPct: "50%" }, { nudgeGrowthTokens: 90000 }).outputHeadroomMaxPct, "50%");
+});
+
+test("resolveCompress: outputHeadroomMaxPct resolves global → provider → model end-to-end (#896)", () => {
+    const routes: ProviderRoutes = {
+        "https://api.example.com": {
+            compress: { outputHeadroomMaxPct: 0.5 },
+            models: { "big-model": { compress: { outputHeadroomMaxPct: "25%" } } },
+        },
+    };
+    assert.equal(resolveCompress(routes, "https://api.example.com/chat", "big-model", { outputHeadroomMaxPct: 1 }).outputHeadroomMaxPct, "25%");
+    assert.equal(resolveCompress(routes, "https://api.example.com/chat", "other-model", { outputHeadroomMaxPct: 1 }).outputHeadroomMaxPct, 0.5);
+    assert.equal(resolveCompress(routes, "https://other.com/chat", "big-model", { outputHeadroomMaxPct: 1 }).outputHeadroomMaxPct, 1);
+});
+
+test("resolveOutputHeadroomCap: unset → 0.25 default; ratio / percent-string pass through (#896)", () => {
+    assert.equal(resolveOutputHeadroomCap(undefined), 0.25);
+    assert.equal(resolveOutputHeadroomCap(0.25), 0.25);
+    assert.equal(resolveOutputHeadroomCap("25%"), 0.25);
+    assert.equal(resolveOutputHeadroomCap("0%"), 0);
+    assert.equal(resolveOutputHeadroomCap(1), 1);
+    assert.equal(Number.isFinite(resolveOutputHeadroomCap("abc")), false, "unparseable → NaN (reserveOutputHeadroom falls back to legacy)");
+});
+
+test("parseCompressSettings: parses outputHeadroomMaxPct, rejects negative / malformed (#896)", () => {
+    assert.equal(parseCompressSettings({ outputHeadroomMaxPct: 0.25 })?.outputHeadroomMaxPct, 0.25);
+    assert.equal(parseCompressSettings({ outputHeadroomMaxPct: 0 })?.outputHeadroomMaxPct, 0);
+    assert.equal(parseCompressSettings({ outputHeadroomMaxPct: 1 })?.outputHeadroomMaxPct, 1);
+    assert.equal(parseCompressSettings({ outputHeadroomMaxPct: 1.5 })?.outputHeadroomMaxPct, 1.5, ">= 1 = legacy full-capability reservation");
+    assert.equal(parseCompressSettings({ outputHeadroomMaxPct: "25%" })?.outputHeadroomMaxPct, "25%");
+    // Absent key stays undefined — no default injected at parse time.
+    assert.equal(parseCompressSettings({})?.outputHeadroomMaxPct, undefined);
+    assert.equal(parseCompressSettings({ outputHeadroomMaxPct: -0.25 }), undefined);
+    assert.equal(parseCompressSettings({ outputHeadroomMaxPct: "abc" }), undefined);
+    assert.equal(parseCompressSettings({ outputHeadroomMaxPct: Number.NaN }), undefined);
+    assert.equal(parseCompressSettings({ outputHeadroomMaxPct: null }), undefined);
 });
 
 test("mergeCompress: reasoningGuard merges sub-field-wise deepest-wins (#739)", () => {
