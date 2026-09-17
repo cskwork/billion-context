@@ -43,9 +43,19 @@ function startFakeProxyV2(): Promise<{ origin: string; toolCalls: Array<{ conver
             return;
         }
         if ((req.url ?? "").startsWith("/__bili/plugin/status")) {
+            if ((req.url ?? "").includes("ses_acp_idle")) {
+                res.writeHead(404, { "content-type": "application/json" });
+                res.end(JSON.stringify({ ok: false, error: "unknown plugin conversation" }));
+                return;
+            }
             res.writeHead(200, { "content-type": "application/json" });
             const panel = (req.url ?? "").includes("ses_acp_long") ? "X".repeat(1500) : "ACP-PANEL-OK";
             res.end(JSON.stringify({ ok: true, panel }));
+            return;
+        }
+        if ((req.url ?? "") === "/__bili/plugin/manifest") {
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(JSON.stringify({ version: "9.9.9-test" }));
             return;
         }
         res.writeHead(404);
@@ -384,6 +394,29 @@ test("v2 setup: /acp reports no proxy detected via synthetic when no proxy", asy
         }
     });
 });
+
+test("v2 setup: first /acp before any model request shows the idle notice (proxy 404s the conversation)", async () => {
+    const proxy = await startFakeProxyV2();
+    const fake = makeFakeCtx();
+    try {
+        await withEnv({ BILLION_CONTEXT_PROXY: proxy.origin, BILLION_CONTEXT_PLUGIN: undefined }, async () => {
+            const cleanup = await biliOpencodePlugin.setup(fake.ctx as never);
+            try {
+                const acp = fake.addedCommands.find((c) => c.name === "acp")!;
+                await acp.execute({ sessionID: "ses_acp_idle" });
+                await until(() => fake.syntheticCalls.length === 1);
+                assert.match(fake.syntheticCalls[0].description!, /billion-context@9\.9\.9-test \u2014 proxy connected, no ACP session yet/);
+                assert.match(fake.syntheticCalls[0].text, /not an instruction/);
+                assert.equal(fake.syntheticCalls[0].resume, false);
+            } finally {
+                cleanup();
+            }
+        });
+    } finally {
+        await proxy.close();
+    }
+});
+
 
 test("v2 setup: /acp truncates long panels to the TUI notice cap", async () => {
     const proxy = await startFakeProxyV2();
