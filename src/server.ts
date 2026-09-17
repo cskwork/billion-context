@@ -1,5 +1,6 @@
 import http from "node:http";
 import fs from "node:fs";
+import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { createCore, type CompressionCore, type CompressionState, type Config, type CoreMessage, type NudgeDecision, type Prompts, type PackSurface, type ToolPrompts, applyAcpToolOverrides, defaultPrompts, defaultCountTokens, estimateTokensFast, renderNudgeText, deactivateBlock, viableRanges } from "acp-kernel";
 import { resolveCompress, resolveCompressPrompts, resolveCompressSurfaceDetailed, resolveRequestConfig } from "./compress-settings.js";
@@ -42,7 +43,7 @@ import {
     subagentNamespace,
 } from "acp-kernel/wire";
 import { responsesToCoreWithToolImages as responsesToCore, patchResponsesInputWithToolImages as patchResponsesInput } from "./responses-tool-output.js";
-import { getSession, listSessions, type Session, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight, withSessionLock, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, snapshotMessages, applyCompactionArchive, ensureCanonicalId } from "./session.js";
+import { getSession, listSessions, type Session, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight, withSessionLock, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, snapshotMessages, applyCompactionArchive, ensureCanonicalId, storeEffectiveConfig } from "./session.js";
 import { ABSORB_TOOL, ABSORB_TOOL_OPENAI, ABSORB_TOOL_RESPONSES, COMPRESS_TOOL, ACP_TOOLS_ANTHROPIC, ACP_TOOLS_OPENAI, ACP_TOOLS_RESPONSES, ACP_READONLY_TOOLS_RESPONSES, COMPRESS_TOOL_NAME, buildAbsorbSystemPrompt, buildCompressSystemPrompt, buildCompressHybridSystemPrompt, withConversationIdNote, withMarkerIntegrityNote, withStagedCompressGuidance } from "./compress-tool.js";
 import { applyAbsorbView, absorbEnabled, absorbToolName, storeEffectiveAbsorb } from "./absorb.js";
 import { rewriteJsonResponse, type RewriteCtx } from "./stream.js";
@@ -53,7 +54,7 @@ import { renderUI, handleConfigGet, handleConfigPut } from "./web/index.js";
 import { reapOrphanBlocks } from "./orphan-gc.js";
 import { getStore } from "./persist.js";
 import { log as loggerLog, configureLogger, getLogPath, closeLogger } from "./logger.js";
-import { configFile, defaultLogFile, stateDir } from "./paths.js";
+import { configFile, defaultLogFile, dumpsDir, stateDir } from "./paths.js";
 import { atomicWriteInstanceFile, clearProxyInstanceFile, isPidAlive, registerInstanceAndWarn, unregisterInstance } from "./instance.js";
 import { compressLoopResponsesJson } from "./compress-loop-responses.js";
 import { hoistTrappedToolItems } from "./tool-pair-order.js";
@@ -906,13 +907,13 @@ async function handle(
     }
     if (bodyDumpEnabled() && parsed && typeof parsed === "object") {
         try {
-            const rawDir = process.env.ACP_RAW_DUMP_DIR || `${stateDir()}/raw`;
+            const rawDir = process.env.ACP_RAW_DUMP_DIR || path.join(stateDir(), "raw");
             try { fs.mkdirSync(rawDir, { recursive: true }); } catch { /* best-effort */ }
             const hdrs = maskHeadersForLog(
                 Object.fromEntries(Object.entries(req.headers).map(([k, v]) => [k, Array.isArray(v) ? v.join(",") : String(v)])),
             );
             const hdrText = Object.entries(hdrs).map(([k, v]) => `${k}: ${v}`).join("\n");
-            fs.writeFileSync(`${rawDir}/${Date.now()}-INCOMING.txt`, `${req.method} ${maskUrlsInText(req.url ?? "")}\n${hdrText}\n\n${bodyBuffer.toString("utf8")}`);
+            fs.writeFileSync(path.join(rawDir, `${Date.now()}-INCOMING.txt`), `${req.method} ${maskUrlsInText(req.url ?? "")}\n${hdrText}\n\n${bodyBuffer.toString("utf8")}`);
         } catch (err) { logDumpFailure("INCOMING dump", err); }
     }
     // Per-request context limit + compression tuning: look up body.model against
@@ -1352,12 +1353,16 @@ async function handle(
             // a larger (e.g. beta) window is not evidence. Fires only on a
             // low-confidence fallback (nativeFromFallback) — an authoritative
             // window is never second-guessed from one turn. lastInputTokens is a
-            // lower bound on the real window, so raising to it is safe (overshoot
-            // self-corrects via the overflow path).
+            // lower bound on the real window ONLY when it came from an upstream
+            // usage report (#857: an estimate-derived baseline — preflight
+            // write-back, #604 failure arming — can exceed the window without
+            // the upstream ever accepting it); absent provenance on legacy
+            // files is untrusted. With a usage-grounded value, raising to it is
+            // safe (overshoot self-corrects via the overflow path).
             const prevInput = session.stats.lastInputTokens ?? 0;
             const prevWindow = session.metadata.lastTurnWindow as number | undefined;
             const resolved = reqConfig.modelContextLimit;
-            if (prevWindow !== undefined && prevInput > prevWindow && prevInput > resolved && prevInput >= 1000) {
+            if (session.stats.lastInputTokensSource === "usage" && prevWindow !== undefined && prevInput > prevWindow && prevInput > resolved && prevInput >= 1000) {
                 // #570: a successful turn's reported input is grounded evidence
                 // (the upstream accepted it), so it lands in the CONFIRMED
                 // fields — a later weak-overflow heuristic must not clobber it.
@@ -1414,6 +1419,11 @@ async function handle(
         // to tell "context exceeded our window" (evidence) from "context fit
         // inside a larger window" (not evidence). #393.
         session.metadata.lastTurnWindow = reqConfig.modelContextLimit;
+        // #833: remember the FINAL resolved Config (post self-heal + headroom,
+        // same instant as effectiveContextLimit above) so request-context-free
+        // display paths (/__bili/plugin/status Nudge line, plugin tool API)
+        // render from the values the kernel actually used this turn.
+        storeEffectiveConfig(session, reqConfig);
         // acquireInFlight must precede the lock so evictOldest() cannot flush
         // this session between getSession and lock acquisition (inFlight===0
         // window). Released in the outer finally after forward completes.
@@ -1491,6 +1501,7 @@ async function handle(
                         opts,
                         core,
                         reqConfig,
+                        nativeWindow,
                         (parsed as { model?: string }).model,
                         route,
                         affinity,
@@ -2789,6 +2800,7 @@ async function preflightCompressIfNeeded(
     opts: ProxyOptions,
     core: CompressionCore,
     config: Config,
+    configuredWindow: number,
     model: string | undefined,
     route: ReturnType<typeof resolveUpstream>,
     affinity: string | undefined,
@@ -2837,14 +2849,23 @@ async function preflightCompressIfNeeded(
     // relays (#488) but overestimates pixel-tile upstreams (a 400KB JPEG ≈ 1.6K real
     // tokens, not ~133K), so an image-dominated payload can clear the window on ESTIMATE
     // alone. When images are the sole over-window component (text fits) and we hold no
-    // upstream overflow evidence (measured baseline under window + no learned limit for
-    // this model), forward once and let the upstream arbitrate billing: tile upstreams
-    // accept it; byte relays reject it (400) → forward()'s self-heal learns the window
-    // (it counts rejected image tokens) → later requests fail-fast. #488's 400 loop stays
-    // broken (exactly one rejected forward). With either evidence signal present we trust
-    // the estimate and fall through to fold / fail-fast below.
+    // upstream overflow evidence, forward once and let the upstream arbitrate billing:
+    // tile upstreams accept it; byte relays reject it (400) → forward()'s self-heal
+    // learns the window (it counts rejected image tokens) → later requests fail-fast.
+    // #488's 400 loop stays broken (exactly one rejected forward). Evidence signals:
+    // (1) a usage-grounded baseline ≥ window — an estimate-derived or legacy-unmarked
+    // baseline does NOT count (#857: preflight used to write image estimates back into
+    // lastInputTokens, which permanently closed this hatch on pixel-billing upstreams);
+    // (2) a GOVERNING learned limit (≤ the configured window — an above-window learned
+    // value never applied via the downward self-heal, so it has not observed this
+    // payload overflowing). Compared against the CONFIGURED window (pre output-
+    // headroom reservation): a limit equal to it is still upstream-stated
+    // evidence (#767), while an above-configured value is #857's upward-self-heal
+    // residue and never applied. With either present we trust the estimate and
+    // fall through to fold / fail-fast below.
     const learnedLimit = resolveLearnedLimit(session, model);
-    const noOverflowEvidence = session.stats.lastInputTokens < limit && learnedLimit === undefined;
+    const governingLearned = learnedLimit !== undefined && learnedLimit <= configuredWindow ? learnedLimit : undefined;
+    const noOverflowEvidence = (session.stats.lastInputTokens < limit || session.stats.lastInputTokensSource !== "usage") && governingLearned === undefined;
     if (imageTokens > 0 && payloadEstimate >= limit && textEstimate < limit && noOverflowEvidence) {
         log("warn", `[${session.id}] image-dominated payload (~${textEstimate} text + ~${imageTokens} image tokens) exceeds window ${limit} by estimate only, no upstream overflow evidence — forwarding once so the upstream arbitrates billing (#496)`);
         return prepared;
@@ -3036,6 +3057,10 @@ function armFailureShrink(prepared: Prepared, log: (level: string, msg: string) 
     if (!Number.isFinite(est) || est <= 0) return;
     if (est > s.stats.lastInputTokens) {
         s.stats.lastInputTokens = est;
+        // #857: the body includes base64 images, so this estimate carries the
+        // same b64/4 over-count as the preflight image floor — tag it so the
+        // evidence-grade consumers (self-heal, #496 gate, retraction) skip it.
+        s.stats.lastInputTokensSource = "estimate";
         markDirty(s);
         log("warn", `[${s.id}] ${reason} with no usage report — armed emergency shrink with local estimate ${est} tokens`);
     }
@@ -3149,10 +3174,10 @@ async function forward(
                 log("info", `[debug] tools=[${toolNames.join(",")}] msgs=${parsed.messages?.length ?? 0} stream=${parsed.stream ?? false} system_len=${JSON.stringify(parsed.messages?.find((m: Record<string, string>) => m.role === "system")?.content ?? "").length}`);
             }
             if (bodyDumpEnabled() && process.env.ACP_DUMP_REQ !== "0") {
-                const dumpDir = process.env.ACP_DUMP_DIR || `${stateDir()}/dumps`;
+                const dumpDir = dumpsDir();
                 try { fs.mkdirSync(dumpDir, { recursive: true }); } catch { /* best-effort */ }
                 const sid = prepared?.session.id ?? "unknown";
-                const out = `${dumpDir}/req-${Date.now()}-${safeSessionId(sid)}.json`;
+                const out = path.join(dumpDir, `req-${Date.now()}-${safeSessionId(sid)}.json`);
                 try {
                     const pretty = JSON.stringify(JSON.parse(wireBody), null, 2);
                     fs.writeFileSync(out, pretty);
@@ -3182,9 +3207,9 @@ async function forward(
         bodyDumpEnabled()
             ? (() => {
                   try {
-                      const rawDir = process.env.ACP_RAW_DUMP_DIR || `${stateDir()}/raw`;
+                      const rawDir = process.env.ACP_RAW_DUMP_DIR || path.join(stateDir(), "raw");
                       fs.mkdirSync(rawDir, { recursive: true });
-                      return `${rawDir}/${Date.now()}-${safeSessionId(prepared?.session.id)}`;
+                      return path.join(rawDir, `${Date.now()}-${safeSessionId(prepared?.session.id)}`);
                   } catch {
                       return "";
                   }
@@ -3432,15 +3457,22 @@ async function forward(
                 // that failure's size for a success and delete the window we
                 // just learned. Without one, keep the max-floor (a real usage
                 // report from the next successful turn overwrites either way).
+                // #857: these values are window numbers stated by the upstream
+                // (or derived from such), not content estimates — trusted
+                // provenance for the self-heal / #496-evidence consumers.
                 if (info.window) {
                     s.stats.lastInputTokens = info.window;
+                    s.stats.lastInputTokensSource = "usage";
                 } else {
                     const floor =
                         (reqModel ? confirmedMap[reqModel] : undefined) ??
                         (s.metadata.confirmedContextLimit as number | undefined) ??
                         (s.metadata.effectiveContextLimit as number | undefined) ??
                         0;
-                    if (floor > 0) s.stats.lastInputTokens = Math.max(s.stats.lastInputTokens, floor);
+                    if (floor > 0 && floor > s.stats.lastInputTokens) {
+                        s.stats.lastInputTokens = floor;
+                        s.stats.lastInputTokensSource = "usage";
+                    }
                 }
                 // The learned window (metadata) and the armed emergency
                 // (lastInputTokens) live in memory only until scheduled —
@@ -3812,6 +3844,7 @@ async function forward(
                         0,
                         total - (prepared.session.stats.compressCreditTokens ?? 0),
                     );
+                    prepared.session.stats.lastInputTokensSource = "usage";
                     if (typeof cached === "number") {
                         prepared.session.stats.cachedTokens += cached;
                         prepared.session.stats.cacheSamples += 1;

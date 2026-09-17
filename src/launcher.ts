@@ -2367,11 +2367,12 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         // #535 phase 3: file-free — omp is pi-based and runs on its REAL home
         // (no overlay, no PI_CODING_AGENT_DIR redirect). Provider baseUrls are
         // overridden at extension load from the env manifest (omp's fork keeps
-        // pi's registerProvider), and native compaction — auto AND manual — is
-        // cancelled by the extension's session_before_compact handler (omp's
-        // event carries no reason field, so under bili every compaction is
-        // cancelled; the native summarizer would destroy the ACP-tagged
-        // context). https upstreams ride cert-MITM like pi.
+        // pi's registerProvider), and AUTO native compaction is cancelled by
+        // the extension (#851): session_before_compact carries no reason field,
+        // so the plugin cancels only passes announced via auto_compaction_start
+        // (the native summarizer would destroy the ACP-tagged context); manual
+        // /compact stays user-owned and its surviving summary is archived by
+        // the proxy on session_compact. https upstreams ride cert-MITM like pi.
         env = buildPiEnv(origin, ca, process.env, routes.httpRewrites);
         delete env.PI_CODING_AGENT_DIR;
         const ompExt = selfDistFile("agent/omp.js");

@@ -97,16 +97,19 @@ function makeSessionWithMaps(opts: {
     learnedScalar?: number;
     confirmedScalar?: number;
     lastInput?: number;
+    lastInputSource?: "usage" | "estimate";
 }): Session {
     const metadata: Record<string, unknown> = { effectiveContextLimit: opts.window ?? 140000 };
     if (opts.learnedMap) metadata.learnedContextLimits = opts.learnedMap;
     if (opts.confirmedMap) metadata.confirmedContextLimits = opts.confirmedMap;
     if (opts.learnedScalar !== undefined) metadata.learnedContextLimit = opts.learnedScalar;
     if (opts.confirmedScalar !== undefined) metadata.confirmedContextLimit = opts.confirmedScalar;
+    const stats: Record<string, unknown> = { lastInputTokens: opts.lastInput ?? 0 };
+    if (opts.lastInputSource !== undefined) stats.lastInputTokensSource = opts.lastInputSource;
     const session = {
         id: `weak-${Math.random().toString(36).slice(2, 8)}`,
         metadata,
-        stats: { lastInputTokens: opts.lastInput ?? 0 },
+        stats,
     } as unknown as Session;
     ids.push(session.id);
     return session;
@@ -131,9 +134,21 @@ test("#570: weak confirmations still refine their own speculative values", () =>
 });
 
 test("#570 retraction: a successful turn above the learned window removes it", () => {
-    const session = makeSessionWithMaps({ learnedMap: { qwen: 121815 }, lastInput: 126000 });
+    const session = makeSessionWithMaps({ learnedMap: { qwen: 121815 }, lastInput: 126000, lastInputSource: "usage" });
     assert.equal(retractStaleLearnedLimits(session, "qwen"), true);
     assert.equal((session.metadata.learnedContextLimits as Record<string, number>).qwen, undefined);
+});
+
+test("#857 retraction: an estimate-derived baseline never retracts (poison pattern)", () => {
+    const session = makeSessionWithMaps({ confirmedMap: { qwen: 150528 }, lastInput: 160000, lastInputSource: "estimate" });
+    assert.equal(retractStaleLearnedLimits(session, "qwen"), false);
+    assert.equal((session.metadata.confirmedContextLimits as Record<string, number>).qwen, 150528, "real window survives");
+});
+
+test("#857 retraction: a legacy unmarked baseline never retracts", () => {
+    const session = makeSessionWithMaps({ confirmedMap: { qwen: 150528 }, lastInput: 160000 });
+    assert.equal(retractStaleLearnedLimits(session, "qwen"), false);
+    assert.equal((session.metadata.confirmedContextLimits as Record<string, number>).qwen, 150528, "real window survives");
 });
 
 test("#570 retraction: within the margin the value survives (estimation noise)", () => {
@@ -149,7 +164,7 @@ test("#570 retraction: the armed emergency value (== learned) never retracts its
 });
 
 test("#570 retraction: confirmed values retract too (resized server / KV growth)", () => {
-    const session = makeSessionWithMaps({ confirmedMap: { qwen: 150528 }, lastInput: 160000 });
+    const session = makeSessionWithMaps({ confirmedMap: { qwen: 150528 }, lastInput: 160000, lastInputSource: "usage" });
     assert.equal(retractStaleLearnedLimits(session, "qwen"), true);
     assert.equal((session.metadata.confirmedContextLimits as Record<string, number>).qwen, undefined);
 });
@@ -159,10 +174,19 @@ test("#570 retraction: other models' entries survive; stale model-unknown scalar
         learnedMap: { qwen: 121815, other: 90000 },
         learnedScalar: 110000,
         lastInput: 130000,
+        lastInputSource: "usage",
     });
     assert.equal(retractStaleLearnedLimits(session, "qwen"), true);
     assert.equal((session.metadata.learnedContextLimits as Record<string, number>).other, 90000, "other model untouched");
     assert.equal(session.metadata.learnedContextLimit, undefined, "stale scalar retracted");
+});
+
+test("#857 arming: noteWeakOverflow tags its baseline raise as estimate", () => {
+    const session = makeSessionWithMaps({ window: 140000 });
+    for (const r of ["r1", "r2", "r3"]) noteWeakOverflow(session, { inputTokens: 134000, reason: r });
+    const stats = session.stats as unknown as { lastInputTokens: number; lastInputTokensSource?: string };
+    assert.equal(stats.lastInputTokens, 134000, "armed");
+    assert.equal(stats.lastInputTokensSource, "estimate", "estimate provenance tagged");
 });
 
 test("#570 resolvers: confirmed > speculative, per-model > scalar", () => {

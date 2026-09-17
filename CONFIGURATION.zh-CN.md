@@ -163,6 +163,8 @@
 - **状态：** ACTIVE
 - **说明：** 将模型名映射到其上下文窗口声明。LLM 的 `/models` 端点**不会**返回上下文窗口大小（已在 OpenAI、Anthropic、zhipu、comfly 上验证），因此代理无法在运行时发现它们 —— 你必须在此声明。`context` 是模型的上下文窗口（以 token 为单位）；`output` 是最大输出大小。当模型未声明时，代理回退到内置上下文表或 models.dev 注册表。每个模型条目还可以携带按模型的 `compress` 块（见[压缩调优](#压缩调优)）。
 
+  内置上下文表是随每个版本发布的静态数据，可能过期 —— 例如 DeepSeek 的规范请求 id `deepseek-flash` 在 models.dev 上没有以该名列出（其窗口列在 `deepseek-v4-flash` 名下），因此只有兜底表能回答它（#852）。日志会为每个模型记录一次胜出来源（`[window] ... fallback=true` 表示值来自内置表）。若解析出的窗口不对，按上文声明 `models.<name>.context`（它优先于注册表和内置表），或固定 `compress.modelContextLimit`；注意 provider 键必须带流量的 scheme（MITM 登录态客户端流量用 `mitm://<host>`，`/bili/` 流量用 `https://<host>`）。
+
 ### `proxy`
 
 - **类型：** `string`
@@ -196,7 +198,7 @@
 - **类型：** `boolean`
 - **默认值：** *（无 —— 压缩开启）*
 - **状态：** ACTIVE
-- **说明：** 按路由覆盖全局 [`passthrough`](#passthrough) 设置。设为 `true` 时，匹配该路由的所有请求**逐字节转发**：不走 kernel 往返（不重序列化 messages、不注入 ACP 渲染标签、不删除 `prompt_cache_key`），响应原样 pipe，该路由不建立 session 状态。用于上游反作弊会拒绝 bili 改写后请求体的场景 —— 例如 ZCode 对 kernel 重建的 `messages` 请求体返回 `405 / 3012`（"request has been blocked due to unusual activity"，#661）。`mitm://` 键只命中该 host 的 MITM（登录态客户端）流量，普通 `https://` 键则同时覆盖 MITM 与 `/bili/`（API key）流量：
+- **说明：** 按路由覆盖全局 [`passthrough`](#passthrough) 设置。设为 `true` 时，匹配该路由的所有请求**逐字节转发**：不走 kernel 往返（不重序列化 messages、不注入 ACP 渲染标签、不删除 `prompt_cache_key`），响应原样 pipe，该路由不建立 session 状态。用于上游反作弊会拒绝 bili 改写后请求体的场景 —— 例如 ZCode 对 kernel 重建的 `messages` 请求体返回 `405 / 3012`（"request has been blocked due to unusual activity"，#661）。`mitm://` 键只命中该 host 的 MITM（登录态客户端）流量，普通 `https://` 键只命中 `/bili/`（API key）流量 —— 两种 scheme 互不重叠：
 
   ```jsonc
   {
@@ -689,7 +691,7 @@ Claude Code 的 undici fetch 忽略 `HTTPS_PROXY`，所以证书 MITM 拦不到�
 
 启动器优先零文件注入（env > CLI 参数/扩展 API > 生成文件；见 [README —— 注入优先级](README.zh-CN.md)）。确实绕不开文件时写的都是**副本** —— 真实配置绝不编辑：
 
-- **pi / omp** —— 不写任何文件（#535）：provider baseUrl 走 `BILI_PROVIDER_REWRITES` env 清单，由 bili 扩展加载时消费（`registerProvider`）；原生压缩改由扩展内取消（`session_before_compact`）。真实 `~/.pi` / `~/.omp` 主目录原样不动。
+- **pi / omp** —— 不写任何文件（#535）：provider baseUrl 走 `BILI_PROVIDER_REWRITES` env 清单，由 bili 扩展加载时消费（`registerProvider`）；自动原生压缩改由扩展内取消（`session_before_compact`，omp 按 `auto_compaction_start` 预告区分自动/手动，#851），手动 `/compact` 保持用户所有。真实 `~/.pi` / `~/.omp` 主目录原样不动。
 - **opencode** —— 临时 `opencode.json`（由 `OPENCODE_CONFIG` 指向，客户端退出时删除），明文 `baseURL` 重写为 `/bili/` 形式，**并追加了薄 `/acp` 插件**（开箱即原生工具；独立的 `opencode-acp` 插件检测到 `BILLION_CONTEXT_PROXY` 后自禁用）。
 - **hermes** —— 不写任何文件（#535）：其 httpx 栈走 `HTTPS_PROXY`（+ `HERMES_CA_BUNDLE`）—— https 经 CONNECT 证书 MITM，明文 http 经 absolute-form 正向代理请求。若没配置任何 provider，启动器打印警告，hermes 将**不经代理**运行（无压缩）。
 - **dsh** —— 按目的地分流（#535）：dsh 的 fetch 栈尊重代理 env，但对回环目标无条件绕过，所以**非回环**上游走 `HTTPS_PROXY`（证书 MITM）/ `HTTP_PROXY`（absolute-form 正向代理请求），`SSL_CERT_FILE` → `combined-ca.pem`；仅**回环**上游保留持久 overlay `DSH_HOME`（`~/.dsh-bili`），重写后的 `settings.yaml` 让它们走 `/bili/`。`profiles/`、凭据、会话符号链接共享；真实 `~/.dsh` 绝不触碰。内置 `deepseek-official` 路由另行经 `$DEEPSEEK_BASE_URL` 接管（dsh 解析顺序为 settings `llm-deepseek.baseURL` ?? 环境变量 ?? 默认值，用户配置优先，环境变量作零配置兜底）—— 即便没有任何自定义 provider，内置 deepseek 路由也照样走代理。
