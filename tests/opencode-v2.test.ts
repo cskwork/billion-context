@@ -285,8 +285,15 @@ test("v2 setup: activates from /bili/ baseURL on round 1, stamps headers, forwar
                 assert.equal(proxy.toolCalls.at(-1)?.conversationId, "ses_v2_1");
                 assert.equal(proxy.toolCalls.at(-1)?.tool, "compress");
 
-                const statusOut = await fake.addedTools.find((t) => t.name === "acp_status")!.execute({}, { sessionID: "ses_other" });
+                // Panel-first: acp_status returns the status panel when the
+                // proxy serves one for this conversation (ses_other gets the
+                // generic "ACP-PANEL-OK"), and falls back to the forwarded
+                // kernel tool when the status endpoint 404s (ses_acp_idle).
+                const panelOut = await fake.addedTools.find((t) => t.name === "acp_status")!.execute({}, { sessionID: "ses_other" });
+                assert.equal(panelOut.content, "ACP-PANEL-OK");
+                const statusOut = await fake.addedTools.find((t) => t.name === "acp_status")!.execute({}, { sessionID: "ses_acp_idle" });
                 assert.equal(statusOut.content, "STATUS-RESULT");
+                assert.equal(proxy.toolCalls.at(-1)?.tool, "acp_status");
             } finally {
                 cleanup();
             }
