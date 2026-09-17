@@ -26,7 +26,7 @@ import { peekRegistryOutputLimit } from "./registry.js";
 // summarization calls sized to fit the smaller window, before the payload is
 // forwarded.
 
-const MAX_PREFLIGHT_ROUNDS = 8;
+export const MAX_PREFLIGHT_ROUNDS = 16;
 const CHUNK_FRACTION = 0.6;
 const MIN_CHUNK_TOKENS = 2000;
 const MIN_SUMMARY_CHARS = 50;
@@ -41,7 +41,20 @@ const MIN_SUMMARY_CHARS = 50;
 const MAX_SUMMARY_OUTPUT_TOKENS = 32768;
 // #574: bound on upstream summarization calls per invocation — the multi-range
 // walk can otherwise spend a call per viable range in a block-dense history.
-const MAX_SUMMARY_CALLS_PER_PREFLIGHT = 8;
+export const MAX_SUMMARY_CALLS_PER_PREFLIGHT = 16;
+
+// #869 review: coverage bound of the two depth budgets above. One round folds
+// ONE range and each fold removes at most CHUNK_FRACTION x window tokens (the
+// per-call chunk budget), so MAX_PREFLIGHT_ROUNDS rounds cover an overshoot of
+// at most MAX_PREFLIGHT_ROUNDS x CHUNK_FRACTION x window ~= 9.6x the window —
+// a payload of up to ~10.6x the window in the best case. Real coverage is
+// lower: a range smaller than the chunk budget saves less, and the #726
+// halving worklist can spend several calls on one range without completing a
+// fold. Beyond the bound the loop still exits cleanly — the fail-fast reports
+// the post-fold size and the remaining compressible-range count, so an
+// operator sees exactly how far the budget ran out. 16 is tuned to the
+// incident class behind #868 (a 1.39x-window payload); it is a fixed depth,
+// not scaled to the overshoot — scaling it is a separate design question.
 
 export type PreflightProtocol = "anthropic" | "openai" | "responses";
 
@@ -101,6 +114,12 @@ export interface PreflightResult {
      *  stale (e.g. a double-counted usage report, #300). The caller uses it
      *  to decide whether forwarding as-is is actually safe. */
     payloadEstimate: number;
+    /** Compressible ranges still visible in the kernel's final view after the
+     *  walk stopped — how much foldable headroom a deeper budget would find
+     *  (0 when nothing foldable remains). Surfaced in the fail-fast message
+     *  so an operator can see why the payload is still over the window
+     *  (#869 review). */
+    rangesRemaining: number;
     /** Whether the final payload fits the window, judged with the same
      *  measure the loop used: the optimistic token estimate for
      *  measured-baseline sessions (#300 — a stale HIGH baseline must not
@@ -696,7 +715,7 @@ function noEmergencyTruncate(config: Config): Config {
 export async function preflightCompress(deps: PreflightDeps, messages: CoreMessage[]): Promise<PreflightResult> {
     const limit = deps.config.modelContextLimit;
     let target = Math.min(limit, deps.compressionTarget ?? limit);
-    const result: PreflightResult = { compressedRanges: 0, savedTokens: 0, payloadEstimate: estimateCoreMessages(messages) + (deps.imageFloor ?? 0) + (deps.wireOverhead ?? 0), fitsWindow: true };
+    const result: PreflightResult = { compressedRanges: 0, savedTokens: 0, payloadEstimate: estimateCoreMessages(messages) + (deps.imageFloor ?? 0) + (deps.wireOverhead ?? 0), rangesRemaining: 0, fitsWindow: true };
     if (limit <= 0) return result;
     const budget = Math.max(MIN_CHUNK_TOKENS, Math.floor(limit * CHUNK_FRACTION));
     // applyCompression rejects ranges below config.compress.minCompressRange
@@ -732,6 +751,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
     let summaryCalls = 0;
     let budgetHit = false;
     let rangesTried = 0;
+    let rangesRemaining = 0;
     for (let round = 0; round < MAX_PREFLIGHT_ROUNDS; round++) {
         if (deps.signal?.aborted) {
             failure = ABORTED_FAILURE;
@@ -769,6 +789,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
         if (startTokens < 0) startTokens = currentTokens;
         if (currentTokens < target) break;
         const ranges = viableRanges(turn.nudge?.compressibleRanges ?? []);
+        rangesRemaining = ranges.length;
         if (ranges.length === 0) {
             // #330: nothing foldable outside the soft-protected recent zone.
             // Relax the soft zone (oldest-first within it) and retry — the hard
@@ -943,6 +964,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             deps.session.stats.lastInputTokensSource = "estimate";
         }
     }
+    result.rangesRemaining = rangesRemaining;
     result.savedTokens = Math.max(0, startTokens - currentTokens);
     if (currentTokens >= limit) result.failure = failure;
     result.fitsWindow = baselineKnown ? result.payloadEstimate < limit : finalUpper < limit;

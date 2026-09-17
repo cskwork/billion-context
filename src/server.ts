@@ -63,6 +63,7 @@ import { containsToolCallXmlFragment } from "./loop/tag-echo-filter.js";
 import { isStrictReasoningEcho, normalizeStrictEchoReasoning } from "./strict-echo.js";
 export { isStrictReasoningEcho, normalizeStrictEchoReasoning };
 import { isFakeCompletion, injectFakeCompletionHint, maxFakeCompletionRetries, fakeBufCap } from "./fake-completion.js";
+import { makeContinuationRefetch } from "./degenerate-retry.js";
 import { reasoningGuardEngages, runReasoningGuard } from "./reasoning-guard.js";
 import { sanitizeResponsesInputIds, dropWhitespaceResponsesMessages, normalizeResponsesMessageItems } from "./loop/adapter-responses.js";
 import { CODEX_COMPACT_HEALTH_RATIO, codexCompactMode, isCodexClient, hasCompactionTrigger, stripBiliCompactionItems, replaceBiliCompactionItems, codexCompactGate, codexCompactGatePre, buildTriggerForgeBody, mergeForgedSummaries } from "./codex-compact.js";
@@ -2875,12 +2876,20 @@ async function preflightCompressIfNeeded(
     // session.stats.lastInputTokens, which can be stale — e.g. a
     // double-counted usage report (#300) — and must not turn a fitting
     // payload into a fail-fast false positive.
-    const failFast = (status: number, detail: string, retryable: boolean): PreflightFailFast => {
+    // #869 review: quote the POST-FOLD size once folding happened — reporting
+    // only the original tokenCount reads as "nothing happened" even when 16
+    // folds removed hundreds of thousands of tokens. foldedTokens/rangesLeft
+    // stay undefined when no fold ran, so the original phrasing holds there.
+    const failFast = (status: number, detail: string, retryable: boolean, foldedTokens?: number, rangesLeft?: number): PreflightFailFast => {
         const imageNote = imageTokens >= limit
             ? ` Images alone account for ~${imageTokens} tokens (≥ window ${limit}); compression cannot remove them — shrink or remove the images, or raise the window.`
             : "";
+        const sizeClause = foldedTokens !== undefined && foldedTokens < tokenCount
+            ? `context ~${foldedTokens} tokens (down from ~${tokenCount} before preflight) exceeds the model window ${limit}`
+            : `context ~${tokenCount} tokens exceeds the model window ${limit}`;
+        const rangesClause = rangesLeft !== undefined ? `, with ${rangesLeft} compressible range(s) still visible` : "";
         const message =
-            `context ~${tokenCount} tokens exceeds the model window ${limit} (model=${model}) ` +
+            `${sizeClause} (model=${model})${rangesClause} ` +
             `and preflight compression could not bring it under: ${detail}.` +
             imageNote +
             ` The over-window payload was NOT forwarded.`;
@@ -3006,7 +3015,7 @@ async function preflightCompressIfNeeded(
     }
     const status = f?.kind === "upstream" && f.status === 429 ? 503 : 502;
     const retryable = f?.retryable === true || (f?.kind === "upstream" && f.status !== undefined && (f.status === 429 || f.status >= 500));
-    const ff = failFast(status, f?.detail ?? "the payload still exceeds the window after preflight compression", retryable);
+    const ff = failFast(status, f?.detail ?? "the payload still exceeds the window after preflight compression", retryable, result.compressedRanges > 0 ? session.stats.lastInputTokens : undefined, result.rangesRemaining);
     const contentDeadEnd = f?.kind === "exhausted" || (f?.kind === "upstream" && f.status !== undefined && f.status >= 400 && f.status < 500 && !retryable);
     if (contentDeadEnd && result.compressedRanges === 0) {
         const cooldownMs = preflightDeadEndCooldownMs();
@@ -3575,9 +3584,49 @@ async function forward(
             }
             if (prepared.stream) {
                 if (prepared.protocol === "responses") {
-                    await pipePluginResponsesWithStrip(pluginBody, res, prepared.session, (msg) => log("info", `[${prepared.session.id}] ${msg}`));
+                    // #732/#821 applies to this pipe too (#871): the agent's own
+                    // body, held here with its URL and headers, is re-issued once
+                    // when the turn completes with nothing visible.
+                    await pipePluginResponsesWithStrip(
+                        pluginBody,
+                        res,
+                        prepared.session,
+                        (msg) => log("info", `[${prepared.session.id}] ${msg}`),
+                        makeContinuationRefetch({
+                            protocol: "responses",
+                            body,
+                            upstreamUrl,
+                            reqHeaders: buildForwardHeaders(headers),
+                            proxyUrl,
+                            dispatcher,
+                            signal: clientAbort.signal,
+                            log,
+                            label: prepared.session.id,
+                        }),
+                    );
                 } else {
-                    await pipePluginChatWithStrip(pluginBody, res, prepared.protocol, prepared.session, (msg) => log("info", `[${prepared.session.id}] ${msg}`));
+                    // #732/#821: the plugin pipe re-issues the agent's own body
+                    // once when a turn ends with nothing visible (the render-tag
+                    // echo case) — it holds the URL and headers, this is where
+                    // they live.
+                    await pipePluginChatWithStrip(
+                        pluginBody,
+                        res,
+                        prepared.protocol,
+                        prepared.session,
+                        (msg) => log("info", `[${prepared.session.id}] ${msg}`),
+                        makeContinuationRefetch({
+                            protocol: prepared.protocol,
+                            body,
+                            upstreamUrl,
+                            reqHeaders: buildForwardHeaders(headers),
+                            proxyUrl,
+                            dispatcher,
+                            signal: clientAbort.signal,
+                            log,
+                            label: prepared.session.id,
+                        }),
+                    );
                 }
             } else {
                 await pipePluginJson(pluginBody, res, prepared.session, prepared.protocol);
@@ -3658,7 +3707,23 @@ async function forward(
             // Responses stream. Same pipe as the non-injected branch below;
             // no session, so usage accounting stays off.
             if ((upstream.headers.get("content-type") ?? "").includes("text/event-stream")) {
-                await pipePluginResponsesWithStrip(toClient, res, undefined, tagLog);
+                await pipePluginResponsesWithStrip(
+                    toClient,
+                    res,
+                    undefined,
+                    tagLog,
+                    makeContinuationRefetch({
+                        protocol: "responses",
+                        body,
+                        upstreamUrl,
+                        reqHeaders: buildForwardHeaders(headers),
+                        proxyUrl,
+                        dispatcher,
+                        signal: clientAbort.signal,
+                        log,
+                        label: prepared.session.id,
+                    }),
+                );
             } else {
                 await pipeThrough(toClient, res);
             }
@@ -3682,9 +3747,42 @@ async function forward(
             const p = prepared;
             const tagLog = (msg: string) => log("info", `[${p.session.id}] ${msg}`);
             if (p.protocol === "responses") {
-                await pipePluginResponsesWithStrip(responseBody, res, undefined, tagLog);
+                await pipePluginResponsesWithStrip(
+                    responseBody,
+                    res,
+                    undefined,
+                    tagLog,
+                    makeContinuationRefetch({
+                        protocol: "responses",
+                        body,
+                        upstreamUrl,
+                        reqHeaders: buildForwardHeaders(headers),
+                        proxyUrl,
+                        dispatcher,
+                        signal: clientAbort.signal,
+                        log,
+                        label: p.session.id,
+                    }),
+                );
             } else {
-                await pipePluginChatWithStrip(responseBody, res, p.protocol, undefined, tagLog);
+                await pipePluginChatWithStrip(
+                    responseBody,
+                    res,
+                    p.protocol,
+                    undefined,
+                    tagLog,
+                    makeContinuationRefetch({
+                        protocol: p.protocol,
+                        body,
+                        upstreamUrl,
+                        reqHeaders: buildForwardHeaders(headers),
+                        proxyUrl,
+                        dispatcher,
+                        signal: clientAbort.signal,
+                        log,
+                        label: p.session.id,
+                    }),
+                );
             }
         } else if (
             prepared &&
