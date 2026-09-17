@@ -90,6 +90,7 @@ import {
     type SpawnChild,
     type SpawnFn,
     runLaunch,
+    type ClientName,
     type ClientConfig,
     type HttpRewrite,
 } from "../src/launcher.ts";
@@ -3707,6 +3708,141 @@ test("runLaunch trae: cert-MITM envs (SSL_CERT_FILE combined bundle), no budget/
         else process.env.NO_PROXY = prevNoProxy;
         fs.rmSync(home, { recursive: true, force: true });
     }
+});
+
+const INHERITED_PROXY_TEST_VARS = [
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "no_proxy",
+    "NO_PROXY",
+] as const;
+
+// #890 harness: runLaunch under a fake HOME + BILI_CLIENT_BIN shim with every
+// generic proxy var inherited from the "shell"; returns the env actually
+// passed to the spawned client.
+async function captureLaunchedClientEnv(client: ClientName): Promise<NodeJS.ProcessEnv> {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), `bili-${client}-launch-`));
+    const fakeBin = path.join(home, process.platform === "win32" ? `fake-${client}.exe` : `fake-${client}`);
+    fs.writeFileSync(fakeBin, "");
+    const prevHome = process.env.HOME;
+    const prevUserProfile = process.env.USERPROFILE;
+    const prevBin = process.env.BILI_CLIENT_BIN;
+    const prevExit = process.exit;
+    const savedProxyVars: Record<string, string | undefined> = {};
+    for (const k of INHERITED_PROXY_TEST_VARS) savedProxyVars[k] = process.env[k];
+    const prevMarker = process.env.BILI_TEST_MARKER;
+    process.env.HOME = home;
+    if (prevUserProfile !== undefined) process.env.USERPROFILE = home;
+    process.env.BILI_CLIENT_BIN = fakeBin;
+    process.env.http_proxy = "http://corp-proxy.example:8080";
+    process.env.https_proxy = "http://corp-proxy.example:8080";
+    process.env.all_proxy = "socks5://corp-proxy.example:1080";
+    process.env.HTTP_PROXY = "http://corp-proxy.example:8080";
+    process.env.ALL_PROXY = "socks5://corp-proxy.example:1080";
+    process.env.no_proxy = "localhost,.corp";
+    process.env.NO_PROXY = "localhost,.corp";
+    process.env.BILI_TEST_MARKER = "keep";
+    process.exit = (() => undefined) as typeof process.exit;
+    const clientEnvs: (NodeJS.ProcessEnv | undefined)[] = [];
+    const spawnImpl: SpawnFn = (cmd, args, opts) => {
+        const env = (opts as { env?: NodeJS.ProcessEnv } | undefined)?.env;
+        if (cmd === fakeBin) {
+            clientEnvs.push(env);
+            const child = makeFakeChild(0);
+            const orig = child.on.bind(child);
+            (child as { on: SpawnChild["on"] }).on = (event, listener) => {
+                orig(event, listener);
+                if (event === "exit") setTimeout(() => listener(0, null), 0);
+                return child;
+            };
+            return child;
+        }
+        return makeFakeChild(42424);
+    };
+    try {
+        await runLaunch(
+            { client, clientArgs: [], overrides: {} },
+            { fetchImpl: async () => ({ ok: true }), spawnImpl, sleep: () => Promise.resolve() },
+        );
+    } finally {
+        process.exit = prevExit;
+        process.env.HOME = prevHome;
+        if (prevUserProfile === undefined) delete process.env.USERPROFILE;
+        else process.env.USERPROFILE = prevUserProfile;
+        if (prevBin === undefined) delete process.env.BILI_CLIENT_BIN;
+        else process.env.BILI_CLIENT_BIN = prevBin;
+        for (const [k, v] of Object.entries(savedProxyVars)) {
+            if (v === undefined) delete process.env[k];
+            else process.env[k] = v;
+        }
+        if (prevMarker === undefined) delete process.env.BILI_TEST_MARKER;
+        else process.env.BILI_TEST_MARKER = prevMarker;
+        fs.rmSync(home, { recursive: true, force: true });
+    }
+    assert.equal(clientEnvs.length, 1, `${client} client spawned exactly once`);
+    return clientEnvs[0]!;
+}
+
+function assertInheritedProxyStripped(seenEnv: NodeJS.ProcessEnv, origin: string): void {
+    assert.equal(seenEnv.HTTPS_PROXY, origin, "HTTPS_PROXY points at bili");
+    for (const k of INHERITED_PROXY_TEST_VARS) {
+        if (k === "HTTPS_PROXY") continue;
+        assert.equal(seenEnv[k], undefined, `inherited ${k} stripped`);
+    }
+    assert.equal(seenEnv.BILI_TEST_MARKER, "keep", "unrelated env vars preserved");
+}
+
+test("runLaunch opencode: inherited proxy vars stripped so traffic cannot bypass bili (#890)", async () => {
+    const seenEnv = await captureLaunchedClientEnv("opencode");
+    const origin = seenEnv.BILLION_CONTEXT_PROXY;
+    assert.ok(/^http:\/\/127\.0\.0\.1:\d+$/.test(String(origin)), `origin: ${origin}`);
+    assert.ok(String(seenEnv.NODE_EXTRA_CA_CERTS).endsWith(path.join("billion-context", "ca", "root-ca.pem")), String(seenEnv.NODE_EXTRA_CA_CERTS));
+    assertInheritedProxyStripped(seenEnv, String(origin));
+});
+
+test("runLaunch pi: inherited proxy vars stripped so traffic cannot bypass bili (#890)", async () => {
+    const seenEnv = await captureLaunchedClientEnv("pi");
+    const origin = seenEnv.BILLION_CONTEXT_PROXY;
+    assert.ok(/^http:\/\/127\.0\.0\.1:\d+$/.test(String(origin)), `origin: ${origin}`);
+    assert.ok(String(seenEnv.NODE_EXTRA_CA_CERTS).endsWith(path.join("billion-context", "ca", "root-ca.pem")), String(seenEnv.NODE_EXTRA_CA_CERTS));
+    assertInheritedProxyStripped(seenEnv, String(origin));
+});
+
+test("runLaunch omp: inherited proxy vars stripped so traffic cannot bypass bili (#890)", async () => {
+    const seenEnv = await captureLaunchedClientEnv("omp");
+    const origin = seenEnv.BILLION_CONTEXT_PROXY;
+    assert.ok(/^http:\/\/127\.0\.0\.1:\d+$/.test(String(origin)), `origin: ${origin}`);
+    assert.ok(String(seenEnv.NODE_EXTRA_CA_CERTS).endsWith(path.join("billion-context", "ca", "root-ca.pem")), String(seenEnv.NODE_EXTRA_CA_CERTS));
+    assertInheritedProxyStripped(seenEnv, String(origin));
+});
+
+test("runLaunch codex: inherited proxy vars stripped so traffic cannot bypass bili (#890)", async () => {
+    const prevPlugin = process.env.BILI_LAUNCHER_PLUGIN;
+    process.env.BILI_LAUNCHER_PLUGIN = "0";
+    let seenEnv: NodeJS.ProcessEnv;
+    try {
+        seenEnv = await captureLaunchedClientEnv("codex");
+    } finally {
+        if (prevPlugin === undefined) delete process.env.BILI_LAUNCHER_PLUGIN;
+        else process.env.BILI_LAUNCHER_PLUGIN = prevPlugin;
+    }
+    const origin = seenEnv.BILLION_CONTEXT_PROXY;
+    assert.ok(/^http:\/\/127\.0\.0\.1:\d+$/.test(String(origin)), `origin: ${origin}`);
+    assert.ok(String(seenEnv.SSL_CERT_FILE).endsWith(path.join("billion-context", "ca", "combined-ca.pem")), String(seenEnv.SSL_CERT_FILE));
+    assert.equal(seenEnv.NODE_EXTRA_CA_CERTS, undefined, "codex uses SSL_CERT_FILE, not NODE_EXTRA_CA_CERTS");
+    assertInheritedProxyStripped(seenEnv, String(origin));
+});
+
+test("runLaunch codebuddy: inherited proxy vars stripped so loopback traffic cannot be hijacked (#890)", async () => {
+    const seenEnv = await captureLaunchedClientEnv("codebuddy");
+    const origin = seenEnv.BILLION_CONTEXT_PROXY;
+    assert.ok(/^http:\/\/127\.0\.0\.1:\d+$/.test(String(origin)), `origin: ${origin}`);
+    assert.ok(String(seenEnv.NODE_EXTRA_CA_CERTS).endsWith(path.join("billion-context", "ca", "root-ca.pem")), String(seenEnv.NODE_EXTRA_CA_CERTS));
+    assertInheritedProxyStripped(seenEnv, String(origin));
 });
 
 test("parseKimiToml: providers/models/env channels (quoted names, overrides win, per-model base_url)", () => {
