@@ -4,6 +4,7 @@ import { dirname } from "node:path";
 import { configFile } from "./paths.js";
 import { log as loggerLog } from "./logger.js";
 import { validateHttpProxy, type ProxyFallbackOptions } from "./upstream-proxy.js";
+import { resolveOutputHeadroomCap } from "./util.js";
 
 import { parseCompatRoles } from "./compat-roles.js";
 import type { ImageBillingMode } from "./image-tokens.js";
@@ -95,6 +96,18 @@ export type CompressSettings = {
      *  table / registry and the legacy `modelContextLimit` / per-model
      *  `context`. See {@link resolveContextLimitValue}. */
     modelContextLimit?: number | string;
+    /** Cap on the output-headroom reservation as a fraction of the context
+     *  window: reserved = min(max_tokens, pct × window), so the kernel's
+     *  nudge/truncate bands sit below (window − reserved). Accepts a ratio
+     *  (0.25) or percent string ("25%"). Default: 0.25 (aligned with
+     *  billion-context-pi #207). Set 0 to disable the reservation entirely;
+     *  >= 1 restores the legacy full-capability reservation (input + a response
+     *  using its ENTIRE output budget always fits — what strict backends like
+     *  SGLang/vLLM enforce). A reply longer than the reservation overflows
+     *  once; the overflow self-heal recovers it next turn (#896). Negative or
+     *  unparseable values reject the whole compress block. Anthropic wire is
+     *  exempt (its input limit is enforced independently of max_tokens). */
+    outputHeadroomMaxPct?: number | string;
     /** Context usage percentage that triggers forced compression nudges
      *  (bypasses growth-gate + cadence). Accepts a ratio (0.75) or percent
      *  string ("75%"). Maps to kernel `nudge.maxContextLimitPct`. */
@@ -364,6 +377,10 @@ export type ProxyOptions = {
      *  hosts are TLS-terminated locally and fed back into the same request
      *  pipeline; all other hosts are blind-tunnelled. */
     mitm: { enabled: boolean; domains: string[] };
+    /** Mask non-public target hosts in proxy logs (#255, default on when
+     *  omitted). Opt out for local debugging with env BILI_LOG_MASK_HOSTS=0
+     *  or `maskHosts: false` (#897); credential masking stays on either way. */
+    maskHosts?: boolean;
 };
 
 /** Re-read ONLY the routes from the current config sources, returning a fresh
@@ -504,6 +521,7 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
                 ...splitCsv(env.BILI_MITM_DOMAINS),
             ]),
         },
+        maskHosts: (env.BILI_LOG_MASK_HOSTS ?? (fileConfig.maskHosts === false ? "0" : "1")) !== "0",
     };
 }
 
@@ -539,6 +557,9 @@ type FileConfig = {
     compress?: CompressSettings & { injectTool?: boolean; injectNudge?: boolean };
     promptCache?: { routing?: string };
     mitm?: { enabled?: boolean; domains?: string[] };
+    /** Set `false` to log real (non-public) target hosts instead of the
+     *  `<private-host>` placeholder (#897; env BILI_LOG_MASK_HOSTS=0 wins). */
+    maskHosts?: boolean;
     /** Global wire-compat block. `roles` maps message roles to the role name
      *  upstreams accept (e.g. `{"developer":"system"}`) — applied to the
      *  final forwarded body for openai/responses requests (#552). */
@@ -670,6 +691,15 @@ export function parseCompressSettings(v: unknown): (CompressSettings & { injectT
     }
     for (const key of ["nudgeGrowthTokens", "preserveRecentMessages", "preserveRecentTokens", "minCompressRange", "minCompressRangeChars", "stripImagesKeepRecent"] as const) {
         takeNumber(key);
+    }
+    if ("outputHeadroomMaxPct" in obj) {
+        const v = obj.outputHeadroomMaxPct;
+        if (typeof v !== "number" && typeof v !== "string") ok = false;
+        else {
+            const pct = resolveOutputHeadroomCap(v);
+            if (!Number.isFinite(pct) || pct < 0) ok = false;
+            else out.outputHeadroomMaxPct = v;
+        }
     }
     if ("tiers" in obj) {
         if (typeof obj.tiers !== "boolean") ok = false;

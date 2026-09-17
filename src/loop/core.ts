@@ -13,25 +13,20 @@ import {
 } from "../compress-tool.js";
 import { effectiveAbsorbConfig, executeAbsorb, isProxyToolFor } from "../absorb.js";
 import { applyRanges } from "../stream.js";
-import { executeSearchContext, resolveDecompress } from "../decompress-shared.js";
+import { executeSearchContextTarget, resolveDecompress } from "../decompress-shared.js";
 import { buildVisibilityMarker } from "../compress-loop.js";
 import { fetchWithRetry, UpstreamHttpError } from "../fetch-util.js";
 import { proxyDispatcher } from "../upstream-proxy.js";
-import { noteWeakOverflow } from "../weak-overflow.js";
+import { noteWeakOverflow, recordProvenInput } from "../weak-overflow.js";
 import { warnCacheCollapse } from "../cache-warn.js";
 import { dumpRejectedBody } from "../error-dump.js";
 import { dumpsDir } from "../paths.js";
 import { isStrictReasoningEcho, normalizeStrictEchoBody } from "../strict-echo.js";
 import { log as loggerLog } from "../logger.js";
 import { promptInputTotal, type WireProtocol } from "../util.js";
+import { DEGENERATE_RETRY_NUDGE } from "../degenerate-retry.js";
 
 export const MAX_LOOP_ROUNDS = 10;
-
-// #732: ephemeral continuation prompt appended ONLY to the degenerate-turn
-// retry body — never committed to coreMessages/session state, so it is neither
-// persisted nor replayed on the client's next (client-authored) request.
-const DEGENERATE_RETRY_NUDGE =
-    "[billion-context] Your previous response ended with no visible text and no tool call. Continue now: take your next concrete action.";
 
 function isLoopThinking(m: CoreMessage): boolean {
     return m.contentType === "reasoning" && typeof m.id === "string" && m.id.startsWith("acp_loop_");
@@ -151,7 +146,7 @@ export function executeProxyTool(
         return resolveDecompress(args, ctx);
     }
     if (toolName === "search_context") {
-        return executeSearchContext(args, ctx.core, ctx.session.state);
+        return executeSearchContextTarget(args, ctx.core, ctx.session.id, ctx.session.state);
     }
     if (toolName === "acp_status") {
         return handleAcpStatus(args, ctx);
@@ -454,7 +449,12 @@ export async function* runCompressLoop(
                 resolvedText = extracted.clean;
                 allCalls = [...calls, ...extracted.calls];
             }
-            const functionCallIds = new Set(calls.map(c => c.callId));
+            // #906: gate on allCalls (structured + text-extracted), not just
+            // structured calls — an extracted trigger executes identically, so
+            // its result must ride back as a real tool-call/tool-result pair;
+            // the marker fallback below would become a mid-conversation
+            // developer item the backend may drop (and truncates the result).
+            const functionCallIds = new Set(allCalls.map(c => c.callId));
 
             if (ctx.textProtocol && resolvedText.length > 0) {
                 yield adapter.emitText(resolvedText);
@@ -622,7 +622,11 @@ export async function* runCompressLoop(
                 // overflow signal (sglang-style backends accept an oversized
                 // prompt then die mid-stream). Both shapes: !sawDone (chat /
                 // anthropic) and truncatedDone (responses synthetic failed done).
-                if ((!sawDone || truncatedDone) && streamError === undefined) {
+                // #887: NOT when the client aborted — the abort breaks the parse
+                // loop at the signal check with the same !sawDone shape, and three
+                // ESCs inside 15min would arm a shrunken window (MIN_EVENTS=3)
+                // that throttles the session below its true window (#570 family).
+                if ((!sawDone || truncatedDone) && streamError === undefined && !signal?.aborted) {
                     const reqModel = typeof requestBody["model"] === "string" ? requestBody["model"] : undefined;
                     noteWeakOverflow(ctx.session, {
                         inputTokens: usage.inputTokens,
@@ -638,6 +642,17 @@ export async function* runCompressLoop(
                     ctx.log(`[acp-loop] round ${round}: ${msg}`);
                     yield adapter.emitError(msg);
                     return;
+                }
+                // #901: a normally-completed round proves the upstream accepted
+                // this input size — feed the capability baseline that
+                // noteWeakOverflow counts against (never on the truncated /
+                // error exits above).
+                if (!truncatedDone && streamError === undefined) {
+                    const total = promptInputTotal(ctx.protocol, usage.inputTokens, usage.cachedTokens, usage.creationTokens);
+                    if (total > 0) {
+                        const reqModel = typeof requestBody["model"] === "string" ? requestBody["model"] : undefined;
+                        recordProvenInput(ctx.session, total, reqModel);
+                    }
                 }
                 // A passthrough round already streamed the upstream's own finish
                 // chunk + [DONE] verbatim (original id + order); re-emitting a

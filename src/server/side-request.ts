@@ -82,12 +82,13 @@ export function sideRequestGuard(
     modelContextLimit: number,
     learnedLimit: number | undefined,
     imageBilling: ResolvedImageBilling = "bytes",
+    headroomCap: number = 1,
 ): { blocked: boolean; estimate: number; limit: number } {
     let limit = modelContextLimit;
     if (typeof learnedLimit === "number" && learnedLimit > 0 && learnedLimit < limit) limit = learnedLimit;
     const field = outputBudgetField(parsed);
     const maxOut = field ? ((parsed as Record<string, unknown>)[field] as number) : 0;
-    if (limit > 0 && shouldReserveOutputHeadroom(protocol)) limit = reserveOutputHeadroom(limit, maxOut);
+    if (limit > 0 && shouldReserveOutputHeadroom(protocol)) limit = reserveOutputHeadroom(limit, maxOut, headroomCap);
     const estimate = estimateRawBodyTokens(parsed) + imageTokensInParsedBody(protocol, parsed, imageBilling);
     return { blocked: limit > 0 && estimate >= limit * SIDE_REQUEST_GUARD_TOLERANCE, estimate, limit };
 }
