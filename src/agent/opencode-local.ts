@@ -67,7 +67,9 @@ import type { RewriteCtx } from "../stream.js";
 type OcPart = { type: string; [k: string]: unknown };
 type OcTokens = { input?: number; output?: number; reasoning?: number; cache?: { read?: number; write?: number } };
 type OcMessage = {
-    id: string;
+    // v2's context projection emits tool-result messages with NO id — part
+    // ids (the tool call id) are the only stable key there.
+    id?: string;
     role: string;
     content?: OcPart[];
     tokens?: OcTokens;
@@ -154,12 +156,19 @@ export function opencodeToCore(messages: OcMessage[]): CoreMessage[] {
                     text: JSON.stringify(p.input ?? {}),
                 });
             } else if (p.type === "tool-result") {
+                // v2 projections give the carrying message id `undefined`, so a
+                // positional id would collide across turns (every tool result
+                // becomes "undefined:0", the kernel dedups them into one and
+                // the rebuild orphans the later calls — the model then sees
+                // opencode's "Tool result missing" placeholder and re-issues
+                // the call in a loop). Key by call id instead: unique + stable.
+                const callId = typeof p.id === "string" ? p.id : undefined;
                 out.push({
-                    id,
+                    id: callId !== undefined ? `tr_${callId}` : `${msg.id}:${i}`,
                     role: "tool",
                     contentType: "tool-result",
                     toolName: typeof p.name === "string" ? p.name : undefined,
-                    toolCallId: typeof p.id === "string" ? p.id : undefined,
+                    toolCallId: callId,
                     text: toolResultText((p as { result?: { value?: unknown } }).result?.value),
                 });
             } else if (p.type === "reasoning") {
@@ -225,7 +234,20 @@ function estimateFallback(messages: CoreMessage[]): number {
 export function coreToOpencode(view: CoreMessage[], originals: OcMessage[]): OcMessage[] {
     const partsByMsg = new Map<string, OcPart[]>();
     for (const msg of originals) {
-        if (!partsByMsg.has(msg.id)) partsByMsg.set(msg.id, Array.isArray(msg.content) ? msg.content : []);
+        const key = msg.id ?? "";
+        if (!partsByMsg.has(key)) partsByMsg.set(key, Array.isArray(msg.content) ? msg.content : []);
+    }
+    // tool-result parts keyed by call id (v2: the carrying message has no id)
+    const toolPartByCall = new Map<string, OcPart>();
+    const toolMsgByCall = new Map<string, OcMessage>();
+    for (const msg of originals) {
+        if (msg.role !== "tool" || !Array.isArray(msg.content)) continue;
+        for (const p of msg.content) {
+            if (p.type === "tool-result" && typeof p.id === "string" && !toolPartByCall.has(p.id)) {
+                toolPartByCall.set(p.id, p);
+                toolMsgByCall.set(p.id, msg);
+            }
+        }
     }
     const out: OcMessage[] = [];
     let i = 0;
@@ -233,6 +255,14 @@ export function coreToOpencode(view: CoreMessage[], originals: OcMessage[]): OcM
         const core = view[i];
         if (core.id.startsWith("acp_summary_")) {
             out.push({ id: core.id, role: "user", content: [{ type: "text", text: core.text ?? "" }] });
+            i++;
+            continue;
+        }
+        if (core.id.startsWith("tr_")) {
+            const callId = core.id.slice(3);
+            const part = toolPartByCall.get(callId);
+            const msg = toolMsgByCall.get(callId);
+            if (part !== undefined && msg !== undefined) out.push({ ...msg, content: [part] });
             i++;
             continue;
         }

@@ -107,8 +107,47 @@ function compressContent(sid: string, summary: string): Array<{ startId: string;
         return hit[0];
     };
     const start = refOf("msg_a1:1");
-    const end = refOf("msg_t1:0");
+    const end = refOf("tr_call_1");
     return [{ startId: start, endId: end, summary }];
+}
+
+test("v2 shape: tool-result messages with NO id keep unique per-call refs and every result survives the rebuild", () => {
+    // v2's context projection emits tool-result messages with id undefined;
+    // positional ids collapsed them all onto "undefined:0" (#-loop bug).
+    const v2shape: OcMessage[] = [
+        { id: "msg_u1", role: "user", content: [{ type: "text", text: "status pls" }] },
+        {
+            id: "msg_a1",
+            role: "assistant",
+            content: [
+                { type: "reasoning", text: "check status" },
+                { type: "tool-call", id: "call_a", name: "acp_status", input: {} },
+            ],
+        },
+        { role: "tool", content: [{ type: "tool-result", id: "call_a", name: "acp_status", result: { type: "text", value: "PANEL ONE" } }] },
+        {
+            id: "msg_a2",
+            role: "assistant",
+            content: [{ type: "tool-call", id: "call_b", name: "acp_status", input: {} }],
+        },
+        { role: "tool", content: [{ type: "tool-result", id: "call_b", name: "acp_status", result: { type: "text", value: "PANEL TWO" } }] },
+    ];
+    const cores = opencodeToCore(v2shape);
+    const trIds = cores.filter((c) => c.contentType === "tool-result").map((c) => c.id);
+    assert.deepEqual(trIds, ["tr_call_a", "tr_call_b"]);
+
+    const rebuilt = coreToOpencode(cores, v2shape);
+    const results = rebuilt
+        .filter((m) => m.role === "tool")
+        .map((m) => toolResultTextOf(m))
+        .sort();
+    assert.deepEqual(results, ["PANEL ONE", "PANEL TWO"]);
+});
+
+function toolResultTextOf(m: OcMessage): string {
+    const p = m.content?.[0] as { result?: { value?: unknown } } | undefined;
+    const v = p?.result?.value;
+    return typeof v === "string" ? v : "";
 }
 
 test("local host: nudge + compress prompt injected on the wire view; compress tool executes; carrier survives, dead parts drop", async () => {
