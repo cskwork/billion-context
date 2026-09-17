@@ -2,6 +2,7 @@ import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
+import { performance } from "node:perf_hooks";
 import { createCore, type CompressionCore, type CompressionState, type Config, type CoreMessage, type NudgeDecision, type Prompts, type PackSurface, type ToolPrompts, applyAcpToolOverrides, defaultPrompts, defaultCountTokens, estimateTokensFast, renderNudgeText, deactivateBlock, viableRanges } from "acp-kernel";
 import { resolveCompress, resolveCompressPrompts, resolveCompressSurfaceDetailed, resolveRequestConfig } from "./compress-settings.js";
 import { dropCompressReasoning, type CompressReasoningConfig } from "./reasoning-drop.js";
@@ -788,8 +789,14 @@ async function handle(
     let route: ReturnType<typeof resolveUpstream>;
     let upstreamOrigin: string;
     let protocol: "anthropic" | "openai" | "responses" | null;
+    // #903: cost clock starts BEFORE the body read — local= covers body
+    // reception + parse + processTurn + rebuild/serialize, i.e. everything bili
+    // does before handing off. inboundBytes stays the raw wire size (pre-decode).
+    const reqT0 = performance.now();
+    let inboundBytes = 0;
     try {
         bodyBuffer = await readBody(req);
+        inboundBytes = bodyBuffer.length;
         const url = req.url ?? "";
         urlPath = url.split("?", 2)[0];
         responsesCompact = urlPath.endsWith("/responses/compact");
@@ -881,6 +888,15 @@ async function handle(
             parsed = null;
         }
     }
+    // #903: inbound message count for the per-request cost line — messages
+    // (anthropic/openai) or input (responses); null when the body has neither.
+    const inboundMsgs: number | null = (() => {
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+        const p = parsed as Record<string, unknown>;
+        if (Array.isArray(p.messages)) return p.messages.length;
+        if (Array.isArray(p.input)) return p.input.length;
+        return null;
+    })();
     // #806: a parseable body missing the conversation field used to crash the
     // kernel's conversation-signal fingerprint (body.messages.find on undefined —
     // top-level arrays included) and surface as an opaque 502. Reject it with the
@@ -1312,6 +1328,7 @@ async function handle(
                 compressInjected: false,
                 sidePassthrough: true,
             };
+            logRequestCost(log, session.id, inboundMsgs, inboundBytes, reqT0);
             await forward(req, res, opts, bodyBuffer, sidePrepared, core, reqConfig, log, route, instanceId, affinity);
             return;
         }
@@ -1475,6 +1492,7 @@ async function handle(
                     const gatePre = codexCompactGatePre(session, reqConfig.modelContextLimit);
                     if (mode === "intercept" && gatePre) prepared = runPrepare();
                     if (prepared?.codexForge) {
+                        logRequestCost(log, session.id, inboundMsgs, inboundBytes, reqT0);
                         await forward(req, res, opts, prepared.body, prepared, core, reqConfig, log, route, instanceId, affinity);
                         rememberPluginMessages(sessionId, prepared.processedMessages, prepared.originalMessages, prepared.nudge);
                         return;
@@ -1488,6 +1506,7 @@ async function handle(
                     const forwardBody = normalized ? Buffer.from(JSON.stringify({ ...original, input: items })) : bodyBuffer;
                     const why = mode !== "intercept" ? "BILI_CODEX_COMPACT=pass" : !gatePre ? "gate preconditions not met" : "transform/forge failed";
                     log("info", `[${session.id}] codex compaction_trigger request not intercepted (${why}) — forwarding ${normalized ? `with bili summaries normalized (replaced=${replaced}, dropped=${dropped})` : "verbatim"} (no preflight, no rebuild, no window clamp)`);
+                    logRequestCost(log, session.id, inboundMsgs, inboundBytes, reqT0);
                     await forward(req, res, opts, forwardBody, null, core, reqConfig, log, route, instanceId, affinity);
                     return;
                 }
@@ -1551,10 +1570,12 @@ async function handle(
                                 }));
                             }
                         }
+                        logRequestCost(log, session.id, inboundMsgs, inboundBytes, reqT0);
                         return;
                     }
                     prepared = outcome;
                 }
+                logRequestCost(log, session.id, inboundMsgs, inboundBytes, reqT0);
                 await forward(req, res, opts, prepared!.body, prepared!, core, reqConfig, log, route, instanceId, affinity);
                 // Remember for ALL modes (not just plugin): wire clients (dsh,
                 // hermes, unplug'd pi) read the same panel via /__bili/plugin/status
@@ -3999,6 +4020,21 @@ function headerValue(req: http.IncomingMessage, name: string): string | undefine
         if (k.toLowerCase() === lower) return Array.isArray(v) ? v[0] : v;
     }
     return undefined;
+}
+
+function formatBytes(n: number): string {
+    if (n < 1024) return `${n}B`;
+    if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)}KiB`;
+    if (n < 1024 * 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(1)}MiB`;
+    return `${(n / (1024 * 1024 * 1024)).toFixed(1)}GiB`;
+}
+
+// #903: per-request local-cost line, logged at every point where bili finishes
+// its own processing and hands the request off (upstream forward, forged local
+// response, or fail-fast error) — see handle().
+function logRequestCost(log: (level: string, msg: string) => void, sessionId: string, msgs: number | null, inboundBytes: number, t0: number): void {
+    const ms = Math.max(0, Math.round(performance.now() - t0));
+    log("info", `[${sessionId}] request: ${msgs ?? "?"} msgs, inbound=${formatBytes(inboundBytes)}, local=${ms}ms`);
 }
 
 /** Thrown by readBody when the request body exceeds MAX_REQUEST_BYTES.
