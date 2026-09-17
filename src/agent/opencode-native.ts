@@ -40,8 +40,31 @@
 // install opencode` writes <configDir>/plugins/billion-context/index.js
 // re-exporting this entry (same wrapper shape the launcher builds,
 // src/launcher.ts prepareOpencodeHttpRewrite).
+//
+// OpenCode 1.x loads the SAME entry through `.server(ctx)` (hooks object).
+// V1 runtime facts (probed on 1.14.46, ~/projects/opencode-stable):
+//   - config hook: receives the SHARED cached config object (Config.get →
+//     InstanceState.use) — mutating provider.<id>.options.baseURL persists
+//     for the process lifetime, no file writes needed. Providers WITHOUT an
+//     explicit baseURL (SDK defaults) cannot be caught this way — documented.
+//   - "chat.headers": per-LLM-request header mutation — the V1 equivalent of
+//     V2's stampHeaders (x-bili-plugin + conversation id).
+//   - tool: { [name]: { description, args, execute } } registers native tools;
+//     args must be REAL zod fields (registry wraps them with its own
+//     z.object(...).safeParse) — hence zod is a runtime dependency, lazily
+//     imported below. Same tool set/schemas as V2 (ACP_TOOLS_OPENAI),
+//     converted JSON-schema → zod. When zod cannot be resolved (dist copied
+//     without node_modules) the plugin degrades to proxy mode: no headers, no
+//     tools — the proxy injects wire tools, compression still works.
+//   - command.execute.before + ctx.client.session.prompt: /acp command
+//     (shared factory opencode-acp-command.ts).
+//   - "experimental.session.compacting" exists but config compaction.auto=false
+//     (written by the config hook, same as the launcher/installer) is the
+//     owner-switch; no compaction-prompt surgery needed.
 
-import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST } from "../launcher.js";
+import { ACP_TOOLS_OPENAI } from "../compress-tool.js";
+import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST, unwrapUpstream, wrapUpstream } from "../launcher.js";
+import { createAcpCommandHooks } from "./opencode-acp-command.js";
 import { markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, singleFlight } from "./native-bootstrap.js";
 import { isModelApiUrl, readyOrigin, type NativeInterceptState } from "./native-intercept.js";
 import { createOpencodeV2Setup, type V2HttpRequestEvent, type V2State } from "./opencode-v2.js";
@@ -223,4 +246,186 @@ if (plan.mode !== "off") {
     }
 }
 
-export default { id: "billion-context-opencode-native", setup: createOpencodeV2Setup({ route: createNativeRoute(state) }) };
+// ———— OpenCode 1.x native surface (V1 `.server()`) ————————————————————
+
+type ZodLike = typeof import("zod");
+
+interface V1ToolContext {
+    sessionID: string;
+    messageID?: string;
+    agent?: string;
+    abort?: AbortSignal;
+}
+
+interface V1Tool {
+    description: string;
+    args: Record<string, unknown>;
+    execute: (args: Record<string, unknown>, ctx: V1ToolContext) => Promise<string>;
+}
+
+export interface V1ProviderOptions {
+    baseURL?: unknown;
+    [key: string]: unknown;
+}
+
+export interface V1Config {
+    provider?: Record<string, { options?: V1ProviderOptions } | undefined> | undefined;
+    command?: Record<string, import("./opencode-acp-command.js").OpencodeCommandConfig>;
+    compaction?: unknown;
+    [key: string]: unknown;
+}
+
+export interface V1ChatHeadersInput {
+    sessionID: string;
+    agent?: string;
+    model?: { providerID?: unknown; id?: unknown };
+}
+
+export interface V1Hooks {
+    config?: (input: V1Config) => Promise<void>;
+    "chat.headers"?: (input: V1ChatHeadersInput, output: { headers: Record<string, string> }) => Promise<void>;
+    "command.execute.before"?: (input: { command: string; sessionID: string; arguments?: string }, output?: { parts: unknown[] }) => Promise<void>;
+    tool?: Record<string, V1Tool>;
+}
+
+export interface V1PluginContext {
+    client?: import("./opencode-acp-command.js").OpencodeClient;
+}
+
+/** JSON-schema (ACP_TOOLS_OPENAI parameters) → zod raw shape. Only the shapes
+ *  our own tools use; anything exotic degrades to z.any() — the proxy
+ *  re-validates server-side anyway (parseCompressArgs), client zod is just
+ *  the host's parameter gate. */
+export function jsonSchemaToZodShape(schema: unknown, z: ZodLike): Record<string, unknown> {
+    if (schema === null || typeof schema !== "object" || Array.isArray(schema)) return {};
+    const props = (schema as { properties?: unknown }).properties;
+    if (props === null || typeof props !== "object" || Array.isArray(props)) return {};
+    const out: Record<string, unknown> = {};
+    for (const [key, raw] of Object.entries(props as Record<string, unknown>)) {
+        out[key] = jsonSchemaFieldToZod(raw, z);
+    }
+    return out;
+}
+
+function jsonSchemaFieldToZod(raw: unknown, z: ZodLike): unknown {
+    if (raw === null || typeof raw !== "object") return z.any();
+    const spec = raw as { type?: unknown; enum?: unknown; items?: unknown; anyOf?: unknown; description?: unknown };
+    if (Array.isArray(spec.enum) && spec.enum.length > 0 && spec.enum.every((v) => typeof v === "string")) {
+        return z.enum(spec.enum as [string, ...string[]]);
+    }
+    switch (spec.type) {
+        case "string":
+            return typeof spec.description === "string" ? z.string().describe(spec.description) : z.string();
+        case "number":
+            return z.number();
+        case "boolean":
+            return z.boolean();
+        case "array": {
+            const item = jsonSchemaFieldToZod(spec.items, z);
+            return item === undefined ? z.array(z.any()) : z.array(item as never);
+        }
+        default:
+            // object / anyOf / unknown — accept anything; the proxy validates
+            return z.any();
+    }
+}
+
+/** Rewrite provider baseURLs to `<origin>/bili/<url>` (idempotent) and flip
+ *  compaction.auto off. Providers without an explicit baseURL keep their SDK
+ *  default (traffic goes direct) — V1 has no request seam to catch those. */
+export function rewriteV1Providers(cfg: V1Config, origin: string): number {
+    const providers = cfg.provider;
+    if (providers === null || typeof providers !== "object") return 0;
+    let rewritten = 0;
+    for (const entry of Object.values(providers)) {
+        const options = entry?.options;
+        if (options === null || typeof options !== "object") continue;
+        const base = options.baseURL;
+        if (typeof base !== "string" || base.trim().length === 0) continue;
+        if (!/^https?:\/\//i.test(base)) continue;
+        // unwrapUpstream strips ANY existing `<…>/bili/` prefix (stale wrap
+        // from another proxy origin included), wrapUpstream re-adds ours.
+        const next = wrapUpstream(origin, unwrapUpstream(base));
+        if (next === base) continue;
+        options.baseURL = next;
+        rewritten++;
+    }
+    const compaction = cfg.compaction;
+    cfg.compaction = {
+        ...(compaction !== null && typeof compaction === "object" && !Array.isArray(compaction) ? (compaction as Record<string, unknown>) : {}),
+        auto: false,
+    };
+    return rewritten;
+}
+
+export interface V1NativeDeps {
+    /** zod module (tests inject; runtime lazy-imports "zod"). */
+    z?: ZodLike;
+    /** Tool forwarder (tests inject; runtime POSTs /__bili/plugin/tool). */
+    forward?: (origin: string, conversationId: string, tool: string, args: unknown) => Promise<string>;
+}
+
+/** Build the V1 hooks for a RESOLVED proxy origin. `deps.z` present → plugin
+ *  mode (tools + header stamping); absent → proxy mode (rewrite only, the
+ *  proxy injects wire tools). Exported for tests; the `server` export below
+ *  wires the real bootstrap + zod. */
+export function createV1ServerHooks(origin: string, ctx: V1PluginContext, deps: V1NativeDeps = {}): V1Hooks {
+    const acp = createAcpCommandHooks(() => origin, ctx);
+    const hooks: V1Hooks = {
+        config: async (cfg) => {
+            await acp.config?.(cfg);
+            const n = rewriteV1Providers(cfg, origin);
+            if (n > 0) console.log(`[bili-opencode-native] v1: rewrote ${n} provider baseURL(s) -> ${origin}/bili/`);
+        },
+        "command.execute.before": async (input, _output) => {
+            await acp["command.execute.before"]?.(input);
+        },
+    };
+    if (deps.z !== undefined) {
+        hooks["chat.headers"] = async (input, output) => {
+            output.headers["x-bili-plugin"] = "opencode";
+            output.headers["x-bili-plugin-conversation"] = input.sessionID;
+        };
+        const forward = deps.forward ?? ((o, conversationId, tool, args) => import("./shared.js").then((m) => m.forwardTool(o, conversationId, tool, args)));
+        const tools: Record<string, V1Tool> = {};
+        for (const t of ACP_TOOLS_OPENAI) {
+            const fn = t.function;
+            tools[fn.name] = {
+                description: fn.description ?? fn.name,
+                args: jsonSchemaToZodShape(fn.parameters, deps.z),
+                execute: async (args, v1ctx) => forward(origin, v1ctx.sessionID, fn.name, args),
+            };
+        }
+        hooks.tool = tools;
+    } else {
+        console.error("[bili-opencode-native] v1: zod unavailable — plugin tools skipped; sessions run in proxy mode (wire-injected compress)");
+    }
+    return hooks;
+}
+
+async function resolveV1Origin(): Promise<string | undefined> {
+    try {
+        return await readyOrigin(state);
+    } catch {
+        return undefined;
+    }
+}
+
+const server = async (ctx: V1PluginContext): Promise<V1Hooks> => {
+    if (plan.mode === "off") return {};
+    const origin = await resolveV1Origin();
+    if (origin === undefined) {
+        console.error("[bili-opencode-native] v1: proxy bootstrap failed — model traffic goes direct (uncompressed)");
+        return {};
+    }
+    console.log(`[bili-opencode-native] v1 active (proxy ${origin})`);
+    let z: ZodLike | undefined;
+    try {
+        z = (await import("zod")) as ZodLike;
+    } catch {
+        z = undefined;
+    }
+    return createV1ServerHooks(origin, ctx, { z });
+};
+
+export default { id: "billion-context-opencode-native", setup: createOpencodeV2Setup({ route: createNativeRoute(state) }), server };

@@ -13,7 +13,7 @@
 | Language | TypeScript (strict, ESM) |
 | Build | tsup (bundling, inlines acp-kernel) |
 | Test | Node.js built-in: `node --import tsx --test tests/*.test.ts` |
-| Runtime Dep | `acp-kernel` (bundled at build time, zero runtime deps in dist) |
+| Runtime Dep | `acp-kernel` (bundled at build time) + `zod` (external, only used by `dist/agent/opencode-native.js` V1 tools; `dist/index.js` stays dependency-free) |
 
 ### Repository Info
 
@@ -65,7 +65,7 @@ billion-context/
 │   ├── compress-tool.ts          # compress tool parsing (kernel parseCompressArgs)
 │   ├── decompress-shared.ts      # Shared decompress logic
 │   ├── orphan-gc.ts              # Orphaned block cleanup
-│   ├── agent/                    # Thin agent-side plugins (pi/omp/opencode)
+│   ├── agent/                    # Thin agent-side plugins (pi/omp/opencode; opencode-acp-command.ts = shared /acp hooks V1+V2, opencode-native.ts = self-spawn native, V1 `.server()` + V2 `setup`)
 │   ├── web/                      # Web UI (config + context windows)
 │   ├── fetch-util.ts             # HTTP fetch with timeout
 │   └── util.ts                   # Misc utilities
@@ -76,7 +76,7 @@ billion-context/
 
 ### Key Design Decisions
 
-1. **acp-kernel is bundled inline** — tsup does NOT list it in `external`, so `dist/index.js` is self-contained (zero runtime deps)
+1. **acp-kernel is bundled inline** — tsup does NOT list it in `external`, so `dist/index.js` is self-contained. Exception: `zod` (exact `4.1.8`, matching the opencode host's own zod so V1 plugin-tool shapes interoperate) is a real dependency and stays external — only `dist/agent/opencode-native.js` imports it (lazily, at plugin-tool registration); `dist/index.js` and every other entry remain zod-free. When zod cannot be resolved at runtime the V1 plugin degrades to plain proxy mode instead of failing.
 2. **Tags use XML format** `<acp tokens="2" type="text">m00001</acp>` — written with hex escapes (`\x3c`, `\x3e`) to avoid Write/Edit tool stripping
 3. **Auto-update**: checks npm registry every 3 min (`CHECK_INTERVAL_MS = 3*60*1000`), first check per process ignores throttle
 4. **Tee logger**: all proxy logs go through `src/logger.ts` (file + stderr). Do NOT use `console.error` in server-side modules — use `loggerLog()`.
