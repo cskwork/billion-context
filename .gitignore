@@ -5,3 +5,6 @@ dist/
 *.tgz
 .bili-coop-build-stamp
 tmp/
+
+# docker rig build workspace (legacy, pre ~/tmp/oc2-ctl rig) — 200MB+ binaries
+iso/
