@@ -71,8 +71,13 @@ test("#853 summary output cap: 32k default, clamped to known model ceiling", asy
         };
         try {
             await preflightCompress(deps, messages);
-            assert.equal(bodies.length, 1, "exactly one summary call");
-            assert.equal(bodies[0].max_tokens, expectedCap, label);
+            // #668: a span dominated by one huge message is split into
+            // token-budgeted chunks (one summary call each, so every call fits
+            // the window) — the cap must hold on ALL of them.
+            assert.ok(bodies.length >= 1, "at least one summary call");
+            for (const b of bodies) {
+                assert.equal(b.max_tokens, expectedCap, label);
+            }
         } finally {
             server.close();
             await once(server, "close");
