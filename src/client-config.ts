@@ -1001,6 +1001,75 @@ export function readOpencodeConfig(file: string): OpencodeConfig {
     return parseOpencodeProviders(readConfigFileRoot(file));
 }
 
+export interface OpencodeProjectProviderView {
+    baseURL?: string;
+    file: string;
+}
+
+export interface OpencodeProjectLayer {
+    providers: Record<string, OpencodeProjectProviderView>;
+}
+
+function findGitRoot(start: string): string | undefined {
+    let cur = start;
+    for (;;) {
+        if (fs.existsSync(path.join(cur, ".git"))) return cur;
+        const parent = path.dirname(cur);
+        if (parent === cur) return undefined;
+        cur = parent;
+    }
+}
+
+// Mirrors opencode's own project-config discovery (verified against
+// opencode 1.14.46, #843): from cwd up to the git root (or filesystem root
+// when outside any repo), every level contributes <dir>/opencode.json{,c}
+// plus <dir>/.opencode/opencode.json{,c}; nearest level wins per provider id.
+// These files outrank $OPENCODE_CONFIG, so they can silently override the
+// launcher's rewrite delivery.
+export function readOpencodeProjectLayer(cwd: string): OpencodeProjectLayer {
+    const start = path.resolve(cwd);
+    const gitRoot = findGitRoot(start);
+    const dirs: string[] = [];
+    let cur = start;
+    for (;;) {
+        dirs.push(cur);
+        if (cur === gitRoot) break;
+        const parent = path.dirname(cur);
+        if (parent === cur) break;
+        cur = parent;
+    }
+    dirs.reverse();
+    const providers: Record<string, OpencodeProjectProviderView> = {};
+    for (const dir of dirs) {
+        const candidates = [
+            path.join(dir, "opencode.json"),
+            path.join(dir, "opencode.jsonc"),
+            path.join(dir, ".opencode", "opencode.json"),
+            path.join(dir, ".opencode", "opencode.jsonc"),
+        ];
+        for (const file of candidates) {
+            const parsed = readConfigFileRoot(file);
+            if (!parsed) continue;
+            const provRoot = parsed.provider;
+            if (!provRoot || typeof provRoot !== "object" || Array.isArray(provRoot)) continue;
+            for (const [name, value] of Object.entries(provRoot as Record<string, unknown>)) {
+                if (!value || typeof value !== "object" || Array.isArray(value)) continue;
+                const opts = (value as Record<string, unknown>).options;
+                const rawBase = opts && typeof opts === "object" && !Array.isArray(opts) ? (opts as Record<string, unknown>).baseURL : undefined;
+                const baseURL = typeof rawBase === "string" && rawBase !== "" ? rawBase : undefined;
+                const prev = providers[name];
+                if (!prev) {
+                    providers[name] = baseURL !== undefined ? { baseURL, file } : { file };
+                } else if (baseURL !== undefined) {
+                    prev.baseURL = baseURL;
+                    prev.file = file;
+                }
+            }
+        }
+    }
+    return { providers };
+}
+
 export function parseZcodeConfig(obj: unknown): ZcodeConfig {
     const result: ZcodeConfig = { providers: {} };
     if (!obj || typeof obj !== "object" || Array.isArray(obj)) return result;

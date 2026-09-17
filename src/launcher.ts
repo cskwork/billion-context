@@ -54,7 +54,7 @@ import { selfPackageRoot, isBiliPiEntry, ompPluginLoadedFrom } from "./plugin-in
 function selfDistFile(name: string): string {
     return path.join(selfPackageRoot(), "dist", name);
 }
-import { nonEmpty, resolvePiHome, resolveOmpHome, resolveDshHome, resolveCodexHome, loadClientConfig, collectModelWindows, type ClientConfig, type CodexConfig, resolveOpencodeConfigFile, readOpencodeConfigRoot, opencodePluginBaseDir, type OpencodeConfig, type OpencodeProvider, type HermesConfig, type HermesProvider, qoderIsCnSite, QODER_DEFAULT_MODEL_HOSTS, resolveTraeHome, readTraeConfig, TRAE_DEFAULT_MODEL_HOSTS, JCODE_DEFAULT_MODEL_HOSTS, type TraeConfig, resolveKimiHome, readKimiConfig, parseKimiToml, KIMI_DEFAULT_MODEL_HOSTS, type KimiConfig, type KimiProvider } from "./client-config.js";
+import { nonEmpty, resolvePiHome, resolveOmpHome, resolveDshHome, resolveCodexHome, loadClientConfig, collectModelWindows, type ClientConfig, type CodexConfig, resolveOpencodeConfigFile, readOpencodeConfigRoot, opencodePluginBaseDir, type OpencodeConfig, type OpencodeProvider, type HermesConfig, type HermesProvider, qoderIsCnSite, QODER_DEFAULT_MODEL_HOSTS, resolveTraeHome, readTraeConfig, TRAE_DEFAULT_MODEL_HOSTS, JCODE_DEFAULT_MODEL_HOSTS, type TraeConfig, resolveKimiHome, readKimiConfig, parseKimiToml, KIMI_DEFAULT_MODEL_HOSTS, type KimiConfig, type KimiProvider, readOpencodeProjectLayer, type OpencodeProjectLayer } from "./client-config.js";
 import { loadRoutes, resolveConfiguredContextLimit, lookupContextLimit, type ProviderRoutes } from "./config.js";
 import { contextFromRegistry } from "./registry.js";
 
@@ -97,6 +97,8 @@ export {
     readOpencodeConfigRoot,
     type OpencodeConfig,
     type OpencodeProvider,
+    readOpencodeProjectLayer,
+    type OpencodeProjectLayer,
     type CodebuddyConfig,
     readCodebuddyConfig,
     parseCodebuddyModelsJson,
@@ -1744,6 +1746,50 @@ function absolutizePluginEntry(baseDir: string, entry: unknown): unknown {
     return entry;
 }
 
+export function opencodeEffectiveCwd(clientArgs: readonly string[]): string {
+    for (let i = 0; i < clientArgs.length; i++) {
+        const arg = clientArgs[i];
+        if (arg === "--dir") return path.resolve(clientArgs[i + 1] ?? ".");
+        if (arg.startsWith("--dir=")) return path.resolve(arg.slice("--dir=".length));
+    }
+    return process.cwd();
+}
+
+function isBiliRouted(baseURL: string, httpsDomains: ReadonlySet<string>): boolean {
+    if (unwrapUpstream(baseURL) !== baseURL) return true;
+    let url: URL;
+    try {
+        url = new URL(baseURL);
+    } catch {
+        return false;
+    }
+    return url.protocol === "https:" && httpsDomains.has(url.hostname.toLowerCase());
+}
+
+// #843: project-layer opencode config outranks the launcher's $OPENCODE_CONFIG
+// rewrite delivery, so providers defined there bypass the proxy silently.
+export function opencodeProjectBypassWarnings(
+    layer: OpencodeProjectLayer,
+    routes: DiscoveredRoutes,
+): string[] {
+    const warnings: string[] = [];
+    const httpsDomains = new Set(routes.httpsDomains.map((d) => d.toLowerCase()));
+    const rewrittenKeys = new Set([...routes.httpRewrites, ...routes.httpsRewrites].map((r) => r.key));
+    for (const [name, view] of Object.entries(layer.providers)) {
+        if (!view.baseURL || isBiliRouted(view.baseURL, httpsDomains)) continue;
+        if (rewrittenKeys.has(name)) {
+            warnings.push(
+                `bili: ${view.file} redefines provider "${name}" in opencode's project layer, which outranks the launcher's rewritten $OPENCODE_CONFIG — "${name}" traffic will NOT go through the proxy (no compression). Move the provider to your global opencode config to restore compression.`,
+            );
+        } else {
+            warnings.push(
+                `bili: provider "${name}" is defined only in opencode's project layer (${view.file}) — the launcher never sees it, so no rewrite was applied and "${name}" traffic will NOT go through the proxy (no compression). Move it to your global opencode config to enable compression.`,
+            );
+        }
+    }
+    return warnings;
+}
+
 function dedupeInOrder(list: string[]): string[] {
     const seen = new Set<string>();
     const out: string[] = [];
@@ -2393,6 +2439,9 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         const ocDirMode = opencodePluginPath !== undefined && opencodeMajorVersion(resolveClientCommand("opencode", process.env).command) >= 2;
         opencodeTmpFile = prepareOpencodeHttpRewrite(readOpencodeConfigRoot(process.env), origin, routes.httpRewrites, routes.httpsRewrites, opencodePluginPath, ocDirMode);
         if (opencodeTmpFile) env.OPENCODE_CONFIG = opencodeTmpFile;
+        for (const warning of opencodeProjectBypassWarnings(readOpencodeProjectLayer(opencodeEffectiveCwd(clientArgs)), routes)) {
+            console.error(warning);
+        }
     } else if (base === "hermes") {
         // #535 phase 2: file-free — no overlay HERMES_HOME, no config.yaml
         // runs on its REAL home — including a user-set HERMES_HOME (discovery
