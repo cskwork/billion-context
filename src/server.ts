@@ -79,7 +79,7 @@ import { flushPrefixAffinity, hydratePrefixAffinity, scheduleAffinityPersist } f
 import { consumePluginRegisterFor, flushConversations, handlePluginCompact, handlePluginManifest, handlePluginRegister, handlePluginStatus, handlePluginTool, loadConversations, pipePluginChatWithStrip, pipePluginJson, pipePluginResponsesWithStrip, pluginAgentHeader, pluginConversationHeader, pluginReportedContextWindow, recordPluginSession, rememberPluginMessages, takePendingPluginRegister } from "./plugin.js";
 import { setupMitm, readMitmUpstream, getBlindTunnelStats } from "./mitm.js";
 import type { BiliMessage } from "acp-kernel/wire";
-import { hardenOpenaiAssistantContent, isLoopbackAddress, inspectContextOverflow, reserveOutputHeadroom, shouldReserveOutputHeadroom, systemToUser, usageTotals, type WireProtocol } from "./util.js";
+import { hardenOpenaiAssistantContent, isLoopbackAddress, inspectContextOverflow, reserveOutputHeadroom, resolveOutputHeadroomCap, shouldReserveOutputHeadroom, systemToUser, usageTotals, type WireProtocol } from "./util.js";
 import { recordProvenInput, resolveConfirmedLimit, resolveLearnedLimit, resolveSpeculativeLimit, retractStaleLearnedLimits, sessionProvenMax } from "./weak-overflow.js";
 import { BILI_TUNNEL_HEADER, checkTunnelDestination, tunnelAllowlistFromEnv } from "./tunnel-guard.js";
 import { dumpRejectedBody } from "./error-dump.js";
@@ -1286,6 +1286,11 @@ async function handle(
         // tool-carrying main request re-enters the pipeline at full budget (see
         // restoreOutputBudget for the starvation mechanism).
         restoreOutputBudget(parsed, session, log);
+        // #896: the per-scope output-headroom cap (compress.outputHeadroomMaxPct,
+        // three-level merge; default 0.25, aligned with billion-context-pi).
+        // Resolved once here so the side-request guard below AND the main-path
+        // reservation measure against the SAME capped window.
+        const headroomCap = resolveOutputHeadroomCap(resolveCompress(opts.routes, route?.rewrittenUrl, (parsed as { model?: string }).model, opts.compress).outputHeadroomMaxPct);
         // #388: side requests (title-gen etc.) share the main session key but
         // must not touch kernel state (processTurn/snapshot/usage would pollute
         // the main view). Forward with a minimal prepared marked sidePassthrough:
@@ -1303,7 +1308,7 @@ async function handle(
             // then scalar) — the learner now writes the confirmed channel, so the
             // legacy direct map read would miss windows learned from real 400s.
             const learnedLimit = resolveLearnedLimit(session, reqModel);
-            const guard = sideRequestGuard(parsed, protocol, reqConfig.modelContextLimit, learnedLimit, imageBillingFor(opts, route?.rewrittenUrl ?? upstreamOrigin));
+            const guard = sideRequestGuard(parsed, protocol, reqConfig.modelContextLimit, learnedLimit, imageBillingFor(opts, route?.rewrittenUrl ?? upstreamOrigin), headroomCap);
             if (guard.blocked) {
                 log("warn", `[${session.id}] side request (~${guard.estimate} tokens) ≥ effective window ${guard.limit} (model=${reqModel ?? "?"}) — NOT forwarded: guaranteed upstream 400 (side requests bypass preflight by design, #388)`);
                 if (!res.headersSent && !res.writableEnded && !res.destroyed) {
@@ -1399,7 +1404,7 @@ async function handle(
             }
         }
         // Reserve the model's OUTPUT budget for this turn from the window so the
-        // kernel's nudge/truncate bands sit below (window - maxOutput) and a
+        // kernel's nudge/truncate bands sit below (window - reserved) and a
         // context+output overflow can't happen on a small window (e.g. 100k with a
         // large max_tokens — the most common "context blew up" cause; none of the
         // three layers reserved room for the output before this). Anthropic is
@@ -1408,6 +1413,10 @@ async function handle(
         // maxOutput on every session for no safety gain — see
         // shouldReserveOutputHeadroom. max_tokens is the exact output budget
         // requested for THIS turn, so the reservation is precise and per-request.
+        // #896: headroomCap (compress.outputHeadroomMaxPct, default 0.25, aligned
+        // with billion-context-pi #207) caps the reservation at headroomCap × window
+        // — reserved = min(maxOutput, headroomCap × window). Replies longer than the
+        // reservation overflow once; the self-heal above recovers it next turn.
         // Only reserve when it leaves a usable window (maxOutput < window);
         // otherwise the request is degenerate (output >= whole window) and the
         // self-heal above handles the resulting overflow. Feeds reqConfig (→
@@ -1417,7 +1426,7 @@ async function handle(
             const p = parsed as Record<string, unknown>;
             const rawMax = p.max_tokens ?? p.max_completion_tokens ?? p.max_output_tokens;
             const maxOutput = typeof rawMax === "number" ? rawMax : 0;
-            let reserved = reserveOutputHeadroom(reqConfig.modelContextLimit, maxOutput);
+            let reserved = reserveOutputHeadroom(reqConfig.modelContextLimit, maxOutput, headroomCap);
             // Fallback-derived windows are optimistic guesses: never let the
             // output-headroom reservation push the effective window below the
             // floor (issue #282: 128k table − 64k max_tokens → 64k effective

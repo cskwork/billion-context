@@ -248,6 +248,13 @@ For each request, the proxy resolves the settings by longest-URL-prefix match (t
 - **Status:** ACTIVE
 - **Description:** The context window size, in tokens. This is the **denominator** the engine uses for its usage ratio (`usage = tokens / modelContextLimit`) — it is **not** a truncation cap. Accepts an absolute number (`200000`) or a percent string (`"80%"` = 80% of the model's native window, resolved from the built-in table or models.dev registry). When omitted at every level, the native window is used. This is the highest-priority source for the model limit; it overrides the built-in table, the legacy per-model `context` field, and the top-level `modelContextLimit`.
 
+#### `outputHeadroomMaxPct`
+
+- **Type:** `number | string`
+- **Default:** `0.25`
+- **Status:** ACTIVE
+- **Description:** Cap on the output-headroom reservation, as a fraction of the context window: reserved amount = `min(max_tokens, pct × window)`. The reservation keeps the engine's nudge/truncate bands below `window − reserved`, so long replies can't push "input + output" past the window — it applies to APIs that count output against the window (Anthropic Messages is exempt: its input limit is enforced independently of `max_tokens`, so it is excluded). Without a cap, models whose registered max output takes a large share of the window (e.g. `maxTokens` 131072 on a 262144 window) lose most of their input budget and the 75% force-compress threshold fires at about a third of the full window. The `0.25` default bounds that loss while still guaranteeing no overflow at the 95% emergency threshold for any single-turn reply up to 25% of the window; longer replies overflow once and are recovered by the next turn's overflow self-heal. Note the cap only relaxes oversized reservations: when `max_tokens` is already ≤ `pct × window`, the reservation stays the full `max_tokens` (byte-identical to the legacy behavior). Accepts a ratio (`0.25`) or percent string (`"25%"`); set `0` to disable the reservation entirely; `>= 1` restores the legacy full-capability reservation (input + a full-budget reply always fits — what strict backends like SGLang/vLLM enforce). Negative or unparseable values reject the whole `compress` block. Example: 262144-token window, `max_tokens = 131072` → default `0.25` reserves 65536 → effective window 196608 (legacy full reservation: 131072); `max_tokens = 65536` → reserves 65536 → 196608 unchanged (65536 ≤ 25% of the window). Aligned with billion-context-pi (`#207`) via #896.
+
 #### `maxContextLimit`
 
 - **Type:** `number | string`

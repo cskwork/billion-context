@@ -246,6 +246,13 @@
 - **状态：** ACTIVE
 - **说明：** 上下文窗口大小，以 token 为单位。它是引擎用于计算使用率比例的**分母**（`usage = tokens / modelContextLimit`）—— 它**不是**截断上限。接受绝对数值（`200000`）或百分比字符串（`"80%"` = 模型原始窗口的 80%，从内置表或 models.dev 注册表解析）。在每个层级都省略时，使用原始窗口。这是模型上限的最高优先级来源；它会覆盖内置表、旧版按模型的 `context` 字段以及顶层的 `modelContextLimit`。
 
+#### `outputHeadroomMaxPct`
+
+- **类型：** `number | string`
+- **默认值：** `0.25`
+- **状态：** ACTIVE
+- **说明：** 输出预留（output headroom）的上限，以上下文窗口的比例为单位：预留量 = `min(max_tokens, pct × window)`。该预留让引擎的 nudge/truncate 档位位于 `window − 预留量` 之下，防止长回复把「输入+输出」推进窗口之外 —— 适用于把输出计入窗口的 API（Anthropic Messages 豁免：其 input limit 独立于 `max_tokens` 执行，故排除在外）。不设上限时，注册最大输出占窗口比例大的模型（如 262144 窗口上 maxTokens 131072）会失去大半输入预算，75% 强制压缩阈值会在约三分之一的完整窗口处就触发。默认 0.25 在控制损失的同时保证只要单轮回复不超过窗口的 25%，就不会在 95% 紧急阈值下溢出；更长的回复会溢出一次，由下一轮的 overflow self-heal 恢复。注意该上限只放宽过大的预留：当 `max_tokens` 本身 ≤ `pct × window` 时，预留仍是完整的 `max_tokens`（与旧行为逐字节一致）。接受比例（`0.25`）或百分比字符串（`"25%"`）；设 `0` 完全禁用预留；`>= 1` 恢复旧的完整预留行为（input + 用满预算的响应总能放进窗口 —— SGLang/vLLM 等严格后端的要求）。负数或无法解析的值会拒绝整个 `compress` 块。示例：窗口 262144 token、`max_tokens = 131072` → 默认 `0.25` 预留 65536 → 有效窗口 196608（旧完整预留：131072）；`max_tokens = 65536` → 预留 65536 → 196608 不变（65536 ≤ 窗口的 25%）。与 billion-context-pi（`#207`）对齐，见 #896。
+
 #### `maxContextLimit`
 
 - **类型：** `number | string`
