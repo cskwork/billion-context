@@ -320,6 +320,18 @@ Then send one message from your client and watch the log
 should see a `processTurn` line per request, and once the conversation grows,
 `[acp-usage] round N input=X cached=Y (cache hit Z%)` + a `compress` event.
 
+### Client uses `http.proxy` (CONNECT) but nothing compresses
+
+Some clients (VS Code-based IDEs: CodeBuddy, Cursor, Windsurf, …) only offer an HTTP **proxy** setting (`http.proxy`, `codingcopilot.httpProxyURL`, …) — no model base-URL to rewrite. Such clients send `CONNECT <model-host>:443` through the proxy instead of plain `/bili/…` requests. That path is only decrypted when the model host is on bili's **MITM whitelist**; otherwise bili blind-tunnels the TLS bytes (opaque relay) and can never see — or compress — the model requests (#897).
+
+This failure mode is now loud instead of silent:
+
+- a one-time `BLIND TUNNEL WARNING` per target host in the log, with the fix steps;
+- `blindTunnels` (count + exact target hosts) in `curl -s http://localhost:8787/__bili/health` and `/__bili/stats` (loopback-only);
+- an `UNDECRYPTED TRAFFIC (instance-level)` section in `acp_status` output while such tunnels exist.
+
+To actually compress such a client: add its model domain to `"mitm".domains` in `billion-context.json` (e.g. `"mitm": { "domains": ["copilot.tencent.com"] }`) or via `BILI_MITM_DOMAINS`, restart bili, and make the client trust bili's root CA (`NODE_EXTRA_CA_CERTS=~/.local/share/billion-context/ca/root-ca.pem` for Node-based clients, or the client's own CA-path setting). The `/bili/` prefix trick does not apply here — there is no URL to change. Details: [CONFIGURATION.md → MITM](CONFIGURATION.md#mitm-transparent-proxy-login-clients).
+
 ## Running the proxy
 
 ### Flags

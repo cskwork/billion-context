@@ -14,6 +14,7 @@ import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { setLogCapture } from "../src/logger.ts";
 import { formatUpstreamError } from "../src/upstream-proxy.ts";
 import {
+    isMaskHostsEnabled,
     isPublicApiHost,
     maskHeaderForLog,
     maskHeadersForLog,
@@ -22,6 +23,7 @@ import {
     maskHostPortForLog,
     maskUrlForLog,
     maskUrlsInText,
+    setMaskHostsEnabled,
 } from "../src/log-mask.ts";
 
 /** #255 Part B: logs (bili.log + launcher tmp log) must carry no sensitive
@@ -128,6 +130,27 @@ test("maskHostInText: scrubs the tunnel target from error text, leaves other add
     );
     assert.equal(maskHostInText("no host here", "192.168.1.50"), "no host here");
     assert.equal(maskHostInText("connect ECONNREFUSED 192.168.1.50:8443", ""), "connect ECONNREFUSED 192.168.1.50:8443");
+});
+
+test("host masking default ON (#255) and setMaskHostsEnabled(false) opt-out (#897)", () => {
+    assert.ok(isMaskHostsEnabled(), "host masking must be ON by default");
+    assert.equal(maskHostForLog("relay.internal"), "<private-host>", "default masks non-public hosts");
+    setMaskHostsEnabled(false);
+    try {
+        assert.equal(maskHostForLog("relay.internal"), "relay.internal");
+        assert.equal(maskHostPortForLog("relay.internal:8443"), "relay.internal:8443");
+        assert.equal(maskUrlForLog("https://relay.internal/v1/chat/completions"), "https://relay.internal/v1/chat/completions");
+        assert.equal(maskUrlsInText("forward POST → http://192.168.1.50:11434/v1/messages"), "forward POST → http://192.168.1.50:11434/v1/messages");
+        assert.equal(maskHeaderForLog("host", "relay.internal"), "relay.internal");
+        assert.equal(maskHostInText("connect ECONNREFUSED 192.168.1.50:8443", "192.168.1.50"), "connect ECONNREFUSED 192.168.1.50:8443");
+        // Public hosts are verbatim either way; credential masking is a separate
+        // concern and stays ON while host masking is off.
+        assert.equal(maskHostForLog("api.openai.com"), "api.openai.com");
+        assert.equal(maskHeaderForLog("authorization", "Bearer sk-test-secret"), "<masked 21 chars>");
+    } finally {
+        setMaskHostsEnabled(true);
+    }
+    assert.equal(maskHostForLog("relay.internal"), "<private-host>", "restored to masked after opt-out test");
 });
 
 test("formatUpstreamError: non-public url and endpoint identity masked", () => {

@@ -7,6 +7,7 @@ import {
     type Config,
     type CoreMessage,
 } from "acp-kernel";
+import { getBlindTunnelStats } from "./mitm.js";
 import { preCompactionArchiveOf, type Session } from "./session.js";
 import { VERSION } from "./version.js";
 
@@ -72,6 +73,19 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
         for (const id of archivedIds) {
             extra.push(`  ${id} — ${archive[id].reason}`);
         }
+    }
+    const blind = getBlindTunnelStats();
+    if (blind.total > 0) {
+        // #897: CONNECT traffic to non-MITM hosts was blind-relayed — it never
+        // entered any session, so "no compressed blocks" can be a routing
+        // misconfiguration, not just a short conversation. Surface it here
+        // where an operator actually looks when compression appears dead.
+        const hosts = Object.entries(blind.hosts)
+            .sort((a, b) => b[1] - a[1])
+            .map(([h, n]) => `${h}×${n}`)
+            .join(", ");
+        extra.push("");
+        extra.push(`UNDECRYPTED TRAFFIC (instance-level): ${blind.total} CONNECT tunnel(s) to host(s) outside the MITM whitelist were blind-relayed since instance start — that traffic was never decrypted, so it never entered any session and CANNOT be compressed (${hosts}). To compress such a client: add its model domain to "mitm".domains in billion-context.json, restart bili, and make the client trust bili's root CA. Exact counts: GET /__bili/stats → blindTunnels.`);
     }
     return extra.length > 0 ? `${base}\n${extra.join("\n")}` : base;
 }

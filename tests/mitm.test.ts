@@ -7,9 +7,10 @@ import tls from "node:tls";
 import net from "node:net";
 import { once } from "node:events";
 import http from "node:http";
-import { isMitmHost, readMitmUpstream, MITM_UPSTREAM_KEY, setupMitm, noteMitmTlsError, _resetCertRejectionWarningForTest } from "../src/mitm.js";
+import { isMitmHost, readMitmUpstream, MITM_UPSTREAM_KEY, setupMitm, noteMitmTlsError, _resetCertRejectionWarningForTest, recordBlindTunnel, getBlindTunnelStats, _resetBlindTunnelStatsForTest } from "../src/mitm.js";
 import { ensureRootCA, rootCaPath, getSecureContext, mintHostCert, _resetForTest } from "../src/ca.js";
 import { _resetDiscoveryCacheForTest } from "../src/discover.js";
+import { setMaskHostsEnabled } from "../src/log-mask.js";
 
 // isMitmHost now calls discoverMitmDomains(), which reads real client config
 // files. Isolate discovery to an empty temp HOME so the isMitmHost assertions
@@ -350,6 +351,79 @@ await test("setupMitm e2e: blind TCP tunnel to a non-whitelisted host passes byt
             server.closeAllConnections?.();
             upstream.close();
             upstream.closeAllConnections?.();
+        }
+    });
+});
+
+test("recordBlindTunnel: counts per host and warns exactly once per host (#897)", () => {
+    _resetBlindTunnelStatsForTest();
+    const logs: string[] = [];
+    const log = (msg: string) => { logs.push(msg); };
+    recordBlindTunnel("copilot.tencent.com", log);
+    recordBlindTunnel("copilot.tencent.com", log);
+    recordBlindTunnel("copilot.tencent.com", log);
+    recordBlindTunnel("relay.internal", log);
+    const stats = getBlindTunnelStats();
+    assert.equal(stats.total, 4);
+    assert.deepEqual(stats.hosts, { "copilot.tencent.com": 3, "relay.internal": 1 });
+    const warnings = logs.filter((l) => l.includes("BLIND TUNNEL WARNING"));
+    assert.equal(warnings.length, 2, `one warning per distinct host, got ${warnings.length}`);
+    assert.match(warnings[0], /"mitm"\.domains/, "warning must name the config fix");
+    assert.match(warnings[0], /BILI_MITM_DOMAINS/, "warning must name the env alternative");
+    assert.match(warnings[0], /__bili\/stats/, "warning must point at the stats endpoint for exact hosts");
+    // #255 default: non-public hosts stay masked in the log even in warnings.
+    assert.ok(!warnings.some((l) => l.includes("copilot.tencent.com")), "non-public host must not appear verbatim by default");
+    assert.match(warnings[0], /<private-host>/, "masked placeholder expected by default");
+});
+
+test("recordBlindTunnel: BILI_LOG_MASK_HOSTS=0 (setMaskHostsEnabled(false)) shows real hosts (#897)", () => {
+    _resetBlindTunnelStatsForTest();
+    setMaskHostsEnabled(false);
+    try {
+        const logs: string[] = [];
+        recordBlindTunnel("copilot.tencent.com", (msg) => { logs.push(msg); });
+        recordBlindTunnel("copilot.tencent.com", (msg) => { logs.push(msg); });
+        const warnings = logs.filter((l) => l.includes("BLIND TUNNEL WARNING"));
+        assert.equal(warnings.length, 1, "still deduplicated per host when unmasked");
+        assert.ok(warnings[0].includes("copilot.tencent.com"), "real host visible when masking is opt-out");
+    } finally {
+        setMaskHostsEnabled(true);
+        _resetBlindTunnelStatsForTest();
+    }
+});
+
+await test("setupMitm e2e: blind tunnels are counted in getBlindTunnelStats and warned once (#897)", async () => {
+    await withTmpCa(async () => {
+        _resetBlindTunnelStatsForTest();
+        const upstream = net.createServer((sock) => {
+            sock.on("data", (c) => sock.write("UPSTREAM-SAW:" + c.toString("utf8")));
+        });
+        upstream.listen(0, "127.0.0.1");
+        await once(upstream, "listening");
+        const upPort = (upstream.address() as { port: number }).port;
+
+        const logs: string[] = [];
+        const server = http.createServer((_req, res) => { res.writeHead(500); res.end(); });
+        setupMitm(server, [], (msg) => { logs.push(msg); });
+        server.listen(0, "127.0.0.1");
+        await once(server, "listening");
+        const port = (server.address() as { port: number }).port;
+        try {
+            for (let i = 0; i < 2; i++) {
+                const { statusLine, socket } = await rawConnect(port, "127.0.0.1", `127.0.0.1:${upPort}`);
+                assert.match(statusLine, /^HTTP\/1\.1 200/);
+                socket.destroy();
+            }
+            const stats = getBlindTunnelStats();
+            assert.equal(stats.total, 2, "each established blind tunnel must be counted");
+            assert.deepEqual(stats.hosts, { "127.0.0.1": 2 });
+            assert.equal(logs.filter((l) => l.includes("BLIND TUNNEL WARNING")).length, 1, "warning fires once per host, not per tunnel");
+        } finally {
+            server.close();
+            server.closeAllConnections?.();
+            upstream.close();
+            upstream.closeAllConnections?.();
+            _resetBlindTunnelStatsForTest();
         }
     });
 });

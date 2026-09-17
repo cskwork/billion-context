@@ -14,7 +14,7 @@ import { contextFromRegistry, loadRegistry, peekRegistryContext } from "./regist
 import { codexAlignedWindow } from "./codex-models.js";
 import { fetchWithTimeout, MAX_REQUEST_BYTES, upstreamTimeoutMs } from "./fetch-util.js";
 import { formatUpstreamError, getUpstreamConnectionStatus, recordUpstreamConnection, resolveProxy, resolveProxyDecision, proxyDispatcher, type UpstreamProxyDecision } from "./upstream-proxy.js";
-import { maskHeaderForLog, maskHeadersForLog, maskHostPortForLog, maskUrlForLog, maskUrlsInText } from "./log-mask.js";
+import { maskHeaderForLog, maskHeadersForLog, maskHostPortForLog, setMaskHostsEnabled, maskUrlForLog, maskUrlsInText } from "./log-mask.js";
 // Protocol codecs live in the kernel now (single source of truth shared with
 // the omp/pi adapters): import from "acp-kernel/wire".
 import {
@@ -76,7 +76,7 @@ import { affinityToken, clientConversationHeader, codexTurnIdentity, preferPromp
 import { prefixAffinity, type AnonymousAffinity } from "./prefix-affinity.js";
 import { flushPrefixAffinity, hydratePrefixAffinity, scheduleAffinityPersist } from "./affinity-persist.js";
 import { consumePluginRegisterFor, flushConversations, handlePluginCompact, handlePluginManifest, handlePluginRegister, handlePluginStatus, handlePluginTool, loadConversations, pipePluginChatWithStrip, pipePluginJson, pipePluginResponsesWithStrip, pluginAgentHeader, pluginConversationHeader, pluginReportedContextWindow, recordPluginSession, rememberPluginMessages, takePendingPluginRegister } from "./plugin.js";
-import { setupMitm, readMitmUpstream } from "./mitm.js";
+import { setupMitm, readMitmUpstream, getBlindTunnelStats } from "./mitm.js";
 import type { BiliMessage } from "acp-kernel/wire";
 import { hardenOpenaiAssistantContent, isLoopbackAddress, inspectContextOverflow, reserveOutputHeadroom, shouldReserveOutputHeadroom, systemToUser, usageTotals, type WireProtocol } from "./util.js";
 import { resolveConfirmedLimit, resolveLearnedLimit, resolveSpeculativeLimit, retractStaleLearnedLimits } from "./weak-overflow.js";
@@ -302,6 +302,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
                 body,
         );
     });
+    setMaskHostsEnabled(opts.maskHosts ?? true);
     if (opts.mitm.enabled) {
         // Non-loopback bind (--host 0.0.0.0 / LAN IP) opts into serving
         // remote clients: CONNECT is then allowed for non-loopback clients
@@ -643,7 +644,7 @@ async function handle(
     }
     if (req.method === "GET" && req.url === "/__bili/health") {
         res.writeHead(200, { "content-type": "application/json" });
-        res.end(JSON.stringify({ ok: true, upstream: opts.upstream, instanceId, pid: process.pid, startedAt: instanceStartedAt }));
+        res.end(JSON.stringify({ ok: true, upstream: opts.upstream, instanceId, pid: process.pid, startedAt: instanceStartedAt, blindTunnels: getBlindTunnelStats() }));
         return;
     }
     // Web config UI (served as HTML, separate from the JSON health check above).
@@ -4088,7 +4089,7 @@ function sendStats(res: http.ServerResponse): void {
         restored: s.restored === true,
     }));
     res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({ sessions }, null, 2));
+    res.end(JSON.stringify({ sessions, blindTunnels: getBlindTunnelStats() }, null, 2));
 }
 
 function headerValue(req: http.IncomingMessage, name: string): string | undefined {
