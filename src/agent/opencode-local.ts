@@ -43,6 +43,7 @@ import {
     buildCompressSystemPrompt,
     parseCompressInput,
     withConversationIdNote,
+    withLocalTagFormatNote,
     withMarkerIntegrityNote,
     withStagedCompressGuidance,
 } from "../compress-tool.js";
@@ -186,7 +187,7 @@ export function opencodeToCore(messages: OcMessage[]): CoreMessage[] {
 // seam, so stripping on ingest is the equivalent guard.
 function stripEchoes(messages: CoreMessage[]): CoreMessage[] {
     for (const m of messages) {
-        if (m.role === "assistant" && m.contentType === "text" && m.text !== undefined && m.text.includes("\\x3cacp")) {
+        if (m.role === "assistant" && m.contentType === "text" && m.text !== undefined && m.text.includes("\x3cacp")) {
             m.text = stripAcpTags(m.text);
         }
     }
@@ -384,7 +385,7 @@ export function createOpencodeLocalHost(): OpencodeLocalHost {
             e.messages = rebuilt;
             const sys = e.system;
             if (Array.isArray(sys)) {
-                const prompt = withConversationIdNote(withMarkerIntegrityNote(buildCompressSystemPrompt(defaultPrompts)), ensureCanonicalId(session));
+                const prompt = withLocalTagFormatNote(withConversationIdNote(withMarkerIntegrityNote(buildCompressSystemPrompt(defaultPrompts)), ensureCanonicalId(session)));
                 sys.push({ type: "text", text: prompt });
             }
         },
@@ -414,6 +415,29 @@ export function createOpencodeLocalHost(): OpencodeLocalHost {
                     result = executeSearchContext(args, core, session.state);
                 } else if (name === "acp_status") {
                     result = handleAcpStatus(args, ctx);
+                    // Default (no drilldown args) renders the panel first — the
+                    // same panel /acp shows — then the structured report the
+                    // model needs. Drilldown queries (scope/view/tool/sort/limit)
+                    // return the report alone.
+                    const drilldown = typeof args.scope === "string" || typeof args.view === "string"
+                        || typeof args.tool === "string" || typeof args.sort === "string" || typeof args.limit === "number";
+                    if (!drilldown) {
+                        const turn = core.processTurn({
+                            messages: mem.view,
+                            state: session.state,
+                            config: mem.config,
+                            tokenCount: session.stats.lastInputTokens,
+                            renderTags: "none",
+                        });
+                        result = buildStatusPanel({
+                            version: `billion-context-opencode-local@${VERSION}`,
+                            tokenCount: session.stats.lastInputTokens,
+                            systemPromptTokens: mem.systemTokens,
+                            state: session.state,
+                            nudge: turn.nudge,
+                            modelContextLimit: mem.window,
+                        }) + "\n\n" + result;
+                    }
                 } else {
                     const absorb = effectiveAbsorbConfig(session, mem.config);
                     if (absorb?.enabled === true && name === (absorb.toolName ?? ABSORB_TOOL_NAME)) {

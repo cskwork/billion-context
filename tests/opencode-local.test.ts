@@ -272,3 +272,41 @@ test("local host: renderStatus reports state after a turn", async () => {
         assert.match(panel, /Context/);
     });
 });
+
+test("local host: acp_status default renders the status panel first, drilldown args return the report alone", async () => {
+    const state = fs.mkdtempSync(path.join(os.tmpdir(), "bili-oc-local-st2-"));
+    await withEnv({ XDG_STATE_HOME: state, BILLION_CONTEXT_PLUGIN: undefined }, async () => {
+        _resetSessionsForTest();
+        const host = createOpencodeLocalHost();
+        const sid = "ses_status_tool";
+        await host.onContext(ctxEvent(sid, transcript(sid)), 1000);
+        const plain = await host.executeTool("acp_status", {}, sid, "call_st");
+        assert.match(plain, /ACP Context Analysis/, "default call must lead with the panel");
+        assert.match(plain, /ACTIVE SURFACE/, "structured report follows the panel");
+        const drill = await host.executeTool("acp_status", { scope: "compressed" }, sid, "call_st2");
+        assert.ok(!drill.includes("ACP Context Analysis"), "drilldown returns the report alone");
+        assert.match(drill, /pack=default/);
+    });
+});
+
+test("local host: echoed acp tags in assistant text are stripped on ingest (wire view stays clean)", async () => {
+    const state = fs.mkdtempSync(path.join(os.tmpdir(), "bili-oc-local-echo-"));
+    await withEnv({ XDG_STATE_HOME: state, BILLION_CONTEXT_PLUGIN: undefined }, async () => {
+        _resetSessionsForTest();
+        const host = createOpencodeLocalHost();
+        const sid = "ses_echo";
+        const echoed = "checking status\n\x3cacp tokens=\"18\" type=\"tool:acp_status\"\x3em00006\x3c/acp\x3e\ndone";
+        const e = ctxEvent(sid, [
+            { id: "msg_u1", role: "user", content: [{ type: "text", text: "check status" }] },
+            { id: "msg_a1", role: "assistant", content: [{ type: "text", text: echoed }] },
+        ]);
+        await host.onContext(e, 100000);
+        const texts: string[] = [];
+        for (const m of e.messages) {
+            for (const p of m.content) if (p.type === "text" && typeof p.text === "string") texts.push(p.text);
+        }
+        const joined = texts.join("\n");
+        assert.ok(!joined.includes("tool:acp_status"), `fabricated tag must not survive ingest/view, got: ${JSON.stringify(joined)}`);
+        assert.ok(!joined.replace(/\x3cacp tokens="[^"]*" type="[^"]+"\x3e[^\x3c]*\x3c\/acp\x3e/g, "").includes("\x3cacp"), "only the host's own text tags may appear");
+    });
+});
