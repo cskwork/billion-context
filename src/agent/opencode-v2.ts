@@ -41,7 +41,12 @@
 // available on all observed surfaces.
 
 import { ACP_TOOLS_OPENAI, ABSORB_TOOL_OPENAI } from "../compress-tool.js";
-import { forwardTool, proxyBaseFromEnv, proxyBaseFromUrl, reportCompactionBoundary } from "./shared.js";
+import { fetchProxyVersion, fetchStatus, forwardTool, proxyBaseFromEnv, proxyBaseFromUrl, reportCompactionBoundary } from "./shared.js";
+
+// OpenCode V2 TUI renders a synthetic message as a visible Notice row only when its display text fits the
+// timeline cap (~1KB): longer text renders nothing (#880). Panels go to description verbatim under the cap.
+import { V2_SYNTHETIC_TEXT } from "./shared.js";
+const V2_SYNTHETIC_VISIBLE_MAX = 1024;
 
 type V2Registration = { dispose?: () => void | Promise<void> };
 
@@ -65,6 +70,19 @@ interface V2ToolEditor {
     }): void;
 }
 
+interface V2CommandInvocation {
+    sessionID?: unknown;
+    [key: string]: unknown;
+}
+
+interface V2CommandEditor {
+    add(def: {
+        name: string;
+        description?: string;
+        execute: (input: V2CommandInvocation) => Promise<void>;
+    }): void;
+}
+
 interface V2CatalogModelEntry {
     providerID?: unknown;
     id?: unknown;
@@ -74,9 +92,13 @@ interface V2CatalogModelEntry {
 export interface V2PluginContext {
     session?: {
         hook?: (name: string, cb: (e: V2HttpRequestEvent) => void | Promise<void>) => void | Promise<V2Registration | undefined>;
+        synthetic?: (input: { sessionID: string; text: string; description?: string; resume?: boolean }) => Promise<unknown>;
     };
     tool?: {
         transform?: (cb: (editor: V2ToolEditor) => void) => void | Promise<V2Registration | undefined>;
+    };
+    command?: {
+        transform?: (cb: (editor: V2CommandEditor) => void) => void | Promise<V2Registration | undefined>;
     };
     event?: { subscribe?: (opts?: { signal?: AbortSignal }) => AsyncIterable<{ type?: unknown; data?: Record<string, unknown> }> | undefined };
     catalog?: { model?: { list?: () => Promise<{ data?: V2CatalogModelEntry[] }> | undefined } | undefined };
@@ -180,16 +202,107 @@ export function createOpencodeV2Setup(options: OpencodeV2SetupOptions = {}): (ct
                         const base = state.proxyBase ?? proxyBaseFromEnv();
                         if (!base) return { content: "bili: no proxy detected (launch opencode through `bili opencode`, or point the provider baseURL at the bili proxy)" };
                         try {
+                            // Panel-first for acp_status: the proxy's status
+                            // endpoint renders the same rich panel the /acp
+                            // command shows; the forwarded kernel tool returns
+                            // the legacy flat report. acp_status is read-only,
+                            // so reading the panel changes no state. Fall back
+                            // to the tool call when no panel comes back (older
+                            // proxy, unknown conversation).
+                            if (t.name === "acp_status") {
+                                const status = await fetchStatus(base, tctx.sessionID);
+                                const panel = status?.["panel"];
+                                if (typeof panel === "string" && panel.length > 0) return { content: panel };
+                            }
                             const result = await forwardTool(base, tctx.sessionID, t.name, args);
                             return { content: result };
                         } catch (err) {
-                            return { content: err instanceof Error ? err.message : String(err) };
+                            const msg = err instanceof Error ? err.message : String(err);
+                            if (msg.includes("no model request has arrived with this conversation id yet")) {
+                                return { content: "bili: no ACP state for this session yet — no model request has been routed through the proxy. Tell the user to send one normal message first; ACP activates automatically once model traffic flows through the proxy (verify the provider baseURL goes through bili, or launch via `bili opencode` / the installed plugin)." };
+                            }
+                            return { content: msg };
                         }
                     },
                 });
             }
         });
         if (toolReg) registrations.push(toolReg);
+
+        // /acp status command (#809): registered via the V2 command editor where
+        // supported (2.0.x stable; inert-safe otherwise) and rendered as a
+        // synthetic non-model-turn message; TUI-only (`run` dispatches no slash cmds).
+        try {
+            const commandReg = await ctx.command?.transform?.((editor) => {
+                editor.add({
+                    name: "acp",
+                    description: "Show ACP status (billion-context proxy)",
+                    execute: async (input) => {
+                        const sid = typeof input.sessionID === "string" ? input.sessionID : "";
+                        if (!sid) {
+                            console.warn("[bili-opencode] /acp invoked without a sessionID; cannot render ACP status");
+                            return;
+                        }
+                        let text: string;
+                        if (pluginDisabled()) {
+                            text = "bili: disabled (BILLION_CONTEXT_PLUGIN=0)";
+                        } else {
+                            const base = state.proxyBase ?? proxyBaseFromEnv();
+                            if (!base) {
+                                text = "bili: no proxy detected (set BILLION_CONTEXT_PROXY or point the provider at the proxy's /bili/ URL, then run /acp again)";
+                            } else {
+                                try {
+                                    const status = await fetchStatus(base, sid);
+                                    if (status && typeof status.panel === "string" && status.panel.length > 0) {
+                                        text = status.panel;
+                                    } else if (status && status.ok === false) {
+                                        let version: string | undefined;
+                                        try {
+                                            version = await fetchProxyVersion(base);
+                                        } catch {
+                                            version = undefined;
+                                        }
+                                        text = version !== undefined
+                                            ? `billion-context@${version} — proxy connected, no ACP session yet. Send a model request, then run /acp again.`
+                                            : "bili: no ACP session yet (send a model request first, then run /acp)";
+                                    } else if (!status) {
+                                        // fetchStatus soft-fails to undefined both when the proxy 404s an absent or
+                                        // never-seen conversation and when the proxy is unreachable. Probe the
+                                        // manifest to claim "connected" only when it answers.
+                                        const version = await fetchProxyVersion(base).catch(() => undefined);
+                                        text = version !== undefined
+                                            ? `billion-context@${version} — proxy connected, no ACP session yet. Send a model request, then run /acp again.`
+                                            : "bili: cannot reach the bili proxy (run `bili start`, then run /acp again)";
+                                    } else {
+                                        const errText = status?.error;
+                                        text = typeof errText === "string" && errText.length > 0
+                                            ? `bili: proxy returned no status panel (${errText})`
+                                            : "bili: proxy returned no status panel";
+                                    }
+                                } catch (err) {
+                                    text = `bili: /acp failed (${err instanceof Error ? err.message : String(err)})`;
+                                }
+                            }
+                        }
+                        try {
+                            // resume:false — OpenCode V2 defaults to delivery "steer" + execution.wake(), which would
+                            // start a model turn on every /acp invocation with no user input (spurious empty turns).
+                            // Short panels become the visible description verbatim; long ones keep their leading
+                            // lines plus a marker so the model-facing body never repeats the whole panel.
+                            const description = text.length > V2_SYNTHETIC_VISIBLE_MAX
+                                ? text.slice(0, V2_SYNTHETIC_VISIBLE_MAX - 20) + "\n\n[panel truncated]"
+                                : text;
+                            await ctx.session?.synthetic?.({ sessionID: sid, text: V2_SYNTHETIC_TEXT, description, resume: false });
+                        } catch (err) {
+                            console.error(`[bili-opencode] /acp render failed: ${err instanceof Error ? err.message : String(err)}`);
+                        }
+                    },
+                });
+            });
+            if (commandReg) registrations.push(commandReg);
+        } catch (err) {
+            console.warn(`[bili-opencode] /acp command registration unavailable; continuing without it: ${err instanceof Error ? err.message : String(err)}`);
+        }
 
         const subscription = ctx.event?.subscribe?.({ signal: ac.signal });
         if (subscription && typeof subscription[Symbol.asyncIterator] === "function") {
