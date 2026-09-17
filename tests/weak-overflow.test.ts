@@ -1,6 +1,6 @@
 import { test, beforeEach } from "node:test";
 import assert from "node:assert/strict";
-import { noteWeakOverflow, resetWeakOverflow, resolveConfirmedLimit, resolveLearnedLimit, retractStaleLearnedLimits } from "../src/weak-overflow.ts";
+import { noteWeakOverflow, resetWeakOverflow, recordProvenInput, resolveConfirmedLimit, resolveLearnedLimit, resolveProvenBaseline, retractStaleLearnedLimits, sessionProvenMax } from "../src/weak-overflow.ts";
 import type { Session } from "../src/session.ts";
 
 const ids: string[] = [];
@@ -22,11 +22,77 @@ beforeEach(() => {
     ids.length = 0;
 });
 
-test("low usage is ignored entirely", () => {
-    const session = makeSession(100000);
-    for (let i = 0; i < 10; i++) noteWeakOverflow(session, { inputTokens: 50000, reason: "test" });
-    assert.equal(session.metadata.learnedContextLimit, undefined);
-    assert.equal((session.stats as { lastInputTokens: number }).lastInputTokens, 0);
+// #901: the old gate counted only failures at ≥90% of the TRUSTED window. When
+// the trusted window overstated reality, every overflow failure landed below
+// the gate and the learner starved exactly where the deployment was broken.
+// The baseline is now demonstrated capability (recordProvenInput on genuine
+// completions), not the trusted window.
+
+test("#901: failures at or below demonstrated capability are not counted", () => {
+    const session = makeSession(1_000_000);
+    recordProvenInput(session, 391_918, "glm");
+    // The issue's 7 mid-stream cuts: inputs 60k–96k, all far below the 392k
+    // success level — relay instability, not overflow.
+    for (const input of [60_000, 72_000, 81_000, 88_000, 92_000, 95_000, 96_000]) {
+        noteWeakOverflow(session, { inputTokens: input, model: "glm", reason: "relay cut" });
+    }
+    assert.equal(session.metadata.learnedContextLimit, undefined, "noise never learns a window");
+    assert.equal(session.metadata.learnedContextLimits, undefined);
+    assert.equal((session.stats as { lastInputTokens: number }).lastInputTokens, 0, "emergency shrink never armed by noise");
+});
+
+test("#901 regression: no success sample yet — low-usage failures count (the blind spot)", () => {
+    const session = makeSession(1_000_000);
+    // 40% of the trusted 1M window: under the old MIN_USAGE gate this was
+    // ignored forever when the trusted window overstated reality (~370k true).
+    for (const r of ["r1", "r2", "r3"]) noteWeakOverflow(session, { inputTokens: 400_000, reason: r });
+    assert.equal(session.metadata.learnedContextLimit, 400_000, "learned despite 40% usage of the trusted window");
+    assert.equal((session.stats as { lastInputTokens: number }).lastInputTokens, 400_000, "emergency shrink armed");
+});
+
+test("#901: filtered noise does not consume the event budget — a real overflow still fires", () => {
+    const session = makeSession(1_000_000);
+    recordProvenInput(session, 391_918, "glm");
+    for (let i = 0; i < 10; i++) noteWeakOverflow(session, { inputTokens: 90_000, model: "glm", reason: "noise" });
+    noteWeakOverflow(session, { inputTokens: 400_000, model: "glm", reason: "o1" });
+    noteWeakOverflow(session, { inputTokens: 402_000, model: "glm", reason: "o2" });
+    noteWeakOverflow(session, { inputTokens: 404_000, model: "glm", reason: "o3" });
+    assert.equal((session.metadata.learnedContextLimits as Record<string, number>)["glm"], 404_000);
+});
+
+test("#901: the issue deployment end-to-end — inflated 1M trusted, 392k proven, 60–96k cuts are noise, 400k cutoffs learn", () => {
+    const session = makeSession(1_000_000);
+    recordProvenInput(session, 391_918, "z-ai/glm-5.3-flash");
+    for (let i = 0; i < 7; i++) {
+        noteWeakOverflow(session, { inputTokens: 60_000 + i * 5_000, model: "z-ai/glm-5.3-flash", reason: "ttft_timeout@180s" });
+    }
+    assert.equal(session.metadata.learnedContextLimits, undefined, "cuts below demonstrated capability never learn a window");
+    for (const r of ["r1", "r2", "r3"]) {
+        noteWeakOverflow(session, { inputTokens: 400_000, model: "z-ai/glm-5.3-flash", reason: "cut" });
+    }
+    assert.equal((session.metadata.learnedContextLimits as Record<string, number>)["z-ai/glm-5.3-flash"], 400_000, "oversized deaths above capability confirm");
+});
+
+test("#901: recordProvenInput stores per-model and scalar; baseline resolves max with scalar fallback", () => {
+    const session = makeSession(1_000_000);
+    recordProvenInput(session, 50_000, "a");
+    recordProvenInput(session, 391_918, "a");
+    recordProvenInput(session, 200_000, "b");
+    recordProvenInput(session, 80_000);
+    assert.equal(resolveProvenBaseline(session, "a"), 391_918, "max of recent successes for the model");
+    assert.equal(resolveProvenBaseline(session, "b"), 200_000);
+    assert.equal(resolveProvenBaseline(session, "c"), 80_000, "model with no samples falls back to the scalar bucket");
+    assert.equal(resolveProvenBaseline(session), 80_000);
+    assert.equal(sessionProvenMax(session), 391_918, "display aid spans all models + scalar");
+});
+
+test("#901: the proven ring is bounded so a resized upstream drains out", () => {
+    const session = makeSession(1_000_000);
+    recordProvenInput(session, 999_999);
+    for (let i = 1; i <= 100; i++) recordProvenInput(session, i * 1000);
+    const arr = session.metadata.provenInput as number[];
+    assert.equal(arr.length, 100, "ring capped at PROVEN_MAX_SAMPLES");
+    assert.equal(resolveProvenBaseline(session), 100_000, "the stale giant drained out of the ring");
 });
 
 test("three high-usage events learn a conservative window and arm emergency", () => {
@@ -74,11 +140,16 @@ test("events older than the window do not accumulate", () => {
     }
 });
 
-test("unknown window disables the signal", () => {
+// #901: counting no longer requires a configured window at all — capability
+// evidence (or its absence) decides, so sessions with an unknown window can
+// still learn from repeated oversized deaths.
+test("#901: no configured window — failures still accumulate and learn", () => {
     const session = makeSession(0);
-    noteWeakOverflow(session, { inputTokens: 95000, reason: "r" });
-    assert.equal(session.metadata.learnedContextLimit, undefined);
-    assert.equal((session.stats as { lastInputTokens: number }).lastInputTokens, 0);
+    noteWeakOverflow(session, { inputTokens: 95000, reason: "r1" });
+    noteWeakOverflow(session, { inputTokens: 96000, reason: "r2" });
+    assert.equal(session.metadata.learnedContextLimit, undefined, "not before the 3rd event");
+    noteWeakOverflow(session, { inputTokens: 97000, reason: "r3" });
+    assert.equal(session.metadata.learnedContextLimit, 97000, "learns with zero configured window");
 });
 
 test("falls back to lastInputTokens when inputTokens is absent", () => {
