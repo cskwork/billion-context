@@ -428,9 +428,9 @@ export async function* runCompressLoop(
                 // with tool-call fragments falls through to the plain
                 // truncation error, since their semantics only survive a
                 // completed stream. OpenAI wire only: visible text means the
-                 // stateful wires' identity framing (message_start /
-                 // response.created) already reached the client, and a
-                 // re-fetched response would duplicate it.
+                // stateful wires' identity framing (message_start /
+                // response.created) already reached the client, and a
+                // re-fetched response would duplicate it.
                 if (
                     (!sawDone || truncatedDone) &&
                     forwardedVisible &&
