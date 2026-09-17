@@ -202,6 +202,18 @@ export function createOpencodeV2Setup(options: OpencodeV2SetupOptions = {}): (ct
                         const base = state.proxyBase ?? proxyBaseFromEnv();
                         if (!base) return { content: "bili: no proxy detected (launch opencode through `bili opencode`, or point the provider baseURL at the bili proxy)" };
                         try {
+                            // Panel-first for acp_status: the proxy's status
+                            // endpoint renders the same rich panel the /acp
+                            // command shows; the forwarded kernel tool returns
+                            // the legacy flat report. acp_status is read-only,
+                            // so reading the panel changes no state. Fall back
+                            // to the tool call when no panel comes back (older
+                            // proxy, unknown conversation).
+                            if (t.name === "acp_status") {
+                                const status = await fetchStatus(base, tctx.sessionID);
+                                const panel = status?.["panel"];
+                                if (typeof panel === "string" && panel.length > 0) return { content: panel };
+                            }
                             const result = await forwardTool(base, tctx.sessionID, t.name, args);
                             return { content: result };
                         } catch (err) {
