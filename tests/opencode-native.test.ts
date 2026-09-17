@@ -274,11 +274,28 @@ test("nativeAttachOrigin: normalizes a valid http(s) origin (trailing slash stri
     assert.equal(nativeAttachOrigin({ BILLION_CONTEXT_ATTACH: "  https://proxy.example.com/ " }), "https://proxy.example.com");
 });
 
-test("planNativeOpencode: default is spawn; opt-out and launcher-owned are off", () => {
+test("planNativeOpencode: default is spawn; opt-out and /bili/ launches are off", () => {
     assert.deepEqual(planNativeOpencode({}), { mode: "spawn" });
     assert.deepEqual(planNativeOpencode({ BILLION_CONTEXT_PLUGIN: "0" }), { mode: "off" });
     assert.deepEqual(planNativeOpencode({ BILI_NATIVE_OPENCODE: "0" }), { mode: "off" });
-    assert.deepEqual(planNativeOpencode({ BILLION_CONTEXT_PROXY: "http://127.0.0.1:36485" }), { mode: "off" });
+    assert.deepEqual(planNativeOpencode({ BILI_PROVIDER_REWRITES: '{"vllm":"http://127.0.0.1:1/bili/http://x"}' }), { mode: "off" });
+});
+
+test("planNativeOpencode: a preset BILLION_CONTEXT_PROXY is an attach target, not a stand-down", () => {
+    assert.deepEqual(
+        planNativeOpencode({ BILLION_CONTEXT_PROXY: "http://127.0.0.1:36485" }),
+        { mode: "attach", attachOrigin: "http://127.0.0.1:36485" },
+    );
+    assert.deepEqual(
+        planNativeOpencode({ BILLION_CONTEXT_PROXY: "http://127.0.0.1:36485/" }),
+        { mode: "attach", attachOrigin: "http://127.0.0.1:36485" },
+    );
+    // kill switches and a /bili/ launch still win over the preset
+    assert.deepEqual(planNativeOpencode({ BILLION_CONTEXT_PROXY: "http://127.0.0.1:36485", BILLION_CONTEXT_PLUGIN: "0" }), { mode: "off" });
+    assert.deepEqual(planNativeOpencode({ BILLION_CONTEXT_PROXY: "http://127.0.0.1:36485", BILI_PROVIDER_REWRITES: "{}" }), { mode: "off" });
+    // a garbage preset falls back to spawn (self-managed) rather than dead-off
+    assert.deepEqual(planNativeOpencode({ BILLION_CONTEXT_PROXY: "garbage" }), { mode: "spawn" });
+    assert.deepEqual(planNativeOpencode({ BILLION_CONTEXT_PROXY: "  " }), { mode: "spawn" });
 });
 
 test("planNativeOpencode: attach wins over spawn when no launcher owns the proxy", () => {
@@ -289,10 +306,10 @@ test("planNativeOpencode: attach wins over spawn when no launcher owns the proxy
     assert.deepEqual(planNativeOpencode({ BILLION_CONTEXT_ATTACH: "garbage" }), { mode: "spawn" });
 });
 
-test("planNativeOpencode: a launcher-owned proxy stands down even over an explicit attach", () => {
+test("planNativeOpencode: explicit BILLION_CONTEXT_ATTACH wins over the env preset", () => {
     assert.deepEqual(
         planNativeOpencode({ BILLION_CONTEXT_PROXY: "http://127.0.0.1:36485", BILLION_CONTEXT_ATTACH: "http://10.0.0.5:9000" }),
-        { mode: "off" },
+        { mode: "attach", attachOrigin: "http://10.0.0.5:9000" },
     );
 });
 

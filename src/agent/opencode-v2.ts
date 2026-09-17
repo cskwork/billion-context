@@ -205,7 +205,11 @@ export function createOpencodeV2Setup(options: OpencodeV2SetupOptions = {}): (ct
                             const result = await forwardTool(base, tctx.sessionID, t.name, args);
                             return { content: result };
                         } catch (err) {
-                            return { content: err instanceof Error ? err.message : String(err) };
+                            const msg = err instanceof Error ? err.message : String(err);
+                            if (msg.includes("no model request has arrived with this conversation id yet")) {
+                                return { content: "bili: no ACP state for this session yet — no model request has been routed through the proxy. Tell the user to send one normal message first; ACP activates automatically once model traffic flows through the proxy (verify the provider baseURL goes through bili, or launch via `bili opencode` / the installed plugin)." };
+                            }
+                            return { content: msg };
                         }
                     },
                 });
