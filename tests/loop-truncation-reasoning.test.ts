@@ -6,12 +6,14 @@ import type { Session } from "../src/session.ts";
 import { runCompressLoop, createOpenaiAdapter } from "../src/loop/index.ts";
 import { buildCompressSystemPrompt } from "../src/compress-tool.ts";
 
-// #413 review: the truncation-retry predicate must treat live-forwarded
-// reasoning chunks as client-visible side effects. The openai adapter yields
-// reasoning events with `raw` (adapter-openai.ts:328) and no meta precedes a
-// pure reasoning_content chunk — if those yields don't set forwardedAny, a
-// round-1 truncation after reasoning-only output retries and the client sees
-// the partial reasoning TWICE.
+// #413 follow-up (#862): a reasoning-only prefix is invisible to host turn
+// semantics — the client's turn does not start until visible text or a tool
+// call arrives. A round-1 truncation after live-forwarded reasoning chunks is
+// therefore retried once (blind re-fetch): the re-fetched stream appends its
+// own thinking + answer to the same wire and the client never sees an error.
+// Pre-#862 this shape was left as a hard error because the gate counted
+// reasoning bytes as client-visible (forwardedAny); the gate is now
+// !forwardedVisible (src/loop/core.ts).
 
 const OPENAI_BODY = { model: "glm", messages: [], stream: true, max_tokens: 10 };
 
@@ -21,6 +23,7 @@ function makeCtx(id: string): {
     messages: CoreMessage[];
     session: Session;
     log: (m: string) => void;
+    protocol: "openai";
 } {
     return {
         core: createCore(),
@@ -39,6 +42,7 @@ function makeCtx(id: string): {
             persisted: false,
         },
         log: () => {},
+        protocol: "openai",
     };
 }
 
@@ -63,7 +67,7 @@ function mockFetch(handler: () => Response): { calls: () => number; restore: () 
 
 const sse = (obj: unknown): string => `data: ${JSON.stringify(obj)}\n\n`;
 
-test("truncation after live reasoning chunks must not retry (reasoning already reached the client)", async () => {
+test("truncation after live reasoning chunks retries once (reasoning-only prefix is invisible to host turn semantics)", async () => {
     const partial = sse({ id: "c1", choices: [{ index: 0, delta: { reasoning_content: "partial thought before EOF" } }] });
     const full = sse({ id: "c2", choices: [{ index: 0, delta: { reasoning_content: "second attempt reasoning" } }] })
         + sse({ id: "c2", choices: [{ index: 0, delta: { content: "FINAL ANSWER" } }] })
@@ -73,12 +77,12 @@ test("truncation after live reasoning chunks must not retry (reasoning already r
     const ctx = makeCtx("trunc-reasoning");
     try {
         const out = await drain(new Response(partial, { status: 200 }).body!, ctx);
-        assert.equal(mock.calls(), 0, "no retry: reasoning bytes were already forwarded to the client");
+        assert.equal(mock.calls(), 1, "one blind re-fetch: nothing client-VISIBLE reached the turn yet");
         const firstIdx = out.indexOf("partial thought before EOF");
-        assert.ok(firstIdx >= 0, "partial reasoning was forwarded to the client");
+        assert.ok(firstIdx >= 0, "attempt-1 partial reasoning was forwarded to the client");
         assert.equal(out.indexOf("partial thought before EOF", firstIdx + 1), -1, "partial reasoning appears exactly once (no duplicated attempt)");
-        assert.ok(!out.includes("second attempt reasoning"), "retry stream content never fetched");
-        assert.ok(out.includes("upstream stream truncated"), "truncation surfaced to client");
+        assert.ok(out.includes("FINAL ANSWER"), "the re-fetched stream's answer reached the client");
+        assert.ok(!out.includes("upstream stream truncated"), "self-healed: no truncation error surfaced");
     } finally {
         mock.restore();
     }
