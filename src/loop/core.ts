@@ -454,7 +454,12 @@ export async function* runCompressLoop(
                 resolvedText = extracted.clean;
                 allCalls = [...calls, ...extracted.calls];
             }
-            const functionCallIds = new Set(calls.map(c => c.callId));
+            // #906: gate on allCalls (structured + text-extracted), not just
+            // structured calls — an extracted trigger executes identically, so
+            // its result must ride back as a real tool-call/tool-result pair;
+            // the marker fallback below would become a mid-conversation
+            // developer item the backend may drop (and truncates the result).
+            const functionCallIds = new Set(allCalls.map(c => c.callId));
 
             if (ctx.textProtocol && resolvedText.length > 0) {
                 yield adapter.emitText(resolvedText);
