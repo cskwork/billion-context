@@ -40,6 +40,44 @@ export function _resetCertRejectionWarningForTest(): void {
     warnedCertRejected = false;
 }
 
+// #897: a client wired via http.proxy/CONNECT whose model host is NOT on the
+// MITM whitelist is blind-tunnelled — no error, no compression, silently.
+// Track per-host tunnel counts (instance-level: undecrypted traffic never
+// reaches the session layer) and warn ONCE per host with the fix, so the
+// failure mode is visible instead of silent.
+const blindTunnelCounts = new Map<string, number>();
+const warnedBlindTunnels = new Set<string>();
+
+export interface BlindTunnelStats {
+    total: number;
+    hosts: Record<string, number>;
+}
+
+/** Record one established blind TCP tunnel for `host`. Warns once per host
+ *  per process with the remediation steps. */
+export function recordBlindTunnel(host: string, log?: Logger): void {
+    blindTunnelCounts.set(host, (blindTunnelCounts.get(host) ?? 0) + 1);
+    if (!warnedBlindTunnels.has(host)) {
+        warnedBlindTunnels.add(host);
+        log?.(`mitm ${maskHostForLog(host)} BLIND TUNNEL WARNING: this host is not in the MITM whitelist, so bili relays its TLS traffic opaquely and CANNOT see or compress this client's model requests. To compress it: add its domain to "mitm".domains in billion-context.json (or BILI_MITM_DOMAINS), restart bili, and make the client trust bili's root CA (${rootCaPath()}). Exact target hosts: GET /__bili/stats → blindTunnels (loopback only); set BILI_LOG_MASK_HOSTS=0 to show them in this log too.`);
+    }
+}
+
+export function getBlindTunnelStats(): BlindTunnelStats {
+    const hosts: Record<string, number> = {};
+    let total = 0;
+    for (const [h, n] of blindTunnelCounts) {
+        hosts[h] = n;
+        total += n;
+    }
+    return { total, hosts };
+}
+
+export function _resetBlindTunnelStatsForTest(): void {
+    blindTunnelCounts.clear();
+    warnedBlindTunnels.clear();
+}
+
 /** Max ms to wait for a MITM client to finish the TLS handshake after we
  *  return CONNECT 200. Bounds slowloris-style resource hold (a client that
  *  opens the tunnel but never sends/trickle-feeds its ClientHello).
@@ -169,6 +207,7 @@ function tunnelThrough(
         upstream.pipe(clientSocket);
         clientSocket.pipe(upstream);
         log(`tunnel ${maskHostForLog(host)}:${port} established (blind TCP, not decrypted)`);
+        recordBlindTunnel(host, log);
         const cleanup = (where: string, err: Error) => {
             log(`tunnel ${maskHostForLog(host)}:${port} ${where} closed: ${maskHostInText(err.message, host)}`);
             upstream.destroy();

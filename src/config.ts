@@ -364,6 +364,10 @@ export type ProxyOptions = {
      *  hosts are TLS-terminated locally and fed back into the same request
      *  pipeline; all other hosts are blind-tunnelled. */
     mitm: { enabled: boolean; domains: string[] };
+    /** Mask non-public target hosts in proxy logs (#255, default on when
+     *  omitted). Opt out for local debugging with env BILI_LOG_MASK_HOSTS=0
+     *  or `maskHosts: false` (#897); credential masking stays on either way. */
+    maskHosts?: boolean;
 };
 
 /** Re-read ONLY the routes from the current config sources, returning a fresh
@@ -504,6 +508,7 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
                 ...splitCsv(env.BILI_MITM_DOMAINS),
             ]),
         },
+        maskHosts: (env.BILI_LOG_MASK_HOSTS ?? (fileConfig.maskHosts === false ? "0" : "1")) !== "0",
     };
 }
 
@@ -539,6 +544,9 @@ type FileConfig = {
     compress?: CompressSettings & { injectTool?: boolean; injectNudge?: boolean };
     promptCache?: { routing?: string };
     mitm?: { enabled?: boolean; domains?: string[] };
+    /** Set `false` to log real (non-public) target hosts instead of the
+     *  `<private-host>` placeholder (#897; env BILI_LOG_MASK_HOSTS=0 wins). */
+    maskHosts?: boolean;
     /** Global wire-compat block. `roles` maps message roles to the role name
      *  upstreams accept (e.g. `{"developer":"system"}`) — applied to the
      *  final forwarded body for openai/responses requests (#552). */

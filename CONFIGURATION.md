@@ -481,6 +481,7 @@ Environment variables take precedence over the config file. They are useful for 
 | `ACP_REASONING_KEEP` | Responses API only: set `none` to drop all reasoning items. Default routes reasoning through the compression pipeline so it is hidden automatically once its turn is summarized (prevents the unbounded accumulation that broke Codex's prompt-cache prefix). |
 | `ACP_LOG_FILE` | Log file path (default XDG state path; `off` disables the file, keeps stderr). Auto-rotates at 10 MB. |
 | `ACP_DUMP_SSE` | Directory to dump raw SSE frames for debugging. |
+| `BILI_LOG_MASK_HOSTS` | Set `0` to turn OFF host masking in proxy logs (#897): non-public target hosts (private relays, internal domains) are logged verbatim instead of `<private-host>`. Default is ON (#255 — logs get pasted into public issues); credential-header masking is independent and always on. Real target hosts are always available without touching this flag: `GET /__bili/stats` → `blindTunnels`, `GET /__bili/health` (both loopback-only), and the `acp_status` output. |
 | `BILI_UPSTREAM_PROXY` | Upstream proxy for the proxy's own outbound connections — highest priority, above per-URL/per-provider config. See the README *Upstream proxy* section. |
 | `BILI_PERSIST` | Set `0` to disable session persistence (in-memory only, lost on restart). |
 | `BILI_PERSIST_DEBOUNCE_MS` | Debounce window for persistence writes to disk, in ms (default `500`). |
@@ -623,10 +624,13 @@ Supported MITM clients:
 |---|---|---|---|
 | **ZCode** | bigmodel coding plan (OAuth) | `open.bigmodel.cn` (builtin provider) | ✅ tested |
 | **Claude Code** | Claude subscription (OAuth) | `api.anthropic.com` | ❓ untested (may not work — needs verification) |
+| **CodeBuddy** (VS Code IDE) | IDE account login | `copilot.tencent.com` (reached via `http.proxy`) | ✅ user-verified (#897) |
 
 > **Codex exception:** Codex exposes a top-level `openai_base_url` config field, so the ChatGPT login version CAN use the `/bili/` prefix (see above). MITM is not needed for Codex.
 
 MITM is scoped to a **whitelist** of model hosts (`open.bigmodel.cn`, `api.anthropic.com`, `api.openai.com`, `chatgpt.com`). All other HTTPS hosts are blind-tunnelled — billion-context never decrypts non-model traffic.
+
+> **CONNECT-only clients (`http.proxy`):** many IDE-class clients (CodeBuddy, Cursor, Windsurf, …) expose no model base-URL setting — they route all traffic through an HTTP proxy via `CONNECT`. Such a client is only decrypted when its model host is whitelisted above (or discovered/auto-whitelisted by a launcher); otherwise its tunnels are **blind**: no error, but also **no compression**, because billion-context never sees the cleartext. This misconfiguration is surfaced explicitly (#897): the first blind tunnel per host logs a one-time `BLIND TUNNEL WARNING` with the fix steps; `GET /__bili/health` and `/__bili/stats` report `blindTunnels` (count + exact target hosts, loopback-only); and `acp_status` gains an `UNDECRYPTED TRAFFIC (instance-level)` section while such tunnels exist. Fix: add the client's model domain to `"mitm".domains` (or `BILI_MITM_DOMAINS`), restart, and trust the root CA per the steps below. Note proxy logs mask non-public target hosts by default (`<private-host>`, #255) — set `BILI_LOG_MASK_HOSTS=0` to see them verbatim in your local log.
 
 One-time setup (trust the root CA in the client):
 
