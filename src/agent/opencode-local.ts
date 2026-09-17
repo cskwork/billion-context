@@ -182,7 +182,7 @@ export function opencodeToCore(messages: OcMessage[]): CoreMessage[] {
     return out;
 }
 
-// Strip model-imitated <acp ...> tags from assistant text before ingest: the
+// Strip model-imitated \x3cacp ...\x3e tags from assistant text before ingest: the
 // proxy strips echoes at stream time (#206/#717); a local host has no stream
 // seam, so stripping on ingest is the equivalent guard.
 function stripEchoes(messages: CoreMessage[]): CoreMessage[] {

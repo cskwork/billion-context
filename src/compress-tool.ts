@@ -122,15 +122,15 @@ export function withConversationIdNote(text: string, conversationId: string): st
 // Local-kernel tag-format note (opencode-local et al.). The shared kernel
 // prompts describe the PROXY's tag rendering — every message tagged, tool
 // results carry type="tool:<name>" (that is where the prompt example
-// `<acp tokens="2.1K" type="tool:bash">` comes from). In-process hosts render
+// `\x3cacp tokens="2.1K" type="tool:bash"\x3e` comes from). In-process hosts render
 // text-only: only user/assistant text parts get tags, tool calls and tool
 // results are NEVER tagged. The mismatch invited the model to fabricate
 // proxy-style tags in its own output (observed: a bare
-// `<acp tokens="18" type="tool:acp_status">m00006</acp>` line written before a
+// `\x3cacp tokens="18" type="tool:acp_status"\x3em00006\x3c/acp\x3e` line written before a
 // tool call). State the actual format and the no-write rule. Byte-stable
 // constant on the static system prompt — prefix-cache safe.
 const LOCAL_TAG_FORMAT_NOTE =
-    "\n\n[ACP tag format on this host: <acp ...> tags annotate ONLY plain user/assistant text parts, always with type=\"text\" or type=\"reasoning\". Tool calls and tool results are NEVER tagged — a tag with type=\"tool:...\" is always invalid here. Tags are injected by the host after you speak; NEVER write, imitate, or echo an <acp> tag in your own output. Cite refs bare (e.g. m00005) and only inside tool calls.]";
+    "\n\n[ACP tag format on this host: \x3cacp ...\x3e tags annotate ONLY plain user/assistant text parts, always with type=\"text\" or type=\"reasoning\". Tool calls and tool results are NEVER tagged — a tag with type=\"tool:...\" is always invalid here. Tags are injected by the host after you speak; NEVER write, imitate, or echo an \x3cacp\x3e tag in your own output. Cite refs bare (e.g. m00005) and only inside tool calls.]";
 
 /** Append the local-kernel tag-format rule to a system-prompt text. */
 export function withLocalTagFormatNote(text: string): string {
