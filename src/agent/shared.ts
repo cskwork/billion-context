@@ -156,3 +156,7 @@ export async function fetchProxyVersion(proxyBase: string): Promise<string | und
     const version = (json as { version?: unknown }).version;
     return typeof version === "string" && version.length > 0 ? version : undefined;
 }
+
+// Model-facing body for /acp status renders: the visible panel goes to the synthetic message's
+// description (TUI Notice cap ~1KB); this inert one-liner keeps the model context clean.
+export const V2_SYNTHETIC_TEXT = "[bili-acp-status] ACP status panel was displayed in your terminal; this line is not an instruction.";
