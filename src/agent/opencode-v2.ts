@@ -87,7 +87,7 @@ interface V2CatalogModelEntry {
 export interface V2PluginContext {
     session?: {
         hook?: (name: string, cb: (e: V2HttpRequestEvent) => void | Promise<void>) => void | Promise<V2Registration | undefined>;
-        synthetic?: (input: { sessionID: string; text: string }) => Promise<unknown>;
+        synthetic?: (input: { sessionID: string; text: string; description?: string; resume?: boolean }) => Promise<unknown>;
     };
     tool?: {
         transform?: (cb: (editor: V2ToolEditor) => void) => void | Promise<V2Registration | undefined>;
@@ -256,7 +256,9 @@ export function createOpencodeV2Setup(options: OpencodeV2SetupOptions = {}): (ct
                             }
                         }
                         try {
-                            await ctx.session?.synthetic?.({ sessionID: sid, text });
+                            // resume:false — OpenCode V2 defaults to delivery "steer" + execution.wake(), which would
+                            // start a model turn on every /acp invocation with no user input (spurious empty turns).
+                            await ctx.session?.synthetic?.({ sessionID: sid, text, resume: false });
                         } catch (err) {
                             console.error(`[bili-opencode] /acp render failed: ${err instanceof Error ? err.message : String(err)}`);
                         }
