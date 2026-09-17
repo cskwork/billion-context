@@ -914,8 +914,8 @@ test("plugin install/remove roundtrips for pi/omp/codex/opencode under a fake HO
         assert.match(pluginRemove("claude"), /not installed/);
 
         const rows = pluginStatusAll();
-        assert.equal(rows.length, 5);
-        assert.deepEqual(PLUGIN_AGENTS, ["pi", "omp", "claude", "codex", "opencode"]);
+        assert.equal(rows.length, 6);
+        assert.deepEqual(PLUGIN_AGENTS, ["pi", "omp", "claude", "codex", "opencode", "opencode-local"]);
     });
     fs.rmSync(home, { recursive: true, force: true });
 });
@@ -957,7 +957,7 @@ test("plugin install/remove/status survive a non-object mcp in opencode.json (#8
             let data = JSON.parse(fs.readFileSync(ocFile, "utf8")) as Record<string, unknown>;
             assert.deepEqual(data.plugin, [path.join(home, ".config/opencode/plugins/billion-context")]);
             assert.deepEqual(data.compaction, { auto: false });
-            assert.equal(pluginStatusAll().find((r) => r.agent === "opencode")?.status, "installed");
+            assert.equal(pluginStatusAll().find((r) => r.agent === "opencode")?.status, "installed (native proxy)");
             assert.doesNotThrow(() => pluginRemove("opencode"));
             data = JSON.parse(fs.readFileSync(ocFile, "utf8")) as Record<string, unknown>;
             assert.equal(data.plugin, undefined);
@@ -969,6 +969,34 @@ test("plugin install/remove/status survive a non-object mcp in opencode.json (#8
         fs.rmSync(home, { recursive: true, force: true });
     }
 });
+
+test("plugin install opencode-local: in-process kernel entry, no proxy needed", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-oc-local-"));
+    const ocFile = path.join(home, ".config/opencode/opencode.json");
+    try {
+        await withEnv({ OPENCODE_CONFIG: ocFile, BILI_MCP_PROXY: undefined, XDG_STATE_HOME: path.join(home, "state") }, async () => {
+            // No proxy running and no origin env — the local kernel must
+            // install WITHOUT the origin requirement (it spawns nothing).
+            const msg = pluginInstall("opencode-local");
+            assert.match(msg, /opencode-local: installed/);
+            assert.match(msg, /mcp\.bili skipped \(local kernel/);
+            const data = JSON.parse(fs.readFileSync(ocFile, "utf8")) as { mcp?: unknown; plugin?: string[]; compaction?: Record<string, unknown> };
+            assert.equal(data.mcp, undefined);
+            assert.deepEqual(data.plugin, [path.join(home, ".config/opencode/plugins/billion-context")]);
+            assert.deepEqual(data.compaction, { auto: false });
+            const entry = fs.readFileSync(path.join(home, ".config/opencode/plugins/billion-context/index.js"), "utf8");
+            assert.match(entry, /opencode-local\.js/);
+            assert.equal(pluginStatusAll().find((r) => r.agent === "opencode")?.status, "installed (local kernel)");
+            assert.match(pluginRemove("opencode-local"), /removed/);
+            const after = JSON.parse(fs.readFileSync(ocFile, "utf8")) as Record<string, unknown>;
+            assert.equal(after.plugin, undefined);
+            assert.equal(after.compaction, undefined);
+        });
+    } finally {
+        fs.rmSync(home, { recursive: true, force: true });
+    }
+});
+
 
 test("omp plugin: scoped matching, existence check, overlay redirect (issue #392)", async () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-plugin-omp-"));
@@ -1086,7 +1114,7 @@ test("plugin list survives a broken host config (per-row error, no crash)", asyn
     await withEnv(hintEnv(home, piAgentDir), async () => {
         fs.writeFileSync(path.join(home, ".claude.json"), "{ broken json");
         const rows = pluginStatusAll();
-        assert.equal(rows.length, 5);
+        assert.equal(rows.length, 6);
         const claude = rows.find((r) => r.agent === "claude")!;
         assert.match(claude.status, /error: .*not valid JSON/);
         const pi = rows.find((r) => r.agent === "pi")!;

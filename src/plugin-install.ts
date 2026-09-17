@@ -36,7 +36,7 @@ function proxyOriginForInstall(): string {
     return inst.origin;
 }
 
-export const PLUGIN_AGENTS = ["pi", "omp", "claude", "codex", "opencode"] as const;
+export const PLUGIN_AGENTS = ["pi", "omp", "claude", "codex", "opencode", "opencode-local"] as const;
 export type PluginAgent = (typeof PLUGIN_AGENTS)[number];
 
 export function selfPackageRoot(): string {
@@ -448,11 +448,15 @@ function isPlainMcpObject(v: unknown): v is Record<string, unknown> {
     return v !== null && typeof v === "object" && !Array.isArray(v);
 }
 
-function opencodeInstall(): string {
+function opencodeInstall(mode: "opencode" | "opencode-local" = "opencode"): string {
     const file = opencodeJson();
     const data = readJson(file);
     const notes: string[] = [];
 
+    // The pure-local kernel has no proxy to reach — no MCP shell there.
+    if (mode === "opencode-local") {
+        notes.push("mcp.bili skipped (local kernel — no proxy)");
+    } else
     // MCP shell is optional: the native plugin below self-spawns a proxy, so a
     // missing live origin skips the shell instead of failing the install.
     try {
@@ -475,7 +479,8 @@ function opencodeInstall(): string {
     }
 
     // Native plugin (#820): self-spawned proxy + http.request URL rewrite.
-    const agentJs = path.join(selfPackageRoot(), "dist", "agent", "opencode-native.js");
+    // `opencode-local` swaps the entry for the in-process kernel host.
+    const agentJs = path.join(selfPackageRoot(), "dist", "agent", mode === "opencode-local" ? "opencode-local.js" : "opencode-native.js");
     requireDistFile(agentJs);
     const dir = opencodePluginDir(file);
     fs.mkdirSync(dir, { recursive: true });
@@ -499,7 +504,7 @@ function opencodeInstall(): string {
     };
 
     writeJson(file, data);
-    return `opencode: installed -> ${file} (${notes.join("; ")})`;
+    return `${mode}: installed -> ${file} (${notes.join("; ")})`;
 }
 
 function opencodeRemove(): string {
@@ -556,7 +561,25 @@ function opencodeStatus(): string {
     const data = readJson(file);
     const mcp = data.mcp;
     const plugins = Array.isArray(data.plugin) ? (data.plugin as unknown[]).filter((x): x is string => typeof x === "string") : [];
-    return (isPlainMcpObject(mcp) && "bili" in mcp) || plugins.includes(opencodePluginDir(file)) ? "installed" : "not installed";
+    const dir = opencodePluginDir(file);
+    if (!(isPlainMcpObject(mcp) && "bili" in mcp) && !plugins.includes(dir)) return "not installed";
+    try {
+        const entry = fs.readFileSync(path.join(dir, "index.js"), "utf8");
+        if (entry.includes("opencode-local.js")) return "installed (local kernel)";
+        if (entry.includes("opencode-native.js")) return "installed (native proxy)";
+    } catch {}
+    return "installed";
+}
+
+function opencodeLocalStatus(): string {
+    // The opencode-local row reports specifically whether the shared plugin
+    // dir points at the IN-PROCESS kernel entry (dist/agent/opencode-local.js).
+    try {
+        const entry = fs.readFileSync(path.join(opencodePluginDir(opencodeJson()), "index.js"), "utf8");
+        return entry.includes("opencode-local.js") ? "installed (local kernel)" : "not installed";
+    } catch {
+        return "not installed";
+    }
 }
 
 // — dispatch ————————————————————————————————————————————————————————————
@@ -566,7 +589,7 @@ export function isPluginAgent(value: string): value is PluginAgent {
 }
 
 export function pluginInstall(agent: PluginAgent): string {
-    return agent === "pi" ? piInstall() : agent === "omp" ? ompInstall() : agent === "claude" ? claudeInstall() : agent === "codex" ? codexInstall() : opencodeInstall();
+    return agent === "pi" ? piInstall() : agent === "omp" ? ompInstall() : agent === "claude" ? claudeInstall() : agent === "codex" ? codexInstall() : opencodeInstall(agent);
 }
 
 export function pluginRemove(agent: PluginAgent): string {
@@ -580,6 +603,7 @@ export function pluginStatusAll(): Array<{ agent: string; status: string }> {
         ["claude", claudeStatus],
         ["codex", codexStatus],
         ["opencode", opencodeStatus],
+        ["opencode-local", opencodeLocalStatus],
     ];
     return checks.map(([agent, check]) => {
         try {

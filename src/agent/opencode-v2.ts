@@ -46,9 +46,9 @@ import { fetchProxyVersion, fetchStatus, forwardTool, proxyBaseFromEnv, proxyBas
 // OpenCode V2 TUI renders a synthetic message as a visible Notice row only when its display text fits the
 // timeline cap (~1KB): longer text renders nothing (#880). Panels go to description verbatim under the cap.
 import { V2_SYNTHETIC_TEXT } from "./shared.js";
-const V2_SYNTHETIC_VISIBLE_MAX = 1024;
+export const V2_SYNTHETIC_VISIBLE_MAX = 1024;
 
-type V2Registration = { dispose?: () => void | Promise<void> };
+export type V2Registration = { dispose?: () => void | Promise<void> };
 
 interface V2Headers {
     set(name: string, value: string): void;
@@ -109,7 +109,7 @@ const WINDOW_REFRESH_MS = 60000;
 // Kill switch = fully inert (same semantics as detectProxyBase): gates header stamping, tool forwarding, compaction reporting.
 const pluginDisabled = (): boolean => process.env.BILLION_CONTEXT_PLUGIN === "0";
 
-const V2_BILI_TOOLS = [...ACP_TOOLS_OPENAI, ABSORB_TOOL_OPENAI].map((t) => ({
+export const V2_BILI_TOOLS = [...ACP_TOOLS_OPENAI, ABSORB_TOOL_OPENAI].map((t) => ({
     name: t.function.name,
     description: t.function.description,
     input: t.function.parameters,
@@ -121,7 +121,7 @@ export interface V2State {
     windowsAt?: number;
 }
 
-function refreshWindows(ctx: V2PluginContext, state: V2State): void {
+export function refreshWindows(ctx: V2PluginContext, state: V2State): void {
     const now = Date.now();
     if (state.windows && state.windowsAt !== undefined && now - state.windowsAt < WINDOW_REFRESH_MS) return;
     state.windowsAt = now;

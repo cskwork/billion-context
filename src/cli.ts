@@ -53,7 +53,7 @@ Usage:
                                     (--full includes original messages; --output FILE)
   bili update                      check for & install a newer version now
   bili plugin install <agent>      install the thin plugin into a host (pi/omp/
-                                    claude/codex/opencode; original backed up once)
+                                    claude/codex/opencode/opencode-local; original backed up once)
   bili plugin remove <agent>       remove it again
   bili plugin list                 show install status for every host
   bili mcp                         run the bili MCP server standalone (stdio)
