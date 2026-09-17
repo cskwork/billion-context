@@ -13,7 +13,7 @@ import { composeStreamFilters, containsMarkerLineText, containsRenderTagText, cr
 import { log as loggerLog } from "./logger.js";
 import { emitStreamError, emitUpstreamTruncation } from "./stream-error.js";
 import { degenerateTurnWarning } from "./degenerate-turn.js";
-import { noteWeakOverflow } from "./weak-overflow.js";
+import { noteWeakOverflow, recordProvenInput } from "./weak-overflow.js";
 import { warnCacheCollapse } from "./cache-warn.js";
 import { promptInputTotal, type WireProtocol } from "./util.js";
 import { stateDir } from "./paths.js";
@@ -1022,6 +1022,12 @@ export async function pipePluginChatWithStrip(
             log?.(msg);
         }
     };
+    // #901: a terminal-delimited turn proves the upstream accepted this input size.
+    const maybeRecordProven = () => {
+        if (!sawTerminal || !session || res.destroyed || res.writableEnded) return;
+        const total = promptInputTotal(protocol, acc.inputTokens, acc.cachedTokens, acc.creationTokens);
+        if (total > 0) recordProvenInput(session, total);
+    };
     const pushField = (field: string, index: number, text: string): [string, boolean] => {
         const s = filterFor(field, index);
         const clean = s.filter.push(text);
@@ -1218,6 +1224,7 @@ export async function pipePluginChatWithStrip(
         settleUsage();
         maybeNoteTruncated();
         maybeWarnDegenerate();
+        maybeRecordProven();
         if (truncated) {
             emitUpstreamTruncation(res, protocol, finalFinishReason !== undefined, log);
             return;
@@ -1372,6 +1379,12 @@ export async function pipePluginResponsesWithStrip(
             loggerLog("warn", msg);
             log?.(msg);
         }
+    };
+    // #901: a terminal-delimited turn proves the upstream accepted this input size.
+    const maybeRecordProven = () => {
+        if (!sawTerminal || !session || res.destroyed || res.writableEnded) return;
+        const total = promptInputTotal("responses", acc.inputTokens, acc.cachedTokens, acc.creationTokens);
+        if (total > 0) recordProvenInput(session, total);
     };
     let lastDeltaMeta: { item_id?: unknown; output_index?: unknown } | null = null;
     const flushTail = (after: string) => {
@@ -1619,6 +1632,7 @@ export async function pipePluginResponsesWithStrip(
         maybeWarnDegenerate();
         settleUsage();
         maybeNoteTruncated();
+        maybeRecordProven();
         // #721: same as the chat-pipe twin — never close bare on a missing
         // done-family event. Responses has no separate finish-reason concept
         // (terminal events carry the status), so this is always the error shape.
@@ -1705,17 +1719,22 @@ export async function pipePluginJson(
         if (session && usage) {
             const input = num(usage["prompt_tokens"]) ?? num(usage["input_tokens"]);
             if (input !== undefined) {
+                const cached =
+                    num((usage["prompt_tokens_details"] as Record<string, unknown> | undefined)?.["cached_tokens"]) ??
+                    num((usage["input_tokens_details"] as Record<string, unknown> | undefined)?.["cached_tokens"]) ??
+                    num(usage["cache_read_input_tokens"]) ??
+                    // #779: DeepSeek-style top-level field (openai wire)
+                    num(usage["prompt_cache_hit_tokens"]);
+                const creation = num(usage["cache_creation_input_tokens"]);
                 applyUsageSample(session, {
                     inputTokens: input,
                     outputTokens: num(usage["completion_tokens"]) ?? num(usage["output_tokens"]),
-                    cachedTokens:
-                        num((usage["prompt_tokens_details"] as Record<string, unknown> | undefined)?.["cached_tokens"]) ??
-                        num((usage["input_tokens_details"] as Record<string, unknown> | undefined)?.["cached_tokens"]) ??
-                        num(usage["cache_read_input_tokens"]) ??
-                        // #779: DeepSeek-style top-level field (openai wire)
-                        num(usage["prompt_cache_hit_tokens"]),
-                    creationTokens: num(usage["cache_creation_input_tokens"]),
+                    cachedTokens: cached,
+                    creationTokens: creation,
                 }, protocol);
+                // #901: a fully-read non-streaming response proves acceptance of this input size.
+                const total = promptInputTotal(protocol, input, cached, creation);
+                if (total > 0) recordProvenInput(session, total);
                 markDirty(session);
             }
         }

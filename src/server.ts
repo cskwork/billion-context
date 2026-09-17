@@ -80,7 +80,7 @@ import { consumePluginRegisterFor, flushConversations, handlePluginCompact, hand
 import { setupMitm, readMitmUpstream, getBlindTunnelStats } from "./mitm.js";
 import type { BiliMessage } from "acp-kernel/wire";
 import { hardenOpenaiAssistantContent, isLoopbackAddress, inspectContextOverflow, reserveOutputHeadroom, shouldReserveOutputHeadroom, systemToUser, usageTotals, type WireProtocol } from "./util.js";
-import { resolveConfirmedLimit, resolveLearnedLimit, resolveSpeculativeLimit, retractStaleLearnedLimits } from "./weak-overflow.js";
+import { recordProvenInput, resolveConfirmedLimit, resolveLearnedLimit, resolveSpeculativeLimit, retractStaleLearnedLimits, sessionProvenMax } from "./weak-overflow.js";
 import { BILI_TUNNEL_HEADER, checkTunnelDestination, tunnelAllowlistFromEnv } from "./tunnel-guard.js";
 import { dumpRejectedBody } from "./error-dump.js";
 
@@ -3964,6 +3964,11 @@ async function forward(
                     }
                     const out = u.completion_tokens ?? u.output_tokens;
                     if (typeof out === "number") prepared.session.stats.outputTokens += out;
+                    // #901: a clean non-streaming completion proves the upstream accepted
+                    // this input size — feed the capability baseline. Model echoed by the
+                    // response when present; scalar bucket otherwise.
+                    const respModel = typeof json.model === "string" ? json.model : undefined;
+                    recordProvenInput(prepared.session, total, respModel);
                 }
                 if (prepared.protocol === "openai") {
                     rewriteOpenaiJsonResponse(json, ctx);
@@ -4107,6 +4112,11 @@ function sendStats(res: http.ServerResponse): void {
         outputTokens: s.stats.outputTokens,
         cacheSamples: s.stats.cacheSamples,
         cacheHitPct: s.stats.cacheSamples > 0 && s.stats.inputTokens > 0 ? Math.round(s.stats.cachedTokens / s.stats.inputTokens * 100) : null,
+        // #901: window credibility — trusted (configured/registry) window vs the
+        // largest input recent successful turns actually got through. A wide gap
+        // means the provider overstates its window.
+        contextWindow: typeof s.metadata.effectiveContextLimit === "number" ? s.metadata.effectiveContextLimit : undefined,
+        provenMaxInput: sessionProvenMax(s),
         lastSeen: new Date(s.lastSeen).toISOString(),
         restored: s.restored === true,
     }));

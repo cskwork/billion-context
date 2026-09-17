@@ -17,7 +17,7 @@ import { executeSearchContextTarget, resolveDecompress } from "../decompress-sha
 import { buildVisibilityMarker } from "../compress-loop.js";
 import { fetchWithRetry, UpstreamHttpError } from "../fetch-util.js";
 import { proxyDispatcher } from "../upstream-proxy.js";
-import { noteWeakOverflow } from "../weak-overflow.js";
+import { noteWeakOverflow, recordProvenInput } from "../weak-overflow.js";
 import { warnCacheCollapse } from "../cache-warn.js";
 import { dumpRejectedBody } from "../error-dump.js";
 import { dumpsDir } from "../paths.js";
@@ -638,6 +638,17 @@ export async function* runCompressLoop(
                     ctx.log(`[acp-loop] round ${round}: ${msg}`);
                     yield adapter.emitError(msg);
                     return;
+                }
+                // #901: a normally-completed round proves the upstream accepted
+                // this input size — feed the capability baseline that
+                // noteWeakOverflow counts against (never on the truncated /
+                // error exits above).
+                if (!truncatedDone && streamError === undefined) {
+                    const total = promptInputTotal(ctx.protocol, usage.inputTokens, usage.cachedTokens, usage.creationTokens);
+                    if (total > 0) {
+                        const reqModel = typeof requestBody["model"] === "string" ? requestBody["model"] : undefined;
+                        recordProvenInput(ctx.session, total, reqModel);
+                    }
                 }
                 // A passthrough round already streamed the upstream's own finish
                 // chunk + [DONE] verbatim (original id + order); re-emitting a
