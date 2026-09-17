@@ -11,6 +11,11 @@ export type RewriteCtx = {
     core: CompressionCore;
     config: Config;
     messages: CoreMessage[];
+    /** Deployment identity for the acp_status surface line, e.g.
+     * "billion-context-opencode-local 0.1.115". Absent → proxy default
+     * ("billion-context <version>"). Lets in-process deployments (opencode
+     * local kernel) distinguish their panel from proxy-mode output. */
+    hostLabel?: string;
     /** View handed to applyCompression. Defaults to `messages`; hosts whose
      *  `messages` view has pruned/hidden content (so block anchors can't
      *  resolve) pass the unpruned log here (billion-context-pi#195). */

@@ -67,6 +67,10 @@ export interface LoopCtx {
     messages: CoreMessage[];
     /** View handed to applyCompression (see RewriteCtx.compressMessages). */
     compressMessages?: CoreMessage[];
+    /** Deployment identity for the acp_status surface line, e.g.
+     * "billion-context-opencode-local 0.1.115". Absent → proxy default.
+     * Lets in-process deployments distinguish their panel from proxy mode. */
+    hostLabel?: string;
     session: Session;
     log: (msg: string) => void;
     proxyUrl?: string;

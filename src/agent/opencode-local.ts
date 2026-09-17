@@ -402,6 +402,7 @@ export function createOpencodeLocalHost(): OpencodeLocalHost {
                     messages: mem.view,
                     compressMessages: mem.msgs,
                     session,
+                    hostLabel: `billion-context-opencode-local ${VERSION}`,
                     log: logLine,
                 };
                 let result: string;

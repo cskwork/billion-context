@@ -15,6 +15,8 @@ export interface AcpStatusCtx {
     config: Config;
     messages: CoreMessage[];
     session: Session;
+    /** Deployment identity for the surface line ("billion-context <ver>" by default). */
+    hostLabel?: string;
 }
 
 // The ranges/nudge section is recomputed from live session state on every
@@ -37,7 +39,7 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
         limit,
         meta: {
             pack: ctx.session.meta.activePack ?? "default",
-            host: `billion-context ${VERSION}`,
+            host: ctx.hostLabel ?? `billion-context ${VERSION}`,
         },
     });
     if (scope) return base;
