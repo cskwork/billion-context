@@ -2349,7 +2349,7 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         // at extension load from the env manifest (registerProvider; see
         // buildPiEnv), and the old settings.json compaction-off generation is
         // replaced by the extension's session_before_compact cancel.
-        env = buildPiEnv(origin, ca, process.env, routes.httpRewrites, routes.httpsRewrites);
+        env = buildPiEnv(origin, ca, stripInheritedProxy(process.env), routes.httpRewrites, routes.httpsRewrites);
         // #535: never let a stale inherited overlay redirect (from a legacy
         // launch or a shell exported inside one) leak into the child — pi
         // always runs on its REAL home now.
@@ -2373,7 +2373,7 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         // (the native summarizer would destroy the ACP-tagged context); manual
         // /compact stays user-owned and its surviving summary is archived by
         // the proxy on session_compact. https upstreams ride cert-MITM like pi.
-        env = buildPiEnv(origin, ca, process.env, routes.httpRewrites);
+        env = buildPiEnv(origin, ca, stripInheritedProxy(process.env), routes.httpRewrites);
         delete env.PI_CODING_AGENT_DIR;
         const ompExt = selfDistFile("agent/omp.js");
         if (ompExt && fs.existsSync(ompExt) && !ompPluginLoadedFrom(ompRealHome)) {
@@ -2543,7 +2543,7 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         if (directUrl) {
             env = { ...process.env, BILLION_CONTEXT_PROXY: origin };
         } else {
-            env = buildCodexEnv(origin, resolveCombinedCaPath(process.env), process.env);
+            env = buildCodexEnv(origin, resolveCombinedCaPath(process.env), stripInheritedProxy(process.env));
             clientArgs = buildCodexArgs(origin, routes.httpRewrites, routes.httpsRewrites, clientArgs);
             const budgetArgs = await resolveCodexBudgetArgs({
                 model: config.codex?.model,
@@ -2569,7 +2569,7 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
             if (inj.warning) console.error(`bili: ${inj.warning}`);
         }
     } else if (base === "codebuddy") {
-        env = buildCodebuddyEnv(origin, ca, routes.httpRewrites, routes.httpsRewrites, process.env);
+        env = buildCodebuddyEnv(origin, ca, routes.httpRewrites, routes.httpsRewrites, stripInheritedProxy(process.env));
         const codebuddyBudget = await resolveCodebuddyBudgetEnv({
             model: config.codebuddy?.model,
             userAutoCompactWindow: config.codebuddy?.autoCompactWindow,
@@ -2656,7 +2656,7 @@ export async function runTestPi(params: RunTestPiParams, deps: LauncherDeps = {}
     }
 
     const ca = resolveCaCertPath(process.env);
-    const env = buildPiEnv(handle.origin, ca, process.env);
+    const env = buildPiEnv(handle.origin, ca, stripInheritedProxy(process.env));
     const sessionDir = path.join(os.tmpdir(), `bili-pi-test-${Date.now()}`);
     fs.mkdirSync(sessionDir, { recursive: true });
     const args = [
