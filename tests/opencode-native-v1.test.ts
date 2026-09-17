@@ -4,6 +4,7 @@ import type { z } from "zod";
 
 import {
     createV1ServerHooks,
+    extractV1Windows,
     jsonSchemaToZodShape,
     rewriteV1Providers,
     type V1Config,
@@ -130,6 +131,45 @@ describe("rewriteV1Providers", () => {
     });
 });
 
+describe("extractV1Windows", () => {
+    it("collects finite positive limits keyed by provider/model and floors them", () => {
+        const cfg: V1Config = {
+            provider: {
+                openai: { models: { gpt: { limit: { context: 128_000.9 } } } },
+                anthropic: { models: { claude: { limit: { context: 200_000 } } } },
+            },
+        };
+        const m = extractV1Windows(cfg);
+        assert.equal(m.get("openai/gpt"), 128000);
+        assert.equal(m.get("anthropic/claude"), 200000);
+    });
+
+    it("drops non-finite, non-positive and non-numeric limits", () => {
+        const cfg: V1Config = {
+            provider: {
+                p: {
+                    models: {
+                        zero: { limit: { context: 0 } },
+                        neg: { limit: { context: -5 } },
+                        nan: { limit: { context: Number.NaN } },
+                        str: { limit: { context: "big" } },
+                        empty: { limit: {} },
+                        nolimit: {},
+                    },
+                },
+            },
+        };
+        assert.deepEqual(extractV1Windows(cfg), new Map());
+    });
+
+    it("returns an empty map for missing or broken provider tables", () => {
+        assert.deepEqual(extractV1Windows({}), new Map());
+        assert.deepEqual(extractV1Windows({ provider: "nope" }), new Map());
+        assert.deepEqual(extractV1Windows({ provider: { p: {} } }), new Map());
+        assert.deepEqual(extractV1Windows({ provider: { p: { models: "nope" } } }), new Map());
+    });
+});
+
 describe("createV1ServerHooks", () => {
     const origin = "http://127.0.0.1:19199";
 
@@ -180,6 +220,27 @@ describe("createV1ServerHooks", () => {
         const cfg: V1Config = { provider: { o: { options: { baseURL: "https://api.openai.com/v1" } } } };
         await hooks.config?.(cfg);
         assert.equal(cfg.provider?.o?.options?.baseURL, `${origin}/bili/https://api.openai.com/v1`);
+    });
+
+    it("stamps x-bili-plugin-context-window from config-declared model limits (omits when absent)", async () => {
+        const deps = makeDeps();
+        const hooks = createV1ServerHooks(origin, {}, deps);
+        assert.ok(hooks["chat.headers"]);
+        const cfg: V1Config = {
+            provider: {
+                openai: { options: { baseURL: "https://api.openai.com/v1" }, models: { gpt: { limit: { context: 128_000.9 } } } },
+            },
+        };
+        await hooks.config?.(cfg);
+        const h1: Record<string, string> = {};
+        await hooks["chat.headers"]?.({ sessionID: "ses_w", model: { providerID: "openai", id: "gpt" } }, { headers: h1 });
+        assert.equal(h1["x-bili-plugin-context-window"], "128000");
+        const h2: Record<string, string> = {};
+        await hooks["chat.headers"]?.({ sessionID: "ses_w", model: { providerID: "openai", id: "other" } }, { headers: h2 });
+        assert.equal(h2["x-bili-plugin-context-window"], undefined);
+        const h3: Record<string, string> = {};
+        await hooks["chat.headers"]?.({ sessionID: "ses_w" }, { headers: h3 });
+        assert.equal(h3["x-bili-plugin-context-window"], undefined);
     });
 
     it("command.execute.before only reacts to /acp", async () => {

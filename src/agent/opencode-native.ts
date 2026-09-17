@@ -268,8 +268,24 @@ export interface V1ProviderOptions {
     [key: string]: unknown;
 }
 
+export interface V1ModelLimit {
+    context?: unknown;
+    [key: string]: unknown;
+}
+
+export interface V1ModelDef {
+    limit?: V1ModelLimit | undefined;
+    [key: string]: unknown;
+}
+
+export interface V1ProviderDef {
+    options?: V1ProviderOptions | undefined;
+    models?: Record<string, V1ModelDef | undefined> | undefined;
+    [key: string]: unknown;
+}
+
 export interface V1Config {
-    provider?: Record<string, { options?: V1ProviderOptions } | undefined> | undefined;
+    provider?: Record<string, V1ProviderDef | undefined> | undefined;
     command?: Record<string, import("./opencode-acp-command.js").OpencodeCommandConfig>;
     compaction?: unknown;
     [key: string]: unknown;
@@ -358,6 +374,24 @@ export function rewriteV1Providers(cfg: V1Config, origin: string): number {
     return rewritten;
 }
 
+/** Provider-declared model windows (`provider.<id>.models.<m>.limit.context`) as a `${id}/${m}` map.
+ *  V1 has no catalog seam (cf. V2 `ctx.catalog.model.list()`), so config is the only window source;
+ *  non-finite/non-positive values are dropped so a partial table stays unstamped rather than fabricated. */
+export function extractV1Windows(cfg: V1Config): Map<string, number> {
+    const map = new Map<string, number>();
+    const providers = cfg.provider;
+    if (providers === null || typeof providers !== "object") return map;
+    for (const [pid, entry] of Object.entries(providers)) {
+        const models = entry?.models;
+        if (models === null || typeof models !== "object") continue;
+        for (const [mid, model] of Object.entries(models)) {
+            const c = model?.limit?.context;
+            if (typeof c === "number" && Number.isFinite(c) && c > 0) map.set(`${pid}/${mid}`, Math.floor(c));
+        }
+    }
+    return map;
+}
+
 export interface V1NativeDeps {
     /** zod module (tests inject; runtime lazy-imports "zod"). */
     z?: ZodLike;
@@ -371,11 +405,13 @@ export interface V1NativeDeps {
  *  wires the real bootstrap + zod. */
 export function createV1ServerHooks(origin: string, ctx: V1PluginContext, deps: V1NativeDeps = {}): V1Hooks {
     const acp = createAcpCommandHooks(() => origin, ctx);
+    let windows = new Map<string, number>();
     const hooks: V1Hooks = {
         config: async (cfg) => {
             await acp.config?.(cfg);
             const n = rewriteV1Providers(cfg, origin);
             if (n > 0) console.log(`[bili-opencode-native] v1: rewrote ${n} provider baseURL(s) -> ${origin}/bili/`);
+            windows = extractV1Windows(cfg);
         },
         "command.execute.before": async (input, _output) => {
             await acp["command.execute.before"]?.(input);
@@ -385,6 +421,11 @@ export function createV1ServerHooks(origin: string, ctx: V1PluginContext, deps: 
         hooks["chat.headers"] = async (input, output) => {
             output.headers["x-bili-plugin"] = "opencode";
             output.headers["x-bili-plugin-conversation"] = input.sessionID;
+            const model = input.model;
+            if (model && typeof model.providerID === "string" && typeof model.id === "string") {
+                const w = windows.get(`${model.providerID}/${model.id}`);
+                if (w !== undefined) output.headers["x-bili-plugin-context-window"] = String(w);
+            }
         };
         const forward = deps.forward ?? ((o, conversationId, tool, args) => import("./shared.js").then((m) => m.forwardTool(o, conversationId, tool, args)));
         const tools: Record<string, V1Tool> = {};
