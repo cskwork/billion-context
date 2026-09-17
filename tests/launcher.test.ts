@@ -3709,6 +3709,85 @@ test("runLaunch trae: cert-MITM envs (SSL_CERT_FILE combined bundle), no budget/
     }
 });
 
+test("runLaunch opencode: inherited proxy vars stripped so traffic cannot bypass bili (#890)", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-opencode-launch-"));
+    const prevHome = process.env.HOME;
+    const prevUserProfile = process.env.USERPROFILE;
+    const prevBin = process.env.BILI_CLIENT_BIN;
+    const prevProxyVars: Record<string, string | undefined> = {
+        http_proxy: process.env.http_proxy,
+        https_proxy: process.env.https_proxy,
+        all_proxy: process.env.all_proxy,
+        HTTP_PROXY: process.env.HTTP_PROXY,
+        NO_PROXY: process.env.NO_PROXY,
+    };
+    const prevMarker = process.env.BILI_TEST_MARKER;
+    process.env.HOME = home;
+    if (prevUserProfile !== undefined) process.env.USERPROFILE = home;
+    process.env.http_proxy = "http://corp-proxy.example:8080";
+    process.env.https_proxy = "http://corp-proxy.example:8080";
+    process.env.all_proxy = "socks5://corp-proxy.example:1080";
+    process.env.HTTP_PROXY = "http://corp-proxy.example:8080";
+    process.env.NO_PROXY = "localhost,.corp";
+    process.env.BILI_TEST_MARKER = "keep";
+    const fakeOc = path.join(home, "fake-opencode");
+    fs.writeFileSync(fakeOc, "");
+    process.env.BILI_CLIENT_BIN = fakeOc;
+
+    const clientEnvs: (NodeJS.ProcessEnv | undefined)[] = [];
+    const spawnImpl: SpawnFn = (cmd, args, opts) => {
+        const env = (opts as { env?: NodeJS.ProcessEnv } | undefined)?.env;
+        if (cmd === fakeOc) {
+            clientEnvs.push(env);
+            const child = makeFakeChild(0);
+            const orig = child.on.bind(child);
+            (child as { on: SpawnChild["on"] }).on = (event, listener) => {
+                orig(event, listener);
+                if (event === "exit") setTimeout(() => listener(0, null), 0);
+                return child;
+            };
+            return child;
+        }
+        return makeFakeChild(42424);
+    };
+    const fetchImpl = async () => ({ ok: true });
+    const prevExit = process.exit;
+    process.exit = (() => undefined) as typeof process.exit;
+
+    try {
+        await runLaunch(
+            { client: "opencode", clientArgs: [], overrides: {} },
+            { fetchImpl, spawnImpl, sleep: () => Promise.resolve() },
+        );
+        assert.equal(clientEnvs.length, 1);
+        const seenEnv = clientEnvs[0]!;
+        const origin = seenEnv.BILLION_CONTEXT_PROXY;
+        assert.ok(/^http:\/\/127\.0\.0\.1:\d+$/.test(String(origin)), `origin: ${origin}`);
+        assert.equal(seenEnv.HTTPS_PROXY, origin);
+        assert.ok(String(seenEnv.NODE_EXTRA_CA_CERTS).endsWith(path.join("billion-context", "ca", "root-ca.pem")), String(seenEnv.NODE_EXTRA_CA_CERTS));
+        assert.equal(seenEnv.http_proxy, undefined, "inherited http_proxy stripped");
+        assert.equal(seenEnv.https_proxy, undefined, "inherited https_proxy stripped");
+        assert.equal(seenEnv.all_proxy, undefined, "inherited all_proxy stripped");
+        assert.equal(seenEnv.HTTP_PROXY, undefined, "inherited HTTP_PROXY stripped");
+        assert.equal(seenEnv.NO_PROXY, undefined, "inherited NO_PROXY stripped");
+        assert.equal(seenEnv.BILI_TEST_MARKER, "keep", "unrelated env vars preserved");
+    } finally {
+        process.exit = prevExit;
+        process.env.HOME = prevHome;
+        if (prevUserProfile === undefined) delete process.env.USERPROFILE;
+        else process.env.USERPROFILE = prevUserProfile;
+        if (prevBin === undefined) delete process.env.BILI_CLIENT_BIN;
+        else process.env.BILI_CLIENT_BIN = prevBin;
+        for (const [k, v] of Object.entries(prevProxyVars)) {
+            if (v === undefined) delete process.env[k];
+            else process.env[k] = v;
+        }
+        if (prevMarker === undefined) delete process.env.BILI_TEST_MARKER;
+        else process.env.BILI_TEST_MARKER = prevMarker;
+        fs.rmSync(home, { recursive: true, force: true });
+    }
+});
+
 test("parseKimiToml: providers/models/env channels (quoted names, overrides win, per-model base_url)", () => {
     const toml = [
         "# comment",

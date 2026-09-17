@@ -2383,8 +2383,11 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         // opencode: HTTPS upstreams ride cert-MITM (HTTPS_PROXY + CA); plaintext
         // HTTP upstreams get a /bili/-rewritten copy of opencode.json via
         // OPENCODE_CONFIG (real config untouched). BILLION_CONTEXT_PROXY makes
-        // opencode-acp self-disable so the proxy owns the ACP tools.
-        env = { ...process.env, HTTPS_PROXY: origin, NODE_EXTRA_CA_CERTS: ca, BILLION_CONTEXT_PROXY: origin };
+        // opencode-acp self-disable so the proxy owns the ACP tools. Base env is
+        // stripped like hermes/dsh/kimi/qoder/trae/jcode (#890): undici/Bun prefer
+        // lowercase http(s)_proxy over the uppercase injected below, so an
+        // inherited lowercase var would silently route model traffic around bili.
+        env = { ...stripInheritedProxy(process.env), HTTPS_PROXY: origin, NODE_EXTRA_CA_CERTS: ca, BILLION_CONTEXT_PROXY: origin };
         const opencodePlugin = selfDistFile("agent/opencode.js");
         const opencodePluginPath = opencodePlugin && fs.existsSync(opencodePlugin) ? opencodePlugin : undefined;
         const ocDirMode = opencodePluginPath !== undefined && opencodeMajorVersion(resolveClientCommand("opencode", process.env).command) >= 2;
