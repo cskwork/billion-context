@@ -44,7 +44,8 @@ function startFakeProxyV2(): Promise<{ origin: string; toolCalls: Array<{ conver
         }
         if ((req.url ?? "").startsWith("/__bili/plugin/status")) {
             res.writeHead(200, { "content-type": "application/json" });
-            res.end(JSON.stringify({ ok: true, panel: "ACP-PANEL-OK" }));
+            const panel = (req.url ?? "").includes("ses_acp_long") ? "X".repeat(1500) : "ACP-PANEL-OK";
+            res.end(JSON.stringify({ ok: true, panel }));
             return;
         }
         res.writeHead(404);
@@ -354,7 +355,9 @@ test("v2 setup: /acp command registered and renders proxy status panel via synth
                 await acp!.execute({ sessionID: "ses_acp_1" });
                 await until(() => fake.syntheticCalls.length === 1);
                 assert.equal(fake.syntheticCalls[0].sessionID, "ses_acp_1");
-                assert.match(fake.syntheticCalls[0].text, /ACP-PANEL-OK/);
+                assert.match(fake.syntheticCalls[0].description!, /ACP-PANEL-OK/);
+                assert.match(fake.syntheticCalls[0].text, /displayed in your terminal/);
+                assert.match(fake.syntheticCalls[0].text, /not an instruction/);
                 assert.equal(fake.syntheticCalls[0].resume, false);
             } finally {
                 cleanup();
@@ -373,12 +376,36 @@ test("v2 setup: /acp reports no proxy detected via synthetic when no proxy", asy
             const acp = fake.addedCommands.find((c) => c.name === "acp")!;
             await acp.execute({ sessionID: "s_nopx" });
             await until(() => fake.syntheticCalls.length === 1);
-            assert.match(fake.syntheticCalls[0].text, /no proxy detected/);
+            assert.match(fake.syntheticCalls[0].description!, /no proxy detected/);
+            assert.match(fake.syntheticCalls[0].text, /not an instruction/);
             assert.equal(fake.syntheticCalls[0].resume, false);
         } finally {
             cleanup();
         }
     });
+});
+
+test("v2 setup: /acp truncates long panels to the TUI notice cap", async () => {
+    const proxy = await startFakeProxyV2();
+    const fake = makeFakeCtx();
+    try {
+        await withEnv({ BILLION_CONTEXT_PROXY: proxy.origin, BILLION_CONTEXT_PLUGIN: undefined }, async () => {
+            const cleanup = await biliOpencodePlugin.setup(fake.ctx as never);
+            try {
+                const acp = fake.addedCommands.find((c) => c.name === "acp")!;
+                await acp.execute({ sessionID: "ses_acp_long" });
+                await until(() => fake.syntheticCalls.length === 1);
+                const desc = fake.syntheticCalls[0].description ?? "";
+                assert.ok(desc.length > 0 && desc.length <= 1024);
+                assert.match(desc, /\[panel truncated\]$/);
+                assert.match(fake.syntheticCalls[0].text, /not an instruction/);
+            } finally {
+                cleanup();
+            }
+        });
+    } finally {
+        await proxy.close();
+    }
 });
 
 test("v2 /acp: host omits sessionID → warn once, render nothing (never an empty-id synthetic)", async () => {
@@ -414,7 +441,7 @@ test("v2 /acp: disabled + valid session still renders the 'disabled' notice", as
             const acp = fake.addedCommands.find((c) => c.name === "acp")!;
             await acp.execute({ sessionID: "ses_dis" });
             await until(() => fake.syntheticCalls.length === 1);
-            assert.match(fake.syntheticCalls[0].text, /disabled/);
+            assert.match(fake.syntheticCalls[0].description!, /disabled/);
             assert.equal(fake.syntheticCalls[0].sessionID, "ses_dis");
         } finally {
             cleanup();
@@ -443,8 +470,8 @@ test("v2 /acp: surfaces status.error when the proxy returns no panel", async () 
                 const acp = fake.addedCommands.find((c) => c.name === "acp")!;
                 await acp.execute({ sessionID: "ses_err" });
                 await until(() => fake.syntheticCalls.length === 1);
-                assert.match(fake.syntheticCalls[0].text, /no status panel/);
-                assert.match(fake.syntheticCalls[0].text, /backend-busy/);
+                assert.match(fake.syntheticCalls[0].description!, /no status panel/);
+                assert.match(fake.syntheticCalls[0].description!, /backend-busy/);
             } finally {
                 cleanup();
             }
