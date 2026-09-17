@@ -34,6 +34,19 @@ const MAX_SUMMARY_OUTPUT_TOKENS = 8192;
 // walk can otherwise spend a call per viable range in a block-dense history.
 export const MAX_SUMMARY_CALLS_PER_PREFLIGHT = 16;
 
+// #869 review: coverage bound of the two depth budgets above. One round folds
+// ONE range and each fold removes at most CHUNK_FRACTION x window tokens (the
+// per-call chunk budget), so MAX_PREFLIGHT_ROUNDS rounds cover an overshoot of
+// at most MAX_PREFLIGHT_ROUNDS x CHUNK_FRACTION x window ~= 9.6x the window —
+// a payload of up to ~10.6x the window in the best case. Real coverage is
+// lower: a range smaller than the chunk budget saves less, and the #726
+// halving worklist can spend several calls on one range without completing a
+// fold. Beyond the bound the loop still exits cleanly — the fail-fast reports
+// the post-fold size and the remaining compressible-range count, so an
+// operator sees exactly how far the budget ran out. 16 is tuned to the
+// incident class behind #868 (a 1.39x-window payload); it is a fixed depth,
+// not scaled to the overshoot — scaling it is a separate design question.
+
 export type PreflightProtocol = "anthropic" | "openai" | "responses";
 
 export interface PreflightDeps {
