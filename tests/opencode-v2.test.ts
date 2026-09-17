@@ -80,7 +80,7 @@ function makeFakeCtx() {
     let signal: AbortSignal | undefined;
     const addedTools: FakeAddedTool[] = [];
     const addedCommands: FakeAddedCommand[] = [];
-    const syntheticCalls: Array<{ sessionID: string; text: string }> = [];
+    const syntheticCalls: Array<{ sessionID: string; text: string; description?: string; resume?: boolean }> = [];
     let modelRequestCb: ((e: Record<string, unknown>) => void | Promise<void>) | undefined;
     const disposed: number[] = [];
 
@@ -91,7 +91,7 @@ function makeFakeCtx() {
                 modelRequestCb = cb;
                 return { dispose: () => { disposed.push(1); } };
             },
-            synthetic: async (input: { sessionID: string; text: string }) => {
+            synthetic: async (input: { sessionID: string; text: string; description?: string; resume?: boolean }) => {
                 syntheticCalls.push(input);
                 return {};
             },
@@ -355,6 +355,7 @@ test("v2 setup: /acp command registered and renders proxy status panel via synth
                 await until(() => fake.syntheticCalls.length === 1);
                 assert.equal(fake.syntheticCalls[0].sessionID, "ses_acp_1");
                 assert.match(fake.syntheticCalls[0].text, /ACP-PANEL-OK/);
+                assert.equal(fake.syntheticCalls[0].resume, false);
             } finally {
                 cleanup();
             }
@@ -373,6 +374,7 @@ test("v2 setup: /acp reports no proxy detected via synthetic when no proxy", asy
             await acp.execute({ sessionID: "s_nopx" });
             await until(() => fake.syntheticCalls.length === 1);
             assert.match(fake.syntheticCalls[0].text, /no proxy detected/);
+            assert.equal(fake.syntheticCalls[0].resume, false);
         } finally {
             cleanup();
         }
