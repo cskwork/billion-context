@@ -30,9 +30,10 @@
 // retries are rate-limited to one attempt per RESPAWN_COOLDOWN_MS so a
 // persistently failing spawn does not become a per-request spawn storm.
 //
-// Skipped when a proxy is already managed (BILLION_CONTEXT_PROXY set by a
-// `bili` launch, or BILI_PROVIDER_REWRITES set by a `bili` /bili/ launch) or
-// opted out (BILI_NATIVE_OPENCODE=0 / BILLION_CONTEXT_PLUGIN=0).
+// Skipped when opted out (BILI_NATIVE_OPENCODE=0 / BILLION_CONTEXT_PLUGIN=0)
+// or when a `bili` /bili/ launch owns routing (BILI_PROVIDER_REWRITES). A
+// preset BILLION_CONTEXT_PROXY is treated as an EXTERNAL attach target
+// (probe + rewrite + stamp) instead of a stand-down — see planNativeOpencode.
 //
 // Deployment: OpenCode 2.x `plugin` entries must be DIRECTORIES whose index.js
 // is the entrypoint (bare file paths are rejected, #754 probe) — `bili plugin
@@ -41,7 +42,7 @@
 // src/launcher.ts prepareOpencodeHttpRewrite).
 
 import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST } from "../launcher.js";
-import { markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, singleFlight } from "./native-bootstrap.js";
+import { markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, singleFlight } from "./native-bootstrap.js";
 import { isModelApiUrl, readyOrigin, type NativeInterceptState } from "./native-intercept.js";
 import { createOpencodeV2Setup, type V2HttpRequestEvent, type V2State } from "./opencode-v2.js";
 
@@ -50,13 +51,20 @@ export function shouldBootstrapNativeOpencode(env: NodeJS.ProcessEnv): boolean {
     return nativeBootstrapGate(env, "BILI_NATIVE_OPENCODE");
 }
 
-/** Decide this process's native posture (#809). Precedence off > attach >
- *  spawn: a launcher-owned proxy or an opt-out stands us down entirely (even
- *  over an explicit attach); otherwise attach to BILLION_CONTEXT_ATTACH when
- *  given, else spawn our own watchdog proxy. */
+/** Decide this process's native posture (#809). Precedence kill-switch >
+ *  /bili/ rewrite launch > attach > spawn. A preset BILLION_CONTEXT_PROXY is
+ *  an ATTACH target, not a stand-down: the pseudo-attach hole (preset env +
+ *  bare opencode) used to disarm routing entirely while tools still found the
+ *  proxy through the env — model traffic went direct, the proxy never saw the
+ *  session, and every tool forward 404'd. Attach keeps the user's intent
+ *  ("route through THIS proxy") and matches BILLION_CONTEXT_ATTACH semantics
+ *  (probe + rewrite + stamp); explicit BILLION_CONTEXT_ATTACH wins when both
+ *  are set. A /bili/ launch (BILI_PROVIDER_REWRITES) still stands us down —
+ *  its URLs are already proxy-shaped and isModelApiUrl skips them. */
 export function planNativeOpencode(env: NodeJS.ProcessEnv): { mode: "off" | "attach" | "spawn"; attachOrigin?: string } {
-    if (!shouldBootstrapNativeOpencode(env)) return { mode: "off" };
-    const attachOrigin = nativeAttachOrigin(env);
+    if (env.BILLION_CONTEXT_PLUGIN === "0" || env.BILI_NATIVE_OPENCODE === "0") return { mode: "off" };
+    if (env.BILI_PROVIDER_REWRITES !== undefined) return { mode: "off" };
+    const attachOrigin = nativeAttachOrigin(env) ?? proxyEnvOrigin(env);
     if (attachOrigin !== undefined) return { mode: "attach", attachOrigin };
     return { mode: "spawn" };
 }

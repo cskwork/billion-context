@@ -25,6 +25,22 @@ export function nativeBootstrapGate(env: NodeJS.ProcessEnv, optOutKey: string): 
     return true;
 }
 
+/** Normalize a preset BILLION_CONTEXT_PROXY value (http/https, trailing
+ *  slashes stripped) for attach-style routing. Returns undefined when unset,
+ *  blank, or not a valid http(s) origin. */
+export function proxyEnvOrigin(env: NodeJS.ProcessEnv): string | undefined {
+    const raw = env.BILLION_CONTEXT_PROXY;
+    if (raw === undefined) return undefined;
+    const url = raw.trim();
+    if (url.length === 0 || !/^https?:\/\//i.test(url)) return undefined;
+    try {
+        new URL(url);
+    } catch {
+        return undefined;
+    }
+    return url.replace(/\/+$/, "");
+}
+
 /** External-proxy attach signal (#809): when BILLION_CONTEXT_ATTACH holds a
  *  valid http(s) origin, a host-native entry routes model traffic THROUGH that
  *  pre-existing proxy instead of spawning its own — no ownership, no respawn,
