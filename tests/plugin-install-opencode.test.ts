@@ -151,3 +151,99 @@ test("pluginInstall/remove/status opencode end-to-end (dev form under tsx)", (t)
 
     assert.match(pluginRemove("opencode"), /not installed/);
 });
+
+const MCP_PINNED = { type: "local", command: ["/usr/bin/node", "/opt/old/dist/mcp.js"], environment: { BILI_MCP_PROXY: "http://127.0.0.1:18787" }, enabled: true };
+
+type OcMcpCfg = { plugin?: unknown; mcp?: { bili?: Record<string, unknown> } & Record<string, unknown> };
+
+function withOcConfig(t: import("node:test").TestContext, initial: OcMcpCfg): { file: string; read: () => OcMcpCfg } {
+    const prevXdg = process.env.XDG_CONFIG_HOME;
+    const prevState = process.env.XDG_STATE_HOME;
+    const prevOpen = process.env.OPENCODE_CONFIG;
+    delete process.env.OPENCODE_CONFIG;
+    const xdg = tempDir("bili-oc-mcp-");
+    const state = tempDir("bili-oc-mcp-state-");
+    process.env.XDG_CONFIG_HOME = xdg;
+    process.env.XDG_STATE_HOME = state;
+    t.after(() => {
+        if (prevXdg === undefined) delete process.env.XDG_CONFIG_HOME;
+        else process.env.XDG_CONFIG_HOME = prevXdg;
+        if (prevState === undefined) delete process.env.XDG_STATE_HOME;
+        else process.env.XDG_STATE_HOME = prevState;
+        if (prevOpen === undefined) delete process.env.OPENCODE_CONFIG;
+        else process.env.OPENCODE_CONFIG = prevOpen;
+        fs.rmSync(xdg, { recursive: true, force: true });
+        fs.rmSync(state, { recursive: true, force: true });
+    });
+    const file = path.join(xdg, "opencode", "opencode.json");
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify(initial, null, 2));
+    return { file, read: () => JSON.parse(fs.readFileSync(file, "utf8")) as OcMcpCfg };
+}
+
+test("#926 default install never writes mcp.bili, even with BILI_MCP_PROXY set", (t) => {
+    const prevEnv = process.env.BILI_MCP_PROXY;
+    process.env.BILI_MCP_PROXY = "http://127.0.0.1:18787";
+    t.after(() => {
+        if (prevEnv === undefined) delete process.env.BILI_MCP_PROXY;
+        else process.env.BILI_MCP_PROXY = prevEnv;
+    });
+    const { read } = withOcConfig(t, {});
+    const out = pluginInstall("opencode");
+    assert.match(out, /mcp\.bili not written/);
+    assert.equal(read().mcp, undefined);
+});
+
+test("#926 default install heals a stale pinned mcp.bili from an older install", (t) => {
+    const { read } = withOcConfig(t, { mcp: { bili: MCP_PINNED } });
+    const out = pluginInstall("opencode");
+    assert.match(out, /mcp\.bili removed \(stale second tool face/);
+    assert.equal(read().mcp, undefined);
+});
+
+test("#926 --with-mcp writes mcp.bili without an origin pin (live discovery)", (t) => {
+    const prevEnv = process.env.BILI_MCP_PROXY;
+    delete process.env.BILI_MCP_PROXY;
+    t.after(() => {
+        if (prevEnv === undefined) delete process.env.BILI_MCP_PROXY;
+        else process.env.BILI_MCP_PROXY = prevEnv;
+    });
+    const { read } = withOcConfig(t, {});
+    const out = pluginInstall("opencode", { withMcp: true });
+    assert.match(out, /mcp\.bili written \(no origin pin/);
+    const bili = read().mcp?.bili;
+    assert.ok(bili, "mcp.bili written");
+    assert.equal(bili!.environment, undefined);
+    assert.equal(bili!.enabled, true);
+});
+
+test("#926 --with-mcp pins the origin only when BILI_MCP_PROXY is explicit", (t) => {
+    const prevEnv = process.env.BILI_MCP_PROXY;
+    process.env.BILI_MCP_PROXY = "http://127.0.0.1:8787";
+    t.after(() => {
+        if (prevEnv === undefined) delete process.env.BILI_MCP_PROXY;
+        else process.env.BILI_MCP_PROXY = prevEnv;
+    });
+    const { read } = withOcConfig(t, {});
+    const out = pluginInstall("opencode", { withMcp: true });
+    assert.match(out, /mcp\.bili written \(BILI_MCP_PROXY=http:\/\/127\.0\.0\.1:8787\)/);
+    const bili = read().mcp?.bili;
+    assert.deepEqual(bili!.environment, { BILI_MCP_PROXY: "http://127.0.0.1:8787" });
+});
+
+test("#926 --with-mcp strips a stale pin from an existing entry but keeps the entry", (t) => {
+    const prevEnv = process.env.BILI_MCP_PROXY;
+    delete process.env.BILI_MCP_PROXY;
+    t.after(() => {
+        if (prevEnv === undefined) delete process.env.BILI_MCP_PROXY;
+        else process.env.BILI_MCP_PROXY = prevEnv;
+    });
+    const { read } = withOcConfig(t, { mcp: { bili: MCP_PINNED } });
+    const out = pluginInstall("opencode", { withMcp: true });
+    assert.match(out, /mcp\.bili present \(stale BILI_MCP_PROXY pin removed/);
+    const bili = read().mcp?.bili;
+    assert.ok(bili, "entry kept");
+    assert.equal(bili!.environment, undefined);
+    assert.deepEqual(bili!.command, ["/usr/bin/node", "/opt/old/dist/mcp.js"]);
+    assert.equal(bili!.enabled, true);
+});

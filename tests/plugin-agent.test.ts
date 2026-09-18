@@ -898,14 +898,18 @@ test("plugin install/remove roundtrips for pi/omp/codex/opencode under a fake HO
         const ocPluginDir = path.join(home, ".config/opencode/plugins/billion-context");
         const ocInstallMsg = pluginInstall("opencode");
         assert.match(ocInstallMsg, /installed/);
-        assert.match(ocInstallMsg, /mcp\.bili written/);
+        // #926: default install adds NO mcp.bili (native plugin provides the
+        // tools); --with-mcp opts in and pins only via explicit BILI_MCP_PROXY.
+        assert.match(ocInstallMsg, /mcp\.bili not written/);
+        const ocWithMcp = pluginInstall("opencode", { withMcp: true });
+        assert.match(ocWithMcp, /mcp\.bili written \(BILI_MCP_PROXY=http:\/\/127\.0\.0\.1:8787\)/);
         let oc = JSON.parse(fs.readFileSync(ocFile, "utf8")) as { mcp?: Record<string, { command: string[]; environment?: Record<string, string> }>; compaction?: Record<string, unknown>; $schema?: string } & Record<string, unknown>;
         assert.equal(oc.mcp?.bili.command[1]!.endsWith(path.join("dist", "mcp.js")), true);
         assert.equal(oc.mcp?.bili.environment?.BILI_MCP_PROXY, "http://127.0.0.1:8787");
         assert.deepEqual(oc[ocKey], ["some-other-plugin", ocPluginDir]);
         assert.match(fs.readFileSync(path.join(ocPluginDir, "index.js"), "utf8").replace(/\\+/g, "/"), /agent\/opencode-native\.js/);
         assert.deepEqual(oc.compaction, { auto: false, buffer: 100 });
-        const ocAgain = pluginInstall("opencode");
+        const ocAgain = pluginInstall("opencode", { withMcp: true });
         assert.match(ocAgain, /mcp\.bili present/);
         assert.match(ocAgain, new RegExp(`${ocKey} present`));
         assert.match(pluginRemove("opencode"), /removed/);
@@ -938,8 +942,9 @@ test("plugin install opencode without a live proxy: MCP shell skipped, native pl
             const ocKey = pickPluginKey(detectOpencodeMajor());
             const msg = pluginInstall("opencode");
             assert.match(msg, /installed/);
-            assert.match(msg, /mcp\.bili skipped/);
-            assert.match(msg, /no bili proxy origin found/);
+            // #926: no mcp.bili by default — with or without a live proxy
+            assert.match(msg, /mcp\.bili not written/);
+            assert.doesNotMatch(msg, /no bili proxy origin found/);
             const data = JSON.parse(fs.readFileSync(ocFile, "utf8")) as { mcp?: unknown; compaction?: Record<string, unknown> } & Record<string, unknown>;
             assert.equal(data.mcp, undefined);
             assert.deepEqual(data[ocKey], [path.join(home, ".config/opencode/plugins/billion-context")]);
@@ -1160,11 +1165,12 @@ test("plugin opencode survives a non-object mcp (issue #836 / #809 N4)", async (
         assert.equal(pluginStatusAll().find((r) => r.agent === "opencode")!.status, "not installed");
         assert.equal(fs.readFileSync(ocFile, "utf8"), malformed);
 
-        // New installer (#919/#927): a bogus mcp key skips ONLY the mcp shell —
-        // the native plugin entry + compaction.auto still land, and sibling
-        // keys survive untouched.
+        // New installer (#919/#927): a bogus mcp key skips ONLY the mcp shell
+        // (#926: only reachable via --with-mcp now) — the native plugin entry
+        // + compaction.auto still land, and sibling keys survive untouched.
         assert.doesNotThrow(() => pluginInstall("opencode"));
-        assert.match(pluginInstall("opencode"), /skipped/i);
+        assert.match(pluginInstall("opencode", { withMcp: true }), /skipped/i);
+        assert.match(pluginInstall("opencode"), /mcp\.bili not written/);
         const data = JSON.parse(fs.readFileSync(ocFile, "utf8")) as Record<string, unknown>;
         assert.equal(data.mcp, "bogus-string");
         assert.equal(data.other, 1);

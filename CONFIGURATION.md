@@ -762,14 +762,15 @@ bili plugin install pi      # add this billion-context install to pi's settings.
 bili plugin install omp     # same for omp (config.yml extensions)
 bili plugin install claude  # register the bili MCP server (claude mcp add, user scope)
 bili plugin install codex   # append [mcp_servers.bili] to ~/.codex/config.toml
-bili plugin install opencode  # add mcp.bili to ~/.config/opencode/opencode.json
+bili plugin install opencode  # self-spawning native plugin (+ tools) in ~/.config/opencode/opencode.json
+                                  # --with-mcp also adds the mcp.bili MCP face (no origin pin — live discovery)
 bili plugin list            # install status for every supported host
 bili plugin remove pi       # undo (original files backed up to *.bili-bak once)
 ```
 
 `install pi` also replaces any **legacy** billion-context entries (old `npm:billion-context-pi` references, stale `npm:billion-context@x.y.z`, leftover dev-checkout paths) so exactly one bili plugin stays live.
 
-The installed plugin is a **thin** one (~5 KB, zero runtime deps): it detects the proxy (from the `/bili/` baseURL or `BILLION_CONTEXT_PROXY`), fetches tool schemas from the proxy, registers native tools, and forwards executions — the proxy remains the single compression authority, so plugin and proxy always match versions. Hosts without a plugin API (claude, codex, opencode) install the MCP bridge (`dist/mcp.js`) instead — same protocol underneath, though MCP has no slash-commands (no `/acp` panel command).
+The installed plugin is a **thin** one (~5 KB, zero runtime deps): it detects the proxy (from the `/bili/` baseURL or `BILLION_CONTEXT_PROXY`), fetches tool schemas from the proxy, registers native tools, and forwards executions — the proxy remains the single compression authority, so plugin and proxy always match versions. Hosts without a plugin API (claude, codex) install the MCP bridge (`dist/mcp.js`) instead — same protocol underneath, though MCP has no slash-commands (no `/acp` panel command). opencode has its own plugin API, so its install adds the native plugin tools and no MCP face by default (`--with-mcp` opts in; the entry carries no `BILI_MCP_PROXY` pin — `dist/mcp.js` discovers the live proxy via the instance file at call time, which survives the native plugin's ephemeral-port restarts, #926).
 
 Kill switch: `BILLION_CONTEXT_PLUGIN=0` disables plugin mode entirely (wire-level injection resumes).
 

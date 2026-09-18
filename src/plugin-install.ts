@@ -674,32 +674,63 @@ export function applyOpencodePluginEntry(args: { data: Record<string, unknown>; 
     return [`plugin -> ${shimDir} (replaced ${replaced.join(", ")})`, DEV_FORM_NOTE];
 }
 
-function opencodeInstall(): string {
+function opencodeInstall(withMcp = false): string {
     const file = opencodeTargetFile();
     const { original, data } = loadOpencodeConfig(file);
     const notes: string[] = [];
     const touched = new Set<string>();
 
-    // MCP shell is optional: the native plugin below self-spawns a proxy, so a
-    // missing live origin skips the shell instead of failing the install.
-    try {
-        const mcpJs = path.join(selfPackageRoot(), "dist", "mcp.js");
-        requireDistFile(mcpJs);
+    // #926: the native plugin below registers the bili tools itself (auto
+    // session-bound), so opencode gets NO mcp.bili by default — a frozen
+    // BILI_MCP_PROXY there goes stale the moment the plugin's
+    // ephemeral-port proxy restarts. Default heals any entry an older
+    // install froze in. --with-mcp opts in; the entry then carries no origin
+    // pin (dist/mcp.js discovers the live proxy via the instance file at
+    // call time) unless BILI_MCP_PROXY is set for this install.
+    if (!withMcp) {
         const rawMcp = data.mcp;
-        if (rawMcp != null && !isPlainMcpObject(rawMcp)) {
-            notes.push('mcp.bili skipped ("mcp" is not an object)');
+        if (isPlainMcpObject(rawMcp) && "bili" in rawMcp) {
+            delete rawMcp.bili;
+            if (Object.keys(rawMcp).length === 0) delete data.mcp;
+            touched.add("mcp");
+            notes.push("mcp.bili removed (stale second tool face — the native plugin provides the bili tools; install with --with-mcp to keep an MCP face)");
         } else {
-            const mcp = (rawMcp as Record<string, unknown> | undefined) ?? {};
-            if ("bili" in mcp) notes.push("mcp.bili present");
-            else {
-                mcp.bili = { type: "local", command: [process.execPath, mcpJs], environment: { BILI_MCP_PROXY: proxyOriginForInstall() }, enabled: true };
-                data.mcp = mcp;
-                touched.add("mcp");
-                notes.push("mcp.bili written");
-            }
+            notes.push("mcp.bili not written (the native plugin provides the bili tools; --with-mcp adds an MCP face)");
         }
-    } catch (err) {
-        notes.push(`mcp.bili skipped (${err instanceof Error ? err.message : String(err)})`);
+    } else {
+        try {
+            const mcpJs = path.join(selfPackageRoot(), "dist", "mcp.js");
+            requireDistFile(mcpJs);
+            const rawMcp = data.mcp;
+            if (rawMcp != null && !isPlainMcpObject(rawMcp)) {
+                notes.push('mcp.bili skipped ("mcp" is not an object)');
+            } else {
+                const mcp = (rawMcp as Record<string, unknown> | undefined) ?? {};
+                const explicit = process.env.BILI_MCP_PROXY?.trim();
+                const bili = mcp.bili;
+                if (bili !== null && typeof bili === "object" && !Array.isArray(bili)) {
+                    const env = (bili as Record<string, unknown>).environment;
+                    const envObj = env !== null && typeof env === "object" && !Array.isArray(env) ? (env as Record<string, unknown>) : undefined;
+                    if (envObj?.BILI_MCP_PROXY !== undefined && explicit === undefined) {
+                        delete envObj.BILI_MCP_PROXY;
+                        if (Object.keys(envObj).length === 0) delete (bili as Record<string, unknown>).environment;
+                        touched.add("mcp");
+                        notes.push("mcp.bili present (stale BILI_MCP_PROXY pin removed — live discovery takes over)");
+                    } else {
+                        notes.push("mcp.bili present");
+                    }
+                } else {
+                    const entry: Record<string, unknown> = { type: "local", command: [process.execPath, mcpJs], enabled: true };
+                    if (explicit !== undefined) entry.environment = { BILI_MCP_PROXY: explicit };
+                    mcp.bili = entry;
+                    data.mcp = mcp;
+                    touched.add("mcp");
+                    notes.push(explicit !== undefined ? `mcp.bili written (BILI_MCP_PROXY=${explicit})` : "mcp.bili written (no origin pin — live discovery via instance file)");
+                }
+            }
+        } catch (err) {
+            notes.push(`mcp.bili skipped (${err instanceof Error ? err.message : String(err)})`);
+        }
     }
 
     // Native plugin (#820/#925): self-spawned proxy + http.request URL rewrite.
@@ -811,8 +842,8 @@ export function isPluginAgent(value: string): value is PluginAgent {
     return (PLUGIN_AGENTS as readonly string[]).includes(value);
 }
 
-export function pluginInstall(agent: PluginAgent): string {
-    return agent === "pi" ? piInstall() : agent === "omp" ? ompInstall() : agent === "claude" ? claudeInstall() : agent === "codex" ? codexInstall() : opencodeInstall();
+export function pluginInstall(agent: PluginAgent, opts: { withMcp?: boolean } = {}): string {
+    return agent === "pi" ? piInstall() : agent === "omp" ? ompInstall() : agent === "claude" ? claudeInstall() : agent === "codex" ? codexInstall() : opencodeInstall(opts.withMcp === true);
 }
 
 export function pluginRemove(agent: PluginAgent): string {

@@ -116,7 +116,7 @@ test("install targets existing opencode.jsonc, preserves comments, keeps compact
         await withEnv(env, async () => {
             const msg = pluginInstall("opencode");
             assert.match(msg, /installed -> .*opencode\.jsonc/);
-            assert.match(msg, /mcp\.bili written/);
+            assert.match(msg, /mcp\.bili not written/);
             assert.match(msg, /compaction\.auto already disabled/);
             assert.doesNotMatch(msg, /set to false/);
             const dir = path.join(cfgDir, "plugins/billion-context");
@@ -131,7 +131,7 @@ test("install targets existing opencode.jsonc, preserves comments, keeps compact
 
             // idempotent re-run: byte-identical file, presence notes only
             const again = pluginInstall("opencode");
-            assert.match(again, /mcp\.bili present/);
+            assert.match(again, /mcp\.bili not written/);
             assert.match(again, new RegExp(`${ocKey} present`));
             assert.match(again, /compaction\.auto already disabled/);
             assert.equal(fs.readFileSync(file, "utf8"), text, "re-run leaves the file byte-identical");
