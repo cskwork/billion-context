@@ -935,6 +935,22 @@ function restoreDshPatchPlaceholder(text: string): string {
     return `${header}[]\n`;
 }
 
+/** True when this profile installs billion-context as a dsh bundle
+ *  (`dsh plugin --profile <name> add billion-context` — the package lands in
+ *  the profile's node_modules and its manifest-declared patch mounts as a
+ *  bundle layer). Such a profile must NOT also receive the managed block:
+ *  cordis rejects duplicate loader entry ids across layers, so a second
+ *  `id: bili-native` insert would hard-fail dsh boot. */
+export function dshBundleInstalled(profileDir: string): boolean {
+    try {
+        const manifest = JSON.parse(fs.readFileSync(path.join(profileDir, "package.json"), "utf8")) as { dsh?: { profile?: { bundles?: unknown } } };
+        const bundles = manifest.dsh?.profile?.bundles;
+        return Array.isArray(bundles) && bundles.includes("billion-context");
+    } catch {
+        return false;
+    }
+}
+
 function dshInstall(): string {
     const root = selfPackageRoot();
     requireDistFile(path.join(root, "dist", "agent", "dsh-native.js"));
@@ -942,6 +958,10 @@ function dshInstall(): string {
     const notes: string[] = [];
     let touched = 0;
     for (const dir of dshProfileDirs()) {
+        if (dshBundleInstalled(dir)) {
+            notes.push(`${path.basename(dir)}: skipped (installed as a dsh bundle — remove it with \'dsh plugin --profile ${path.basename(dir)} remove billion-context\' instead)`);
+            continue;
+        }
         const file = path.join(dir, "cordis.patch.yml");
         let text: string;
         try {
@@ -952,13 +972,18 @@ function dshInstall(): string {
         fs.writeFileSync(file, mergeDshManagedPatch(text, block));
         touched += 1;
     }
-    if (fs.existsSync(resolveDshHome(process.env)) && touched === 0) notes.push("no profile directories found");
+    if (fs.existsSync(resolveDshHome(process.env)) && touched === 0 && notes.length === 0) notes.push("no profile directories found");
     return `wrote bili-native plugin + compaction off into ${touched} dsh profile(s) under ${path.join(resolveDshHome(process.env), "profiles")}${notes.length > 0 ? ` (${notes.join("; ")})` : ""} — restart dsh to load it`;
 }
 
 function dshRemove(): string {
+    const notes: string[] = [];
     let touched = 0;
     for (const dir of dshProfileDirs()) {
+        if (dshBundleInstalled(dir)) {
+            notes.push(`${path.basename(dir)}: installed as a dsh bundle — remove it with \'dsh plugin --profile ${path.basename(dir)} remove billion-context\' instead`);
+            continue;
+        }
         const file = path.join(dir, "cordis.patch.yml");
         let text: string;
         try {
@@ -970,11 +995,12 @@ function dshRemove(): string {
         fs.writeFileSync(file, restoreDshPatchPlaceholder(stripDshManagedPatch(text)));
         touched += 1;
     }
-    return `removed the bili patch from ${touched} dsh profile(s) — restart dsh to finish`;
+    return `removed the bili patch from ${touched} dsh profile(s)${notes.length > 0 ? ` (${notes.join("; ")})` : ""} — restart dsh to finish`;
 }
 
 function dshStatus(): string {
     const dirs = dshProfileDirs();
+    const bundle = dirs.filter((dir) => dshBundleInstalled(dir));
     const withBlock = dirs.filter((dir) => {
         try {
             return fs.readFileSync(path.join(dir, "cordis.patch.yml"), "utf8").includes(DSH_PATCH_BEGIN);
@@ -982,6 +1008,8 @@ function dshStatus(): string {
             return false;
         }
     });
+    if (bundle.length === dirs.length && dirs.length > 0) return `installed (dsh bundle in all ${dirs.length} profiles — remove with 'dsh plugin --profile <name> remove billion-context')`;
+    if (bundle.length > 0) return `installed as a dsh bundle in ${bundle.length}/${dirs.length} profiles`;
     if (withBlock.length === dirs.length && dirs.length > 0) return "installed";
     if (withBlock.length > 0) return `installed in ${withBlock.length}/${dirs.length} profiles — rerun install to fix`;
     return "not installed";
@@ -999,6 +1027,7 @@ export function dshNativeInstalled(env: NodeJS.ProcessEnv = process.env): boolea
         return false;
     }
     return dirs.some((dir) => {
+        if (dshBundleInstalled(dir)) return true;
         try {
             return fs.readFileSync(path.join(dir, "cordis.patch.yml"), "utf8").includes(DSH_PATCH_BEGIN);
         } catch {

@@ -82,7 +82,7 @@ AI 编程助手的<strong>通用上下文压缩代理</strong>
 | **opencode 2.0+** | `bili opencode`(内置 V2 插件 —— 原生工具,无需另装包)或 `bili plugin install opencode`(自拉起原生插件,免启动器) |
 | **opencode** | [`billion-context`](https://github.com/ranxianglei/billion-context),`bili opencode`(新会话走 bili 代理;现有 [`opencode-acp`](https://github.com/ranxianglei/opencode-acp) 会话继续可用,见下文「OpenCode 1.x」) |
 | **omp** | [`billion-context`](https://github.com/ranxianglei/billion-context)，`bili omp`（内置插件） |
-| **dsh** | [`billion-context`](https://github.com/ranxianglei/billion-context) —— `bili dsh`（启动器，经 `--patch` 注入完整原生插件：工具、会话绑定 `/acp`、fetch 拦截）或 `bili plugin install dsh`（自拉起原生插件，免启动器 —— 往 `~/.dsh/profiles/*/cordis.patch.yml` 每个profile 写入 cordis patch） |
+| **dsh** | [`billion-context`](https://github.com/ranxianglei/billion-context) —— `bili dsh`（启动器，经 `--patch` 注入完整原生插件：工具、会话绑定 `/acp`、fetch 拦截）或 `bili plugin install dsh`（自拉起原生插件，免启动器 —— 往 `~/.dsh/profiles/*/cordis.patch.yml` 每个profile 写入 cordis patch）或 `dsh plugin --profile <name> add billion-context`（dsh 侧安装，全程不需 bili 命令 —— 从 npm 挂载包内 patch 层） |
 | **其余所有**（没有上下文 hook） | [`billion-context`](https://github.com/ranxianglei/billion-context) —— `bili <client>`（启动器，优先）或 `/bili/` 前缀 |
 
 **原生模式 vs 独立扩展。** 宿主原生插件(`bili plugin install pi` / `opencode` —— 代理在宿主进程内拉起)与独立进程内扩展(`billion-context-pi`、`opencode-acp`)**互斥**:两者同时生效意味着双重压缩。安装器负责切换:`bili plugin install pi` 会替换旧的 `npm:billion-context-pi` 条目;`bili plugin install opencode` 会从全局 opencode.json 里剔除旧的 `opencode-acp` 条目 —— 裸名、`npm:` 别名、带版本号(`opencode-acp@stable`)、路径形式都认,数组/对象两种形态都处理;原配置会快照到 `opencode.json.bili-bak`。**项目级**安装(`opencode plugin opencode-acp` 写的是 `<project>/.opencode/opencode.json`,不是全局配置)不会被碰 —— 需手动移除,安装器输出里会提醒。作为手动安装的运行期安全网,原生入口在加载时同步设置 `BILLION_CONTEXT_NATIVE=<host>`,让独立扩展在动作时自动退出 —— 它自己的加载期 `BILLION_CONTEXT_PROXY` 检查看不见原生模式异步拉起的代理,`/bili/` baseURL 检查也看不见 fetch 层改写。
@@ -122,6 +122,8 @@ bili plugin install opencode    # 在 opencode 真实配置里注册插件 + 关
 bili plugin install dsh         # 往每个 ~/.dsh/profiles/*/cordis.patch.yml 追加受管块
 bili plugin remove <client>     # 卸载(dsh 还原占位符;配置快照存 .bili-bak)
 ```
+
+dsh 用户可以完全不用 bili：`dsh plugin --profile <name> add billion-context` 经 dsh 自己的插件通道装上同一个原生插件（pnpm 装进 profile、挂载包内 patch 层）—— 见下文 dsh 段。
 
 插件加载时**自拉起自己的代理**(已有健康实例则直接复用 —— 父进程 pid 看门狗在客户端退出时收掉它),把模型流量改写到 `<proxy>/bili/<上游URL>`,并把 `compress` / `decompress` / `acp_status` 注册为客户端原生工具(plugin 模式),`/acp` 面板绑定当前会话。退出开关:`BILI_NATIVE_PI=0`、`BILI_NATIVE_OPENCODE=0`、`BILI_NATIVE_DSH=0`。
 
@@ -189,6 +191,7 @@ bili
 
 - **启动器:** `bili dsh` 经 `--patch` overlay(`~/.dsh-bili/.bili-acp.patch.yml`)注入完整原生插件 —— 每个 profile 启动即注册 bili 工具，模型请求盖 `x-bili-plugin` + dsh 会话 id(plugin 模式)，`/acp` 会话绑定。同一份 patch 同时禁用 dsh 原生自动压缩(`compaction-basic` → `auto: false`);手动 `/compact` 仍可用。
 - **原生(免启动器):** `bili plugin install dsh` 往每个 profile 的 `~/.dsh/profiles/<name>/cordis.patch.yml` 追加受管块(标记 `# bili begin` / `# bili end`;用户条目与注释保留，占位 `[]` 根会被替换，卸载时还原)。先在每个 profile 里跑过一次 dsh 让目录存在。插件加载时自拉起代理(已有健康实例则附看，不重复拉;父进程 pid 看门狗)，经全局 fetch 补丁把模型流量改写为 `<proxy>/bili/<上游URL>`，原样注册清单工具，并按工具就绪门控 plugin 模式头(第一轮走 wire 模式)。退出开关:`BILI_NATIVE_DSH=0`。卸载:`bili plugin remove dsh`。
+- **dsh 侧安装(全程不需 bili 命令):** `dsh plugin --profile <name> add billion-context` 经 pnpm 把 npm 包装进该 profile 并自动挂载包内 patch 层(`dsh.bundle.patch.yml`) —— 同一插件、行为与原生泳道完全一致。安装器、`bili dsh` 启动器 overlay 与 `plugin status` 都会识别 bundle 安装的 profile 并跳过(cordis 拒绝跨层重复 entry id,二次 insert `id: bili-native` 会直接弄崩 dsh 启动)。卸载:`dsh plugin --profile <name> remove billion-context`。要求 npm 上已发布含 `dsh.bundle.patch.yml` 的版本。
 
 `bili dsh` 启动下插件**附看**(attach)启动器的代理(不二次拉起)。裸上游 URL 与 spawn 模式一样重写为 `<proxy>/bili/<url>`(回环代理目标永不被代理 env 拦截，等于直接绕开 MITM)；已经路由的 `/bili/` 前缀请求原样放行、只盖章。已知局限:手动 `/compact` 没有 dsh 侧事件钩子，其边界交给内核的自然 ingest diff(自动压缩已关，影响罕见)。
 

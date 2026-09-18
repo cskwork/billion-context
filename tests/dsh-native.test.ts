@@ -6,7 +6,7 @@ import path from "node:path";
 import http from "node:http";
 import { pathToFileURL } from "node:url";
 import { apply, planNativeDsh, shouldBootstrapNativeDsh, _resetRegisterForTest, _stateHeadersForTest } from "../src/agent/dsh-native.ts";
-import { dshManagedPatchBlock, dshNativeInstalled, dshProfileDirs, mergeDshManagedPatch, stripDshManagedPatch, pluginInstall, pluginRemove, pluginStatusAll } from "../src/plugin-install.ts";
+import { dshManagedPatchBlock, dshNativeInstalled, dshProfileDirs, mergeDshManagedPatch, stripDshManagedPatch, dshBundleInstalled, pluginInstall, pluginRemove, pluginStatusAll } from "../src/plugin-install.ts";
 
 test("planNativeDsh: kill-switches > attach > spawn precedence (#941)", () => {
     assert.deepEqual(planNativeDsh({}), { mode: "spawn" });
@@ -141,6 +141,59 @@ test("dshNativeInstalled: true iff any profile carries the managed block", async
                 path.join(home, "profiles", "headless", "cordis.patch.yml"),
                 mergeDshManagedPatch(`${HEADER}[]\n`, dshManagedPatchBlock(home)),
             );
+            assert.equal(dshNativeInstalled(), true);
+        });
+    } finally {
+        fs.rmSync(home, { recursive: true, force: true });
+    }
+});
+
+test("dshBundleInstalled: true iff the profile manifest lists billion-context as a bundle", () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-bundle-"));
+    try {
+        fs.mkdirSync(path.join(home, "web"), { recursive: true });
+        assert.equal(dshBundleInstalled(path.join(home, "web")), false); // no manifest
+        fs.writeFileSync(path.join(home, "web", "package.json"), JSON.stringify({ name: "dsh-profile" }));
+        assert.equal(dshBundleInstalled(path.join(home, "web")), false); // no dsh block
+        fs.writeFileSync(path.join(home, "web", "package.json"), JSON.stringify({ dsh: { profile: { bundles: ["something-else"] } } }));
+        assert.equal(dshBundleInstalled(path.join(home, "web")), false);
+        fs.writeFileSync(path.join(home, "web", "package.json"), JSON.stringify({ dsh: { profile: { bundles: ["billion-context"] } } }));
+        assert.equal(dshBundleInstalled(path.join(home, "web")), true);
+    } finally {
+        fs.rmSync(home, { recursive: true, force: true });
+    }
+});
+
+test("dsh install/remove/status skip bundle-installed profiles, dshNativeInstalled recognizes them", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-home-bundle-"));
+    try {
+        await withEnv({ DSH_HOME: home }, async () => {
+            fs.mkdirSync(path.join(home, "profiles", "headless"), { recursive: true });
+            fs.mkdirSync(path.join(home, "profiles", "web"), { recursive: true });
+            fs.writeFileSync(path.join(home, "profiles", "headless", "cordis.patch.yml"), `${HEADER}[]\n`);
+            // web/ installed billion-context via `dsh plugin add` — manifest carries the bundle
+            fs.writeFileSync(path.join(home, "profiles", "web", "package.json"), JSON.stringify({ dsh: { profile: { bundles: ["billion-context"] } } }));
+
+            // the bundle profile already provides bili-native
+            assert.equal(dshNativeInstalled(), true);
+
+            // install only touches the non-bundle profile and says so
+            const msg = pluginInstall("dsh");
+            assert.match(msg, /1 dsh profile/);
+            assert.match(msg, /web: skipped \(installed as a dsh bundle/);
+            assert.ok(!fs.existsSync(path.join(home, "profiles", "web", "cordis.patch.yml")));
+            const headlessTxt = fs.readFileSync(path.join(home, "profiles", "headless", "cordis.patch.yml"), "utf8");
+            assert.ok(headlessTxt.includes("dsh-native.js"));
+
+            assert.match(pluginStatusAll().find((r) => r.agent === "dsh")?.status ?? "", /installed as a dsh bundle in 1\/2 profiles/);
+
+            // remove also skips the bundle profile with a pointer to the dsh-side command
+            const removed = pluginRemove("dsh");
+            assert.match(removed, /1 dsh profile/);
+            assert.match(removed, /dsh plugin --profile web remove billion-context/);
+            const after = fs.readFileSync(path.join(home, "profiles", "headless", "cordis.patch.yml"), "utf8");
+            assert.equal(after, `${HEADER}[]\n`);
+            // web/ still counts as installed via its bundle
             assert.equal(dshNativeInstalled(), true);
         });
     } finally {

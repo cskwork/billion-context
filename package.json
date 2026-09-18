@@ -6,7 +6,8 @@
   "main": "dist/index.js",
   "exports": {
     ".": "./dist/index.js",
-    "./server": "./dist/agent/opencode-native.js"
+    "./server": "./dist/agent/opencode-native.js",
+    "./dsh": "./dist/agent/dsh-native.js"
   },
   "bin": {
     "bili": "./dist/index.js",
@@ -67,9 +68,10 @@
     "node": ">=20"
   },
   "files": [
-    "dist",
+    "LICENSE",
     "README.md",
-    "LICENSE"
+    "dist",
+    "dsh.bundle.patch.yml"
   ],
   "pi": {
     "image": "https://raw.githubusercontent.com/ranxianglei/billion-context/master/docs/logo.png",
@@ -80,5 +82,10 @@
   "publishConfig": {
     "access": "public",
     "registry": "https://registry.npmjs.org"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./dsh.bundle.patch.yml"
+    }
   }
 }
