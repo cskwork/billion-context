@@ -320,8 +320,11 @@ test("proxy error log: connection failure to non-public upstream leaks nothing (
 
 test("mitm CONNECT tunnel failure: err.message host scrubbed from log (#255)", async () => {
     const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "bili-log-mask-mitm-"));
-    const prev = { xdgState: process.env.XDG_STATE_HOME };
+    const prev = { xdgState: process.env.XDG_STATE_HOME, dataHome: process.env.XDG_DATA_HOME };
     process.env.XDG_STATE_HOME = tmpRoot;
+    // MITM-enabled startup calls ensureRootCA(); isolate the CA dir so parallel
+    // test files can't race on the shared real-profile dir on Windows.
+    process.env.XDG_DATA_HOME = path.join(tmpRoot, "data");
     const captured: Captured[] = [];
     setLogCapture((level, msg) => captured.push({ level, msg }));
     _setStoreForTest(new SessionStore({ enabled: false }));
@@ -372,6 +375,8 @@ test("mitm CONNECT tunnel failure: err.message host scrubbed from log (#255)", a
         setLogCapture(null);
         if (prev.xdgState === undefined) delete process.env.XDG_STATE_HOME;
         else process.env.XDG_STATE_HOME = prev.xdgState;
+        if (prev.dataHome === undefined) delete process.env.XDG_DATA_HOME;
+        else process.env.XDG_DATA_HOME = prev.dataHome;
         await close(proxy!);
         fs.rmSync(tmpRoot, { recursive: true, force: true });
     }

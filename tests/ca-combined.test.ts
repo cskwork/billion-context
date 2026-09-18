@@ -16,6 +16,10 @@ test.before(() => {
         savedEnv[k] = process.env[k];
     }
     process.env.HOME = _tmpHome;
+    // caDir() resolves through XDG_DATA_HOME (checked before os.homedir()); on
+    // Windows HOME does NOT affect homedir(), so without this the CA dir leaks
+    // into the real profile dir and races other files' parallel MITM startups.
+    process.env.XDG_DATA_HOME = path.join(_tmpHome, "data");
     delete process.env.SSL_CERT_FILE;
 });
 

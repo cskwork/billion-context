@@ -28,7 +28,11 @@ function close(server: http.Server): Promise<void> {
 test("health + stats expose blindTunnels counts with real hosts (#897)", async () => {
     const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "bili-blind-stats-"));
     const prevXdg = process.env.XDG_STATE_HOME;
+    const prevData = process.env.XDG_DATA_HOME;
     process.env.XDG_STATE_HOME = tmpRoot;
+    // MITM-enabled startup calls ensureRootCA(); isolate the CA dir so parallel
+    // test files can't race on the shared real-profile dir on Windows.
+    process.env.XDG_DATA_HOME = path.join(tmpRoot, "data");
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
     _resetBlindTunnelStatsForTest();
@@ -80,6 +84,8 @@ test("health + stats expose blindTunnels counts with real hosts (#897)", async (
         _resetBlindTunnelStatsForTest();
         if (prevXdg === undefined) delete process.env.XDG_STATE_HOME;
         else process.env.XDG_STATE_HOME = prevXdg;
+        if (prevData === undefined) delete process.env.XDG_DATA_HOME;
+        else process.env.XDG_DATA_HOME = prevData;
         fs.rmSync(tmpRoot, { recursive: true, force: true });
     }
 });
