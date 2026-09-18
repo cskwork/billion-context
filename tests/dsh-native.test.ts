@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import http from "node:http";
 import { pathToFileURL } from "node:url";
-import { apply, planNativeDsh, shouldBootstrapNativeDsh, _resetRegisterForTest } from "../src/agent/dsh-native.ts";
+import { apply, planNativeDsh, shouldBootstrapNativeDsh, _resetRegisterForTest, _stateHeadersForTest } from "../src/agent/dsh-native.ts";
 import { dshManagedPatchBlock, dshNativeInstalled, dshProfileDirs, mergeDshManagedPatch, stripDshManagedPatch, pluginInstall, pluginRemove, pluginStatusAll } from "../src/plugin-install.ts";
 
 test("planNativeDsh: kill-switches > attach > spawn precedence (#941)", () => {
@@ -218,6 +218,16 @@ type RegisteredTool = {
     execute: (args: Record<string, unknown>, exec: { agent?: { session?: { id?: unknown } }; signal?: AbortSignal }) => Promise<unknown>;
 };
 
+/** Poll until cond() holds (10ms ticks, 5s cap) — a fixed sleep races on
+ *  slow CI runners (windows loopback fetch can outlast 50ms). */
+async function waitFor(cond: () => boolean, what: string): Promise<void> {
+    const deadline = Date.now() + 5000;
+    while (!cond()) {
+        if (Date.now() > deadline) throw new Error(`timeout waiting for ${what}`);
+        await new Promise((r) => setTimeout(r, 10));
+    }
+}
+
 function mockCtx() {
     const tools: RegisteredTool[] = [];
     const commands: Array<{ name: string; handler: () => Promise<{ kind: string; text: string }> }> = [];
@@ -246,8 +256,7 @@ test("apply() attach mode: registers manifest tools verbatim, gates headers, for
 
             // headers gate on toolsReady — no session, no headers; and before
             // registration completes nothing is stamped
-            await new Promise((r) => setTimeout(r, 50));
-            assert.equal(ctx.registeredTools.length, 1);
+            await waitFor(() => ctx.registeredTools.length === 1, "manifest tool registration (ctx)");
             const tool = ctx.registeredTools[0];
             assert.equal(tool.name, "compress");
             // parameters pass through verbatim (the manifest's JSON Schema)
@@ -269,7 +278,7 @@ test("apply() attach mode: registers manifest tools verbatim, gates headers, for
                 process.env.BILLION_CONTEXT_PROXY = cap.origin;
                 const ctx2 = mockCtx();
                 apply(ctx2);
-                await new Promise((r) => setTimeout(r, 50));
+                await waitFor(() => ctx2.registeredTools.length === 1, "manifest tool registration (ctx2)");
                 const t2 = ctx2.registeredTools[0];
                 const out = await t2.execute({ summary: "s" }, { agent: { session: { id: "session-7" } } });
                 assert.equal(out, "compressed 42 tokens");
@@ -289,6 +298,44 @@ test("apply() attach mode: registers manifest tools verbatim, gates headers, for
             assert.ok(ok.text.includes("PANEL-OK") || ok.text.includes("billion-context@"));
         });
     } finally {
+        proxy.close();
+        fs.rmSync(home, { recursive: true, force: true });
+        _resetRegisterForTest(undefined);
+    }
+});
+
+test("apply() inactive-context registration failure is silent and terminal (dsh 0.1.5+ teardown)", async () => {
+    const proxy = await startMockProxy([]);
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-inactive-"));
+    const errors: string[] = [];
+    const origErr = console.error;
+    console.error = (...args: unknown[]) => {
+        errors.push(args.map(String).join(" "));
+    };
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin }, async () => {
+            _resetRegisterForTest(proxy.origin);
+            const ctx = mockCtx();
+            // simulate cordis teardown: the plugin context is inactive, so
+            // every service access rejects with cordis's inactive-context error
+            const inactive = new Error('cannot get required service "tools" in inactive context');
+            ctx.tools.register = () => {
+                throw inactive;
+            };
+            apply(ctx);
+            await new Promise((r) => setTimeout(r, 50));
+            assert.equal(ctx.registeredTools.length, 0);
+            // teardown noise is suppressed — no retry log, no wire-mode warning
+            assert.equal(errors.length, 0);
+            // a later nudge (headersFor) must not resurrect retries either
+            const stamp = _stateHeadersForTest();
+            stamp?.("http://example.test/v1/messages");
+            await new Promise((r) => setTimeout(r, 20));
+            assert.equal(ctx.registeredTools.length, 0);
+            assert.equal(errors.length, 0);
+        });
+    } finally {
+        console.error = origErr;
         proxy.close();
         fs.rmSync(home, { recursive: true, force: true });
         _resetRegisterForTest(undefined);
