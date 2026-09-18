@@ -45,7 +45,7 @@ import {
     type ProxyInstanceFile,
     type ProxyStartingMarker,
 } from "./instance.js";
-import { selfPackageRoot, isBiliPiEntry, ompPluginLoadedFrom } from "./plugin-install.js";
+import { selfPackageRoot, isBiliPiEntry, ompPluginLoadedFrom, dshNativeInstalled } from "./plugin-install.js";
 
 /** Absolute path of a file inside our dist/, resolved via the package root
  * (import.meta.url-based) so it survives global-installed symlink bins
@@ -2609,8 +2609,10 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
             );
         }
         // Native /acp command rides a --patch overlay (independent of the
-        // settings rewrite above), so it exists on every profile dsh boots.
-        const dshAcpPatch = writeDshAcpPatch(dshHomeDir);
+        // settings rewrite above) unless a persistent `bili plugin install dsh`
+        // already provides it — a second `id: bili-native` insert would trip
+        // cordis' duplicate-entry-id check and hard-fail dsh boot.
+        const dshAcpPatch = dshNativeInstalled() ? undefined : writeDshAcpPatch(dshHomeDir);
         if (dshAcpPatch) clientArgs = dshArgsWithPatch(clientArgs, dshAcpPatch);
     } else if (base === "kimi") {
         // #757: cert-MITM like hermes/dsh — Kimi Code honors standard proxy

@@ -987,6 +987,26 @@ function dshStatus(): string {
     return "not installed";
 }
 
+/** True when any profile's user layer carries the managed block. The `bili dsh`
+ *  launcher consults this before adding its own --patch overlay: cordis rejects
+ *  duplicate loader entry ids across layers, so a second `id: bili-native`
+ *  insert would hard-fail dsh boot whenever the persistent install is present. */
+export function dshNativeInstalled(env: NodeJS.ProcessEnv = process.env): boolean {
+    let dirs: string[];
+    try {
+        dirs = dshProfileDirs(env);
+    } catch {
+        return false;
+    }
+    return dirs.some((dir) => {
+        try {
+            return fs.readFileSync(path.join(dir, "cordis.patch.yml"), "utf8").includes(DSH_PATCH_BEGIN);
+        } catch {
+            return false;
+        }
+    });
+}
+
 // — dispatch ————————————————————————————————————————————————————————————
 
 export function isPluginAgent(value: string): value is PluginAgent {

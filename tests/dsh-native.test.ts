@@ -6,7 +6,7 @@ import path from "node:path";
 import http from "node:http";
 import { pathToFileURL } from "node:url";
 import { apply, planNativeDsh, shouldBootstrapNativeDsh, _resetRegisterForTest } from "../src/agent/dsh-native.ts";
-import { dshManagedPatchBlock, dshProfileDirs, mergeDshManagedPatch, stripDshManagedPatch, pluginInstall, pluginRemove, pluginStatusAll } from "../src/plugin-install.ts";
+import { dshManagedPatchBlock, dshNativeInstalled, dshProfileDirs, mergeDshManagedPatch, stripDshManagedPatch, pluginInstall, pluginRemove, pluginStatusAll } from "../src/plugin-install.ts";
 
 test("planNativeDsh: kill-switches > attach > spawn precedence (#941)", () => {
     assert.deepEqual(planNativeDsh({}), { mode: "spawn" });
@@ -99,6 +99,7 @@ test("dsh install/remove/status roundtrip under a fake DSH_HOME", async () => {
         await withEnv({ DSH_HOME: home }, async () => {
             // no profiles yet → the installer says run dsh first
             assert.throws(() => pluginInstall("dsh"), /run dsh once/);
+            assert.equal(dshNativeInstalled(), false);
 
             fs.mkdirSync(path.join(home, "profiles", "headless"), { recursive: true });
             fs.mkdirSync(path.join(home, "profiles", "web"), { recursive: true });
@@ -115,12 +116,32 @@ test("dsh install/remove/status roundtrip under a fake DSH_HOME", async () => {
             assert.ok(webTxt.includes("dsh-native.js"));
 
             assert.equal(pluginStatusAll().find((r) => r.agent === "dsh")?.status, "installed");
+            assert.equal(dshNativeInstalled(), true);
 
             const removed = pluginRemove("dsh");
             assert.match(removed, /2 dsh profile/); // install wrote both files
             const after = fs.readFileSync(path.join(home, "profiles", "headless", "cordis.patch.yml"), "utf8");
             assert.equal(after, `${HEADER}[]\n`);
             assert.match(pluginStatusAll().find((r) => r.agent === "dsh")?.status ?? "", /not installed/);
+            assert.equal(dshNativeInstalled(), false);
+        });
+    } finally {
+        fs.rmSync(home, { recursive: true, force: true });
+    }
+});
+
+test("dshNativeInstalled: true iff any profile carries the managed block", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-installed-"));
+    try {
+        await withEnv({ DSH_HOME: home }, () => {
+            fs.mkdirSync(path.join(home, "profiles", "headless"), { recursive: true });
+            fs.mkdirSync(path.join(home, "profiles", "web"), { recursive: true });
+            assert.equal(dshNativeInstalled(), false);
+            fs.writeFileSync(
+                path.join(home, "profiles", "headless", "cordis.patch.yml"),
+                mergeDshManagedPatch(`${HEADER}[]\n`, dshManagedPatchBlock(home)),
+            );
+            assert.equal(dshNativeInstalled(), true);
         });
     } finally {
         fs.rmSync(home, { recursive: true, force: true });
