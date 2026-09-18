@@ -151,8 +151,13 @@ function piInstall(): string {
     writeJson(file, settings);
     // #788: dropped entries must be visible — silently replacing a documented
     // setup (npm:billion-context-pi) left users with no compression and no
-    // idea their config changed.
-    const note = removed.length > 0 ? `\npi: replaced existing entries: ${removed.join(", ")}` : "";
+    // idea their config changed. Project-scope reminder mirrors the opencode
+    // installer's LOCAL-scope note: a `pi install -l` entry lives in
+    // <project>/.pi/settings.json, which this global strip never touches.
+    const note = removed.length > 0
+        ? `\npi: replaced existing entries: ${removed.join(", ")}`
+          + "\npi: also check <project>/.pi/settings.json — a project-scope billion-context-pi entry (pi install -l) lives there, not in this global settings"
+        : "";
     const form = entry === PI_NPM_ENTRY ? " (pi-managed — pi installs/updates it; `pi update` upgrades)" : "";
     return `pi: installed -> ${file} packages += ${entry}${form}${note}`;
 }

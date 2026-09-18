@@ -794,6 +794,8 @@ test("plugin install/remove roundtrips for pi/omp/codex/opencode under a fake HO
         // #788: every dropped entry is named in the output — the
         // billion-context-pi removal in particular must not be silent.
         assert.ok(replaceMsg.includes("replaced existing entries:"));
+        // #939: project-scope reminder mirrors the opencode LOCAL-scope note
+        assert.match(replaceMsg, /<project>\/\.pi\/settings\.json/);
         for (const gone of [
             "npm:billion-context-pi",
             "npm:billion-context-pi@0.1.48",
