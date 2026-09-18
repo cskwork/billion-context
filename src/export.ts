@@ -1,6 +1,6 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
-import { matchSession as matchSessionKernel, renderHandoff as renderHandoffKernel, type HandoffBlockFull } from "acp-kernel";
+import { matchSession as matchSessionKernel, renderHandoff as renderHandoffKernel } from "acp-kernel";
 import type { Session } from "./session.js";
 import { SessionStore } from "./persist.js";
 
@@ -51,22 +51,11 @@ export function renderHandoff(s: Session, full: boolean): string {
     const messages = s.lastMessages;
     if (messages && messages.length > 0) {
         const folded = s.lastMessagesFolded === true;
-        const blocksFull: HandoffBlockFull[] | undefined =
-            full && folded
-                ? s.state.blocks
-                      .filter((b) => b.active)
-                      .map((b): HandoffBlockFull | undefined => {
-                          const content = s.blockContents.get(b.blockId);
-                          return content ? { blockId: b.blockId, topic: b.topic, count: content.full.count, fullText: content.full.text } : undefined;
-                      })
-                      .filter((x) => x !== undefined)
-                : undefined;
-        return renderHandoffKernel({
+        const base = renderHandoffKernel({
             coreMessages: messages,
             state: s.state,
             full,
             folded,
-            blocksFull,
             meta: {
                 title: s.meta.title,
                 label: s.meta.label,
@@ -79,6 +68,7 @@ export function renderHandoff(s: Session, full: boolean): string {
                 ],
             },
         });
+        return base + blockSummariesSection(s, full && folded, base);
     }
 
     // v2 fallback: no snapshot persisted. Block summaries (+ originals with
@@ -120,6 +110,43 @@ export function renderHandoff(s: Session, full: boolean): string {
         lines.push("");
         lines.push("Paste the block summaries above into a new session to continue without the proxy.");
         lines.push("");
+    }
+    return lines.join("\n");
+}
+
+// #845: the kernel handoff never emits state.blocks[].summary, and the persisted
+// snapshot keeps only the newest BILI_PERSIST_TAIL_TOKENS tail — a summary whose
+// anchor fell outside that tail vanishes from the doc although it survives on
+// disk in state.blocks[]. This section guarantees every active block's summary
+// appears at least once. Originals attach only for folded snapshots — a
+// non-folded --full export already contains every original message.
+function blockSummariesSection(s: Session, includeOriginals: boolean, priorDoc: string): string {
+    const active = s.state.blocks.filter((b) => b.active);
+    if (active.length === 0) return "";
+    const lines: string[] = [];
+    lines.push(`## Compressed block summaries`);
+    lines.push("");
+    for (const b of active) {
+        lines.push(`### Block ${b.blockId}${b.topic ? ` — ${b.topic}` : ""}`);
+        lines.push("");
+        lines.push(`tier ${b.tier} · ~${b.compressedTokens} tokens compressed · ${fmtDate(b.createdAt)}`);
+        lines.push("");
+        const summary = b.summary.trim();
+        if (summary === "") {
+            lines.push("_no summary recorded_");
+        } else if (priorDoc.includes(summary)) {
+            lines.push("_summary already shown in the conversation view above_");
+        } else {
+            lines.push(summary);
+        }
+        lines.push("");
+        const content = includeOriginals ? s.blockContents.get(b.blockId) : undefined;
+        if (content) {
+            lines.push(`#### Original messages (${content.full.count})`);
+            lines.push("");
+            lines.push(content.full.text.trim());
+            lines.push("");
+        }
     }
     return lines.join("\n");
 }

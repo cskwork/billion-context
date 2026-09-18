@@ -91,8 +91,13 @@ import {
     type SpawnChild,
     type SpawnFn,
     runLaunch,
+    type ClientName,
     type ClientConfig,
     type HttpRewrite,
+    type DiscoveredRoutes,
+    opencodeEffectiveCwd,
+    opencodeProjectBypassWarnings,
+    readOpencodeProjectLayer,
 } from "../src/launcher.ts";
 import { _setForTest as registrySetForTest, _resetForTest as registryResetForTest } from "../src/registry.ts";
 
@@ -100,8 +105,33 @@ import { _setForTest as registrySetForTest, _resetForTest as registryResetForTes
 // — point the state dir at a throwaway so these tests never touch the real one.
 const prevXdgState = process.env.XDG_STATE_HOME;
 process.env.XDG_STATE_HOME = fs.mkdtempSync(path.join(os.tmpdir(), "bili-launcher-state-"));
+// A host harness that launches bili (omp, codex, claude) exports its client binary,
+// its proxy URL and its CA into every child process. Inherited here they change what
+// runLaunch launches, because BILI_CLIENT_BIN outranks `client: "pi"`
+// (src/launcher.ts:2190), so the injected spawnImpl never matches the fake client and
+// never fires the `exit` this file waits on, hanging the test with no timer or socket
+// left to trace; and they change what the assertions read back from the launched env,
+// where trae then sees NODE_EXTRA_CA_CERTS and kimi sees BILLION_CONTEXT_PROXY.
+const inheritedLaunchVars = [
+    "BILI_CLIENT_BIN",
+    "BILLION_CONTEXT_PROXY",
+    "NODE_EXTRA_CA_CERTS",
+    "SSL_CERT_FILE",
+    "HTTPS_PROXY",
+    "HTTP_PROXY",
+];
+const prevInheritedLaunchVars: Record<string, string | undefined> = {};
+for (const name of inheritedLaunchVars) {
+    prevInheritedLaunchVars[name] = process.env[name];
+    delete process.env[name];
+}
 after(() => {
     removeStartingMarker();
+    for (const name of inheritedLaunchVars) {
+        const value = prevInheritedLaunchVars[name];
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+    }
     if (prevXdgState === undefined) delete process.env.XDG_STATE_HOME;
     else process.env.XDG_STATE_HOME = prevXdgState;
 });
@@ -1911,21 +1941,25 @@ test("prepareOpencodeHttpRewrite: writes rewritten copy from a JSONC user config
         // lives in the global dir, so point that dir somewhere empty
         const root = readOpencodeConfigRoot({ XDG_CONFIG_HOME: path.join(dir, "empty-xdg"), OPENCODE_CONFIG: cfgFile });
         const rw = [{ key: "zhipuai-lb", realUpstream: "http://127.0.0.1:18081/v1" }];
-        const tmpFile = prepareOpencodeHttpRewrite(root, "http://127.0.0.1:8787", rw, []);
+        const spawnEnv: NodeJS.ProcessEnv = {};
+        const tmpFile = prepareOpencodeHttpRewrite(root, "http://127.0.0.1:8787", rw, [], undefined, false, spawnEnv);
         assert.ok(tmpFile);
         const rewritten = JSON.parse(fs.readFileSync(tmpFile, "utf8"));
         assert.equal(rewritten.provider["zhipuai-lb"].options.baseURL, "http://127.0.0.1:8787/bili/http://127.0.0.1:18081/v1");
-        assert.deepEqual(rewritten.plugin, ["opencode-acp@latest"]);
+        // #920: the acp entry is stripped from the clone — the thin plugin
+        // imports the package as a library; its spec rides along via env.
+        assert.deepEqual(rewritten.plugin, []);
+        assert.equal(spawnEnv["BILI_OPENCODE_ACP_SPEC"], "opencode-acp@latest");
         assert.deepEqual(rewritten.compaction, { auto: false });
         assert.equal(fs.readFileSync(cfgFile, "utf8"), original);
         // the caller's merged root must stay pristine (rewrite happens on a clone)
         assert.deepEqual(root, { plugin: ["opencode-acp@latest"], provider: { "zhipuai-lb": { options: { baseURL: "http://127.0.0.1:18081/v1" } } } });
         fs.rmSync(path.dirname(tmpFile), { recursive: true, force: true });
         assert.equal(prepareOpencodeHttpRewrite(root, "http://127.0.0.1:8787", [], []), undefined);
-        const withPlugin = prepareOpencodeHttpRewrite(root, "http://127.0.0.1:8787", [], [], "/opt/bili/dist/agent/opencode.js");
+        const withPlugin = prepareOpencodeHttpRewrite(root, "http://127.0.0.1:8787", [], [], "/opt/bili/dist/agent/opencode.js", false, { ...spawnEnv });
         assert.ok(withPlugin);
         const injected = JSON.parse(fs.readFileSync(withPlugin, "utf8"));
-        assert.deepEqual(injected.plugin, ["opencode-acp@latest", "/opt/bili/dist/agent/opencode.js"]);
+        assert.deepEqual(injected.plugin, ["/opt/bili/dist/agent/opencode.js"]);
         assert.equal(injected.provider["zhipuai-lb"].options.baseURL, "http://127.0.0.1:18081/v1");
         fs.rmSync(path.dirname(withPlugin), { recursive: true, force: true });
         const missingCfg = prepareOpencodeHttpRewrite(undefined, "http://127.0.0.1:8787", [], [], "/opt/bili/dist/agent/opencode.js");
@@ -1934,6 +1968,40 @@ test("prepareOpencodeHttpRewrite: writes rewritten copy from a JSONC user config
         assert.deepEqual(fromEmpty.plugin, ["/opt/bili/dist/agent/opencode.js"]);
         assert.deepEqual(fromEmpty.compaction, { auto: false });
         fs.rmSync(path.dirname(missingCfg), { recursive: true, force: true });
+    } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("prepareOpencodeHttpRewrite: strips opencode-acp entries in all spec forms (#920)", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "oc-rw3-"));
+    try {
+        const root = {
+            plugin: [
+                "opencode-acp@latest",
+                ["opencode-acp@1.2.3", { enabled: true }],
+                { package: "./local/opencode-acp" },
+                "my-opencode-acp-fork",
+                "some-other-plugin",
+            ],
+            plugins: ["/abs/path/to/node_modules/opencode-acp"],
+            provider: {},
+        };
+        const spawnEnv: NodeJS.ProcessEnv = {};
+        const tmpFile = prepareOpencodeHttpRewrite(root, "http://127.0.0.1:8787", [], [], "/opt/bili/dist/agent/opencode.js", false, spawnEnv);
+        assert.ok(tmpFile);
+        const out = JSON.parse(fs.readFileSync(tmpFile, "utf8"));
+        assert.deepEqual(out.plugin, ["my-opencode-acp-fork", "some-other-plugin", "/opt/bili/dist/agent/opencode.js"]);
+        assert.deepEqual(out.plugins, []);
+        // first stripped spec wins — the copy the host would have loaded first
+        assert.equal(spawnEnv["BILI_OPENCODE_ACP_SPEC"], "opencode-acp@latest");
+        fs.rmSync(path.dirname(tmpFile), { recursive: true, force: true });
+        // no acp entries → env untouched
+        const env2: NodeJS.ProcessEnv = {};
+        const plain = prepareOpencodeHttpRewrite({ plugin: ["other"], provider: {} }, "http://127.0.0.1:8787", [], [], "/opt/p.js", false, env2);
+        assert.ok(plain);
+        assert.equal(env2["BILI_OPENCODE_ACP_SPEC"], undefined);
+        fs.rmSync(path.dirname(plain), { recursive: true, force: true });
     } finally {
         fs.rmSync(dir, { recursive: true, force: true });
     }
@@ -3791,6 +3859,141 @@ test("runLaunch trae: cert-MITM envs (SSL_CERT_FILE combined bundle), no budget/
     }
 });
 
+const INHERITED_PROXY_TEST_VARS = [
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "no_proxy",
+    "NO_PROXY",
+] as const;
+
+// #890 harness: runLaunch under a fake HOME + BILI_CLIENT_BIN shim with every
+// generic proxy var inherited from the "shell"; returns the env actually
+// passed to the spawned client.
+async function captureLaunchedClientEnv(client: ClientName): Promise<NodeJS.ProcessEnv> {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), `bili-${client}-launch-`));
+    const fakeBin = path.join(home, process.platform === "win32" ? `fake-${client}.exe` : `fake-${client}`);
+    fs.writeFileSync(fakeBin, "");
+    const prevHome = process.env.HOME;
+    const prevUserProfile = process.env.USERPROFILE;
+    const prevBin = process.env.BILI_CLIENT_BIN;
+    const prevExit = process.exit;
+    const savedProxyVars: Record<string, string | undefined> = {};
+    for (const k of INHERITED_PROXY_TEST_VARS) savedProxyVars[k] = process.env[k];
+    const prevMarker = process.env.BILI_TEST_MARKER;
+    process.env.HOME = home;
+    if (prevUserProfile !== undefined) process.env.USERPROFILE = home;
+    process.env.BILI_CLIENT_BIN = fakeBin;
+    process.env.http_proxy = "http://corp-proxy.example:8080";
+    process.env.https_proxy = "http://corp-proxy.example:8080";
+    process.env.all_proxy = "socks5://corp-proxy.example:1080";
+    process.env.HTTP_PROXY = "http://corp-proxy.example:8080";
+    process.env.ALL_PROXY = "socks5://corp-proxy.example:1080";
+    process.env.no_proxy = "localhost,.corp";
+    process.env.NO_PROXY = "localhost,.corp";
+    process.env.BILI_TEST_MARKER = "keep";
+    process.exit = (() => undefined) as typeof process.exit;
+    const clientEnvs: (NodeJS.ProcessEnv | undefined)[] = [];
+    const spawnImpl: SpawnFn = (cmd, args, opts) => {
+        const env = (opts as { env?: NodeJS.ProcessEnv } | undefined)?.env;
+        if (cmd === fakeBin) {
+            clientEnvs.push(env);
+            const child = makeFakeChild(0);
+            const orig = child.on.bind(child);
+            (child as { on: SpawnChild["on"] }).on = (event, listener) => {
+                orig(event, listener);
+                if (event === "exit") setTimeout(() => listener(0, null), 0);
+                return child;
+            };
+            return child;
+        }
+        return makeFakeChild(42424);
+    };
+    try {
+        await runLaunch(
+            { client, clientArgs: [], overrides: {} },
+            { fetchImpl: async () => ({ ok: true }), spawnImpl, sleep: () => Promise.resolve() },
+        );
+    } finally {
+        process.exit = prevExit;
+        process.env.HOME = prevHome;
+        if (prevUserProfile === undefined) delete process.env.USERPROFILE;
+        else process.env.USERPROFILE = prevUserProfile;
+        if (prevBin === undefined) delete process.env.BILI_CLIENT_BIN;
+        else process.env.BILI_CLIENT_BIN = prevBin;
+        for (const [k, v] of Object.entries(savedProxyVars)) {
+            if (v === undefined) delete process.env[k];
+            else process.env[k] = v;
+        }
+        if (prevMarker === undefined) delete process.env.BILI_TEST_MARKER;
+        else process.env.BILI_TEST_MARKER = prevMarker;
+        fs.rmSync(home, { recursive: true, force: true });
+    }
+    assert.equal(clientEnvs.length, 1, `${client} client spawned exactly once`);
+    return clientEnvs[0]!;
+}
+
+function assertInheritedProxyStripped(seenEnv: NodeJS.ProcessEnv, origin: string): void {
+    assert.equal(seenEnv.HTTPS_PROXY, origin, "HTTPS_PROXY points at bili");
+    for (const k of INHERITED_PROXY_TEST_VARS) {
+        if (k === "HTTPS_PROXY") continue;
+        assert.equal(seenEnv[k], undefined, `inherited ${k} stripped`);
+    }
+    assert.equal(seenEnv.BILI_TEST_MARKER, "keep", "unrelated env vars preserved");
+}
+
+test("runLaunch opencode: inherited proxy vars stripped so traffic cannot bypass bili (#890)", async () => {
+    const seenEnv = await captureLaunchedClientEnv("opencode");
+    const origin = seenEnv.BILLION_CONTEXT_PROXY;
+    assert.ok(/^http:\/\/127\.0\.0\.1:\d+$/.test(String(origin)), `origin: ${origin}`);
+    assert.ok(String(seenEnv.NODE_EXTRA_CA_CERTS).endsWith(path.join("billion-context", "ca", "root-ca.pem")), String(seenEnv.NODE_EXTRA_CA_CERTS));
+    assertInheritedProxyStripped(seenEnv, String(origin));
+});
+
+test("runLaunch pi: inherited proxy vars stripped so traffic cannot bypass bili (#890)", async () => {
+    const seenEnv = await captureLaunchedClientEnv("pi");
+    const origin = seenEnv.BILLION_CONTEXT_PROXY;
+    assert.ok(/^http:\/\/127\.0\.0\.1:\d+$/.test(String(origin)), `origin: ${origin}`);
+    assert.ok(String(seenEnv.NODE_EXTRA_CA_CERTS).endsWith(path.join("billion-context", "ca", "root-ca.pem")), String(seenEnv.NODE_EXTRA_CA_CERTS));
+    assertInheritedProxyStripped(seenEnv, String(origin));
+});
+
+test("runLaunch omp: inherited proxy vars stripped so traffic cannot bypass bili (#890)", async () => {
+    const seenEnv = await captureLaunchedClientEnv("omp");
+    const origin = seenEnv.BILLION_CONTEXT_PROXY;
+    assert.ok(/^http:\/\/127\.0\.0\.1:\d+$/.test(String(origin)), `origin: ${origin}`);
+    assert.ok(String(seenEnv.NODE_EXTRA_CA_CERTS).endsWith(path.join("billion-context", "ca", "root-ca.pem")), String(seenEnv.NODE_EXTRA_CA_CERTS));
+    assertInheritedProxyStripped(seenEnv, String(origin));
+});
+
+test("runLaunch codex: inherited proxy vars stripped so traffic cannot bypass bili (#890)", async () => {
+    const prevPlugin = process.env.BILI_LAUNCHER_PLUGIN;
+    process.env.BILI_LAUNCHER_PLUGIN = "0";
+    let seenEnv: NodeJS.ProcessEnv;
+    try {
+        seenEnv = await captureLaunchedClientEnv("codex");
+    } finally {
+        if (prevPlugin === undefined) delete process.env.BILI_LAUNCHER_PLUGIN;
+        else process.env.BILI_LAUNCHER_PLUGIN = prevPlugin;
+    }
+    const origin = seenEnv.BILLION_CONTEXT_PROXY;
+    assert.ok(/^http:\/\/127\.0\.0\.1:\d+$/.test(String(origin)), `origin: ${origin}`);
+    assert.ok(String(seenEnv.SSL_CERT_FILE).endsWith(path.join("billion-context", "ca", "combined-ca.pem")), String(seenEnv.SSL_CERT_FILE));
+    assert.equal(seenEnv.NODE_EXTRA_CA_CERTS, undefined, "codex uses SSL_CERT_FILE, not NODE_EXTRA_CA_CERTS");
+    assertInheritedProxyStripped(seenEnv, String(origin));
+});
+
+test("runLaunch codebuddy: inherited proxy vars stripped so loopback traffic cannot be hijacked (#890)", async () => {
+    const seenEnv = await captureLaunchedClientEnv("codebuddy");
+    const origin = seenEnv.BILLION_CONTEXT_PROXY;
+    assert.ok(/^http:\/\/127\.0\.0\.1:\d+$/.test(String(origin)), `origin: ${origin}`);
+    assert.ok(String(seenEnv.NODE_EXTRA_CA_CERTS).endsWith(path.join("billion-context", "ca", "root-ca.pem")), String(seenEnv.NODE_EXTRA_CA_CERTS));
+    assertInheritedProxyStripped(seenEnv, String(origin));
+});
+
 test("parseKimiToml: providers/models/env channels (quoted names, overrides win, per-model base_url)", () => {
     const toml = [
         "# comment",
@@ -3993,4 +4196,110 @@ test("runLaunch kimi: cert-MITM envs (combined CA on SSL_CERT_FILE + NODE_EXTRA_
         else process.env.NO_PROXY = prevNoProxy;
         fs.rmSync(home, { recursive: true, force: true });
     }
+});
+
+test("readOpencodeProjectLayer: git-bounded walk, nearest wins, .opencode dir, jsonc", () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), "oc-proj-"));
+    try {
+        const repo = path.join(base, "repo");
+        const deep = path.join(repo, "a", "b");
+        fs.mkdirSync(deep, { recursive: true });
+        fs.mkdirSync(path.join(repo, ".git"), { recursive: true });
+        fs.writeFileSync(
+            path.join(base, "opencode.json"),
+            JSON.stringify({ provider: { outer: { options: { baseURL: "http://127.0.0.1:1/outer" } } } }),
+        );
+        fs.writeFileSync(
+            path.join(repo, "opencode.json"),
+            JSON.stringify({
+                provider: {
+                    shared: { options: { baseURL: "http://127.0.0.1:2/root" } },
+                    onlyRoot: { options: { baseURL: "http://127.0.0.1:3/root" } },
+                },
+            }),
+        );
+        fs.mkdirSync(path.join(repo, ".opencode"), { recursive: true });
+        fs.writeFileSync(
+            path.join(repo, ".opencode", "opencode.json"),
+            JSON.stringify({ provider: { dotdir: { options: { baseURL: "http://127.0.0.1:4/dot" } } } }),
+        );
+        fs.writeFileSync(
+            path.join(deep, "opencode.jsonc"),
+            '// line comment\n/* block */\n{"provider":{"shared":{"options":{"baseURL":"http://127.0.0.1:5/deep"}}},}',
+        );
+        const layer = readOpencodeProjectLayer(deep);
+        assert.equal(layer.providers["outer"], undefined, "walk stops at the git root");
+        assert.deepEqual(layer.providers["shared"], { baseURL: "http://127.0.0.1:5/deep", file: path.join(deep, "opencode.jsonc") });
+        assert.deepEqual(layer.providers["onlyRoot"], { baseURL: "http://127.0.0.1:3/root", file: path.join(repo, "opencode.json") });
+        assert.deepEqual(layer.providers["dotdir"], { baseURL: "http://127.0.0.1:4/dot", file: path.join(repo, ".opencode", "opencode.json") });
+        const sibling = path.join(repo, "empty");
+        fs.mkdirSync(sibling);
+        const layer2 = readOpencodeProjectLayer(sibling);
+        assert.deepEqual(Object.keys(layer2.providers).sort(), ["dotdir", "onlyRoot", "shared"]);
+    } finally {
+        fs.rmSync(base, { recursive: true, force: true });
+    }
+});
+
+test("readOpencodeProjectLayer: outside a repo walks all ancestor levels", () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), "oc-nogit-"));
+    try {
+        const top = path.join(base, "top");
+        const mid = path.join(top, "mid");
+        const leaf = path.join(mid, "leaf");
+        fs.mkdirSync(leaf, { recursive: true });
+        fs.writeFileSync(
+            path.join(top, "opencode.json"),
+            JSON.stringify({ provider: { topP: { options: { baseURL: "http://127.0.0.1:6/top" } } } }),
+        );
+        fs.writeFileSync(
+            path.join(mid, "opencode.json"),
+            JSON.stringify({ provider: { midP: { options: { baseURL: "http://127.0.0.1:7/mid" } } } }),
+        );
+        const layer = readOpencodeProjectLayer(leaf);
+        assert.deepEqual(layer.providers["topP"], { baseURL: "http://127.0.0.1:6/top", file: path.join(top, "opencode.json") });
+        assert.deepEqual(layer.providers["midP"], { baseURL: "http://127.0.0.1:7/mid", file: path.join(mid, "opencode.json") });
+    } finally {
+        fs.rmSync(base, { recursive: true, force: true });
+    }
+});
+
+test("opencodeEffectiveCwd: honors --dir, defaults to process.cwd()", () => {
+    assert.equal(opencodeEffectiveCwd([]), process.cwd());
+    assert.equal(opencodeEffectiveCwd(["run"]), process.cwd());
+    const abs = fs.mkdtempSync(path.join(os.tmpdir(), "oc-dir-"));
+    try {
+        assert.equal(opencodeEffectiveCwd(["--dir", abs]), abs);
+        assert.equal(opencodeEffectiveCwd(["--dir=" + abs]), abs);
+    } finally {
+        fs.rmSync(abs, { recursive: true, force: true });
+    }
+    assert.equal(opencodeEffectiveCwd(["--dir", "rel/z"]), path.resolve("rel/z"));
+});
+
+test("opencodeProjectBypassWarnings: override + project-only warn, routed values silent", () => {
+    const routes: DiscoveredRoutes = {
+        httpsDomains: ["open.bigmodel.cn"],
+        httpRewrites: [{ key: "local-lb", realUpstream: "http://127.0.0.1:8199/v1" }],
+        httpsRewrites: [{ key: "bigmodel", realUpstream: "https://open.bigmodel.cn/api/v4" }],
+        httpEnvRoutes: [],
+    };
+    const F = "/proj/opencode.json";
+    let w = opencodeProjectBypassWarnings({ providers: { "local-lb": { baseURL: "http://127.0.0.1:9999/a", file: F } } }, routes);
+    assert.equal(w.length, 1);
+    assert.match(w[0], /redefines provider "local-lb"/);
+    assert.match(w[0], /will NOT go through the proxy/);
+    assert.match(w[0], new RegExp(F.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+    w = opencodeProjectBypassWarnings({ providers: { ghost: { baseURL: "http://127.0.0.1:7777/p", file: F } } }, routes);
+    assert.equal(w.length, 1);
+    assert.match(w[0], /defined only in opencode's project layer/);
+    w = opencodeProjectBypassWarnings({ providers: { "local-lb": { baseURL: "http://127.0.0.1:8787/bili/http://127.0.0.1:8199/v1", file: F } } }, routes);
+    assert.deepEqual(w, [], "already /bili/-wrapped → routed");
+    w = opencodeProjectBypassWarnings({ providers: { bigmodel: { baseURL: "https://open.bigmodel.cn/api/v4", file: F } } }, routes);
+    assert.deepEqual(w, [], "https host already MITM-routed");
+    w = opencodeProjectBypassWarnings({ providers: { "local-lb": { file: F } } }, routes);
+    assert.deepEqual(w, [], "no explicit baseURL → inherits delivered value via deep merge");
+    w = opencodeProjectBypassWarnings({ providers: { "local-lb": { baseURL: "http://127.0.0.1:9/a", file: F }, ghost: { baseURL: "http://127.0.0.1:7/b", file: F } } }, routes);
+    assert.equal(w.length, 2);
+    assert.deepEqual(opencodeProjectBypassWarnings({ providers: {} }, routes), []);
 });

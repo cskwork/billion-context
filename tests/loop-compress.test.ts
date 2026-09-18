@@ -369,6 +369,52 @@ test("loop #13 (feedback fix): textProtocol + native function_call → round-2 r
     }
 });
 
+// #906: the visibility gate was keyed on STRUCTURED calls only, so a trigger
+// extracted from plain text got its result back as a role:system marker — a
+// mid-conversation developer item in the round-2 re-request (droppable by
+// OpenAI-format backends, truncated to one line), contradicting the loop's own
+// "fed back as a normal tool output" contract. It must ride back as a real
+// function_call/function_call_output pair, exactly like a structured call.
+test("loop #906: textProtocol compress extracted from plain text → round-2 re-request carries a proper function_call/function_call_output pair (not a bare developer marker)", async () => {
+    const ctx = withRefs(makeCtx([
+        textMsg("raw_1", "user", bigText(5000)),
+        textMsg("raw_2", "assistant", bigText(5000)),
+        textMsg("raw_3", "user", bigText(5000)),
+        textMsg("raw_4", "assistant", bigText(5000)),
+        textMsg("raw_5", "user", bigText(5000)),
+        textMsg("raw_6", "assistant", bigText(5000)),
+        textMsg("raw_7", "user", bigText(5000)),
+    ]));
+    ctx.textProtocol = true;
+    const compressArgs = JSON.stringify({ content: [{ startId: "m00001", endId: "m00002", summary: "PAIR-SUMMARY-PAYLOAD-THAT-IS-LONG-ENOUGH-FOR-THE-KERNEL-MIN-LENGTH-CHECK" }] });
+    const round1 = [
+        sse("response.created", { response: { id: "resp_1", status: "in_progress" } }),
+        sse("response.output_text.delta", { type: "response.output_text.delta", item_id: "msg_t", output_index: 0, delta: `\x3cacp_compress\x3e${compressArgs}\x3c/acp_compress\x3e` }),
+        COMPLETED,
+    ].join("");
+    const probe = reFetchProbe();
+    try {
+        await drain(
+            new Response(round1, { status: 200 }).body!,
+            ctx,
+            { model: "gpt-4o", input: [], stream: true },
+            { url: "http://mock", headers: {} },
+            createResponsesAdapter(true),
+        );
+        assert.ok(probe.calls() >= 1, "re-request fires after the extracted compress");
+        const body = JSON.parse(probe.bodies()[0]!) as { input: Record<string, unknown>[] };
+        const fc = body.input.find((i) => i.type === "function_call" && i.name === "compress");
+        assert.ok(fc, "round-2 input carries the extracted compress as a function_call item (previously absent — the result rode as a developer marker instead)");
+        const out = body.input.find((i) => i.type === "function_call_output" && i.call_id === fc?.call_id);
+        assert.ok(out, "paired function_call_output for the same call_id");
+        assert.ok(String(out?.output).includes("[Compressed"), "full result text rides in the output");
+        const devs = body.input.filter((i) => i.type === "message" && i.role === "developer");
+        assert.ok(devs.every((d) => !/^\p{So}(?:[ \t])?\[ACP\]/mu.test(String(d.content))), "no developer message carries an [ACP] visibility marker");
+    } finally {
+        probe.restore();
+    }
+});
+
 test("loop #9 (S2): responses round yields usage → session.stats populated (nudge/stat tracking)", async () => {
     const ctx = makeCtx([
         textMsg("m00001", "user", "hello"),

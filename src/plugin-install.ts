@@ -362,7 +362,8 @@ function claudeRemove(): string {
 
 function claudeStatus(): string {
     const data = readJson(claudeMcpJson()) as { mcpServers?: Record<string, unknown> };
-    return data.mcpServers && "bili" in data.mcpServers ? "installed" : "not installed";
+    const mcpServers = data.mcpServers;
+    return isPlainMcpObject(mcpServers) && "bili" in mcpServers ? "installed" : "not installed";
 }
 
 // — codex ——————————————————————————————————————————————————————————————

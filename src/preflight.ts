@@ -14,6 +14,7 @@ import { applyRanges, type RewriteCtx } from "./stream.js";
 import { fetchWithTimeout, isTransientUpstreamError, replayMaxAttempts, replayBackoffMs, sleep, UpstreamHttpError } from "./fetch-util.js";
 import { proxyDispatcher } from "./upstream-proxy.js";
 import { lastCompressSuffix, type Session } from "./session.js";
+import { peekRegistryOutputLimit } from "./registry.js";
 
 // #247: proactive pre-forward compression. When the session's real context
 // (previous turn's upstream input_tokens) exceeds the current model's window
@@ -25,14 +26,35 @@ import { lastCompressSuffix, type Session } from "./session.js";
 // summarization calls sized to fit the smaller window, before the payload is
 // forwarded.
 
-const MAX_PREFLIGHT_ROUNDS = 8;
+export const MAX_PREFLIGHT_ROUNDS = 16;
 const CHUNK_FRACTION = 0.6;
 const MIN_CHUNK_TOKENS = 2000;
 const MIN_SUMMARY_CHARS = 50;
-const MAX_SUMMARY_OUTPUT_TOKENS = 8192;
+// #853: thinking-on-by-default models spend the shared output budget on
+// reasoning_content before any answer text (observed ~9.5k reasoning tokens on
+// deepseek-flash, whose real output ceiling is 384k) — the old 8192 cap
+// guaranteed content:"" + finish_reason:"length". 32k leaves ~3x headroom
+// over the observed reasoning while still bounding runaway output.
+// summaryPayload() clamps this per model against known models.dev ceilings
+// (peekRegistryOutputLimit — warm cache first, bundled snapshot floor) so
+// models with a smaller real cap are not over-asked.
+const MAX_SUMMARY_OUTPUT_TOKENS = 32768;
 // #574: bound on upstream summarization calls per invocation — the multi-range
 // walk can otherwise spend a call per viable range in a block-dense history.
-const MAX_SUMMARY_CALLS_PER_PREFLIGHT = 8;
+export const MAX_SUMMARY_CALLS_PER_PREFLIGHT = 16;
+
+// #869 review: coverage bound of the two depth budgets above. One round folds
+// ONE range and each fold removes at most CHUNK_FRACTION x window tokens (the
+// per-call chunk budget), so MAX_PREFLIGHT_ROUNDS rounds cover an overshoot of
+// at most MAX_PREFLIGHT_ROUNDS x CHUNK_FRACTION x window ~= 9.6x the window —
+// a payload of up to ~10.6x the window in the best case. Real coverage is
+// lower: a range smaller than the chunk budget saves less, and the #726
+// halving worklist can spend several calls on one range without completing a
+// fold. Beyond the bound the loop still exits cleanly — the fail-fast reports
+// the post-fold size and the remaining compressible-range count, so an
+// operator sees exactly how far the budget ran out. 16 is tuned to the
+// incident class behind #868 (a 1.39x-window payload); it is a fixed depth,
+// not scaled to the overshoot — scaling it is a separate design question.
 
 export type PreflightProtocol = "anthropic" | "openai" | "responses";
 
@@ -92,6 +114,12 @@ export interface PreflightResult {
      *  stale (e.g. a double-counted usage report, #300). The caller uses it
      *  to decide whether forwarding as-is is actually safe. */
     payloadEstimate: number;
+    /** Compressible ranges still visible in the kernel's final view after the
+     *  walk stopped — how much foldable headroom a deeper budget would find
+     *  (0 when nothing foldable remains). Surfaced in the fail-fast message
+     *  so an operator can see why the payload is still over the window
+     *  (#869 review). */
+    rangesRemaining: number;
     /** Whether the final payload fits the window, judged with the same
      *  measure the loop used: the optimistic token estimate for
      *  measured-baseline sessions (#300 — a stale HIGH baseline must not
@@ -173,14 +201,6 @@ export function estimateCoreMessagesUpper(messages: CoreMessage[]): number {
     return chars;
 }
 
-function rangeChars(messages: CoreMessage[], startIdx: number, endIdx: number): number {
-    let chars = 0;
-    for (let i = startIdx; i <= endIdx && i < messages.length; i++) {
-        chars += (messages[i].text ?? "").length;
-    }
-    return chars;
-}
-
 function spanUnitsOf(messages: CoreMessage[], startIdx: number, endIdx: number, countText: (text: string) => number): number {
     let units = 0;
     for (let i = startIdx; i <= endIdx && i < messages.length; i++) {
@@ -189,32 +209,24 @@ function spanUnitsOf(messages: CoreMessage[], startIdx: number, endIdx: number, 
     return units;
 }
 
-function renderRange(messages: CoreMessage[], startIdx: number, endIdx: number): string {
-    const parts: string[] = [];
-    for (let i = startIdx; i <= endIdx && i < messages.length; i++) {
-        const m = messages[i];
-        let text = (m.text ?? "").trim();
-        // #781: images live in BiliMessage sidecars, invisible to m.text — emit
-        // one explicit placeholder each so summaries record them instead of
-        // losing them silently. Replaces the codec's bare "[image]" literal
-        // (anthropic) with the richer media-type/dimension note.
-        const notes = imagePlaceholders(m);
-        if (notes.length > 0) {
-            const note = notes.join(" ");
-            text = text === IMAGE_PLACEHOLDER ? note : text ? `${text}\n${note}` : note;
+// Message-level splitChunks cannot shrink a span dominated by one huge
+// message (e.g. a megabyte tool result); split its rendered content into
+// token-budgeted slices so every summarization call stays inside the window.
+function splitSummaryContent(content: string, budget: number, countTokens: (text: string) => number): string[] {
+    const chunks: string[] = [];
+    let offset = 0;
+    while (offset < content.length) {
+        let low = offset + 1;
+        let high = content.length;
+        while (low < high) {
+            const mid = Math.ceil((low + high) / 2);
+            if (countTokens(content.slice(offset, mid)) <= budget) low = mid;
+            else high = mid - 1;
         }
-        if (!text) continue;
-        const label =
-            m.contentType === "tool-call"
-                ? `assistant tool-call ${m.toolName ?? "?"}`
-                : m.contentType === "tool-result"
-                  ? `tool result ${m.toolName ?? "?"}`
-                  : m.contentType === "reasoning"
-                    ? "assistant reasoning"
-                    : m.role;
-        parts.push(`[${label}]\n${text}`);
+        chunks.push(content.slice(offset, low));
+        offset = low;
     }
-    return parts.join("\n\n");
+    return chunks;
 }
 
 // minUnits: never close a chunk below this many countText units while more
@@ -247,19 +259,37 @@ function splitChunks(
     return chunks;
 }
 
-function summaryPayload(protocol: PreflightProtocol, model: string, system: string, content: string, stream: boolean, includeMaxOutputTokens: boolean): Record<string, unknown> {
+// #853: the summary max_tokens for a model — the 32k default, clamped down to
+// the model's known output ceiling when models.dev reports a smaller one.
+// Host comes from the upstream URL so a known provider's namespaced entry
+// wins over the cross-provider scan; the registry cache is pre-warmed with
+// the bundled snapshot at module load, so this never fetches or blocks.
+function safeHost(url: string): string | undefined {
+    try {
+        return new URL(url).host;
+    } catch {
+        return undefined;
+    }
+}
+function summaryOutputTokens(model: string, host?: string): number {
+    const known = peekRegistryOutputLimit(model, host);
+    return known === undefined ? MAX_SUMMARY_OUTPUT_TOKENS : Math.min(MAX_SUMMARY_OUTPUT_TOKENS, known);
+}
+
+function summaryPayload(protocol: PreflightProtocol, model: string, system: string, content: string, stream: boolean, includeMaxOutputTokens: boolean, host?: string): Record<string, unknown> {
+    const maxOutputTokens = summaryOutputTokens(model, host);
     if (protocol === "anthropic") {
-        return { model, max_tokens: MAX_SUMMARY_OUTPUT_TOKENS, system, messages: [{ role: "user", content }], stream };
+        return { model, max_tokens: maxOutputTokens, system, messages: [{ role: "user", content }], stream };
     }
     if (protocol === "openai") {
-        return { model, max_tokens: MAX_SUMMARY_OUTPUT_TOKENS, messages: [{ role: "system", content: system }, { role: "user", content }], stream };
+        return { model, max_tokens: maxOutputTokens, messages: [{ role: "system", content: system }, { role: "user", content }], stream };
     }
     // #488: codex relays reject Responses calls without store:false ("Store must be set to false").
     // #663: max_output_tokens is optional — omit it once the upstream has
     // rejected the parameter (learned per URL+model); the model's default
     // output cap then applies.
     const payload: Record<string, unknown> = { model, instructions: system, input: [{ role: "user", content }], stream, store: false };
-    if (includeMaxOutputTokens) payload.max_output_tokens = MAX_SUMMARY_OUTPUT_TOKENS;
+    if (includeMaxOutputTokens) payload.max_output_tokens = maxOutputTokens;
     return payload;
 }
 
@@ -280,8 +310,8 @@ const MAX_OUTPUT_TOKENS_REJECTED_RE = /\bmax_output_tokens\b/i;
 // #663: per-endpoint learning of the max_output_tokens rejection. Keyed by
 // upstream URL + model (persisted with the session metadata, like #626's
 // stream flag) because the rejection is per-endpoint: a session can switch
-// models mid-conversation, and a model that accepts the limit must keep the
-// 8192 cap.
+// models mid-conversation, and a model that accepts the limit must keep its
+// (model-clamped) summary cap.
 function noMaxOutputTokensKey(deps: PreflightDeps): string {
     return `${deps.url}\u0000${deps.model}`;
 }
@@ -618,7 +648,7 @@ async function requestSummaryBody(deps: PreflightDeps, body: string): Promise<st
 }
 
 async function requestSummary(deps: PreflightDeps, system: string, content: string, stream: boolean, includeMaxOutputTokens: boolean): Promise<SummaryOutcome> {
-    const text = await requestSummaryBody(deps, JSON.stringify(summaryPayload(deps.protocol, deps.model, system, content, stream, includeMaxOutputTokens)));
+    const text = await requestSummaryBody(deps, JSON.stringify(summaryPayload(deps.protocol, deps.model, system, content, stream, includeMaxOutputTokens, safeHost(deps.url))));
     let json: unknown;
     try {
         json = JSON.parse(text);
@@ -669,7 +699,7 @@ function noEmergencyTruncate(config: Config): Config {
 export async function preflightCompress(deps: PreflightDeps, messages: CoreMessage[]): Promise<PreflightResult> {
     const limit = deps.config.modelContextLimit;
     let target = Math.min(limit, deps.compressionTarget ?? limit);
-    const result: PreflightResult = { compressedRanges: 0, savedTokens: 0, payloadEstimate: estimateCoreMessages(messages) + (deps.imageFloor ?? 0) + (deps.wireOverhead ?? 0), fitsWindow: true };
+    const result: PreflightResult = { compressedRanges: 0, savedTokens: 0, payloadEstimate: estimateCoreMessages(messages) + (deps.imageFloor ?? 0) + (deps.wireOverhead ?? 0), rangesRemaining: 0, fitsWindow: true };
     if (limit <= 0) return result;
     const budget = Math.max(MIN_CHUNK_TOKENS, Math.floor(limit * CHUNK_FRACTION));
     // applyCompression rejects ranges below config.compress.minCompressRange
@@ -705,6 +735,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
     let summaryCalls = 0;
     let budgetHit = false;
     let rangesTried = 0;
+    let rangesRemaining = 0;
     for (let round = 0; round < MAX_PREFLIGHT_ROUNDS; round++) {
         if (deps.signal?.aborted) {
             failure = ABORTED_FAILURE;
@@ -742,6 +773,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
         if (startTokens < 0) startTokens = currentTokens;
         if (currentTokens < target) break;
         const ranges = viableRanges(turn.nudge?.compressibleRanges ?? []);
+        rangesRemaining = ranges.length;
         if (ranges.length === 0) {
             // #330: nothing foldable outside the soft-protected recent zone.
             // Relax the soft zone (oldest-first within it) and retry — the hard
@@ -749,7 +781,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             // estimate (not currentTokens, which is floored by a possibly-stale
             // lastInputTokens from a prior model): if the real payload already
             // fits, stop instead of folding protected content.
-            if (!relaxed && result.payloadEstimate >= limit) {
+            if (!relaxed && (baselineKnown ? result.payloadEstimate : finalUpper) >= limit) {
                 activeConfig = relaxedConfig(deps.config);
                 relaxed = true;
                 target = limit;
@@ -808,17 +840,80 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                 const startRef = maps.idxToRef.get(cs);
                 const endRef = maps.idxToRef.get(ce);
                 if (!startRef || !endRef) continue;
-                if (rangeChars(messages, cs, ce) < minChars) continue;
-                const content = renderRange(messages, cs, ce);
-                if (content.length === 0) continue;
-                if (summaryCalls >= MAX_SUMMARY_CALLS_PER_PREFLIGHT) {
-                    budgetHit = true;
-                    break;
+                const preview = deps.core.applyCompression({
+                    messages,
+                    state: deps.session.state,
+                    config: activeConfig,
+                    ranges: [{ startRef, endRef, summary: "x".repeat(Math.max(MIN_SUMMARY_CHARS, activeConfig.compress.minSummaryLength)) }],
+                });
+                const previousBlockIds = new Set(deps.session.state.blocks.map((block) => block.blockId));
+                const planned = preview.state.blocks.find((block) => !previousBlockIds.has(block.blockId));
+                if (!planned) continue;
+                // Direct raw messages render host-side: #781 image notes live in BiliMessage
+                // sidecars the kernel never sees. Consumed child blocks render through the
+                // kernel from the original state so they stay summaries.
+                const idxById = new Map(messages.map((m, i) => [m.id, i]));
+                const parts: string[] = [];
+                for (const id of planned.directMessageIds) {
+                    const i = idxById.get(id);
+                    if (i === undefined) continue;
+                    const m = messages[i];
+                    let text = m.text ?? "";
+                    const notes = imagePlaceholders(m);
+                    if (notes.length > 0) {
+                        const note = notes.join(" ");
+                        text = text === IMAGE_PLACEHOLDER ? note : text ? `${text}\n${note}` : note;
+                    }
+                    if (!text) continue;
+                    const label =
+                        m.contentType === "tool-call"
+                            ? `assistant tool-call ${m.toolName ?? "?"}`
+                            : m.contentType === "tool-result"
+                              ? `tool result ${m.toolName ?? "?"}`
+                              : m.contentType === "reasoning"
+                                ? "assistant reasoning"
+                                : m.role;
+                    parts.push(`[${label}]\n${text}`);
                 }
-                summaryCalls += 1;
-                let outcome: SummaryOutcome;
+                for (const nid of planned.directBlockIds) {
+                    const nb = deps.session.state.blocks.find((b) => b.blockId === nid);
+                    // The child stays a summary: its raw text is already condensed, and
+                    // re-expanding it would defeat the compression this fold performs.
+                    if (!nb) continue;
+                    const label = nb.topic ? `${nb.blockId}: ${nb.topic}` : nb.blockId;
+                    parts.push(`[summarized ${label}]\n${nb.summary}`);
+                }
+                const content = parts.join("\n\n");
+                if (content.length === 0) continue;
+                let summary: string | null = null;
+                let outcome: SummaryOutcome | undefined;
                 try {
-                    outcome = await summarizeRange(deps, content, startRef, endRef);
+                    const parts: string[] = [];
+                    const chunks = splitSummaryContent(content, budget, countText);
+                    for (const chunk of chunks) {
+                        if (summaryCalls >= MAX_SUMMARY_CALLS_PER_PREFLIGHT) {
+                            budgetHit = true;
+                            break;
+                        }
+                        summaryCalls += 1;
+                        const part = await summarizeRange(deps, chunk, startRef, endRef);
+                        if ("unusable" in part) {
+                            outcome = part;
+                            break;
+                        }
+                        parts.push(part.summary);
+                    }
+                    if (!budgetHit && !outcome && parts.length === chunks.length) {
+                        const candidate = parts.join("\n\n");
+                        // #861: a summary the kernel would reject on length wastes the apply
+                        // attempt and its failure log — route it through the same
+                        // halving/skip path as any unusable output.
+                        if (activeConfig.compress.maxSummaryLength <= 0 || candidate.length <= activeConfig.compress.maxSummaryLength) {
+                            summary = candidate;
+                        } else {
+                            outcome = { unusable: `assembled summary (${candidate.length} chars) exceeds maxSummaryLength (${activeConfig.compress.maxSummaryLength})` };
+                        }
+                    }
                 } catch (err) {
                     if (err instanceof UpstreamHttpError) {
                         failure = {
@@ -842,21 +937,21 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                     }
                     break;
                 }
-                if ("unusable" in outcome) {
-                    lastUnusableDetail = outcome.unusable;
+                if (summary === null) {
+                    const unusableDetail = outcome && "unusable" in outcome ? outcome.unusable : "unknown";
+                    if (outcome) lastUnusableDetail = unusableDetail;
                     const floorUnits = baselineKnown ? 2 * MIN_CHUNK_TOKENS : 2 * minChars;
                     if (ce > cs && spanUnitsOf(messages, cs, ce, countText) >= floorUnits) {
-                        deps.log("warn", `[preflight] chunk ${startRef}:${endRef} produced no usable summary (${outcome.unusable}); retrying with smaller chunks`);
+                        deps.log("warn", `[preflight] chunk ${startRef}:${endRef} produced no usable summary (${unusableDetail}); retrying with smaller chunks`);
                         const mid = Math.floor((cs + ce) / 2);
                         spans.push([mid + 1, ce]);
                         spans.push([cs, mid]);
                         continue;
                     }
-                    deps.log("warn", `[preflight] range ${skipKey} produced no usable summary even at minimum size (${outcome.unusable}); skipping it`);
+                    deps.log("warn", `[preflight] range ${skipKey} produced no usable summary even at minimum size (${unusableDetail}); skipping it`);
                     skipSet.add(skipKey);
                     break;
                 }
-                const summary = outcome.summary;
                 const ctx: RewriteCtx = {
                     core: deps.core,
                     config: activeConfig,
@@ -876,7 +971,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                 // baseline currentTokens is char-based, so net the folded span's
                 // char count against it instead of the token-based credit.
                 const compressed = deps.session.stats.compressCreditTokens - creditBefore;
-                const folded = baselineKnown ? compressed : rangeChars(messages, cs, ce);
+                const folded = baselineKnown ? compressed : messages.filter((message) => planned.effectiveMessageIds.includes(message.id)).reduce((total, message) => total + (message.text ?? "").length, 0);
                 currentTokens = Math.max(0, currentTokens - folded + countText(summary));
                 deps.session.stats.lastInputTokens += defaultCountTokens(summary);
                 appliedThisRound += 1;
@@ -886,7 +981,17 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             if (appliedThisRound > 0) break;
             if (failure || budgetHit) break;
         }
-        if (appliedThisRound === 0) break;
+        if (appliedThisRound === 0) {
+            if (!failure && !budgetHit && !relaxed && (baselineKnown ? result.payloadEstimate : finalUpper) >= limit) {
+                activeConfig = relaxedConfig(deps.config);
+                relaxed = true;
+                summaryCalls = 0;
+                budgetHit = false;
+                deps.log("warn", "[preflight] no usable ranges outside the protected recent zone; relaxing soft protection (preserveRecentMessages/Tokens -> 0) and retrying");
+                continue;
+            }
+            break;
+        }
     }
     if (currentTokens >= limit && !failure) {
         // #726: carry the most recent unusable-summary diagnosis into the
@@ -903,7 +1008,20 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             failure = { kind: "exhausted", detail: `the compress budget was exhausted after ${MAX_PREFLIGHT_ROUNDS} rounds${unusableNote}` };
         }
     }
-    if (result.compressedRanges > 0) deps.session.stats.lastInputTokens = currentTokens;
+    if (result.compressedRanges > 0) {
+        // #857: never persist the IMAGE FLOOR into the usage baseline — images
+        // are billed by the upstream and every fit/clamp gate adds their
+        // estimate separately, so the baseline must stay usage-semantics
+        // (text + overhead only). A bytes-mode floor (b64/4) overestimates
+        // pixel-billing upstreams ~100× and would poison the upward window
+        // self-heal and close the #496 escape hatch permanently.
+        const textBaseline = result.payloadEstimate - (deps.imageFloor ?? 0);
+        if (textBaseline > deps.session.stats.lastInputTokens) {
+            deps.session.stats.lastInputTokens = textBaseline;
+            deps.session.stats.lastInputTokensSource = "estimate";
+        }
+    }
+    result.rangesRemaining = rangesRemaining;
     result.savedTokens = Math.max(0, startTokens - currentTokens);
     if (currentTokens >= limit) result.failure = failure;
     result.fitsWindow = baselineKnown ? result.payloadEstimate < limit : finalUpper < limit;

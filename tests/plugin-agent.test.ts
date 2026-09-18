@@ -257,7 +257,7 @@ test("#535: non-http(s) manifest entries are dropped", () => {
     }
 });
 
-test("#535: session_before_compact cancels only pi auto compaction under bili launch", () => {
+test("#535/#851: session_before_compact cancels only auto compaction under bili launch", () => {
     const prevProxy = process.env.BILLION_CONTEXT_PROXY;
     process.env.BILLION_CONTEXT_PROXY = "http://127.0.0.1:8787";
     try {
@@ -270,17 +270,24 @@ test("#535: session_before_compact cancels only pi auto compaction under bili la
         assert.equal(handler({ reason: "manual" }, undefined), undefined, "manual /compact stays user-owned");
         assert.equal(handler({ reason: "startup" }, undefined), undefined, "unknown reason → not cancelled");
 
-        // omp: the event carries no reason field, so under bili ALL compaction
-        // is cancelled (manual native /compact would destroy the ACP-tagged
-        // context just like the auto path; the host shows "Compaction
-        // cancelled" and the user should reach for /acp instead).
+        // omp: the hook event carries no reason field, so the plugin tracks
+        // the auto_compaction_start announcement instead — only announced
+        // (auto) passes are cancelled, manual stays user-owned (#851).
         const omp = makeFakePi();
         createBiliPlugin("omp")(omp as never);
         const ompHandler = omp.events.get("session_before_compact");
-        assert.ok(ompHandler, "omp under bili launch: cancel-all handler registered");
-        assert.deepEqual(ompHandler({}, undefined), { cancel: true });
-        assert.deepEqual(ompHandler({ reason: "manual" }, undefined), { cancel: true });
-        assert.deepEqual(ompHandler({ reason: "threshold" }, undefined), { cancel: true });
+        assert.ok(ompHandler, "omp under bili launch: handler registered");
+        assert.equal(ompHandler({}, undefined), undefined, "unannounced (manual) compaction stays user-owned");
+        const ompStart = omp.events.get("auto_compaction_start");
+        const ompEnd = omp.events.get("auto_compaction_end");
+        assert.ok(ompStart, "omp tracks auto_compaction_start announcements");
+        assert.ok(ompEnd, "omp tracks auto_compaction_end announcements");
+        ompStart({}, undefined);
+        assert.deepEqual(ompHandler({}, undefined), { cancel: true }, "announced auto compaction is cancelled");
+        assert.equal(ompHandler({}, undefined), undefined, "the announcement is consumed by the cancel");
+        ompStart({}, undefined);
+        ompEnd({}, undefined);
+        assert.equal(ompHandler({}, undefined), undefined, "aborted auto pass (end before hook) leaves manual unblocked");
     } finally {
         if (prevProxy === undefined) delete process.env.BILLION_CONTEXT_PROXY;
         else process.env.BILLION_CONTEXT_PROXY = prevProxy;
@@ -1130,6 +1137,60 @@ test("plugin install refuses to touch broken or non-object configs", async () =>
         fs.mkdirSync(ocDir, { recursive: true });
         fs.writeFileSync(path.join(ocDir, "opencode.json"), "nope{");
         assert.throws(() => pluginInstall("opencode"), /not valid JSON/);
+    });
+    fs.rmSync(home, { recursive: true, force: true });
+});
+
+// #836 (found in #809 N4): a non-object `mcp` (e.g. bare string) made
+// `"bili" in mcp` throw — crashing remove (stranding a half-install) and
+// surfacing "error:" from status. All three opencode sites must degrade
+// gracefully instead of throwing.
+test("plugin opencode survives a non-object mcp (issue #836 / #809 N4)", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-plugin-home-"));
+    const piAgentDir = path.join(home, ".pi/agent");
+    await withEnv(hintEnv(home, piAgentDir), async () => {
+        const ocDir = path.join(home, ".config/opencode");
+        fs.mkdirSync(ocDir, { recursive: true });
+        const ocFile = path.join(ocDir, "opencode.json");
+        const malformed = JSON.stringify({ mcp: "bogus-string", other: 1 });
+        fs.writeFileSync(ocFile, malformed);
+
+        assert.doesNotThrow(() => pluginRemove("opencode"));
+        assert.match(pluginRemove("opencode"), /not installed/);
+        assert.equal(pluginStatusAll().find((r) => r.agent === "opencode")!.status, "not installed");
+        assert.equal(fs.readFileSync(ocFile, "utf8"), malformed);
+
+        // New installer (#919/#927): a bogus mcp key skips ONLY the mcp shell —
+        // the native plugin entry + compaction.auto still land, and sibling
+        // keys survive untouched.
+        assert.doesNotThrow(() => pluginInstall("opencode"));
+        assert.match(pluginInstall("opencode"), /skipped/i);
+        const data = JSON.parse(fs.readFileSync(ocFile, "utf8")) as Record<string, unknown>;
+        assert.equal(data.mcp, "bogus-string");
+        assert.equal(data.other, 1);
+        const ocKey = pickPluginKey(detectOpencodeMajor());
+        assert.deepEqual(data[ocKey], [path.join(ocDir, "plugins", "billion-context")]);
+        assert.deepEqual(data.compaction, { auto: false });
+    });
+    fs.rmSync(home, { recursive: true, force: true });
+});
+
+// #839 (found while reviewing #837): same bug class as #836 on the claude side
+// — a non-object `mcpServers` in .claude.json made `"bili" in mcpServers` throw
+// in claudeStatus(), crashing remove (which calls status first) and surfacing
+// "error:" from status.
+test("plugin claude survives a non-object mcpServers (issue #839)", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-plugin-home-"));
+    const piAgentDir = path.join(home, ".pi/agent");
+    await withEnv(hintEnv(home, piAgentDir), async () => {
+        const cFile = path.join(home, ".claude.json");
+        const malformed = JSON.stringify({ mcpServers: "bogus-string", other: 1 });
+        fs.writeFileSync(cFile, malformed);
+
+        assert.doesNotThrow(() => pluginRemove("claude"));
+        assert.match(pluginRemove("claude"), /not installed/);
+        assert.equal(pluginStatusAll().find((r) => r.agent === "claude")!.status, "not installed");
+        assert.equal(fs.readFileSync(cFile, "utf8"), malformed);
     });
     fs.rmSync(home, { recursive: true, force: true });
 });

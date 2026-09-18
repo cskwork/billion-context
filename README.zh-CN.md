@@ -80,6 +80,7 @@ AI 编程助手的<strong>通用上下文压缩代理</strong>
 | **pi** | [`billion-context-pi`](https://github.com/ranxianglei/billion-context-pi)(进程内扩展) |
 | **opencode 1.x** | [`billion-context`](https://github.com/ranxianglei/billion-context) —— `bili plugin install opencode`(V1 `.server()` 钩子,与 2.x 同一个包装器)或 `bili opencode`(启动器);[`opencode-acp`](https://github.com/ranxianglei/opencode-acp)(进程内扩展)仍可用 |
 | **opencode 2.0+** | `bili opencode`(内置 V2 插件 —— 原生工具,无需另装包)或 `bili plugin install opencode`(自拉起原生插件,免启动器) |
+| **opencode** | [`billion-context`](https://github.com/ranxianglei/billion-context),`bili opencode`(新会话走 bili 代理;现有 [`opencode-acp`](https://github.com/ranxianglei/opencode-acp) 会话继续可用,见下文「OpenCode 1.x」) |
 | **omp** | [`billion-context`](https://github.com/ranxianglei/billion-context),`bili omp`(内置插件) |
 | **其余所有**(没有上下文 hook) | [`billion-context`](https://github.com/ranxianglei/billion-context) —— `bili <client>`(启动器,优先)或 `/bili/` 前缀 |
 
@@ -122,7 +123,7 @@ bili pi                               # 拉起 pi,走代理 —— file-free(#53
 bili codex                            # 拉起 codex
 bili claude                           # 拉起 claude
 bili omp                              # pi 同款,file-free(#535):环境变量 + 扩展 registerProvider + 压缩取消,真实 ~/.omp 不动
-bili opencode                         # HTTPS 走 MITM + 临时 opencode.json(HTTP 走 /bili/)+ 轻量 /acp 插件;OpenCode 2.0+:内置 V2 插件带原生 bili 工具,自动关掉原生 auto-compaction。详见下方「OpenCode 专属说明」
+bili opencode                         # HTTPS 走 MITM + 临时 opencode.json(HTTP 走 /bili/)+ 轻量 /acp 插件;OpenCode 2.0+:内置 V2 插件带原生 bili 工具,自动关掉原生 auto-compaction;OpenCode 1.x:旧 opencode-acp 会话继续可用(条目从副本中移除、包以库形式导入,#920)。详见下方「OpenCode 专属说明」
 bili hermes                           # file-free(#535):hermes 代理环境变量(HTTPS_PROXY + HERMES_CA_BUNDLE)—— https 走 CONNECT MITM,http 走绝对形式转发;真实 ~/.hermes 不动
 bili dsh                              # deepseek-harness:非回环上游走代理 env(https MITM、http absolute-form),回环上游保留 overlay DSH_HOME(~/.dsh-bili)改写(#535),内置 deepseek 路由走 DEEPSEEK_BASE_URL,经 --patch 注入原生 /acp 命令
 bili codebuddy                        # Tencent CodeBuddy Code CLI:CODEBUDDY_BASE_URL /bili/ 重写(OpenAI chat completions wire),预算对齐走 CODEBUDDY_AUTO_COMPACT_WINDOW;真实 ~/.codebuddy 不动
@@ -133,6 +134,16 @@ bili kimi                             # Kimi Code CLI(Moonshot):除无条件回�
 bili pi --mitm-domain api.foo.com     # 向 MITM 白名单追加域名
 ```
 
+
+### OpenCode 1.x —— 旧 opencode-acp 会话继续可用(#920)
+
+在 1.x 主机上，`bili opencode` 会**通过 bili 代理运行新会话**，同时**让现有 `opencode-acp`（"legacy"）会话继续使用其自身机制正常工作**（#920）。启动器会从临时配置副本中移除 `opencode-acp` 条目（主机永远不会以激活状态加载它），而轻量的 bili 插件则改为以库的形式导入已安装的包：
+
+- 每个 ACP 钩子都以"该会话存在 ACP 存储文件"为门控条件（`~/.local/share/opencode/storage/plugin/acp/<sessionID>.json`，或 `acp.jsonc` 中 `storagePath` 指定的目录）——旧版会话保留其 DCP compress / decompress / search_context / acp_status 工具和 `/dcp` 命令；新会话不会被接管，而是运行纯代理模式。
+- 旧版 LLM 请求会被打上 `x-bili-plugin-bypass: 1` 标记，代理将其视为原始透传（无注入、无压缩、无会话状态）。
+- 在代理模式下，压缩工具的名称由代理独占：请求体中同名的客户端工具会在注入前被丢弃，因此上游对每个名称只看到一个定义。
+
+优雅降级：如果包无法找到/导入或不是 v1 版本，插件的行为与此更改之前完全一致——旧版会话的降级方式与 `opencode-acp` 在 `/bili/` baseURL 上自我禁用时的表现相同。
 
 ### 方式 2 —— 改url(`/bili/` 前缀)
 
@@ -196,6 +207,17 @@ OpenCode 2.0 换了新插件 API(`@opencode/plugin`);独立扩展 `opencode-acp`
   注意:2.0 AI-SDK provider 即使本地端点从不校验也要求 `apiKey` 字段 —— 随便填个非空值。
 
 注意事项:2.x 系列以 npm 包 `@opencode/cli` 发布。命令支持随 build 而定:某个预发布版只暴露 list/get/update/remove,而 2.0.x 稳定版允许插件经 `ctx.command.transform((editor) => editor.add(...))` 新增命令 —— TUI 里接受斜杠菜单补全(Tab + Enter)即可调用;注意 `opencode run` 模式完全不派发斜杠命令(它们会透传给模型)。内置插件在两种形状上都刻意不注册命令。
+### 客户端用 `http.proxy`(CONNECT)接入但从不压缩
+
+部分客户端(VS Code 系 IDE:CodeBuddy、Cursor、Windsurf……)只提供一个 HTTP **代理**设置(`http.proxy`、`codingcopilot.httpProxyURL` 等),没有可改写的模型 base-URL。这类客户端不走普通的 `/bili/…` 请求,而是把 `CONNECT <模型域名>:443` 发给代理。只有当模型域名在 bili 的 **MITM 白名单**里时这条路径才会被解密;否则 bili 只做盲隧道(不透明转发),永远看不到——也就无法压缩——模型请求(#897)。
+
+该失效模式现在不再静默:
+
+- 日志里对每个目标域名打一次 `BLIND TUNNEL WARNING`,附修复步骤;
+- `curl -s http://localhost:8787/__bili/health` 与 `/__bili/stats` 输出 `blindTunnels`(计数 + 精确目标域名,仅 loopback);
+- 存在此类隧道时,`acp_status` 输出会多一节 `UNDECRYPTED TRAFFIC (instance-level)`。
+
+要真正压缩这类客户端:把它的模型域名加进 `billion-context.json` 的 `"mitm".domains`(如 `"mitm": { "domains": ["copilot.tencent.com"] }`)或环境变量 `BILI_MITM_DOMAINS`,重启 bili,并让客户端信任 bili 的根 CA(Node 系客户端用 `NODE_EXTRA_CA_CERTS=~/.local/share/billion-context/ca/root-ca.pem`,有 CA 路径设置的用其设置)。`/bili/` 前缀方案在这里不适用——没有 URL 可改。详见 [CONFIGURATION.zh-CN.md → MITM](CONFIGURATION.zh-CN.md#mitm-透明代理登录客户端)。
 
 ## 运行代理
 

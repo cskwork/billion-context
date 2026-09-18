@@ -1,4 +1,4 @@
-import { createInitialState, type CompressionState, type CoreMessage } from "acp-kernel";
+import { createInitialState, type CompressionState, type Config, type CoreMessage } from "acp-kernel";
 import { createHash } from "node:crypto";
 import { getStore } from "./persist.js";
 
@@ -84,6 +84,16 @@ export type Session = {
          *  overwritten each turn). Source of truth for tokenCount — never an
          *  estimate. See onCacheUsage in compress-loop-*.ts. */
         lastInputTokens: number;
+        /** #857: provenance of lastInputTokens. "usage" = last written by an
+         *  upstream usage report (or a value stated BY the upstream, e.g. a
+         *  parsed overflow window); "estimate" = last RAISED by a local
+         *  estimate (preflight fold write-back, #604 failure arming, weak-
+         *  overflow arming). Derivative adjustments (compress credits, fold
+         *  reclaims) preserve the existing flag. Absent on legacy session
+         *  files — evidence-grade consumers (upward window self-heal, #496
+         *  overflow-evidence gate, stale-limit retraction) treat absent as
+         *  untrusted. */
+        lastInputTokensSource?: "usage" | "estimate";
         /** Tokens compressed THIS turn whose fold has not yet materialized in
          *  an upstream usage report (the post-compress re-request re-sends the
          *  UNFOLDED history for prefix-cache reasons, so its usage report
@@ -97,6 +107,16 @@ export type Session = {
         pendingFoldUsage?: boolean;
         /** Current in-context (uncompressed) token count at last processTurn. */
         contextTokens: number;
+        /** #728: char-count upper bound of the LAST turn's outbound payload
+         *  (post-fold processed messages + system/tools overhead + images),
+         *  recorded locally in prepare* each turn. Read ONLY while
+         *  lastInputTokens == 0, as the fallback tokenCount for upstreams
+         *  that never report usage (ChatGPT-login-style backends — see
+         *  effectiveTokenCount in server.ts). Self-correcting: a successful
+         *  fold shrinks the next turn's payload and thus the estimate.
+         *  Cleared by resetSessionCompression (native-compaction boundary).
+         *  Persisted (survives restart like the rest of stats). */
+        localInputEstimate?: number;
     };
     /** Free-form escape hatch for future fields not yet promoted to typed
      *  members. Persisted as-is (must be JSON-serializable). Use sparingly —
@@ -159,6 +179,23 @@ export type Session = {
      *  critical section onto the previous one so they run strictly in order. */
     lockChain?: Promise<unknown>;
 };
+
+// #833: wire paths resolve the kernel Config per request (global → provider →
+// model compress settings + self-heal + output headroom), while the plugin
+// status/tool API reads sessions with no request context and was falling back
+// to the base kernelConfig — which carries NO file/provider/model compress
+// settings — so the panel Nudge line showed kernel defaults regardless of user
+// config. Same pattern as absorb.ts's effectiveAbsorb: stamp the last resolved
+// Config per session (latest wins), read it with fallback to the base.
+export function storeEffectiveConfig(session: Session, config: Config): void {
+    session.metadata["effectiveConfig"] = config;
+}
+
+export function effectiveConfig(session: Session | undefined, fallback: Config): Config {
+    const stored = session?.metadata["effectiveConfig"];
+    if (stored && typeof stored === "object") return { ...fallback, ...(stored as Partial<Config>) };
+    return fallback;
+}
 
 const sessions = new Map<string, Session>();
 
@@ -349,6 +386,12 @@ export function resetSessionCompression(session: Session): void {
     session.state = createInitialState();
     session.blockContents.clear();
     session.stats.lastInputTokens = 0;
+    // #857: a zeroed baseline carries no provenance — drop any stale flag.
+    delete session.stats.lastInputTokensSource;
+    // #728: the pre-compaction outbound payload is gone — the old estimate
+    // (measured against the pre-compaction wire) would read high and blind
+    // the nudge fallback early; let the next prepare* re-measure.
+    session.stats.localInputEstimate = 0;
     session.stats.contextTokens = 0;
     session.metadata.nativeCompactionAt = Date.now();
     markDirty(session);

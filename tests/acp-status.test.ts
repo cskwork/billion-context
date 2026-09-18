@@ -7,6 +7,7 @@ import { handleAcpStatus } from "../src/acp-status.ts";
 import { applyRanges } from "../src/stream.ts";
 import { parseCompressInput, buildCompressSystemPrompt } from "../src/compress-tool.ts";
 import { runCompressLoop, createResponsesAdapter } from "../src/loop/index.ts";
+import { recordBlindTunnel, _resetBlindTunnelStatsForTest } from "../src/mitm.ts";
 
 function textMsg(id: string, role: "user" | "assistant", text: string): CoreMessage {
     return { id, role, contentType: "text", text };
@@ -123,6 +124,28 @@ test("#389: same-turn loop — acp_status after compress in one round shows live
         assert.ok(!statusPart.includes("m00001–m00006"), "compressed range must not be listed as compressible in the same-turn status");
     } finally {
         globalThis.fetch = orig;
+    }
+});
+
+test("#897: acp_status surfaces blind-tunneled CONNECT traffic as UNDECRYPTED TRAFFIC", () => {
+    _resetBlindTunnelStatsForTest();
+    try {
+        const ctx = makeCtx12();
+        const clean = handleAcpStatus({}, ctx);
+        assert.ok(!clean.includes("UNDECRYPTED TRAFFIC"), "no section when no blind tunnels recorded");
+
+        recordBlindTunnel("copilot.tencent.com");
+        recordBlindTunnel("copilot.tencent.com");
+        recordBlindTunnel("api.deepseek.com");
+        const out = handleAcpStatus({}, ctx);
+        assert.ok(out.includes("UNDECRYPTED TRAFFIC (instance-level)"), "section present when blind tunnels exist");
+        assert.ok(out.includes("3 CONNECT tunnel(s)"), `total count rendered (got: ${out.slice(-400)})`);
+        assert.ok(out.includes("copilot.tencent.com×2"), "per-host counts with real hosts, most tunnels first");
+        assert.ok(out.includes("api.deepseek.com×1"));
+        assert.ok(out.includes('add its model domain to "mitm".domains'), "points at the config fix");
+        assert.ok(out.includes("/__bili/stats → blindTunnels"), "points at the stats endpoint");
+    } finally {
+        _resetBlindTunnelStatsForTest();
     }
 });
 

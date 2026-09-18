@@ -1,5 +1,12 @@
 import { createHash } from "node:crypto";
 
+// #920: stamped per request by the opencode thin plugin for LEGACY
+// opencode-acp sessions (acp state on disk). The proxy (server.ts) forwards
+// such requests verbatim — no session binding, no tool injection, no
+// compression — because acp owns those sessions' context in-process. Clients
+// never send this header except through our own plugin.
+export const BILI_PLUGIN_BYPASS_HEADER = "x-bili-plugin-bypass";
+
 /**
  * Cryptographic hash of a string, truncated to a 64-bit id (16 hex chars).
  *
@@ -201,18 +208,48 @@ export function inspectContextOverflow(status: number, bodyText: string): Contex
     return { isOverflow: true, window: parseOverflowWindow(bodyText), message };
 }
 
+/** Default cap on the output-headroom reservation, as a fraction of the
+ *  context window (#896, aligned with billion-context-pi #207). Reserving the
+ *  FULL registered max output halves the effective input budget on models whose
+ *  max_tokens is a large share of the window (e.g. 131072 on a 262144 window),
+ *  while real per-turn replies rarely approach it. Capping at 25% keeps the
+ *  guarantee where it matters — any single-turn reply up to the reserved amount
+ *  still fits at the 95% emergency threshold — while bounding the budget loss.
+ *  A reply longer than the reservation overflows once; the overflow self-heal
+ *  (learned window + armed emergency) recovers it on the next turn. */
+export const DEFAULT_OUTPUT_HEADROOM_MAX_PCT = 0.25;
+
+/** Resolve the user's `outputHeadroomMaxPct` (ratio or "N%" string) to a
+ *  numeric cap, falling back to DEFAULT_OUTPUT_HEADROOM_MAX_PCT when unset.
+ *  Shared by every headroom call site so they all measure against the SAME
+ *  capped limit (#896). */
+export function resolveOutputHeadroomCap(value: number | string | undefined): number {
+    if (value === undefined) return DEFAULT_OUTPUT_HEADROOM_MAX_PCT;
+    if (typeof value === "number") return value;
+    const s = value.trim();
+    return s.endsWith("%") ? Number(s.slice(0, -1)) / 100 : Number(s);
+}
+
 /**
  * Reserve the model's OUTPUT budget from the context window so the kernel's
- * nudge/truncate bands (a fraction of the window) sit below (window - maxOutput)
+ * nudge/truncate bands (a fraction of the window) sit below (window - reserved)
  * and a context+output overflow can't happen on a small window (e.g. 100k with a
  * large max_tokens). Returns the effective window to hand to the kernel. No-op
  * unless maxOutput is a positive finite number that leaves a usable window
  * (maxOutput < window) — a request whose output budget is >= the whole window is
  * degenerate and the self-heal handles the resulting overflow instead.
+ * `capPct` bounds the reservation as a fraction of the window: reserved =
+ * min(maxOutput, capPct * window) (#896, same formula as billion-context-pi
+ * #207). capPct semantics: <= 0 → no reservation; (0,1) → capped reservation;
+ * >= 1 or non-finite → legacy full-capability reservation (input + a response
+ * using its ENTIRE output budget always fits — what strict backends like
+ * SGLang/vLLM enforce).
  */
-export function reserveOutputHeadroom(window: number, maxOutput: number): number {
+export function reserveOutputHeadroom(window: number, maxOutput: number, capPct: number = 1): number {
     if (Number.isFinite(window) && window > 0 && Number.isFinite(maxOutput) && maxOutput > 0 && maxOutput < window) {
-        return window - maxOutput;
+        const cap = Number.isFinite(capPct) ? Math.max(0, Math.min(capPct, 1)) : 1;
+        const reserved = Math.min(maxOutput, cap * window);
+        return reserved > 0 ? window - reserved : window;
     }
     return window;
 }

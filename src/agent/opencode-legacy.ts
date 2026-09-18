@@ -41,7 +41,7 @@
 // caller falls back to bili's own V1 tools (current behavior); legacy
 // sessions then degrade as documented (read-only archives).
 
-import { existsSync, readdirSync } from "node:fs";
+import { accessSync, existsSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -66,9 +66,12 @@ export interface LegacyAcpModule {
 }
 
 /** Candidate `opencode-acp/dist/index.js` paths, most specific first:
- *  project plugin scope, plain project node_modules, opencode's v1 package
- *  cache (`opencode plugin opencode-acp` — global AND project installs land
- *  in `~/.cache/opencode/packages/opencode-acp@<ver>/node_modules`; every
+ *  the launcher's `BILI_OPENCODE_ACP_SPEC` hint when its cache slot exists
+ *  (#920 launcher path — the launcher knows exactly which entry it stripped
+ *  from the temp config), then project plugin scope, plain project
+ *  node_modules, opencode's v1 package cache (`opencode plugin opencode-acp`
+ *  — global AND project installs land in
+ *  `~/.cache/opencode/packages/opencode-acp@<ver>/node_modules`; every
  *  version present is offered, newest first), global user npm root, and
  *  opencode's config-scope node_modules. */
 export function legacyAcpCandidates(cwd: string | undefined): string[] {
@@ -84,6 +87,18 @@ export function legacyAcpCandidates(cwd: string | undefined): string[] {
     for (const d of dirs) pushDir(d);
     const cacheHome = process.env.XDG_CACHE_HOME ?? path.join(homedir(), ".cache");
     const packages = path.join(cacheHome, "opencode", "packages");
+    const spec = process.env.BILI_OPENCODE_ACP_SPEC;
+    if (spec !== undefined && spec.length > 0) {
+        // the spec is the package-cache slot name ("opencode-acp@1.18.1");
+        // authoritative when present — avoid guessing among cache versions.
+        const hinted = path.join(packages, spec, "node_modules", "opencode-acp", "dist", "index.js");
+        try {
+            accessSync(hinted);
+            out.unshift(hinted);
+        } catch {
+            // hint does not resolve — fall through to discovery
+        }
+    }
     try {
         const versions = readdirSync(packages)
             .filter((e) => e.startsWith("opencode-acp@"))

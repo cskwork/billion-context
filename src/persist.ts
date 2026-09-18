@@ -95,6 +95,7 @@ interface PersistedSession {
         outputTokens?: number;
         cacheSamples?: number;
         lastInputTokens?: number;
+        lastInputTokensSource?: string;
         contextTokens?: number;
     };
     /** Free-form escape hatch (v2+). */
@@ -469,6 +470,15 @@ export class SessionStore {
         return session;
     }
 
+    /** Read-only state load for cross-session search (#841): unlike loadSync,
+     *  never schedules a save (no #408 clamp-rewrite side effect). */
+    loadStateForSearch(id: string): CompressionState | null {
+        if (!this.enabled) return null;
+        const envelope = this.loadEnvelope(id);
+        if (!envelope) return null;
+        return mergeState(envelope.payload.state);
+    }
+
     /** #405 fix #4: dual-instance rollback guard. When two proxy processes
      *  share BILI_SESSIONS_DIR, whoever saves last used to win — an instance
      *  holding a STALE in-memory copy would roll counters back (requests:3 →
@@ -612,6 +622,9 @@ function buildSession(parsed: PersistedSession): Session {
             // guard existed) which would otherwise revive after upgrade and
             // feed the /acp panel + web stats as negative percentages.
             lastInputTokens: Math.max(0, stats.lastInputTokens ?? parsed.lastInputTokens ?? 0),
+            // #857: provenance — legacy files lack it; absent stays absent and
+            // evidence-grade consumers treat absent as untrusted.
+            lastInputTokensSource: stats.lastInputTokensSource === "usage" || stats.lastInputTokensSource === "estimate" ? stats.lastInputTokensSource : undefined,
             // In-memory only — a fresh process has no pending compress fold.
             compressCreditTokens: 0,
             contextTokens: Math.max(0, stats.contextTokens ?? parsed.contextTokens ?? 0),
