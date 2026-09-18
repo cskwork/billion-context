@@ -78,7 +78,7 @@ AI 编程助手的<strong>通用上下文压缩代理</strong>
 | 客户端 | 用这个 |
 |---|---|
 | **pi** | [`billion-context-pi`](https://github.com/ranxianglei/billion-context-pi)(进程内扩展) |
-| **opencode** | [`opencode-acp`](https://github.com/ranxianglei/opencode-acp)(进程内扩展) |
+| **opencode** | [`billion-context`](https://github.com/ranxianglei/billion-context),`bili opencode`(新会话走 bili 代理;现有 [`opencode-acp`](https://github.com/ranxianglei/opencode-acp) 会话继续可用,见下文「OpenCode 1.x」) |
 | **omp** | [`billion-context`](https://github.com/ranxianglei/billion-context),`bili omp`(内置插件) |
 | **其余所有**(没有上下文 hook) | [`billion-context`](https://github.com/ranxianglei/billion-context) —— `bili <client>`(启动器,优先)或 `/bili/` 前缀 |
 
@@ -112,7 +112,7 @@ bili pi                               # 拉起 pi,走代理 —— file-free(#53
 bili codex                            # 拉起 codex
 bili claude                           # 拉起 claude
 bili omp                              # pi 同款,file-free(#535):环境变量 + 扩展 registerProvider + 压缩取消,真实 ~/.omp 不动
-bili opencode                         # HTTPS 走 MITM + 临时 opencode.json(HTTP 走 /bili/)+ 轻量 /acp 插件
+bili opencode                         # HTTPS 走 MITM + 临时 opencode.json(HTTP 走 /bili/)+ 轻量 /acp 插件;OpenCode 1.x:旧 opencode-acp 会话继续可用(条目从副本中移除、包以库形式导入,#920)
 bili hermes                           # file-free(#535):hermes 代理环境变量(HTTPS_PROXY + HERMES_CA_BUNDLE)—— https 走 CONNECT MITM,http 走绝对形式转发;真实 ~/.hermes 不动
 bili dsh                              # deepseek-harness:非回环上游走代理 env(https MITM、http absolute-form),回环上游保留 overlay DSH_HOME(~/.dsh-bili)改写(#535),内置 deepseek 路由走 DEEPSEEK_BASE_URL,经 --patch 注入原生 /acp 命令
 bili codebuddy                        # Tencent CodeBuddy Code CLI:CODEBUDDY_BASE_URL /bili/ 重写(OpenAI chat completions wire),预算对齐走 CODEBUDDY_AUTO_COMPACT_WINDOW;真实 ~/.codebuddy 不动
@@ -123,6 +123,16 @@ bili kimi                             # Kimi Code CLI(Moonshot):除无条件回�
 bili pi --mitm-domain api.foo.com     # 向 MITM 白名单追加域名
 ```
 
+
+### OpenCode 1.x —— 旧 opencode-acp 会话继续可用(#920)
+
+在 1.x 主机上，`bili opencode` 会**通过 bili 代理运行新会话**，同时**让现有 `opencode-acp`（"legacy"）会话继续使用其自身机制正常工作**（#920）。启动器会从临时配置副本中移除 `opencode-acp` 条目（主机永远不会以激活状态加载它），而轻量的 bili 插件则改为以库的形式导入已安装的包：
+
+- 每个 ACP 钩子都以"该会话存在 ACP 存储文件"为门控条件（`~/.local/share/opencode/storage/plugin/acp/<sessionID>.json`，或 `acp.jsonc` 中 `storagePath` 指定的目录）——旧版会话保留其 DCP compress / decompress / search_context / acp_status 工具和 `/dcp` 命令；新会话不会被接管，而是运行纯代理模式。
+- 旧版 LLM 请求会被打上 `x-bili-plugin-bypass: 1` 标记，代理将其视为原始透传（无注入、无压缩、无会话状态）。
+- 在代理模式下，压缩工具的名称由代理独占：请求体中同名的客户端工具会在注入前被丢弃，因此上游对每个名称只看到一个定义。
+
+优雅降级：如果包无法找到/导入或不是 v1 版本，插件的行为与此更改之前完全一致——旧版会话的降级方式与 `opencode-acp` 在 `/bili/` baseURL 上自我禁用时的表现相同。
 
 ### 方式 2 —— 改url(`/bili/` 前缀)
 

@@ -1659,8 +1659,10 @@ export function opencodeMajorVersion(command: string): number {
  * paths before the copy is written — opencode resolves them against the
  * declaring file's dir, which the clone no longer is (#826). With pluginDirMode
  * (OpenCode 2.x), the plugin rides as a temp directory whose index.js
- * re-exports pluginPath — 2.x rejects bare file paths in `plugin`. Returns the
- * temp config FILE path (undefined when there is nothing to do).
+ * re-exports pluginPath — 2.x rejects bare file paths in `plugin`. Also strips
+ * opencode-acp entries (#920; see below), recording the first stripped spec in
+ * env["BILI_OPENCODE_ACP_SPEC"]. Returns the temp config FILE path (undefined
+ * when there is nothing to do).
  */
 export function prepareOpencodeHttpRewrite(
     userRoot: Record<string, unknown> | undefined,
@@ -1715,15 +1717,42 @@ export function prepareOpencodeHttpRewrite(
         ...(existingCompaction && typeof existingCompaction === "object" && !Array.isArray(existingCompaction) ? existingCompaction as Record<string, unknown> : {}),
         auto: false,
     };
+    // #920: strip opencode-acp entries from the clone — the host must not load
+    // it armed (its config hook globally self-disables on /bili/ baseURLs and
+    // eagerly adopts every session). The thin plugin imports the same package
+    // as a library instead and gates its hooks on legacy sessions. The first
+    // stripped spec is handed to the child via env so the bridge imports the
+    // exact copy the host would have loaded (state-format compatibility).
+    let strippedAcpSpec: string | undefined;
     for (const key of ["plugin", "plugins"] as const) {
-        if (Array.isArray(root[key])) {
-            const baseDir = opencodePluginBaseDir(env, key);
-            root[key] = (root[key] as unknown[]).map((entry) => absolutizePluginEntry(baseDir, entry));
-        }
+        if (!Array.isArray(root[key])) continue;
+        const baseDir = opencodePluginBaseDir(env, key);
+        root[key] = (root[key] as unknown[])
+            .filter((entry) => {
+                const spec = opencodeAcpPluginSpec(entry);
+                if (spec === undefined) return true;
+                strippedAcpSpec ??= spec;
+                return false;
+            })
+            .map((entry) => absolutizePluginEntry(baseDir, entry));
     }
+    if (strippedAcpSpec) env["BILI_OPENCODE_ACP_SPEC"] = strippedAcpSpec;
     const tmpFile = path.join(tmp, "opencode.json");
     fs.writeFileSync(tmpFile, JSON.stringify(root));
     return tmpFile;
+}
+
+/** Returns the plugin spec when `entry` references the opencode-acp package
+ *  (npm spec, local path, or github spec), else undefined. Matches the package
+ *  name exactly — `my-opencode-acp-fork` does not match. */
+function opencodeAcpPluginSpec(entry: unknown): string | undefined {
+    let spec: unknown;
+    if (typeof entry === "string") spec = entry;
+    else if (Array.isArray(entry) && typeof entry[0] === "string") spec = entry[0];
+    else if (entry !== null && typeof entry === "object" && !Array.isArray(entry)) spec = (entry as Record<string, unknown>).package;
+    if (typeof spec !== "string" || spec.length === 0) return undefined;
+    const base = path.basename(spec);
+    return base === "opencode-acp" || base.startsWith("opencode-acp@") ? spec : undefined;
 }
 
 function isRelativeLocalPluginSpec(spec: unknown): spec is string {
@@ -2428,8 +2457,11 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
     } else if (base === "opencode") {
         // opencode: HTTPS upstreams ride cert-MITM (HTTPS_PROXY + CA); plaintext
         // HTTP upstreams get a /bili/-rewritten copy of opencode.json via
-        // OPENCODE_CONFIG (real config untouched). BILLION_CONTEXT_PROXY makes
-        // opencode-acp self-disable so the proxy owns the ACP tools. Base env is
+        // OPENCODE_CONFIG (real config untouched). #920: the temp-config clone
+        // strips any opencode-acp entry — the thin plugin imports that package
+        // as a library instead (legacy sessions keep working in-process), and
+        // loading it armed would re-arm its global /bili/ self-disable.
+        // BILLION_CONTEXT_PROXY activates the thin plugin itself. Base env is
         // stripped like hermes/dsh/kimi/qoder/trae/jcode (#890): undici/Bun prefer
         // lowercase http(s)_proxy over the uppercase injected below, so an
         // inherited lowercase var would silently route model traffic around bili.
@@ -2437,7 +2469,7 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         const opencodePlugin = selfDistFile("agent/opencode.js");
         const opencodePluginPath = opencodePlugin && fs.existsSync(opencodePlugin) ? opencodePlugin : undefined;
         const ocDirMode = opencodePluginPath !== undefined && opencodeMajorVersion(resolveClientCommand("opencode", process.env).command) >= 2;
-        opencodeTmpFile = prepareOpencodeHttpRewrite(readOpencodeConfigRoot(process.env), origin, routes.httpRewrites, routes.httpsRewrites, opencodePluginPath, ocDirMode);
+        opencodeTmpFile = prepareOpencodeHttpRewrite(readOpencodeConfigRoot(process.env), origin, routes.httpRewrites, routes.httpsRewrites, opencodePluginPath, ocDirMode, env);
         if (opencodeTmpFile) env.OPENCODE_CONFIG = opencodeTmpFile;
         for (const warning of opencodeProjectBypassWarnings(readOpencodeProjectLayer(opencodeEffectiveCwd(clientArgs)), routes)) {
             console.error(warning);
