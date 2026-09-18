@@ -841,7 +841,14 @@ export async function pipePluginChatWithStrip(
     };
     // One state machine per (field, block/choice index) — interleaved choices
     // or content blocks must not share partial-tag state.
-    const streams = new Map<string, { filter: TagEchoFilter; field: string; index: number }>();
+    interface PipeStream {
+        filter: TagEchoFilter;
+        field: string;
+        index: number;
+        choice?: number;
+        toolIndex?: number;
+    }
+    const streams = new Map<string, PipeStream>();
     const filterFor = (field: string, index: number) => {
         const key = `${field}:${index}`;
         let s = streams.get(key);
@@ -851,17 +858,29 @@ export async function pipePluginChatWithStrip(
         }
         return s;
     };
+    const toolArgStreamFor = (choice: number, toolIndex: number) => {
+        const key = `tcall:${choice}:${toolIndex}`;
+        let s = streams.get(key);
+        if (!s) {
+            s = { filter: createTagEchoFilter(onTagDrop), field: "arguments", index: toolIndex, choice, toolIndex };
+            streams.set(key, s);
+        }
+        return s;
+    };
     const anyPending = () => {
         for (const s of streams.values()) if (s.filter.pending()) return true;
         return false;
     };
     let lastChunkMeta: Record<string, unknown> = {};
-    const syntheticTail = (field: string, index: number, tail: string): string => {
+    const syntheticTail = (s: PipeStream, tail: string): string => {
         if (protocol === "anthropic") {
-            const deltaType = field === "text" ? "text_delta" : "thinking_delta";
-            return `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index, delta: { type: deltaType, [field]: tail } })}\n\n`;
+            const deltaType = s.field === "text" ? "text_delta" : s.field === "thinking" ? "thinking_delta" : "input_json_delta";
+            return `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: s.index, delta: { type: deltaType, [s.field]: tail } })}\n\n`;
         }
-        return `data: ${JSON.stringify({ ...lastChunkMeta, object: "chat.completion.chunk", choices: [{ index, delta: { [field]: tail } }] })}\n\n`;
+        if (s.toolIndex !== undefined) {
+            return `data: ${JSON.stringify({ ...lastChunkMeta, object: "chat.completion.chunk", choices: [{ index: s.choice ?? 0, delta: { tool_calls: [{ index: s.toolIndex, function: { arguments: tail } }] } }] })}\n\n`;
+        }
+        return `data: ${JSON.stringify({ ...lastChunkMeta, object: "chat.completion.chunk", choices: [{ index: s.index, delta: { [s.field]: tail } }] })}\n\n`;
     };
     // #673: turn-level observability for degenerate terminal turns.
     let sawToolUse = false;
@@ -976,7 +995,7 @@ export async function pipePluginChatWithStrip(
         for (const s of streams.values()) {
             const tail = s.filter.flush();
             if (tail.length > 0) {
-                out += syntheticTail(s.field, s.index, tail);
+                out += syntheticTail(s, tail);
                 if (s.field === "content" || s.field === "text") {
                     visibleTextChars += tail.length;
                     releasedMarkupChars += tail.length;
@@ -1095,6 +1114,33 @@ export async function pipePluginChatWithStrip(
                     (rebuilt["choices"] as Record<string, unknown>[])[ci]["delta"] = { ...((rebuilt["choices"] as Record<string, unknown>[])[ci]["delta"] as Record<string, unknown>), [field]: clean };
                 }
             }
+            const tcs = dd["tool_calls"];
+            if (Array.isArray(tcs)) {
+                for (let ti = 0; ti < tcs.length; ti++) {
+                    const tc = tcs[ti];
+                    if (!tc || typeof tc !== "object") continue;
+                    const fn = (tc as Record<string, unknown>)["function"];
+                    const av = fn && typeof fn === "object" ? (fn as Record<string, unknown>)["arguments"] : undefined;
+                    if (typeof av !== "string" || av.length === 0) continue;
+                    if (!mayStartRenderTag(av) && !anyPending()) continue;
+                    const choiceIdx = typeof ch?.["index"] === "number" ? ch["index"] : ci;
+                    const tcIdx = typeof (tc as Record<string, unknown>)["index"] === "number" ? ((tc as Record<string, unknown>)["index"] as number) : ti;
+                    const s = toolArgStreamFor(choiceIdx, tcIdx);
+                    const clean = s.filter.push(av);
+                    if (clean === av) continue;
+                    if (!rebuilt) {
+                        rebuilt = { ...ev, choices: choices.map((c) => ({ ...(c as Record<string, unknown>), delta: { ...((c as Record<string, unknown>)["delta"] as Record<string, unknown>) } })) };
+                    }
+                    const rch = (rebuilt["choices"] as Record<string, unknown>[])[ci];
+                    const rdd = rch["delta"] as Record<string, unknown>;
+                    const rtcs = Array.isArray(rdd["tool_calls"]) ? (rdd["tool_calls"] as unknown[]) : [];
+                    const rtc = rtcs[ti] ? { ...(rtcs[ti] as Record<string, unknown>) } : { ...(tc as Record<string, unknown>) };
+                    rtc["function"] = { ...((rtc["function"] ?? {}) as Record<string, unknown>), arguments: clean };
+                    rtcs[ti] = rtc;
+                    rdd["tool_calls"] = rtcs;
+                    rch["delta"] = rdd;
+                }
+            }
         }
         if (rebuilt) {
             // Delta carried no visible text after stripping: drop the whole
@@ -1122,7 +1168,7 @@ export async function pipePluginChatWithStrip(
         }
         const d = ev["delta"] as Record<string, unknown> | undefined;
         const index = typeof ev["index"] === "number" ? ev["index"] : 0;
-        const field = d?.["type"] === "thinking_delta" ? "thinking" : d?.["type"] === "text_delta" ? "text" : null;
+        const field = d?.["type"] === "thinking_delta" ? "thinking" : d?.["type"] === "text_delta" ? "text" : d?.["type"] === "input_json_delta" ? "partial_json" : null;
         if (field === null || typeof d?.[field] !== "string") {
             return rawEvent + "\n\n";
         }
@@ -1316,11 +1362,12 @@ export async function pipePluginResponsesWithStrip(
     let decoder = new TextDecoder("utf-8");
     let buf = "";
     const acc: UsageSample = {};
+    const onTagDrop = (snippet: string) => {
+        loggerLog("warn", `[tag-echo] stripped model-emitted render tag (plugin passthrough): ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
+        log?.(`[tag-echo] stripped model-emitted render tag from plugin passthrough text`);
+    };
     const tagFilter = composeStreamFilters(
-        createTagEchoFilter((snippet) => {
-            loggerLog("warn", `[tag-echo] stripped model-emitted render tag (plugin passthrough): ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
-            log?.(`[tag-echo] stripped model-emitted render tag from plugin passthrough text`);
-        }),
+        createTagEchoFilter(onTagDrop),
         createMarkerLineFilter((snippet) => {
             loggerLog("warn", `[marker-echo] stripped model-emitted ACP confirmation marker (plugin passthrough): ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
             log?.(`[marker-echo] stripped model-emitted ACP confirmation marker from plugin passthrough text`);
@@ -1513,6 +1560,39 @@ export async function pipePluginResponsesWithStrip(
         buf = "";
         return true;
     };
+    interface RespArgStream {
+        filter: TagEchoFilter;
+        type: string;
+        field: string;
+        meta: Record<string, unknown>;
+    }
+    const argStreams = new Map<string, RespArgStream>();
+    const argStreamFor = (type: string, field: string, ev: Record<string, unknown>) => {
+        const id = typeof ev["item_id"] === "string" ? ev["item_id"] : String(ev["output_index"] ?? 0);
+        const key = `${type}:${id}`;
+        let s = argStreams.get(key);
+        if (!s) {
+            const meta: Record<string, unknown> = {};
+            for (const k of ["item_id", "output_index", "summary_index"]) {
+                if (ev[k] !== undefined) meta[k] = ev[k];
+            }
+            s = { filter: createTagEchoFilter(onTagDrop), type, field, meta };
+            argStreams.set(key, s);
+        }
+        return s;
+    };
+    const argAnyPending = () => {
+        for (const s of argStreams.values()) if (s.filter.pending()) return true;
+        return false;
+    };
+    const flushArgTails = () => {
+        let out = "";
+        for (const s of argStreams.values()) {
+            const tail = s.filter.flush();
+            if (tail.length > 0) out += `data: ${JSON.stringify({ type: s.type, ...s.meta, [s.field]: tail })}\n\n`;
+        }
+        return out;
+    };
     try {
         for (;;) {
             const { done, value } = await reader.read();
@@ -1562,6 +1642,17 @@ export async function pipePluginResponsesWithStrip(
                         }
                     }
                     if (retryFraming(type)) continue;
+                    // #933: done-family events also carry full text payloads — strip those too.
+                    // Arg-carrier dones are not visible text: the degenerate-turn retry below
+                    // does not hold on them, so they are stripped and released directly.
+                    if (type === "response.reasoning_summary_part.done" || type === "response.function_call_arguments.done") {
+                        const hadEcho = containsRenderTagText(jsonStr) || containsMarkerLineText(jsonStr);
+                        if (hadEcho) sawStrippedEcho = true;
+                        const evOut = hadEcho ? stripResponsesText(ev) : ev;
+                        const out = hadEcho ? rebuildEvent(rawEvent, evOut) : rawEvent + "\n\n";
+                        await write(flushArgTails() + flushTail(out));
+                        continue;
+                    }
                     if (type === "response.output_text.done" || type === "response.content_part.done" || type === "response.output_item.done") {
                         // HELD until the completion event decides the turn (see
                         // retryEmptyTurn): releasing it earlier would hand the
@@ -1581,19 +1672,28 @@ export async function pipePluginResponsesWithStrip(
                         sawTerminal = true;
                         if (await retryEmptyTurn(type === "response.completed" ? "completed" : undefined)) {
                             // The retry took over: this attempt's held family and
-                            // its own completion frame are dropped together.
+                            // its own completion frame are dropped together. Arg
+                            // streams are empty here by construction — a function
+                            // call would have blocked the retry via sawFunctionCall.
+                            for (const s of argStreams.values()) s.filter.flush();
+                            argStreams.clear();
                             heldEvents = [];
                             heldVisibleChars = 0;
                             continue;
                         }
                         const tailFrame = flushTail("");
                         if (tailFrame.length > 0) await write(tailFrame);
+                        const argTail = flushArgTails();
+                        if (argTail.length > 0) await write(argTail);
                         for (const held of heldEvents) await write(held);
                         heldEvents = [];
                         heldVisibleChars = 0;
-                        // done-family events also carry full text payloads — strip those too.
+                        // The completion frame itself closes the turn: strip it if it
+                        // carries echoed text, rewrite retry ids onto the first attempt's.
+                        const hadEchoText = containsRenderTagText(jsonStr) || containsMarkerLineText(jsonStr);
+                        if (hadEchoText) sawStrippedEcho = true;
                         let evOut = ev;
-                        let rebuild = containsRenderTagText(jsonStr) || containsMarkerLineText(jsonStr) || retryRewritePending();
+                        let rebuild = hadEchoText || retryRewritePending();
                         if (rebuild) evOut = stripResponsesText(ev);
                         rewriteRetryIds(evOut);
                         await write(rebuild ? rebuildEvent(rawEvent, evOut) : rawEvent + "\n\n");
@@ -1629,6 +1729,29 @@ export async function pipePluginResponsesWithStrip(
                         await write(rebuildEvent(rawEvent, rebuilt));
                         continue;
                     }
+                    // Both delta event types carry the fragment in `delta`;
+                    // only the .done variants carry `arguments`.
+                    const argField = type === "response.function_call_arguments.delta" || type === "response.reasoning_summary_text.delta" ? "delta" : null;
+                    if (argField !== null && typeof type === "string") {
+                        const v = ev[argField];
+                        if (typeof v !== "string" || v.length === 0) {
+                            await write(rawEvent + "\n\n");
+                            continue;
+                        }
+                        if (!mayStartRenderTag(v) && !argAnyPending() && !tagFilter.pending()) {
+                            await write(rawEvent + "\n\n");
+                            continue;
+                        }
+                        const s = argStreamFor(type, argField, ev);
+                        const clean = s.filter.push(v);
+                        if (clean.length === 0) continue;
+                        if (clean === v) {
+                            await write(flushArgTails() + rawEvent + "\n\n");
+                            continue;
+                        }
+                        await write(flushArgTails() + rebuildEvent(rawEvent, { ...ev, [argField]: clean }));
+                        continue;
+                    }
                     await write(rawEvent + "\n\n");
                 }
             }
@@ -1637,7 +1760,7 @@ export async function pipePluginResponsesWithStrip(
         // Stream cut without a done-family event: flush whatever the tag
         // filter still holds so prose is never silently lost.
         if (!res.destroyed && !res.writableEnded) {
-            const rest = flushTail("");
+            const rest = flushArgTails() + flushTail("");
             if (rest.length > 0) await write(rest);
         }
         maybeWarnDegenerate();
@@ -1663,7 +1786,7 @@ export async function pipePluginResponsesWithStrip(
         // the top-level handler, which would close the stream bare. Flush
         // held tag tails first so partial prose is never silently lost.
         try {
-            const rest = flushTail("");
+            const rest = flushArgTails() + flushTail("");
             if (rest.length > 0) await write(rest);
         } catch {
             /* client half-gone; the emission below is best-effort too */
