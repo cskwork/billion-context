@@ -33,7 +33,7 @@
 import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST } from "../launcher.js";
 import { markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, singleFlight } from "./native-bootstrap.js";
 import { installNativeFetchIntercept, type NativeInterceptState } from "./native-intercept.js";
-import { fetchManifest, fetchProxyVersion, fetchStatus, fetchStatusLatest, forwardTool, type ManifestTool } from "./shared.js";
+import { fetchManifest, fetchProxyVersion, fetchStatus, fetchStatusLatest, forwardTool, reportRuntimeInfo, type ManifestTool } from "./shared.js";
 
 export const name = "bili-native";
 export const inject = ["tools", "commands", "agents"];
@@ -57,6 +57,12 @@ type PluginContext = {
     tools: { register: (definition: ToolDefinition) => unknown };
     commands: { register: (command: { name: string; description: string; handler: () => Promise<CommandOutcome> }) => unknown };
     agents: { currentInitiator?: () => AgentLike | undefined };
+    // Runtime-info sources (#955), resolved via dynamic ctx.inject when the
+    // host exposes them (both are core dsh services; optional so older dsh
+    // builds or stripped hosts keep the plugin alive without model info).
+    llm?: { resolveModelInfo?: (provider: string, model: string, signal?: AbortSignal) => Promise<{ context?: { contextWindow?: number }; defaultMaxTokens?: number } | undefined> };
+    agentDefaultModel?: { currentSelection?: () => { provider?: string; model?: string } | undefined };
+    inject?: (deps: readonly string[], callback: (sub: PluginContext) => void) => unknown;
 };
 
 /** Decides whether the native bootstrap should run in this process. */
@@ -86,6 +92,62 @@ const state: NativeInterceptState = { origin: undefined, ready: Promise.resolve(
 type RegisterState = { base: string | undefined; toolsReady: boolean; dead: boolean; retryAt: number; pending: Promise<void> | undefined };
 
 const register: RegisterState = { base: undefined, toolsReady: false, dead: false, retryAt: 0, pending: undefined };
+
+// Runtime-info cache (#955): the host's current model selection plus what
+// ctx.llm resolved for it (contextWindow / defaultMaxTokens). Written by an
+// async refresh; read synchronously by headersFor on every model request.
+// Stale entries never leak across a model switch: refresh() keys off the
+// LIVE selection, and a changed selection re-resolves before overwriting.
+type ModelInfoCache = { provider: string; model: string; contextWindow?: number; maxOutput?: number };
+const modelInfo: { cached?: ModelInfoCache; services?: { llm?: PluginContext["llm"]; agentDefaultModel?: PluginContext["agentDefaultModel"] }; refreshing: boolean } = { refreshing: false };
+
+function refreshModelInfo(origin: string | undefined): void {
+    const svc = modelInfo.services;
+    if (svc === undefined || modelInfo.refreshing) return;
+    let selection: { provider?: string; model?: string } | undefined;
+    try {
+        selection = svc.agentDefaultModel?.currentSelection?.();
+    } catch {
+        return;
+    }
+    const provider = selection?.provider;
+    const model = selection?.model;
+    if (typeof provider !== "string" || provider.length === 0 || typeof model !== "string" || model.length === 0) return;
+    if (modelInfo.cached?.provider === provider && modelInfo.cached?.model === model) return;
+    const resolve = svc.llm?.resolveModelInfo;
+    if (resolve === undefined) {
+        modelInfo.cached = { provider, model };
+        return;
+    }
+    modelInfo.refreshing = true;
+    void Promise.resolve()
+        .then(() => resolve(provider, model))
+        .then((info) => {
+            modelInfo.cached = {
+                provider,
+                model,
+                contextWindow: typeof info?.context?.contextWindow === "number" && info.context.contextWindow > 0 ? Math.floor(info.context.contextWindow) : undefined,
+                maxOutput: typeof info?.defaultMaxTokens === "number" && info.defaultMaxTokens > 0 ? Math.floor(info.defaultMaxTokens) : undefined,
+            };
+        })
+        .catch(() => {
+            // Resolution failed (transient catalog read, model offline): keep
+            // the model id (usable for registry lookup) without window claims.
+            modelInfo.cached = { provider, model };
+        })
+        .finally(() => {
+            modelInfo.refreshing = false;
+            if (origin !== undefined && modelInfo.cached !== undefined) {
+                void reportRuntimeInfo(origin, {
+                    agent: "dsh",
+                    model: modelInfo.cached.model,
+                    contextWindow: modelInfo.cached.contextWindow,
+                    maxOutput: modelInfo.cached.maxOutput,
+                    source: "client-config",
+                }).catch(() => {});
+            }
+        });
+}
 
 function errMessage(err: unknown): string {
     return err instanceof Error ? err.message : String(err);
@@ -224,12 +286,38 @@ export function apply(ctx: PluginContext): void {
         if (!register.toolsReady) return undefined;
         const sid = sessionIdOf(ctx);
         if (sid === undefined) return undefined;
-        return { "x-bili-plugin": "dsh", "x-bili-plugin-conversation": sid };
+        refreshModelInfo(register.base);
+        const headers: Record<string, string> = { "x-bili-plugin": "dsh", "x-bili-plugin-conversation": sid };
+        if (modelInfo.cached !== undefined) {
+            headers["x-bili-plugin-model"] = modelInfo.cached.model;
+            if (modelInfo.cached.contextWindow !== undefined) headers["x-bili-plugin-context-window"] = String(modelInfo.cached.contextWindow);
+            if (modelInfo.cached.maxOutput !== undefined) headers["x-bili-plugin-max-output"] = String(modelInfo.cached.maxOutput);
+        }
+        return headers;
     };
 
     void state.ready.then((origin) => {
         if (origin !== undefined) void registerTools(ctx).catch(() => {});
     });
+
+    // Runtime-info sources (#955): bind the model services when the host
+    // exposes them (dynamic inject — a missing service must never keep the
+    // whole plugin from activating), then report once so the proxy knows the
+    // model config before the first request.
+    if (typeof ctx.inject === "function") {
+        try {
+            ctx.inject(["llm", "agentDefaultModel"], (sub) => {
+                modelInfo.services = { llm: sub.llm, agentDefaultModel: sub.agentDefaultModel };
+                refreshModelInfo(register.base ?? state.origin);
+            });
+        } catch {
+            // inject is best-effort: without the services the plugin just
+            // runs header-less (wire mode + registry guess), as before.
+        }
+    } else if (ctx.llm !== undefined || ctx.agentDefaultModel !== undefined) {
+        modelInfo.services = { llm: ctx.llm, agentDefaultModel: ctx.agentDefaultModel };
+        refreshModelInfo(register.base ?? state.origin);
+    }
 
     ctx.commands.register({
         name: "acp",
@@ -250,6 +338,9 @@ export function _resetRegisterForTest(base: string | undefined): void {
     register.dead = false;
     register.retryAt = 0;
     register.pending = undefined;
+    modelInfo.cached = undefined;
+    modelInfo.services = undefined;
+    modelInfo.refreshing = false;
 }
 
 export function _stateHeadersForTest(): ((url: string) => Record<string, string> | undefined) | undefined {

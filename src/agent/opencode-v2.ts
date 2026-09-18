@@ -41,7 +41,7 @@
 // available on all observed surfaces.
 
 import { ACP_TOOLS_OPENAI, ABSORB_TOOL_OPENAI } from "../compress-tool.js";
-import { fetchProxyVersion, fetchStatus, forwardTool, proxyBaseFromEnv, proxyBaseFromUrl, reportCompactionBoundary } from "./shared.js";
+import { fetchProxyVersion, fetchStatus, forwardTool, proxyBaseFromEnv, proxyBaseFromUrl, reportCompactionBoundary, reportRuntimeInfoOnChange } from "./shared.js";
 
 // OpenCode V2 TUI renders a synthetic message as a visible Notice row only when its display text fits the
 // timeline cap (~1KB): longer text renders nothing (#880). Panels go to description verbatim under the cap.
@@ -86,7 +86,7 @@ interface V2CommandEditor {
 interface V2CatalogModelEntry {
     providerID?: unknown;
     id?: unknown;
-    limit?: { context?: unknown };
+    limit?: { context?: unknown; output?: unknown };
 }
 
 export interface V2PluginContext {
@@ -118,6 +118,7 @@ const V2_BILI_TOOLS = [...ACP_TOOLS_OPENAI, ABSORB_TOOL_OPENAI].map((t) => ({
 export interface V2State {
     proxyBase?: string;
     windows?: Map<string, number>;
+    outputs?: Map<string, number>;
     windowsAt?: number;
 }
 
@@ -129,13 +130,17 @@ function refreshWindows(ctx: V2PluginContext, state: V2State): void {
         try {
             const res = await ctx.catalog?.model?.list?.();
             const map = new Map<string, number>();
+            const outMap = new Map<string, number>();
             for (const m of res?.data ?? []) {
                 const pid = typeof m.providerID === "string" ? m.providerID : "";
                 const id = typeof m.id === "string" ? m.id : "";
                 const c = m.limit?.context;
                 if (pid && id && typeof c === "number" && Number.isFinite(c) && c > 0) map.set(`${pid}/${id}`, Math.floor(c));
+                const o = m.limit?.output;
+                if (pid && id && typeof o === "number" && Number.isFinite(o) && o > 0) outMap.set(`${pid}/${id}`, Math.floor(o));
             }
             if (map.size > 0) state.windows = map;
+            if (outMap.size > 0) state.outputs = outMap;
         } catch {
             // catalog unavailable — window header simply goes unstamped
         }
@@ -164,8 +169,13 @@ export function createOpencodeV2Setup(options: OpencodeV2SetupOptions = {}): (ct
             headers.set("x-bili-plugin", "opencode");
             const model = e.model;
             if (model && typeof model.providerID === "string" && typeof model.id === "string") {
-                const window = state.windows?.get(`${model.providerID}/${model.id}`);
+                const key = `${model.providerID}/${model.id}`;
+                const window = state.windows?.get(key);
                 if (window !== undefined) headers.set("x-bili-plugin-context-window", String(window));
+                const output = state.outputs?.get(key);
+                if (output !== undefined) headers.set("x-bili-plugin-max-output", String(output));
+                headers.set("x-bili-plugin-model", model.id);
+                reportRuntimeInfoOnChange(state.proxyBase, { agent: "opencode", model: model.id, contextWindow: window, maxOutput: output, source: "client-config" });
             }
         };
 

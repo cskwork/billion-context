@@ -72,6 +72,7 @@ import { createAcpCommandHooks } from "./opencode-acp-command.js";
 import { markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, singleFlight } from "./native-bootstrap.js";
 import { installNativeFetchIntercept, isModelApiUrl, readyOrigin, type NativeInterceptState } from "./native-intercept.js";
 import { createOpencodeV2Setup, type V2HttpRequestEvent, type V2State } from "./opencode-v2.js";
+import { reportRuntimeInfoOnChange } from "./shared.js";
 import { callLegacyAcpConfig, isLegacyAcpSession, loadLegacyAcp, type LegacyAcpModule } from "./opencode-legacy.js";
 
 /** Decides whether the native bootstrap should run in this process. */
@@ -427,6 +428,24 @@ export function extractV1Windows(cfg: V1Config): Map<string, number> {
     return map;
 }
 
+/** Configured max output per model (runtime-info #955): opencode's provider
+ *  models declare `limit.output` — the ceiling the client will actually
+ *  request. Same shape as extractV1Windows. */
+export function extractV1Outputs(cfg: V1Config): Map<string, number> {
+    const map = new Map<string, number>();
+    const providers = cfg.provider;
+    if (providers === null || typeof providers !== "object") return map;
+    for (const [pid, entry] of Object.entries(providers)) {
+        const models = entry?.models;
+        if (models === null || typeof models !== "object") continue;
+        for (const [mid, model] of Object.entries(models)) {
+            const o = model?.limit?.output;
+            if (typeof o === "number" && Number.isFinite(o) && o > 0) map.set(`${pid}/${mid}`, Math.floor(o));
+        }
+    }
+    return map;
+}
+
 export interface V1NativeDeps {
     /** zod module (tests inject; runtime lazy-imports "zod"). */
     z?: ZodLike;
@@ -459,6 +478,7 @@ export function createV1ServerHooks(origin: string, ctx: V1PluginContext, deps: 
     const isLegacy = deps.isLegacy ?? isLegacyAcpSession;
     const log = deps.log ?? ((msg: string) => console.log(msg));
     let windows = new Map<string, number>();
+    let outputs = new Map<string, number>();
     const hooks: V1Hooks = {
         config: async (cfg) => {
             if (legacy?.configHook !== undefined) {
@@ -468,6 +488,7 @@ export function createV1ServerHooks(origin: string, ctx: V1PluginContext, deps: 
             const n = rewriteV1Providers(cfg, origin);
             if (n > 0) log(`[bili-opencode-native] v1: rewrote ${n} provider baseURL(s) -> ${origin}/bili/`);
             windows = extractV1Windows(cfg);
+            outputs = extractV1Outputs(cfg);
         },
         "command.execute.before": async (input, output) => {
             if ((input.command === "acp" || input.command === "dcp") && legacy?.commandHook !== undefined && isLegacy(input.sessionID)) {
@@ -520,8 +541,13 @@ export function createV1ServerHooks(origin: string, ctx: V1PluginContext, deps: 
             output.headers["x-bili-plugin-conversation"] = input.sessionID;
             const model = input.model;
             if (model && typeof model.providerID === "string" && typeof model.id === "string") {
-                const w = windows.get(`${model.providerID}/${model.id}`);
+                const key = `${model.providerID}/${model.id}`;
+                const w = windows.get(key);
                 if (w !== undefined) output.headers["x-bili-plugin-context-window"] = String(w);
+                const o = outputs.get(key);
+                if (o !== undefined) output.headers["x-bili-plugin-max-output"] = String(o);
+                output.headers["x-bili-plugin-model"] = model.id;
+                reportRuntimeInfoOnChange(origin, { agent: "opencode", model: model.id, contextWindow: w, maxOutput: o, source: "client-config" });
             }
         };
         const forward = deps.forward ?? ((o, conversationId, tool, args) => import("./shared.js").then((m) => m.forwardTool(o, conversationId, tool, args)));

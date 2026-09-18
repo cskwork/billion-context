@@ -114,6 +114,44 @@ export async function reportCompactionBoundary(proxyBase: string, conversationId
     }, COMPACT_TIMEOUT_MS);
 }
 
+export type RuntimeInfoReport = {
+    agent: string;
+    model: string;
+    contextWindow?: number;
+    maxOutput?: number;
+    baseURL?: string;
+    source?: string;
+};
+
+/** Runtime-info protocol (#955): push the client's OWN model config (what
+ *  the plugin read from the host's config) to the proxy at bootstrap and on
+ *  model switch, before any model request. Fire-and-forget by design — the
+ *  proxy treats a missing report as "guess like before" (registry/table). */
+export async function reportRuntimeInfo(proxyBase: string, info: RuntimeInfoReport): Promise<void> {
+    const { ok, status } = await fetchJson(`${proxyBase}/__bili/plugin/runtime-info`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(info),
+    }, STATUS_TIMEOUT_MS);
+    if (!ok) throw new Error(`runtime-info report failed (${status})`);
+}
+
+// Per-agent last report (model id): a stamp fires at most one POST per model
+// switch, not per request. Failed reports roll back so the next stamp retries.
+const lastRuntimeReport = new Map<string, string>();
+
+/** Stamp-time runtime-info report (#955): no-op unless the agent's reported
+ *  model changed (or this is the first stamp after proxy attach/spawn).
+ *  Soft-fail — an unreachable proxy keeps wire mode exactly as before. */
+export function reportRuntimeInfoOnChange(proxyBase: string | undefined, info: RuntimeInfoReport): void {
+    if (proxyBase === undefined || proxyBase.length === 0) return;
+    if (lastRuntimeReport.get(info.agent) === info.model) return;
+    lastRuntimeReport.set(info.agent, info.model);
+    void reportRuntimeInfo(proxyBase, info).catch(() => {
+        lastRuntimeReport.delete(info.agent);
+    });
+}
+
 export async function forwardTool(proxyBase: string, conversationId: string, tool: string, args: unknown, signal?: AbortSignal): Promise<string> {
     const { ok, status, json } = await fetchJson(`${proxyBase}/__bili/plugin/tool`, {
         method: "POST",

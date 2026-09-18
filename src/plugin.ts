@@ -56,6 +56,8 @@ export const PLUGIN_CONVERSATION_HEADER = "x-bili-plugin-conversation";
  *  no compress loop): the legacy extension owns compression for them. */
 export const PLUGIN_BYPASS_HEADER = "x-bili-plugin-bypass";
 export const PLUGIN_CONTEXT_WINDOW_HEADER = "x-bili-plugin-context-window";
+export const PLUGIN_MAX_OUTPUT_HEADER = "x-bili-plugin-max-output";
+export const PLUGIN_MODEL_HEADER = "x-bili-plugin-model";
 
 export const PLUGIN_PROTOCOL_VERSION = 1;
 
@@ -106,6 +108,26 @@ export function pluginContextWindowHeader(headers: Record<string, string | strin
  *  both headers together (see the manifest's `headers` block). */
 export function pluginReportedContextWindow(headers: Record<string, string | string[] | undefined>): number | undefined {
     return pluginAgentHeader(headers) !== undefined ? pluginContextWindowHeader(headers) : undefined;
+}
+
+/** Configured max output tokens (runtime-info protocol #955). Same gate as
+ *  the window header: a plain client must not be able to move the proxy's
+ *  output-headroom reservation by name. Used only when the request body
+ *  carries no max_tokens of its own — the wire value always wins. */
+export function pluginReportedMaxOutput(headers: Record<string, string | string[] | undefined>): number | undefined {
+    const raw = pluginAgentHeader(headers) === undefined ? undefined : headerValue(headers, PLUGIN_MAX_OUTPUT_HEADER);
+    if (raw === undefined) return undefined;
+    const n = Number.parseInt(raw, 10);
+    return Number.isFinite(n) && n > 0 ? n : undefined;
+}
+
+/** Current model id (runtime-info protocol #955). Informational + lets the
+ *  proxy correlate the per-agent runtime table with the request's model
+ *  before trusting the table's window. Same plugin gate. */
+export function pluginReportedModel(headers: Record<string, string | string[] | undefined>): string | undefined {
+    if (pluginAgentHeader(headers) === undefined) return undefined;
+    const raw = headerValue(headers, PLUGIN_MODEL_HEADER);
+    return raw !== undefined && /^\S{1,256}$/.test(raw) ? raw : undefined;
 }
 
 type ConversationEntry = { sessionId: string; lastSeen: number };
@@ -225,6 +247,81 @@ export function rememberPluginMessages(sessionId: string, processed: CoreMessage
 // wire injection suppressed) and the conversation id becomes its tool-API key
 // — no x-bili-plugin headers required.
 export type PendingPluginRegister = { conversationId: string; agent: string; ts: number };
+
+/** Runtime-info protocol entry (#955): what the client's OWN config says it
+ *  will run — reported at plugin bootstrap and on model switch, before (and
+ *  independent of) any model request. Ranked in the native-window chain
+ *  directly under the per-request header report; entries carry their model
+ *  id and the table is only consulted when that id matches the request's
+ *  model (a stale post-switch entry must never size a different model). */
+export type PluginRuntimeInfo = {
+    agent: string;
+    model: string;
+    contextWindow?: number;
+    maxOutput?: number;
+    baseURL?: string;
+    source: string;
+    ts: number;
+};
+
+const pluginRuntimeTable = new Map<string, PluginRuntimeInfo>();
+const MAX_PLUGIN_RUNTIME_ENTRIES = 32;
+
+export function recordPluginRuntimeInfo(entry: PluginRuntimeInfo): void {
+    pluginRuntimeTable.delete(entry.agent);
+    pluginRuntimeTable.set(entry.agent, entry);
+    while (pluginRuntimeTable.size > MAX_PLUGIN_RUNTIME_ENTRIES) {
+        const oldest = pluginRuntimeTable.keys().next().value;
+        if (oldest === undefined) break;
+        pluginRuntimeTable.delete(oldest);
+    }
+}
+
+/** Latest runtime-info for an agent, usable for `model` only (undefined =
+ *  no report, or a report for a different model). */
+export function pluginRuntimeInfoFor(agent: string | undefined, model: string | undefined): PluginRuntimeInfo | undefined {
+    if (agent === undefined || model === undefined) return undefined;
+    const entry = pluginRuntimeTable.get(agent);
+    if (entry === undefined || entry.model !== model) return undefined;
+    return entry;
+}
+
+/** Accept the bootstrap/model-switch report. Body:
+ *  { agent, model, contextWindow?, maxOutput?, baseURL?, source?,
+ *    conversationId? } — agent+model are required; numbers are validated.
+ *  Loopback-gated like every /__bili/plugin/* endpoint (the route lives
+ *  under the same admin gate in server.ts). */
+export function handlePluginRuntimeInfo(payload: string, res: import("node:http").ServerResponse): void {
+    let parsed: unknown;
+    try {
+        parsed = JSON.parse(payload);
+    } catch {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: "invalid JSON" }));
+        return;
+    }
+    const body = parsed as { agent?: unknown; model?: unknown; contextWindow?: unknown; maxOutput?: unknown; baseURL?: unknown; source?: unknown };
+    const str = (v: unknown, max: number) => (typeof v === "string" && v.length > 0 && v.length <= max ? v : undefined);
+    const num = (v: unknown) => (typeof v === "number" && Number.isFinite(v) && v > 0 ? Math.floor(v) : undefined);
+    const agent = str(body.agent, 64);
+    const model = str(body.model, 256);
+    if (agent === undefined || model === undefined) {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: "agent and model are required" }));
+        return;
+    }
+    recordPluginRuntimeInfo({
+        agent,
+        model,
+        contextWindow: num(body.contextWindow),
+        maxOutput: num(body.maxOutput),
+        baseURL: str(body.baseURL, 2048),
+        source: str(body.source, 64) ?? "client-config",
+        ts: Date.now(),
+    });
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ ok: true }));
+}
 
 const MAX_PENDING_REGISTERS = 64;
 
@@ -419,9 +516,10 @@ export function handlePluginManifest(res: import("node:http").ServerResponse): v
             openai: withSearchContextConversationDescription([...BILI_ACP_TOOLS_OPENAI, ABSORB_TOOL_OPENAI].map(withConversationIdParam)),
             responses: withSearchContextConversationDescription([...BILI_ACP_TOOLS_RESPONSES, ABSORB_TOOL_RESPONSES].map(withConversationIdParam)),
         },
-        headers: { agent: PLUGIN_AGENT_HEADER, conversation: PLUGIN_CONVERSATION_HEADER, contextWindow: PLUGIN_CONTEXT_WINDOW_HEADER },
+        headers: { agent: PLUGIN_AGENT_HEADER, conversation: PLUGIN_CONVERSATION_HEADER, contextWindow: PLUGIN_CONTEXT_WINDOW_HEADER, maxOutput: PLUGIN_MAX_OUTPUT_HEADER, model: PLUGIN_MODEL_HEADER },
         toolEndpoint: "/__bili/plugin/tool",
         statusEndpoint: "/__bili/plugin/status",
+        runtimeInfoEndpoint: "/__bili/plugin/runtime-info",
     }));
 }
 
@@ -560,6 +658,9 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
         fallback: viaFallback || undefined,
         label: session.meta.label ?? null,
         pluginAgent: session.metadata.pluginAgent ?? null,
+        model: session.metadata.lastModel ?? null,
+        windowSource: session.metadata.lastWindowSource ?? null,
+        runtimeInfo: pluginRuntimeInfoFor(typeof session.metadata.pluginAgent === "string" ? session.metadata.pluginAgent : undefined, typeof session.metadata.lastModel === "string" ? session.metadata.lastModel : undefined) ?? null,
         contextLimit: typeof limit === "number" ? limit : null,
         contextTokens: session.stats.lastInputTokens,
         inputTokens: session.stats.inputTokens,
@@ -1894,4 +1995,5 @@ export function _resetPluginStateForTest(): void {
     remembered.clear();
     pendingRegisters.length = 0;
     registeredIds.clear();
+    pluginRuntimeTable.clear();
 }

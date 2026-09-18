@@ -5,7 +5,7 @@
 // minimal structural declarations — the bundled artifact imports NOTHING
 // from the host at runtime (the host duck-types us in).
 
-import { detectProxyBase, fetchManifest, forwardTool, fetchStatus, fetchProxyVersion, type ManifestTool } from "./shared.js";
+import { detectProxyBase, fetchManifest, forwardTool, fetchStatus, fetchProxyVersion, reportRuntimeInfoOnChange, type ManifestTool } from "./shared.js";
 
 type Ctx = {
     sessionManager?: { getSessionId?: () => string } | undefined;
@@ -442,6 +442,16 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
                     const window = ctx.model?.contextWindow;
                     if (typeof window === "number" && Number.isFinite(window) && window > 0) {
                         headers["x-bili-plugin-context-window"] = String(Math.floor(window));
+                    }
+                    // Runtime-info (#955): model id + configured max output.
+                    // pi's model config exposes id / contextWindow / baseUrl;
+                    // maxTokens lives on the model object when configured.
+                    const modelId = ctx.model?.id;
+                    if (typeof modelId === "string" && modelId.length > 0) {
+                        headers["x-bili-plugin-model"] = modelId;
+                        const maxOut = (ctx.model as { maxTokens?: unknown } | undefined)?.maxTokens;
+                        if (typeof maxOut === "number" && Number.isFinite(maxOut) && maxOut > 0) headers["x-bili-plugin-max-output"] = String(Math.floor(maxOut));
+                        reportRuntimeInfoOnChange(proxyBaseForCtx(ctx), { agent, model: modelId, contextWindow: typeof window === "number" && window > 0 ? Math.floor(window) : undefined, maxOutput: typeof maxOut === "number" && maxOut > 0 ? Math.floor(maxOut) : undefined, baseURL: ctx.model?.baseUrl, source: "client-config" });
                     }
                 }
             } catch (err) {

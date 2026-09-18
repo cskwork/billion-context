@@ -125,7 +125,18 @@ bili plugin remove <client>     # 卸载(dsh 还原占位符;配置快照存 .bi
 
 dsh 用户可以完全不用 bili：`dsh plugin --profile <name> add billion-context` 经 dsh 自己的插件通道装上同一个原生插件（pnpm 装进 profile、挂载包内 patch 层）—— 见下文 dsh 段。
 
-插件加载时**自拉起自己的代理**(已有健康实例则直接复用 —— 父进程 pid 看门狗在客户端退出时收掉它),把模型流量改写到 `<proxy>/bili/<上游URL>`,并把 `compress` / `decompress` / `acp_status` 注册为客户端原生工具(plugin 模式),`/acp` 面板绑定当前会话。退出开关:`BILI_NATIVE_PI=0`、`BILI_NATIVE_OPENCODE=0`、`BILI_NATIVE_DSH=0`。
+插件加载时**自拉起自己的代理**(已有健康实例则直接复用 —— 父进程 pid 看门狗在客户端退出时收掉它),把模型流量改写到 `<proxy>/bili/<上游URL>`,并把 `compress` / `decompress` / `acp_status` 注册为客户端原生工具(plugin 模式),`/acp` 面板绑定当前会话。插件还会把客户端**自己的模型配置**上报给代理(runtime-info 协议,#955),压缩预算用真实窗口而不是注册表猜测。退出开关:`BILI_NATIVE_PI=0`、`BILI_NATIVE_OPENCODE=0`、`BILI_NATIVE_DSH=0`。
+
+#### Runtime-info 协议(#955)
+
+原生插件就在客户端进程里,因此能读到客户端自己将要使用的模型配置。它通过两个通道把真相推给代理,代理在上下文窗口解析链里优先采用它而不是 models.dev 注册表/内置表:
+
+| 通道 | 时机 | 字段 |
+|---|---|---|
+| 逐请求头(门控在 `x-bili-plugin`) | 每次模型请求 | `x-bili-plugin-context-window`、`x-bili-plugin-max-output`、`x-bili-plugin-model` |
+| `POST /__bili/plugin/runtime-info`(回环地址) | 插件自举 + 模型切换 | `{agent, model, contextWindow?, maxOutput?, baseURL?, source}` |
+
+窗口解析顺序:`anthropic-beta` 协商 > 逐请求 plugin 头 > runtime-info 表(agent+model 必须匹配) > launcher 环境变量 > 路由配置 > models.dev 注册表 > 内置表。上报的 `maxOutput` 仅在请求体自带输出预算缺席时兜底。现有实现:`src/agent/pi.ts`、`src/agent/opencode-native.ts`(v1)、`src/agent/opencode-v2.ts`、`src/agent/dsh-native.ts` —— 其他客户端接入请遵循同一协议。
 
 注意:
 
