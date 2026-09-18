@@ -424,20 +424,106 @@ function stripParts(content: unknown): unknown {
 }
 
 function stripItemContent(it: unknown): unknown {
-    if (it && typeof it === "object" && Array.isArray((it as Record<string, unknown>).content)) {
-        return { ...(it as Record<string, unknown>), content: stripParts((it as Record<string, unknown>).content) };
+    if (!it || typeof it !== "object") return it;
+    const io = it as Record<string, unknown>;
+    let out: Record<string, unknown> | undefined;
+    const set = (k: string, v: unknown): void => {
+        out ??= { ...io };
+        out[k] = v;
+    };
+    if (Array.isArray(io.content)) set("content", stripParts(io.content));
+    if (typeof io.arguments === "string") set("arguments", stripAcpTags(io.arguments));
+    if (Array.isArray(io.summary)) {
+        set(
+            "summary",
+            io.summary.map((s) =>
+                s && typeof s === "object" && typeof (s as Record<string, unknown>).text === "string"
+                    ? { ...(s as Record<string, unknown>), text: stripAcpTags((s as Record<string, unknown>).text as string) }
+                    : s,
+            ),
+        );
     }
-    return it;
+    return out ?? it;
 }
 
 function stripIfString(v: unknown): unknown {
     return typeof v === "string" ? stripAcpTags(v) : v;
 }
 
+// #933: whole-object invariant — field-enumerated stripping kept missing new
+// carriers (tool-call arguments); these walk every string leaf instead.
+export function stripAcpTagsDeep(v: unknown): unknown {
+    if (typeof v === "string") return stripAcpTags(v);
+    if (Array.isArray(v)) {
+        let changed = false;
+        const out = v.map((x) => {
+            const r = stripAcpTagsDeep(x);
+            if (r !== x) changed = true;
+            return r;
+        });
+        return changed ? out : v;
+    }
+    if (v && typeof v === "object") {
+        let changed = false;
+        const out: Record<string, unknown> = {};
+        for (const [k, x] of Object.entries(v as Record<string, unknown>)) {
+            const r = stripAcpTagsDeep(x);
+            if (r !== x) changed = true;
+            out[k] = r;
+        }
+        return changed ? out : v;
+    }
+    return v;
+}
+
+export function findAcpLikeTagSnippetsDeep(v: unknown, path = "$"): string[] {
+    const hits: string[] = [];
+    const visit = (x: unknown, p: string): void => {
+        if (typeof x === "string") {
+            const pairedSpans: Array<[number, number]> = [];
+            for (const m of x.matchAll(new RegExp(PAIRED.source, "g"))) {
+                hits.push(`${p}: ${m[0].slice(0, 60)}`);
+                pairedSpans.push([m.index, m.index + m[0].length]);
+            }
+            for (const re of [new RegExp(LONE_OPEN.source, "g"), new RegExp(LONE_CLOSE.source, "g")]) {
+                for (const m of x.matchAll(re)) {
+                    if (pairedSpans.some(([s, e]) => m.index! >= s && m.index! < e)) continue;
+                    hits.push(`${p}: ${m[0].slice(0, 60)}`);
+                }
+            }
+            for (const m of x.matchAll(MARKER_LINE)) hits.push(`${p}: ${m[0].slice(0, 60)}`);
+            return;
+        }
+        if (Array.isArray(x)) {
+            x.forEach((it, i) => visit(it, `${p}[${i}]`));
+            return;
+        }
+        if (x && typeof x === "object") {
+            for (const [k, it] of Object.entries(x as Record<string, unknown>)) visit(it, `${p}.${k}`);
+        }
+    };
+    visit(v, path);
+    return hits;
+}
+
+function stripToolCallArgs(tcs: unknown): unknown {
+    if (!Array.isArray(tcs)) return tcs;
+    return tcs.map((tc) => {
+        if (!tc || typeof tc !== "object") return tc;
+        const tco = tc as Record<string, unknown>;
+        const fn = tco["function"];
+        if (fn && typeof fn === "object" && typeof (fn as Record<string, unknown>)["arguments"] === "string") {
+            return { ...tco, function: { ...(fn as Record<string, unknown>), arguments: stripAcpTags((fn as Record<string, unknown>)["arguments"] as string) } };
+        }
+        return tc;
+    });
+}
+
 // Plugin-passthrough parity for the OpenAI chat-completions wire (issue #14:
 // pi + qwen echoed render tags through the verbatim plugin stream): strip the
-// text fields a chat chunk / completion carries — `choices[].delta.{content,
-// reasoning_content, reasoning}` on streams and `choices[].message.*` on
+// text fields and tool-call arguments a chat chunk / completion carries —
+// `choices[].delta.{content,reasoning_content,reasoning}` +
+// `tool_calls[].function.arguments` on streams, `choices[].message.*` on
 // non-streaming bodies. Mutates in place, mirroring stripResponsesText.
 export function stripOpenaiChatText<T>(obj: T): T {
     if (!obj || typeof obj !== "object") return obj;
@@ -453,6 +539,7 @@ export function stripOpenaiChatText<T>(obj: T): T {
                 hh["content"] = stripIfString(hh["content"]);
                 hh["reasoning_content"] = stripIfString(hh["reasoning_content"]);
                 hh["reasoning"] = stripIfString(hh["reasoning"]);
+                hh["tool_calls"] = stripToolCallArgs(hh["tool_calls"]);
                 ch[holder] = hh;
             }
         }
@@ -472,14 +559,22 @@ export function stripAnthropicText<T>(obj: T): T {
         const dd = { ...(d as Record<string, unknown>) };
         dd["text"] = stripIfString(dd["text"]);
         dd["thinking"] = stripIfString(dd["thinking"]);
+        dd["partial_json"] = stripIfString(dd["partial_json"]);
         o["delta"] = dd;
     }
     if (Array.isArray(o["content"])) {
         o["content"] = (o["content"] as unknown[]).map((c) => {
             if (!c || typeof c !== "object") return c;
             const cc = c as Record<string, unknown>;
-            if (typeof cc["text"] !== "string" && typeof cc["thinking"] !== "string") return c;
-            return { ...cc, text: stripIfString(cc["text"]), thinking: stripIfString(cc["thinking"]) };
+            const hasText = typeof cc["text"] === "string" || typeof cc["thinking"] === "string";
+            const input = cc["type"] === "tool_use" ? cc["input"] : undefined;
+            const hasInput = input != null && typeof input === "object";
+            if (!hasText && !hasInput) return c;
+            return {
+                ...cc,
+                ...(hasText ? { text: stripIfString(cc["text"]), thinking: stripIfString(cc["thinking"]) } : {}),
+                ...(hasInput ? { input: stripAcpTagsDeep(input) } : {}),
+            };
         });
     }
     return obj;
@@ -494,13 +589,13 @@ export function stripResponsesText<T>(obj: T): T {
     if (!obj || typeof obj !== "object") return obj;
     const o = obj as Record<string, unknown>;
     if (typeof o.text === "string") o.text = stripAcpTags(o.text);
+    if (typeof o.arguments === "string") o.arguments = stripAcpTags(o.arguments);
+    if (typeof o.delta === "string") o.delta = stripAcpTags(o.delta);
     if (o.part && typeof o.part === "object" && typeof (o.part as Record<string, unknown>).text === "string") {
         o.part = { ...(o.part as Record<string, unknown>), text: stripAcpTags((o.part as Record<string, unknown>).text as string) };
     }
     if (o.item && typeof o.item === "object") {
-        const item = { ...(o.item as Record<string, unknown>) };
-        if (Array.isArray(item.content)) item.content = stripParts(item.content);
-        o.item = item;
+        o.item = stripItemContent(o.item);
     }
     if (o.response && typeof o.response === "object") {
         const resp = { ...(o.response as Record<string, unknown>) };
