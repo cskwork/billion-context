@@ -11,7 +11,7 @@ process.env.NODE_ENV = "test";
 import { proxyBaseFromUrl, proxyBaseFromEnv, detectProxyBase, fetchManifest, forwardTool, fetchStatus } from "../src/agent/shared.ts";
 import biliPlugin, { createBiliPlugin } from "../src/agent/pi.ts";
 import ompPlugin from "../src/agent/omp.ts";
-import { pluginInstall, pluginRemove, pluginStatusAll, PLUGIN_AGENTS, selfPackageRoot, pickPluginKey, detectOpencodeMajor } from "../src/plugin-install.ts";
+import { pluginInstall, pluginRemove, pluginStatusAll, PLUGIN_AGENTS, selfPackageRoot, pickPluginKey, detectOpencodeMajor, piEntryFor, PI_NPM_ENTRY, isPiEntry } from "../src/plugin-install.ts";
 import { resolveProxyOrigin, forwardTool as mcpForwardTool } from "../src/mcp.ts";
 
 function withEnv(vars: Record<string, string | undefined>, fn: () => void | Promise<void>): Promise<void> {
@@ -747,6 +747,19 @@ function hintEnv(home: string, piAgentDir: string): Record<string, string> {
 test("plugin install/remove roundtrips for pi/omp/codex/opencode under a fake HOME", async () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-plugin-home-"));
     const piAgentDir = path.join(home, ".pi/agent");
+    // #925 pi entry form: npm installs write the pi-managed npm spec
+    // (auto-installed at pi startup, upgraded by `pi update`, survives node
+    // prefix moves); dev/checkout installs keep the abs root.
+    {
+        const devRoot = "/home/x/projects/billion-context";
+        assert.equal(piEntryFor(devRoot), devRoot);
+        const npmRoot = "/home/x/.local/lib/node_modules/billion-context";
+        assert.equal(piEntryFor(npmRoot), PI_NPM_ENTRY);
+        assert.equal(PI_NPM_ENTRY, "npm:billion-context");
+        assert.equal(isPiEntry(PI_NPM_ENTRY, devRoot), true);
+        assert.equal(isPiEntry(PI_NPM_ENTRY, npmRoot), true);
+        assert.equal(isPiEntry("npm:billion-context@0.1.40", devRoot), true);
+    }
     await withEnv(hintEnv(home, piAgentDir), async () => {
         const root = selfPackageRoot();
 
