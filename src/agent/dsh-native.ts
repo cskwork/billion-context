@@ -83,9 +83,9 @@ const state: NativeInterceptState = { origin: undefined, ready: Promise.resolve(
 // header stamping (pi.ts discipline): stamped headers flip the proxy into
 // plugin mode, which suppresses wire tool injection — stamping before the
 // local tools exist would send a tool-less request.
-type RegisterState = { base: string | undefined; toolsReady: boolean; retryAt: number; pending: Promise<void> | undefined };
+type RegisterState = { base: string | undefined; toolsReady: boolean; dead: boolean; retryAt: number; pending: Promise<void> | undefined };
 
-const register: RegisterState = { base: undefined, toolsReady: false, retryAt: 0, pending: undefined };
+const register: RegisterState = { base: undefined, toolsReady: false, dead: false, retryAt: 0, pending: undefined };
 
 function errMessage(err: unknown): string {
     return err instanceof Error ? err.message : String(err);
@@ -136,6 +136,14 @@ async function registerTools(ctx: PluginContext): Promise<void> {
         register.toolsReady = true;
     })()
         .catch((err: unknown) => {
+            // Cordis deactivates the plugin context while the host tears down
+            // (dsh --help, early CLI exits): every later register attempt hits
+            // "cannot get required service ... in inactive context" and would
+            // never succeed — stop retrying and stay quiet (dsh 0.1.5+).
+            if (errMessage(err).includes("inactive context")) {
+                register.dead = true;
+                return;
+            }
             register.retryAt = Date.now() + RETRY_INTERVAL_MS;
             console.error(`bili-native-dsh: manifest registration failed (${errMessage(err)}) — retrying; requests stay in wire mode until it succeeds`);
         })
@@ -146,7 +154,7 @@ async function registerTools(ctx: PluginContext): Promise<void> {
 }
 
 function maybeRetry(ctx: PluginContext): void {
-    if (register.toolsReady || register.base === undefined) return;
+    if (register.dead || register.toolsReady || register.base === undefined) return;
     if (register.pending !== undefined) return;
     if (Date.now() < register.retryAt) return;
     void registerTools(ctx).catch(() => {});
@@ -239,6 +247,11 @@ export function apply(ctx: PluginContext): void {
 export function _resetRegisterForTest(base: string | undefined): void {
     register.base = base;
     register.toolsReady = false;
+    register.dead = false;
     register.retryAt = 0;
     register.pending = undefined;
+}
+
+export function _stateHeadersForTest(): ((url: string) => Record<string, string> | undefined) | undefined {
+    return state.headersFor;
 }
