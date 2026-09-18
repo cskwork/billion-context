@@ -165,6 +165,8 @@ A shallow key (`https://open.bigmodel.cn`) matches every path on that host. A de
 
   **Resolution order (first match wins):** (1) per-request sources — the client's `anthropic-beta` larger-context negotiation, a cooperative plugin's report, and the launcher's per-model windows; (2) this per-model `context` declaration; (3) the **warm** models.dev registry cache, when the model is listed (relay/private hosts match the bare model name against the registry's provider-prefixed entries); (4) the built-in context table. So this per-model `context` declaration **outranks the registry** — set it to the window your relay/private deployment actually serves, and it wins even when models.dev lists a different (usually larger) window for the model. `compress.modelContextLimit` remains the highest-priority source (always wins) when you want to pin the window across every route. Each model entry may also carry a per-model `compress` block (see [Compression Tuning](#compression-tuning)).
 
+  The built-in context table (step 4) is static data shipped with each release and can go stale — e.g. DeepSeek's canonical request id `deepseek-flash` is not listed on models.dev under that name (its window is listed under `deepseek-v4-flash`), so only the table answered for it (#852). The log records which source won, once per model per process (`[window] ... fallback=true` means the value came from the built-in table). If the resolved window looks wrong, declare `models.<name>.context` as above — it outranks both the registry and the table — or pin `compress.modelContextLimit`; and remember the provider key must carry the traffic's scheme (`mitm://<host>` for MITM login-client traffic, `https://<host>` for `/bili/` traffic).
+
 ### `proxy`
 
 - **Type:** `string`
@@ -198,7 +200,7 @@ A shallow key (`https://open.bigmodel.cn`) matches every path on that host. A de
 - **Type:** `boolean`
 - **Default:** *(none — compression active)*
 - **Status:** ACTIVE
-- **Description:** Per-route override of the global [`passthrough`](#passthrough) setting. When `true`, every request matching this route is forwarded **byte-for-byte**: no kernel round-trip (no message re-serialization, no ACP render tags, no `prompt_cache_key` removal), the response is piped through untouched, and no session state is created for that route. Use this for upstreams whose anti-fraud fingerprinting rejects bili's rewritten bodies — e.g. ZCode's `405 / 3012` ("request has been blocked due to unusual activity") on the kernel-rebuilt `messages` body (#661). A `mitm://` key targets only the MITM (login-client) traffic of that host, while a plain `https://` key covers both MITM and `/bili/` (API-key) traffic:
+- **Description:** Per-route override of the global [`passthrough`](#passthrough) setting. When `true`, every request matching this route is forwarded **byte-for-byte**: no kernel round-trip (no message re-serialization, no ACP render tags, no `prompt_cache_key` removal), the response is piped through untouched, and no session state is created for that route. Use this for upstreams whose anti-fraud fingerprinting rejects bili's rewritten bodies — e.g. ZCode's `405 / 3012` ("request has been blocked due to unusual activity") on the kernel-rebuilt `messages` body (#661). A `mitm://` key targets only the MITM (login-client) traffic of that host, while a plain `https://` key targets only `/bili/` (API-key) traffic — the two schemes never overlap:
 
   ```jsonc
   {
@@ -245,6 +247,13 @@ For each request, the proxy resolves the settings by longest-URL-prefix match (t
 - **Default:** *(the model's native window)*
 - **Status:** ACTIVE
 - **Description:** The context window size, in tokens. This is the **denominator** the engine uses for its usage ratio (`usage = tokens / modelContextLimit`) — it is **not** a truncation cap. Accepts an absolute number (`200000`) or a percent string (`"80%"` = 80% of the model's native window, resolved from the built-in table or models.dev registry). When omitted at every level, the native window is used. This is the highest-priority source for the model limit; it overrides the built-in table, the legacy per-model `context` field, and the top-level `modelContextLimit`.
+
+#### `outputHeadroomMaxPct`
+
+- **Type:** `number | string`
+- **Default:** `0.25`
+- **Status:** ACTIVE
+- **Description:** Cap on the output-headroom reservation, as a fraction of the context window: reserved amount = `min(max_tokens, pct × window)`. The reservation keeps the engine's nudge/truncate bands below `window − reserved`, so long replies can't push "input + output" past the window — it applies to APIs that count output against the window (Anthropic Messages is exempt: its input limit is enforced independently of `max_tokens`, so it is excluded). Without a cap, models whose registered max output takes a large share of the window (e.g. `maxTokens` 131072 on a 262144 window) lose most of their input budget and the 75% force-compress threshold fires at about a third of the full window. The `0.25` default bounds that loss while still guaranteeing no overflow at the 95% emergency threshold for any single-turn reply up to 25% of the window; longer replies overflow once and are recovered by the next turn's overflow self-heal. Note the cap only relaxes oversized reservations: when `max_tokens` is already ≤ `pct × window`, the reservation stays the full `max_tokens` (byte-identical to the legacy behavior). Accepts a ratio (`0.25`) or percent string (`"25%"`); set `0` to disable the reservation entirely; `>= 1` restores the legacy full-capability reservation (input + a full-budget reply always fits — what strict backends like SGLang/vLLM enforce). Negative or unparseable values reject the whole `compress` block. Example: 262144-token window, `max_tokens = 131072` → default `0.25` reserves 65536 → effective window 196608 (legacy full reservation: 131072); `max_tokens = 65536` → reserves 65536 → 196608 unchanged (65536 ≤ 25% of the window). Aligned with billion-context-pi (`#207`) via #896.
 
 #### `maxContextLimit`
 
@@ -479,6 +488,7 @@ Environment variables take precedence over the config file. They are useful for 
 | `ACP_REASONING_KEEP` | Responses API only: set `none` to drop all reasoning items. Default routes reasoning through the compression pipeline so it is hidden automatically once its turn is summarized (prevents the unbounded accumulation that broke Codex's prompt-cache prefix). |
 | `ACP_LOG_FILE` | Log file path (default XDG state path; `off` disables the file, keeps stderr). Auto-rotates at 10 MB. |
 | `ACP_DUMP_SSE` | Directory to dump raw SSE frames for debugging. |
+| `BILI_LOG_MASK_HOSTS` | Set `0` to turn OFF host masking in proxy logs (#897): non-public target hosts (private relays, internal domains) are logged verbatim instead of `<private-host>`. Default is ON (#255 — logs get pasted into public issues); credential-header masking is independent and always on. Real target hosts are always available without touching this flag: `GET /__bili/stats` → `blindTunnels`, `GET /__bili/health` (both loopback-only), and the `acp_status` output. |
 | `BILI_UPSTREAM_PROXY` | Upstream proxy for the proxy's own outbound connections — highest priority, above per-URL/per-provider config. See the README *Upstream proxy* section. |
 | `BILI_PERSIST` | Set `0` to disable session persistence (in-memory only, lost on restart). |
 | `BILI_PERSIST_DEBOUNCE_MS` | Debounce window for persistence writes to disk, in ms (default `500`). |
@@ -621,10 +631,13 @@ Supported MITM clients:
 |---|---|---|---|
 | **ZCode** | bigmodel coding plan (OAuth) | `open.bigmodel.cn` (builtin provider) | ✅ tested |
 | **Claude Code** | Claude subscription (OAuth) | `api.anthropic.com` | ❓ untested (may not work — needs verification) |
+| **CodeBuddy** (VS Code IDE) | IDE account login | `copilot.tencent.com` (reached via `http.proxy`) | ✅ user-verified (#897) |
 
 > **Codex exception:** Codex exposes a top-level `openai_base_url` config field, so the ChatGPT login version CAN use the `/bili/` prefix (see above). MITM is not needed for Codex.
 
 MITM is scoped to a **whitelist** of model hosts (`open.bigmodel.cn`, `api.anthropic.com`, `api.openai.com`, `chatgpt.com`). All other HTTPS hosts are blind-tunnelled — billion-context never decrypts non-model traffic.
+
+> **CONNECT-only clients (`http.proxy`):** many IDE-class clients (CodeBuddy, Cursor, Windsurf, …) expose no model base-URL setting — they route all traffic through an HTTP proxy via `CONNECT`. Such a client is only decrypted when its model host is whitelisted above (or discovered/auto-whitelisted by a launcher); otherwise its tunnels are **blind**: no error, but also **no compression**, because billion-context never sees the cleartext. This misconfiguration is surfaced explicitly (#897): the first blind tunnel per host logs a one-time `BLIND TUNNEL WARNING` with the fix steps; `GET /__bili/health` and `/__bili/stats` report `blindTunnels` (count + exact target hosts, loopback-only); and `acp_status` gains an `UNDECRYPTED TRAFFIC (instance-level)` section while such tunnels exist. Fix: add the client's model domain to `"mitm".domains` (or `BILI_MITM_DOMAINS`), restart, and trust the root CA per the steps below. Note proxy logs mask non-public target hosts by default (`<private-host>`, #255) — set `BILI_LOG_MASK_HOSTS=0` to see them verbatim in your local log.
 
 One-time setup (trust the root CA in the client):
 
@@ -692,8 +705,8 @@ Where upstreams are discovered from (read-only):
 
 The launcher prefers file-free injection (env vars > CLI flags/extension APIs > generated files; see README, “Injection priority” section). Where a file is unavoidable it is a **copy** — the real config is never edited:
 
-- **pi / omp** — nothing is written (#535): provider baseUrls ride the `BILI_PROVIDER_REWRITES` env manifest consumed by the bili extension at load (`registerProvider`), and native compaction is cancelled in-extension (`session_before_compact`). The real `~/.pi` / `~/.omp` homes are untouched.
-- **opencode** — a temp `opencode.json` pointed at by `OPENCODE_CONFIG` (removed when the client exits), with `/bili/`-rewritten plaintext baseURLs **plus the thin `/acp` plugin appended** (native tools out of the box; the standalone `opencode-acp` plugin self-disables via `BILLION_CONTEXT_PROXY`). Relative local plugin specs (`./x`, `../x`) are re-anchored to absolute paths in the clone — opencode resolves them against the declaring config file's dir, which the clone no longer is (#826).
+- **pi / omp** — nothing is written (#535): provider baseUrls ride the `BILI_PROVIDER_REWRITES` env manifest consumed by the bili extension at load (`registerProvider`), and auto native compaction is cancelled in-extension (`session_before_compact`; omp distinguishes auto vs manual via the `auto_compaction_start` announcement, #851) — manual `/compact` stays user-owned. The real `~/.pi` / `~/.omp` homes are untouched.
+- **opencode** — a temp `opencode.json` pointed at by `OPENCODE_CONFIG` (removed when the client exits), with `/bili/`-rewritten plaintext baseURLs **plus the thin `/acp` plugin appended**. On OpenCode 1.x the `opencode-acp` entries are stripped from the clone (the host must not load it armed) and the thin plugin imports that same package as a library instead, gated on legacy sessions; the first stripped spec rides along via `BILI_OPENCODE_ACP_SPEC` so the bridge imports the exact copy the host would have loaded (#920). Relative local plugin specs (`./x`, `../x`) are re-anchored to absolute paths in the clone — opencode resolves them against the declaring config file's dir, which the clone no longer is (#826).
 - **hermes** — nothing is written (#535): its httpx stack rides `HTTPS_PROXY` (+ `HERMES_CA_BUNDLE`) — https via CONNECT cert-MITM, plain-http via absolute-form forward-proxy requests. If no providers are configured, the launcher prints a warning and hermes runs **unproxied** (compression off).
 - **dsh** — split by destination (#535): dsh's fetch stack honors proxy envs except for an unconditional loopback bypass, so **non-loopback** upstreams ride `HTTPS_PROXY` (cert MITM) / `HTTP_PROXY` (absolute-form forward-proxy requests) with `SSL_CERT_FILE` → `combined-ca.pem`; only **loopback** upstreams keep the persistent overlay `DSH_HOME` (`~/.dsh-bili`) with a rewritten `settings.yaml` routing them through `/bili/`. `profiles/`, credentials and sessions are symlinked through; the real `~/.dsh` is never touched. The built-in `deepseek-official` route is captured separately via `$DEEPSEEK_BASE_URL` (dsh resolves `settings llm-deepseek.baseURL` ?? env ?? default, so a user setting wins and the env is the zero-config fallback) — with no custom providers the deepseek route is still proxied out of the box.
 
@@ -732,7 +745,7 @@ Launcher-mode matrix:
 
 For a native-plugin experience, an agent can run a small cooperative plugin alongside the proxy: the plugin registers the four ACP tools (`compress` / `decompress` / `search_context` / `acp_status`) natively with the agent and drives the agent's own tool loop, while the proxy stays the compression authority (state, history folding, philosophy prompt, nudges). Tool schemas are served by the proxy itself (`GET /__bili/plugin/manifest`), so plugin and proxy can never drift. Protocol spec: [PLUGIN.md](PLUGIN.md).
 
-Plugin-equipped sessions are detected automatically via request headers — wire-level tool injection is then suppressed for them (no double compression, native tool UX). Works in both proxy modes: the `/bili/` prefix baseURL **and** MITM transparent mode. The plugin can also report the agent's own model context window (`x-bili-plugin-context-window`) and read live context usage via `GET /__bili/plugin/status`.
+Plugin-equipped sessions are detected automatically via request headers — wire-level tool injection is then suppressed for them (no double compression, native tool UX). Works in both proxy modes: the `/bili/` prefix baseURL **and** MITM transparent mode. The plugin can also report the agent's own model context window (`x-bili-plugin-context-window`) and read live context usage via `GET /__bili/plugin/status`. One header goes the other way: `x-bili-plugin-bypass: 1` makes the proxy raw-passthrough the request ahead of any pipeline processing (no session binding, injection, or compression) — stamped by the opencode bridge for legacy acp sessions whose compression runs in-process (#920).
 
 ### install / remove / list
 

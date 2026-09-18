@@ -179,6 +179,31 @@ test("reserveOutputHeadroom: no-op for a non-positive / non-finite window", () =
     assert.equal(reserveOutputHeadroom(Number.NaN, 8_000), Number.NaN);
 });
 
+// #896: capPct caps the reservation at a fraction of the WINDOW —
+// reserved = min(maxOutput, capPct × window) — aligned with billion-context-pi #207.
+test("reserveOutputHeadroom: capPct caps the reservation at a fraction of the window (#896)", () => {
+    // Cap binding: max_tokens 131072 on a 262144 window, cap 0.25 → reserved = min(131072, 65536).
+    assert.equal(reserveOutputHeadroom(262_144, 131_072, 0.25), 196_608);
+    // max_tokens binding: 32768 < 0.25 × 262144 → the full max_tokens is reserved.
+    assert.equal(reserveOutputHeadroom(262_144, 32_768, 0.25), 229_376);
+    assert.equal(reserveOutputHeadroom(100_000, 16_384, 0.25), 83_616);
+    assert.equal(reserveOutputHeadroom(100_000, 8_000, 0.5), 92_000, "8000 < 0.5 × 100000 → full max_tokens reserved");
+    assert.equal(reserveOutputHeadroom(100_000, 8_000, 1), 92_000);
+    assert.equal(reserveOutputHeadroom(100_000, 8_000, 0), 100_000, "cap 0 disables the reservation");
+});
+
+test("reserveOutputHeadroom: out-of-range caps clamp, non-finite falls back to the legacy full reservation", () => {
+    assert.equal(reserveOutputHeadroom(100_000, 8_000, 1.5), 92_000, ">= 1 clamps to the legacy full reservation");
+    assert.equal(reserveOutputHeadroom(100_000, 8_000, -0.25), 100_000, "negative clamps to 0 (no reservation)");
+    assert.equal(reserveOutputHeadroom(100_000, 8_000, Number.NaN), 92_000, "non-finite → legacy");
+    assert.equal(reserveOutputHeadroom(100_000, 8_000, Infinity), 92_000, "non-finite → legacy");
+});
+
+test("reserveOutputHeadroom: degenerate maxOutput >= window stays a no-op even with a small cap", () => {
+    assert.equal(reserveOutputHeadroom(100_000, 100_000, 0.25), 100_000);
+    assert.equal(reserveOutputHeadroom(100_000, 150_000, 0.25), 100_000);
+});
+
 // Protocol gate: Anthropic's Messages API enforces the input limit
 // independently of max_tokens (separate output budget), so reserving there
 // would shift every nudge/truncate band down by maxOutput for no safety gain.

@@ -42,13 +42,32 @@ const PUBLIC_HOST_SUFFIXES = [
 
 const CREDENTIAL_HEADER_RE = /key|auth|token|cookie/i;
 
+// #897: host masking is ON by default (#255 — logs get pasted into public
+// issues). Operators who want the real target hosts in their local log can
+// opt out (env BILI_LOG_MASK_HOSTS=0 / config maskHosts:false); real hosts
+// stay visible on the loopback-only /__bili/stats endpoint regardless.
+// Credential masking is independent and always on.
+let maskHostsEnabled = true;
+
+export function setMaskHostsEnabled(enabled: boolean): void {
+    maskHostsEnabled = enabled;
+}
+
+export function isMaskHostsEnabled(): boolean {
+    return maskHostsEnabled;
+}
+
 export function isPublicApiHost(host: string): boolean {
     const h = host.replace(/^\[|\]$/g, "").toLowerCase();
     return PUBLIC_HOST_SUFFIXES.some((s) => h === s || h.endsWith(`.${s}`));
 }
 
+function hostMaskedOff(host: string): boolean {
+    return !maskHostsEnabled || isPublicApiHost(host);
+}
+
 export function maskHostForLog(host: string): string {
-    return isPublicApiHost(host) ? host : PRIVATE_HOST;
+    return hostMaskedOff(host) ? host : PRIVATE_HOST;
 }
 
 /** Mask a URL for logging: non-public host → placeholder; userinfo, query and
@@ -61,7 +80,7 @@ export function maskUrlForLog(url: string): string {
     } catch {
         return "<unparseable-url>";
     }
-    const host = isPublicApiHost(u.hostname) ? u.host : `${PRIVATE_HOST}${u.port ? `:${u.port}` : ""}`;
+    const host = hostMaskedOff(u.hostname) ? u.host : `${PRIVATE_HOST}${u.port ? `:${u.port}` : ""}`;
     return `${u.protocol}//${host}${u.pathname}`;
 }
 
@@ -102,7 +121,7 @@ export function maskHeadersForLog(headers: Record<string, string>): Record<strin
  *  proxy's) are left as-is, matching the `proxy=` design decision. Handles
  *  both the bracketed ([::1]) and bare (::1) IPv6 forms. */
 export function maskHostInText(text: string, host: string): string {
-    if (!host || isPublicApiHost(host)) return text;
+    if (!host || hostMaskedOff(host)) return text;
     const bare = host.replace(/^\[|\]$/g, "");
     const forms = new Set<string>([host, bare]);
     if (bare.includes(":")) forms.add(`[${bare}]`);

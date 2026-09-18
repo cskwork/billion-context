@@ -360,7 +360,8 @@ function claudeRemove(): string {
 
 function claudeStatus(): string {
     const data = readJson(claudeMcpJson()) as { mcpServers?: Record<string, unknown> };
-    return data.mcpServers && "bili" in data.mcpServers ? "installed" : "not installed";
+    const mcpServers = data.mcpServers;
+    return isPlainMcpObject(mcpServers) && "bili" in mcpServers ? "installed" : "not installed";
 }
 
 // — codex ——————————————————————————————————————————————————————————————
@@ -434,11 +435,16 @@ function opencodeJson(): string {
     return path.join(os.homedir(), ".config", "opencode", "opencode.json");
 }
 
+function isPlainMcpObject(v: unknown): v is Record<string, unknown> {
+    return v !== null && typeof v === "object" && !Array.isArray(v);
+}
+
 function opencodeInstall(): string {
     const file = opencodeJson();
     const mcpJs = path.join(selfPackageRoot(), "dist", "mcp.js");
     requireDistFile(mcpJs);
     const data = readJson(file);
+    if (data.mcp != null && !isPlainMcpObject(data.mcp)) return `opencode: mcp.bili skipped ("mcp" is not an object) -> ${file}`;
     const mcp = (data.mcp as Record<string, unknown> | undefined) ?? {};
     if ("bili" in mcp) return `opencode: already installed (${file})`;
     mcp.bili = { type: "local", command: [process.execPath, mcpJs], environment: { BILI_MCP_PROXY: proxyOriginForInstall() }, enabled: true };
@@ -450,8 +456,8 @@ function opencodeInstall(): string {
 function opencodeRemove(): string {
     const file = opencodeJson();
     const data = readJson(file);
-    const mcp = data.mcp as Record<string, unknown> | undefined;
-    if (!mcp || !("bili" in mcp)) return `opencode: not installed (${file})`;
+    const mcp = data.mcp;
+    if (!isPlainMcpObject(mcp) || !("bili" in mcp)) return `opencode: not installed (${file})`;
     delete mcp.bili;
     if (Object.keys(mcp).length === 0) delete data.mcp;
     writeJson(file, data);
@@ -459,8 +465,8 @@ function opencodeRemove(): string {
 }
 
 function opencodeStatus(): string {
-    const mcp = readJson(opencodeJson()).mcp as Record<string, unknown> | undefined;
-    return mcp && "bili" in mcp ? "installed" : "not installed";
+    const mcp = readJson(opencodeJson()).mcp;
+    return isPlainMcpObject(mcp) && "bili" in mcp ? "installed" : "not installed";
 }
 
 // — dispatch ————————————————————————————————————————————————————————————

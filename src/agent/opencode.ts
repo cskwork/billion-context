@@ -9,6 +9,8 @@
 //   - renders the proxy's buildStatusPanel via an ignored chat message
 
 import { ACP_TOOLS_OPENAI, ABSORB_TOOL_OPENAI } from "../compress-tool.js";
+import { createAcpBridge, type AcpBridge, type AcpToolDef } from "./acp-bridge.js";
+import { BILI_PLUGIN_BYPASS_HEADER } from "../util.js";
 import { fetchProxyVersion, forwardTool, proxyBaseFromEnv, proxyBaseFromUrl, reportCompactionBoundary } from "./shared.js";
 
 interface OpencodeCommandConfig {
@@ -38,6 +40,7 @@ interface OpencodeCommandInput {
     command: string;
     sessionID: string;
     arguments?: string;
+    [key: string]: unknown;
 }
 
 interface OpencodePromptPart {
@@ -57,12 +60,18 @@ interface OpencodeClient {
 
 interface OpencodePluginContext {
     client?: OpencodeClient;
+    directory?: string;
 }
 
 interface OpencodeHooks {
     config?: (input: OpencodeConfig) => Promise<void>;
     event?: (input: OpencodeEventInput) => Promise<void>;
     "command.execute.before"?: (input: OpencodeCommandInput, output: { parts: unknown[] }) => Promise<void>;
+    tool?: Record<string, AcpToolDef>;
+    "chat.headers"?: (input: { sessionID?: string }, output: { headers?: Record<string, string> }) => Promise<void>;
+    "experimental.chat.system.transform"?: (input: { sessionID?: string; [key: string]: unknown }, output: { system: unknown[] }) => void | Promise<void>;
+    "experimental.chat.messages.transform"?: (input: Record<string, never>, output: { messages: unknown[] }) => void | Promise<void>;
+    "experimental.text.complete"?: (input: { sessionID?: string; [key: string]: unknown }, output: { text: string }) => void | Promise<void>;
 }
 
 const proxyBase = process.env.BILLION_CONTEXT_PROXY ?? "";
@@ -87,44 +96,84 @@ async function showText(ctx: OpencodePluginContext, sid: string, text: string): 
 const server = async (ctx: OpencodePluginContext): Promise<OpencodeHooks> => {
     if (!proxyBase) return {};
     console.log("[bili-opencode] plugin active (proxy " + proxyBase + ")");
-    return {
+
+    // #920: legacy opencode-acp sessions keep their in-process machinery by
+    // importing the installed acp package as a library; null → current behavior.
+    let bridge: AcpBridge | null = null;
+    try {
+        bridge = await createAcpBridge({ directory: typeof ctx.directory === "string" ? ctx.directory : process.cwd() });
+    } catch (err) {
+        console.error(`[bili-opencode] acp bridge init failed: ${err instanceof Error ? err.message : String(err)}`);
+        bridge = null;
+    }
+
+    const biliCommandBefore = async (input: OpencodeCommandInput): Promise<void> => {
+        if (input.command !== "acp") return;
+        const sid = input.sessionID;
+        let text: string;
+        try {
+            const res = await fetch(`${proxyBase}/__bili/plugin/status?conversationId=${encodeURIComponent(sid)}&fallback=latest`);
+            const status = (await res.json()) as { ok?: boolean; panel?: string; error?: string };
+            if (typeof status.panel === "string" && status.panel.length > 0) {
+                text = status.panel;
+            } else if (status.ok === false) {
+                // zero sessions on the proxy (fresh launch) — friendly idle notice
+                let version: string | undefined;
+                try {
+                    version = await fetchProxyVersion(proxyBase);
+                } catch {
+                    version = undefined;
+                }
+                text = version !== undefined
+                    ? `billion-context@${version} — proxy connected, no ACP session yet. Send a model request, then run /acp again.`
+                    : "bili: no ACP session yet (send a model request first, then run /acp)";
+            } else {
+                text = "bili: proxy returned no status panel";
+            }
+        } catch (err) {
+            text = `bili: /acp failed (${err instanceof Error ? err.message : String(err)})`;
+        }
+        await showText(ctx, sid, text);
+        throw new Error("__BILI_ACP_HANDLED__");
+    };
+
+    const hooksOut: OpencodeHooks = {
         config: async (opencodeConfig) => {
             opencodeConfig.command ??= {};
             opencodeConfig.command["acp"] = {
                 template: "",
                 description: "Show ACP status (billion-context proxy)",
             };
-        },
-        "command.execute.before": async (input) => {
-            if (input.command !== "acp") return;
-            const sid = input.sessionID;
-            let text: string;
-            try {
-                const res = await fetch(`${proxyBase}/__bili/plugin/status?conversationId=${encodeURIComponent(sid)}&fallback=latest`);
-                const status = (await res.json()) as { ok?: boolean; panel?: string; error?: string };
-                if (typeof status.panel === "string" && status.panel.length > 0) {
-                    text = status.panel;
-                } else if (status.ok === false) {
-                    // zero sessions on the proxy (fresh launch) — friendly idle notice
-                    let version: string | undefined;
-                    try {
-                        version = await fetchProxyVersion(proxyBase);
-                    } catch {
-                        version = undefined;
-                    }
-                    text = version !== undefined
-                        ? `billion-context@${version} — proxy connected, no ACP session yet. Send a model request, then run /acp again.`
-                        : "bili: no ACP session yet (send a model request first, then run /acp)";
-                } else {
-                    text = "bili: proxy returned no status panel";
-                }
-            } catch (err) {
-                text = `bili: /acp failed (${err instanceof Error ? err.message : String(err)})`;
+            // acp normally registers /dcp from its own config hook, which the
+            // bridge must not invoke — mirror it so legacy sessions keep the command.
+            if (bridge) {
+                opencodeConfig.command["dcp"] = {
+                    template: "",
+                    description: "Show DCP compression context (opencode-acp)",
+                };
             }
-            await showText(ctx, sid, text);
-            throw new Error("__BILI_ACP_HANDLED__");
         },
+        "command.execute.before": biliCommandBefore,
     };
+
+    if (bridge) {
+        Object.assign(hooksOut, bridge.wrapped);
+        hooksOut.tool = bridge.tools;
+        hooksOut["command.execute.before"] = async (input) => {
+            // acp first: on legacy sessions its handler throws its abort
+            // sentinel for /acp|/dcp; unhandled commands fall through below.
+            await bridge.wrapped["command.execute.before"](input, {});
+            await biliCommandBefore(input);
+        };
+        hooksOut["chat.headers"] = async (input, output) => {
+            if (typeof input?.sessionID === "string" && bridge.isLegacySession(input.sessionID)) {
+                if (!output.headers) output.headers = {};
+                output.headers[BILI_PLUGIN_BYPASS_HEADER] = "1";
+            }
+        };
+        console.log(`[bili-opencode] acp bridge active (opencode-acp ${bridge.version || "?"}, legacy store ${bridge.storeDir})`);
+    }
+    return hooksOut;
 };
 
 // ---------------------------------------------------------------------------

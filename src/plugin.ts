@@ -1,19 +1,21 @@
 import { type CompressionCore, type Config, type CoreMessage, type NudgeDecision, defaultCountTokens } from "acp-kernel";
 import { buildStatusPanel } from "acp-kernel/panel";
 import { fileURLToPath } from "node:url";
+import type { ServerResponse } from "node:http";
 import fs from "node:fs";
 import path from "node:path";
-import { acquireInFlight, findSessionByCanonicalId, listSessions, markCompactionBoundary, markDirty, peekSession, releaseInFlight, withSessionLock, type Session } from "./session.js";
-import { ABSORB_TOOL, ABSORB_TOOL_NAME, ABSORB_TOOL_OPENAI, ABSORB_TOOL_RESPONSES, ACP_TOOLS_ANTHROPIC, ACP_TOOLS_OPENAI, ACP_TOOLS_RESPONSES, PROXY_TOOL_NAMES } from "./compress-tool.js";
+import { acquireInFlight, effectiveConfig, findSessionByCanonicalId, listSessions, markCompactionBoundary, markDirty, peekSession, releaseInFlight, withSessionLock, type Session } from "./session.js";
+import { ABSORB_TOOL, ABSORB_TOOL_NAME, ABSORB_TOOL_OPENAI, ABSORB_TOOL_RESPONSES, BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_OPENAI, BILI_ACP_TOOLS_RESPONSES, PROXY_TOOL_NAMES, SEARCH_CONTEXT_CONVERSATION_ID_PARAM, SEARCH_CONTEXT_TOOL_NAME } from "./compress-tool.js";
 import { effectiveAbsorbConfig, isProxyToolFor } from "./absorb.js";
 import { executeProxyTool } from "./loop/core.js";
 import { normalizeSseLineEndings } from "./sse-util.js";
 import { composeStreamFilters, containsMarkerLineText, containsRenderTagText, createMarkerLineFilter, createTagEchoFilter, mayStartMarkerLine, mayStartRenderTag, stripAnthropicText, stripOpenaiChatText, stripResponsesText, type TagEchoFilter } from "./loop/tag-echo-filter.js";
 import { log as loggerLog } from "./logger.js";
-import { emitUpstreamTruncation } from "./stream-error.js";
+import { emitStreamError, emitUpstreamTruncation } from "./stream-error.js";
 import { degenerateTurnWarning } from "./degenerate-turn.js";
-import { noteWeakOverflow } from "./weak-overflow.js";
+import { noteWeakOverflow, recordProvenInput } from "./weak-overflow.js";
 import { warnCacheCollapse } from "./cache-warn.js";
+import { recordCacheSample } from "./cache-ledger.js";
 import { promptInputTotal, type WireProtocol } from "./util.js";
 import { stateDir } from "./paths.js";
 
@@ -369,6 +371,27 @@ function withConversationIdParam(tool: unknown): unknown {
     return copy;
 }
 
+// #841: search_context's conversation_id doubles as a cross-session read-only
+// search target — widen that one entry's param description beyond the shared
+// routing text (same wording the wire-mode BILI_ constants serve).
+function withSearchContextConversationDescription(tools: unknown[]): unknown[] {
+    return tools.map((tool) => {
+        const t = tool as Record<string, unknown> | null | undefined;
+        if (!t || typeof t !== "object") return tool;
+        const fn = t.function as { name?: unknown } | undefined;
+        const name = typeof t.name === "string" ? t.name : (fn && typeof fn.name === "string" ? fn.name : undefined);
+        if (name !== SEARCH_CONTEXT_TOOL_NAME) return tool;
+        const copy = structuredClone(t) as Record<string, unknown>;
+        const cfn = copy.function as { parameters?: unknown } | undefined;
+        const schema = (copy.input_schema ?? cfn?.parameters ?? copy.parameters) as { properties?: Record<string, unknown> } | undefined;
+        const props = schema?.properties;
+        const param = props?.conversation_id;
+        if (!props || !param || typeof param !== "object") return tool;
+        props.conversation_id = { ...(param as Record<string, unknown>), ...SEARCH_CONTEXT_CONVERSATION_ID_PARAM };
+        return copy;
+    });
+}
+
 export function handlePluginManifest(res: import("node:http").ServerResponse): void {
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({
@@ -383,9 +406,9 @@ export function handlePluginManifest(res: import("node:http").ServerResponse): v
         // manifest has no request context to know which route will win.
         toolNames: [...PROXY_TOOL_NAMES, ABSORB_TOOL_NAME],
         tools: {
-            anthropic: [...ACP_TOOLS_ANTHROPIC, ABSORB_TOOL].map(withConversationIdParam),
-            openai: [...ACP_TOOLS_OPENAI, ABSORB_TOOL_OPENAI].map(withConversationIdParam),
-            responses: [...ACP_TOOLS_RESPONSES, ABSORB_TOOL_RESPONSES].map(withConversationIdParam),
+            anthropic: withSearchContextConversationDescription([...BILI_ACP_TOOLS_ANTHROPIC, ABSORB_TOOL].map(withConversationIdParam)),
+            openai: withSearchContextConversationDescription([...BILI_ACP_TOOLS_OPENAI, ABSORB_TOOL_OPENAI].map(withConversationIdParam)),
+            responses: withSearchContextConversationDescription([...BILI_ACP_TOOLS_RESPONSES, ABSORB_TOOL_RESPONSES].map(withConversationIdParam)),
         },
         headers: { agent: PLUGIN_AGENT_HEADER, conversation: PLUGIN_CONVERSATION_HEADER, contextWindow: PLUGIN_CONTEXT_WINDOW_HEADER },
         toolEndpoint: "/__bili/plugin/tool",
@@ -482,10 +505,13 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
     try {
         const messages = mem ? (mem.processed.length > 0 ? mem.processed : mem.original) : [];
         if (messages.length > 0) {
+            // #833: base kernelConfig carries no file/provider/model compress
+            // settings — render from the session's last resolved Config so the
+            // panel matches actual injection behavior.
             nudge = deps.core.processTurn({
                 messages,
                 state: session.state,
-                config: deps.config,
+                config: effectiveConfig(session, deps.config),
                 tokenCount: session.stats.lastInputTokens,
                 renderTags: "none",
             }).nudge;
@@ -604,7 +630,9 @@ export async function handlePluginTool(
             const messages = mem ? (mem.processed.length > 0 ? mem.processed : mem.original) : [];
             return executeProxyTool(tool, args, {
                 core: deps.core,
-                config: deps.config,
+                // #833: run proxy tools under the session's last resolved Config
+                // (same values the wire path used), not the base kernelConfig.
+                config: effectiveConfig(session, deps.config),
                 messages,
                 session,
                 log: (m) => deps.log("info", `[${session.id}] [plugin] ${m}`),
@@ -724,6 +752,7 @@ export function applyUsageSample(session: Session, sample: UsageSample, protocol
         // Net out pending compress savings (see stream.ts applyRanges): plugin
         // compress tool results shrink the next request, not this report.
         session.stats.lastInputTokens = Math.max(0, total - (session.stats.compressCreditTokens ?? 0));
+        session.stats.lastInputTokensSource = "usage";
         warnCacheCollapse(session, total, sample.cachedTokens ?? 0);
         // #695: per-request parity with the wire path's [acp-usage] — without
         // this, post-fold cache cliffs cannot be attributed from logs.
@@ -731,6 +760,7 @@ export function applyUsageSample(session: Session, sample: UsageSample, protocol
         const foldNew = session.stats.pendingFoldUsage === true;
         if (foldNew) session.stats.pendingFoldUsage = false;
         loggerLog("info", `[${session.id}] [plugin] [acp-usage] input=${total} cached=${sample.cachedTokens ?? "n/a"}${hit === undefined ? "" : ` (cache hit ${hit}%)`}${foldNew ? " fold=new" : ""}`);
+        recordCacheSample(session, { at: Date.now(), input: total, cached: sample.cachedTokens ?? 0, output: sample.outputTokens });
     }
     if (sample.outputTokens !== undefined) session.stats.outputTokens += sample.outputTokens;
 }
@@ -747,6 +777,14 @@ function mergeUsageSample(acc: UsageSample, sample: UsageSample): void {
     if (sample.outputTokens !== undefined) acc.outputTokens = sample.outputTokens;
 }
 
+/** Terminal reasons after which the model genuinely finished its turn. A
+ *  refusal or a safety block must never be re-prompted, and a token-capped turn
+ *  would only truncate again — so the degenerate-turn retry (#732/#821 for the
+ *  plugin pipe) engages on these alone. */
+const CLEAN_TURN_REASONS = new Set(["stop", "end_turn", "stop_sequence"]);
+
+const ANTHROPIC_BLOCK_EVENT = /^content_block_(start|delta|stop)$/;
+
 /** Plugin-mode streaming passthrough for the OpenAI chat-completions and
  *  Anthropic wires: forward upstream events byte-identical (the agent's
  *  native tool loop must see the model's tool calls untouched) while (a)
@@ -760,23 +798,35 @@ function mergeUsageSample(acc: UsageSample, sample: UsageSample): void {
  *  title-gen exclusion / ACP_NO_INJECT_TOOL / classifier bypass). Pass no
  *  session there — usage accounting must be skipped or a title-gen call's
  *  tiny input_tokens would clobber lastInputTokens and break compression
- *  triggering for the main conversation. */
+ *  triggering for the main conversation.
+ *
+ *  `refetch` supplies the one-shot degenerate-turn retry (#732/#821): when the
+ *  turn reaches its terminal with nothing visible — the tag-echo case, where
+ *  the filter empties the only text block so the host aborts an empty turn —
+ *  the pipe re-issues the request through it and splices the retry's content
+ *  into the client stream the first attempt already opened. Omit it for the
+ *  plain pass-through. */
 export async function pipePluginChatWithStrip(
     stream: ReadableStream<Uint8Array>,
-    res: import("node:http").ServerResponse,
+    res: ServerResponse,
     protocol: WireProtocol,
     session?: Session,
     log?: (msg: string) => void,
+    refetch?: () => Promise<ReadableStream<Uint8Array> | null>,
 ): Promise<void> {
-    const reader = stream.getReader();
-    const decoder = new TextDecoder("utf-8");
+    let reader = stream.getReader();
+    let decoder = new TextDecoder("utf-8");
     let buf = "";
     const acc: UsageSample = {};
+    let sawStrippedEcho = false;
     const onTagDrop = (snippet: string) => {
+        droppedTagInFrame = true;
+        sawStrippedEcho = true;
         loggerLog("warn", `[tag-echo] stripped model-emitted render tag (plugin passthrough): ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
         log?.(`[tag-echo] stripped model-emitted render tag from plugin passthrough text`);
     };
     const onMarkerDrop = (snippet: string) => {
+        sawStrippedEcho = true;
         loggerLog("warn", `[marker-echo] stripped model-emitted ACP confirmation marker (plugin passthrough): ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
         log?.(`[marker-echo] stripped model-emitted ACP confirmation marker from plugin passthrough text`);
     };
@@ -808,14 +858,120 @@ export async function pipePluginChatWithStrip(
     let sawToolUse = false;
     let sawThinking = false;
     let visibleTextChars = 0;
+    /** Of that text, the chars released from a held markup span (the
+     *  unclosed-tag case): markup the filter declined to swallow. A turn whose
+     *  only visible output is this is as dead to the host as an empty one. */
+    let releasedMarkupChars = 0;
+    /** Set while a frame is being rewritten because a render tag was dropped:
+     *  the text that survives such a frame is the tag's own interior. */
+    let droppedTagInFrame = false;
     let finalFinishReason: string | undefined;
+    // Degenerate-turn retry (#732/#821 for this pipe). The first attempt's
+    // terminal event is dropped when the retry takes over, so the client sees
+    // one turn: its framing stays open, and the retry's content blocks are
+    // shifted past the ones already streamed.
+    let degenerateRetried = false;
+    let inRetry = false;
+    let retryIndexOffset = 0;
+    let blocksForwarded = 0;
+    /** One-shot re-issue when a turn reaches its terminal with nothing visible:
+     *  the tag-echo case, where the filter empties the only text block and the
+     *  host aborts an empty completed turn. Returns true when the retry stream
+     *  took over, in which case the caller drops the terminal event of the
+     *  attempt it came from. */
+    const retryEmptyTurn = async (reason: string | undefined): Promise<boolean> => {
+        if (refetch === undefined) return false;
+        // Markup released from a held span carries nothing the host can act on:
+        // an unclosed render tag stalls the turn exactly like an empty one.
+        if (visibleTextChars > releasedMarkupChars || sawToolUse) return false;
+        if (reason === undefined || !CLEAN_TURN_REASONS.has(reason)) return false;
+        if (res.destroyed || res.writableEnded) return false;
+        if (degenerateRetried) {
+            // The retry degenerated too. An empty turn is indistinguishable from a
+            // model that produced nothing and the session reads as idle while it is
+            // dead, so the client gets an error the host would never surface (#870).
+            log?.("[plugin] degenerate terminal turn again after the retry; emitting an in-band error (#870)");
+            emitStreamError(res, protocol, "the turn degenerated again after the continuation nudge");
+            return true;
+        }
+        // A turn the model left genuinely bare — no thought, no stripped echo,
+        // no released markup — is the upstream's own empty answer, not a stall:
+        // re-issuing it double-bills an empty completion (#732/#821 keep the
+        // same boundary in the compress loop).
+        if (!sawThinking && !sawStrippedEcho && releasedMarkupChars === 0) return false;
+        degenerateRetried = true;
+        log?.("[plugin] degenerate terminal turn (no usable output); retrying once with a continuation nudge (#732/#821)");
+        let next: ReadableStream<Uint8Array> | null = null;
+        try {
+            next = await refetch();
+        } catch (e) {
+            log?.(`[plugin] degenerate-terminal retry failed (${e instanceof Error ? e.message : String(e)}); passing the empty turn through`);
+            return false;
+        }
+        if (!next) return false;
+        // The turn is NOT over: the retry stream carries its own terminal, and a
+        // cut in it must still raise the truncation signal (#721).
+        sawTerminal = false;
+        finalFinishReason = undefined;
+        retryIndexOffset = blocksForwarded;
+        inRetry = true;
+        // The first attempt's held filter state belongs to text the client never
+        // saw (an emptying tag echo): the retry's content is filtered from
+        // scratch, so a partial tag there cannot swallow its opening characters.
+        streams.clear();
+        // The first attempt is terminal and its body is drained; close the
+        // reader we are abandoning rather than leaving the socket held.
+        try {
+            await reader.cancel();
+        } catch {
+            /* already closed */
+        }
+        reader = next.getReader();
+        decoder = new TextDecoder("utf-8");
+        buf = "";
+        return true;
+    };
+    /** While the retry stream feeds the client, the message the FIRST attempt
+     *  opened is still open: nothing may re-open it. Returns true when the event
+     *  was consumed. */
+    const retryFraming = (ev: Record<string, unknown>): boolean => {
+        if (!inRetry) return false;
+        return ev["type"] === "message_start";
+    };
+    /** The retry's content blocks must land AFTER the ones the client already
+     *  saw. The offset is applied to the serialized payload — a processor with
+     *  nothing to strip forwards the original bytes, so rewriting only the parsed
+     *  event would leave the client's own index untouched. */
+    const offsetRetryIndices = (payload: string): string => {
+        if (!inRetry || retryIndexOffset === 0) return payload;
+        return payload
+            .split("\n")
+            .map((line) => {
+                if (!line.startsWith("data:")) return line;
+                const json = line.slice(5).trim();
+                if (!json.startsWith("{")) return line;
+                let o: Record<string, unknown>;
+                try {
+                    o = JSON.parse(json) as Record<string, unknown>;
+                } catch {
+                    return line;
+                }
+                if (typeof o["index"] !== "number" || !ANTHROPIC_BLOCK_EVENT.test(String(o["type"]))) return line;
+                o["index"] = (o["index"] as number) + retryIndexOffset;
+                return `data: ${JSON.stringify(o)}`;
+            })
+            .join("\n");
+    };
     const flushTails = (): string => {
         let out = "";
         for (const s of streams.values()) {
             const tail = s.filter.flush();
             if (tail.length > 0) {
                 out += syntheticTail(s.field, s.index, tail);
-                if (s.field === "content" || s.field === "text") visibleTextChars += tail.length;
+                if (s.field === "content" || s.field === "text") {
+                    visibleTextChars += tail.length;
+                    releasedMarkupChars += tail.length;
+                }
             }
         }
         return out;
@@ -868,6 +1024,12 @@ export async function pipePluginChatWithStrip(
             log?.(msg);
         }
     };
+    // #901: a terminal-delimited turn proves the upstream accepted this input size.
+    const maybeRecordProven = () => {
+        if (!sawTerminal || !session || res.destroyed || res.writableEnded) return;
+        const total = promptInputTotal(protocol, acc.inputTokens, acc.cachedTokens, acc.creationTokens);
+        if (total > 0) recordProvenInput(session, total);
+    };
     const pushField = (field: string, index: number, text: string): [string, boolean] => {
         const s = filterFor(field, index);
         const clean = s.filter.push(text);
@@ -907,7 +1069,15 @@ export async function pipePluginChatWithStrip(
                 if (clean.length === 0) droppedText = true;
                 else {
                     keptText = true;
-                    if (field === "content") visibleTextChars += clean.length;
+                    if (field === "content") {
+                        visibleTextChars += clean.length;
+                        // What a dropped tag leaves behind is its own interior: the
+                        // host finds no tool call in it and stalls the turn.
+                        if (droppedTagInFrame) {
+                            releasedMarkupChars += clean.length;
+                            droppedTagInFrame = false;
+                        }
+                    }
                 }
                 if (changed) {
                     if (!rebuilt) {
@@ -958,7 +1128,13 @@ export async function pipePluginChatWithStrip(
             if (field === "text" && raw.length > 0) visibleTextChars += raw.length;
             return rawEvent + "\n\n";
         }
-        if (field === "text" && clean.length > 0) visibleTextChars += clean.length;
+        if (field === "text" && clean.length > 0) {
+            visibleTextChars += clean.length;
+            if (droppedTagInFrame) {
+                releasedMarkupChars += clean.length;
+                droppedTagInFrame = false;
+            }
+        }
         if (clean.length === 0 && Object.keys(d ?? {}).length <= 2) return "";
         return rebuildEvent(rawEvent, { ...ev, delta: { ...d, [field]: clean } });
     };
@@ -988,10 +1164,30 @@ export async function pipePluginChatWithStrip(
                         await write(rawEvent + "\n\n");
                         continue;
                     }
+                    if (retryFraming(ev)) continue;
+                    if (protocol === "anthropic" && ev["type"] === "content_block_start") blocksForwarded++;
                     if (ev["type"] === "message_stop") sawTerminal = true;
                     if (ev["type"] === "message_delta") {
                         const d = ev["delta"] as Record<string, unknown> | undefined;
                         if (d && typeof d["stop_reason"] === "string") finalFinishReason = d["stop_reason"] as string;
+                    }
+                    // Each wire declares its terminal on its own event: anthropic on
+                    // message_delta's stop_reason, openai on the finish_reason chunk
+                    // ([DONE] only closes the stream). Read here so the retry
+                    // decision can be taken before that event reaches the client.
+                    let turnTerminal: string | undefined;
+                    if (protocol === "anthropic" && ev["type"] === "message_delta") turnTerminal = finalFinishReason;
+                    else if (protocol === "openai") {
+                        const choices = ev["choices"];
+                        if (Array.isArray(choices)) {
+                            for (const c of choices) {
+                                const fr = c && typeof c === "object" ? (c as Record<string, unknown>)["finish_reason"] : undefined;
+                                if (typeof fr === "string" && fr.length > 0) {
+                                    finalFinishReason = fr;
+                                    turnTerminal = fr;
+                                }
+                            }
+                        }
                     }
                     const sample = usageFromSseEvent(ev);
                     if (sample) mergeUsageSample(acc, sample);
@@ -1000,7 +1196,12 @@ export async function pipePluginChatWithStrip(
                     // processors run and only rebuild when they return the event
                     // verbatim — otherwise their render-tag stripping is lost.
                     const out = protocol === "anthropic" ? processAnthropic(ev, rawEvent) : processOpenai(ev, rawEvent);
-                    if (out.length > 0) await write(out);
+                    // The gate runs AFTER this event is processed: a coalesced chunk
+                    // can carry content AND the finish reason, so its own text has to
+                    // count before the turn may be called empty. The event's output is
+                    // dropped only when the retry takes the turn over.
+                    if (turnTerminal !== undefined && (await retryEmptyTurn(turnTerminal))) continue;
+                    if (out.length > 0) await write(offsetRetryIndices(out));
                 }
             }
             if (res.destroyed || res.writableEnded) break;
@@ -1015,9 +1216,9 @@ export async function pipePluginChatWithStrip(
         // blank-line-delimited block — corrupting the truncation signal. Drop
         // it when the signal follows: an unterminated event is unparseable by
         // the client anyway (same as the pre-#721 bare end).
-        if (!truncated && buf.length > 0 && !res.destroyed && !res.writableEnded) await write(buf);
+        if (!truncated && buf.length > 0 && !res.destroyed && !res.writableEnded) await write(offsetRetryIndices(buf));
         const rest = flushTails();
-        if (rest.length > 0 && !res.destroyed && !res.writableEnded) await write(rest);
+        if (rest.length > 0 && !res.destroyed && !res.writableEnded) await write(offsetRetryIndices(rest));
         // Settle BEFORE res.end() in the finally below: the client can issue
         // its next request (e.g. /__bili/plugin/status, or the follow-up turn
         // that reads lastInputTokens for the nudge decision) the moment the
@@ -1025,6 +1226,7 @@ export async function pipePluginChatWithStrip(
         settleUsage();
         maybeNoteTruncated();
         maybeWarnDegenerate();
+        maybeRecordProven();
         if (truncated) {
             emitUpstreamTruncation(res, protocol, finalFinishReason !== undefined, log);
             return;
@@ -1044,7 +1246,7 @@ export async function pipePluginChatWithStrip(
         // written raw it would fuse with the signal frame.
         try {
             const rest = flushTails();
-            if (rest.length > 0) await write(rest);
+            if (rest.length > 0) await write(offsetRetryIndices(rest));
         } catch {
             /* client half-gone; the emission below is best-effort too */
         }
@@ -1086,15 +1288,23 @@ function hadTextOtherThanTextFields(choices: unknown): boolean {
  *
  *  Also serves proxy-mode Responses SSE that skipped compress injection
  *  (#460, e.g. ACP_NO_INJECT_TOOL). Pass no session there — see
- *  pipePluginChatWithStrip for why usage accounting must be skipped. */
+ *  pipePluginChatWithStrip for why usage accounting must be skipped.
+ *
+ *  #732/#821 parity with pipePluginChatWithStrip: when the turn's completion
+ *  reports a clean status with nothing visible — the echoed render tag was the
+ *  only thing the model emitted, and the filter emptied it — the agent's own
+ *  body is re-issued ONCE with a continuation nudge instead of leaving the host
+ *  with an empty completed turn. The retry is reframed onto the ids the client
+ *  already holds, so the client still sees one turn. */
 export async function pipePluginResponsesWithStrip(
     stream: ReadableStream<Uint8Array>,
-    res: import("node:http").ServerResponse,
+    res: ServerResponse,
     session?: Session,
     log?: (msg: string) => void,
+    refetch?: () => Promise<ReadableStream<Uint8Array> | null>,
 ): Promise<void> {
-    const reader = stream.getReader();
-    const decoder = new TextDecoder("utf-8");
+    let reader = stream.getReader();
+    let decoder = new TextDecoder("utf-8");
     let buf = "";
     const acc: UsageSample = {};
     const tagFilter = composeStreamFilters(
@@ -1110,7 +1320,27 @@ export async function pipePluginResponsesWithStrip(
     // #673: turn-level observability for degenerate terminal turns.
     let sawFunctionCall = false;
     let sawReasoning = false;
+    /** The model emitted markup the filter stripped (or would strip): proof the
+     *  turn produced output, even when none survived to be visible. */
+    let sawStrippedEcho = false;
     let responseStatus: string | undefined;
+    // Degenerate-turn retry (#732/#821 for this pipe). The first attempt's
+    // done-family events are HELD until its completion event decides the turn:
+    // released in place on a healthy turn, dropped whole when the retry takes
+    // over, so the client sees one turn carrying one set of ids.
+    let degenerateRetried = false;
+    let inRetry = false;
+    /** Text the client actually assembled from this attempt's deltas. */
+    let visibleTextChars = 0;
+    /** Done-family events held for the attempt in flight. */
+    let heldEvents: string[] = [];
+    /** Text those held events would hand the client, post-strip. */
+    let heldVisibleChars = 0;
+    /** The ids the client already holds (first attempt), which the retry's own
+     *  created/added events are dropped in favour of. */
+    let heldItemId: unknown;
+    let heldOutputIndex: unknown;
+    let heldResponseId: unknown;
     const write = (s: string): Promise<void> => {
         if (!res.write(Buffer.from(s, "utf8"))) {
             return new Promise<void>((r) => res.once("drain", () => r()));
@@ -1152,14 +1382,127 @@ export async function pipePluginResponsesWithStrip(
             log?.(msg);
         }
     };
+    // #901: a terminal-delimited turn proves the upstream accepted this input size.
+    const maybeRecordProven = () => {
+        if (!sawTerminal || !session || res.destroyed || res.writableEnded) return;
+        const total = promptInputTotal("responses", acc.inputTokens, acc.cachedTokens, acc.creationTokens);
+        if (total > 0) recordProvenInput(session, total);
+    };
     let lastDeltaMeta: { item_id?: unknown; output_index?: unknown } | null = null;
     const flushTail = (after: string) => {
         const tail = tagFilter.flush();
         if (tail.length > 0) {
-            const meta = lastDeltaMeta ?? {};
+            visibleTextChars += tail.length;
+            const meta = inRetry && heldItemId !== undefined ? { item_id: heldItemId, output_index: heldOutputIndex } : (lastDeltaMeta ?? {});
             return `data: ${JSON.stringify({ type: "response.output_text.delta", ...meta, delta: tail })}\n\n` + after;
         }
         return after;
+    };
+    /** Visible (post-strip) text a done-family event carries — what the client
+     *  would assemble from it. It decides the turn's degeneracy together with
+     *  the deltas already forwarded. */
+    const responsesEventTextLength = (ev: Record<string, unknown>): number => {
+        let text = typeof ev["text"] === "string" ? (ev["text"] as string) : "";
+        const part = ev["part"];
+        if (part && typeof part === "object" && typeof (part as Record<string, unknown>)["text"] === "string") {
+            text += (part as Record<string, unknown>)["text"] as string;
+        }
+        const item = ev["item"];
+        const content = item && typeof item === "object" ? (item as Record<string, unknown>)["content"] : undefined;
+        if (Array.isArray(content)) {
+            for (const c of content) {
+                if (c && typeof c === "object" && typeof (c as Record<string, unknown>)["text"] === "string") {
+                    text += (c as Record<string, unknown>)["text"] as string;
+                }
+            }
+        }
+        return text.length;
+    };
+    /** Whether a serialized event must be rebuilt rather than forwarded: the
+     *  retry's ids are rewritten in the parsed event, and a processor with
+     *  nothing to strip forwards the original bytes, which would leave them
+     *  untouched. */
+    const retryRewritePending = (): boolean =>
+        inRetry && (heldItemId !== undefined || heldOutputIndex !== undefined || heldResponseId !== undefined);
+    /** While the retry stream feeds the client, the framing the FIRST attempt
+     *  opened is still open: the retry's own created/added events would hand the
+     *  client a second set of ids, so they are dropped. Returns true when the
+     *  event was consumed. */
+    const retryFraming = (type: unknown): boolean => {
+        if (!inRetry) return false;
+        return type === "response.created" || type === "response.output_item.added" || type === "response.content_part.added";
+    };
+    /** Every id the retry carries is rewritten onto the first attempt's, so the
+     *  client's assembled item stays the one it already holds. */
+    const rewriteRetryIds = (ev: Record<string, unknown>): void => {
+        if (!inRetry) return;
+        if (heldItemId !== undefined) ev["item_id"] = heldItemId;
+        if (heldOutputIndex !== undefined) ev["output_index"] = heldOutputIndex;
+        // `response.output_item.*` carries the item's identity nested as `item.id`
+        // rather than `item_id`. The done event is released to the client, so
+        // without this the client watches the item it holds be replaced.
+        const item = ev["item"];
+        if (heldItemId !== undefined && item && typeof item === "object") {
+            (item as Record<string, unknown>)["id"] = heldItemId;
+        }
+        const resp = ev["response"];
+        if (!resp || typeof resp !== "object") return;
+        const r = resp as Record<string, unknown>;
+        if (heldResponseId !== undefined) r["id"] = heldResponseId;
+        const output = r["output"];
+        if (heldItemId !== undefined && Array.isArray(output)) {
+            for (const item of output) {
+                if (item && typeof item === "object") (item as Record<string, unknown>)["id"] = heldItemId;
+            }
+        }
+    };
+    /** One-shot re-issue when a Responses turn reaches its completion with
+     *  nothing visible: the tag-echo case, where the filter empties the only
+     *  text the model emitted and the host aborts an empty completed turn.
+     *  Returns true when the retry stream took over, in which case the caller
+     *  drops the held done-family events AND the completion it came from. */
+    const retryEmptyTurn = async (status: string | undefined): Promise<boolean> => {
+        if (degenerateRetried || refetch === undefined) return false;
+        if (visibleTextChars > 0 || heldVisibleChars > 0 || sawFunctionCall) return false;
+        if (status !== "completed") return false;
+        if (res.destroyed || res.writableEnded) return false;
+        // A turn the model left genuinely bare — no reasoning, no stripped
+        // echo — is the upstream's own empty answer, not a stall: re-issuing it
+        // double-bills an empty completion (#732/#821 keep the same boundary in
+        // the compress loop).
+        if (!sawReasoning && !sawStrippedEcho) return false;
+        degenerateRetried = true;
+        log?.("[plugin] degenerate terminal turn (no visible output); retrying once with a continuation nudge (#732/#821)");
+        let next: ReadableStream<Uint8Array> | null = null;
+        try {
+            next = await refetch();
+        } catch (e) {
+            log?.(`[plugin] degenerate-terminal retry failed (${e instanceof Error ? e.message : String(e)}); passing the empty turn through`);
+            return false;
+        }
+        if (!next) return false;
+        // The turn is NOT over: the retry carries its own terminal, and a cut in
+        // it must still raise the truncation signal (#721).
+        sawTerminal = false;
+        responseStatus = undefined;
+        heldEvents = [];
+        heldVisibleChars = 0;
+        inRetry = true;
+        // The first attempt's held filter state belongs to text the client never
+        // saw (an emptying tag echo): the retry's content is filtered from
+        // scratch, so a partial tag there cannot swallow its opening characters.
+        tagFilter.flush();
+        // The first attempt is terminal and its body is drained; close the
+        // reader we are abandoning rather than leaving the socket held.
+        try {
+            await reader.cancel();
+        } catch {
+            /* already closed */
+        }
+        reader = next.getReader();
+        decoder = new TextDecoder("utf-8");
+        buf = "";
+        return true;
     };
     try {
         for (;;) {
@@ -1198,22 +1541,53 @@ export async function pipePluginResponsesWithStrip(
                         }
                         const resp = ev["response"] as Record<string, unknown> | undefined;
                         if (resp && typeof resp["status"] === "string") responseStatus = resp["status"] as string;
+                        if (!inRetry) {
+                            // The ids the client holds are the first attempt's: the
+                            // retry is reframed onto them (see rewriteRetryIds).
+                            if (type === "response.created" && resp && resp["id"] !== undefined) heldResponseId = resp["id"];
+                            if (type === "response.output_item.added") {
+                                const added = ev["item"] as Record<string, unknown> | undefined;
+                                if (added && added["id"] !== undefined) heldItemId = added["id"];
+                                if (ev["output_index"] !== undefined) heldOutputIndex = ev["output_index"];
+                            }
+                        }
                     }
-                    if (
-                        type === "response.output_text.done" ||
-                        type === "response.content_part.done" ||
-                        type === "response.output_item.done" ||
-                        type === "response.completed" ||
-                        type === "response.failed" ||
-                        type === "response.incomplete"
-                    ) {
-                        if (type === "response.completed" || type === "response.failed" || type === "response.incomplete") sawTerminal = true;
+                    if (retryFraming(type)) continue;
+                    if (type === "response.output_text.done" || type === "response.content_part.done" || type === "response.output_item.done") {
+                        // HELD until the completion event decides the turn (see
+                        // retryEmptyTurn): releasing it earlier would hand the
+                        // client the echo's own text exactly when the retry is
+                        // about to replace it.
+                        const hadEchoText = containsRenderTagText(jsonStr) || containsMarkerLineText(jsonStr);
+                        if (hadEchoText) sawStrippedEcho = true;
+                        let evOut = ev;
+                        let rebuild = hadEchoText || retryRewritePending();
+                        if (rebuild) evOut = stripResponsesText(ev);
+                        rewriteRetryIds(evOut);
+                        heldVisibleChars += responsesEventTextLength(evOut);
+                        heldEvents.push(rebuild ? rebuildEvent(rawEvent, evOut) : rawEvent + "\n\n");
+                        continue;
+                    }
+                    if (type === "response.completed" || type === "response.failed" || type === "response.incomplete") {
+                        sawTerminal = true;
+                        if (await retryEmptyTurn(type === "response.completed" ? "completed" : undefined)) {
+                            // The retry took over: this attempt's held family and
+                            // its own completion frame are dropped together.
+                            heldEvents = [];
+                            heldVisibleChars = 0;
+                            continue;
+                        }
+                        const tailFrame = flushTail("");
+                        if (tailFrame.length > 0) await write(tailFrame);
+                        for (const held of heldEvents) await write(held);
+                        heldEvents = [];
+                        heldVisibleChars = 0;
                         // done-family events also carry full text payloads — strip those too.
                         let evOut = ev;
-                        let rebuild = containsRenderTagText(jsonStr) || containsMarkerLineText(jsonStr);
+                        let rebuild = containsRenderTagText(jsonStr) || containsMarkerLineText(jsonStr) || retryRewritePending();
                         if (rebuild) evOut = stripResponsesText(ev);
-                        const out = rebuild ? rebuildEvent(rawEvent, evOut) : rawEvent + "\n\n";
-                        await write(flushTail(out));
+                        rewriteRetryIds(evOut);
+                        await write(rebuild ? rebuildEvent(rawEvent, evOut) : rawEvent + "\n\n");
                         continue;
                     }
                     if (type === "response.output_text.delta" && typeof ev["delta"] === "string") {
@@ -1222,18 +1596,28 @@ export async function pipePluginResponsesWithStrip(
                             await write(rawEvent + "\n\n");
                             continue;
                         }
-                        if (!mayStartRenderTag(delta) && !mayStartMarkerLine(delta) && !tagFilter.pending()) {
+                        if (!retryRewritePending() && !mayStartRenderTag(delta) && !mayStartMarkerLine(delta) && !tagFilter.pending()) {
                             await write(rawEvent + "\n\n");
                             continue;
                         }
                         const clean = tagFilter.push(delta);
                         lastDeltaMeta = { item_id: ev["item_id"], output_index: ev["output_index"] };
-                        if (clean.length === 0) continue;
-                        if (clean === delta) {
+                        if (!inRetry && heldItemId === undefined && ev["item_id"] !== undefined) {
+                            heldItemId = ev["item_id"];
+                            heldOutputIndex = ev["output_index"];
+                        }
+                        if (clean.length === 0) {
+                            sawStrippedEcho = true;
+                            continue;
+                        }
+                        visibleTextChars += clean.length;
+                        if (clean === delta && !retryRewritePending()) {
                             await write(rawEvent + "\n\n");
                             continue;
                         }
-                        await write(rebuildEvent(rawEvent, { ...ev, delta: clean }));
+                        const rebuilt = { ...ev, delta: clean };
+                        rewriteRetryIds(rebuilt);
+                        await write(rebuildEvent(rawEvent, rebuilt));
                         continue;
                     }
                     await write(rawEvent + "\n\n");
@@ -1250,6 +1634,7 @@ export async function pipePluginResponsesWithStrip(
         maybeWarnDegenerate();
         settleUsage();
         maybeNoteTruncated();
+        maybeRecordProven();
         // #721: same as the chat-pipe twin — never close bare on a missing
         // done-family event. Responses has no separate finish-reason concept
         // (terminal events carry the status), so this is always the error shape.
@@ -1336,17 +1721,22 @@ export async function pipePluginJson(
         if (session && usage) {
             const input = num(usage["prompt_tokens"]) ?? num(usage["input_tokens"]);
             if (input !== undefined) {
+                const cached =
+                    num((usage["prompt_tokens_details"] as Record<string, unknown> | undefined)?.["cached_tokens"]) ??
+                    num((usage["input_tokens_details"] as Record<string, unknown> | undefined)?.["cached_tokens"]) ??
+                    num(usage["cache_read_input_tokens"]) ??
+                    // #779: DeepSeek-style top-level field (openai wire)
+                    num(usage["prompt_cache_hit_tokens"]);
+                const creation = num(usage["cache_creation_input_tokens"]);
                 applyUsageSample(session, {
                     inputTokens: input,
                     outputTokens: num(usage["completion_tokens"]) ?? num(usage["output_tokens"]),
-                    cachedTokens:
-                        num((usage["prompt_tokens_details"] as Record<string, unknown> | undefined)?.["cached_tokens"]) ??
-                        num((usage["input_tokens_details"] as Record<string, unknown> | undefined)?.["cached_tokens"]) ??
-                        num(usage["cache_read_input_tokens"]) ??
-                        // #779: DeepSeek-style top-level field (openai wire)
-                        num(usage["prompt_cache_hit_tokens"]),
-                    creationTokens: num(usage["cache_creation_input_tokens"]),
+                    cachedTokens: cached,
+                    creationTokens: creation,
                 }, protocol);
+                // #901: a fully-read non-streaming response proves acceptance of this input size.
+                const total = promptInputTotal(protocol, input, cached, creation);
+                if (total > 0) recordProvenInput(session, total);
                 markDirty(session);
             }
         }

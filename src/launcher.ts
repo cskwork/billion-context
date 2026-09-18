@@ -54,7 +54,7 @@ import { selfPackageRoot, isBiliPiEntry, ompPluginLoadedFrom } from "./plugin-in
 function selfDistFile(name: string): string {
     return path.join(selfPackageRoot(), "dist", name);
 }
-import { nonEmpty, resolvePiHome, resolveOmpHome, resolveDshHome, resolveCodexHome, loadClientConfig, collectModelWindows, type ClientConfig, type CodexConfig, resolveOpencodeConfigFile, readOpencodeConfigRoot, opencodePluginBaseDir, type OpencodeConfig, type OpencodeProvider, type HermesConfig, type HermesProvider, qoderIsCnSite, QODER_DEFAULT_MODEL_HOSTS, resolveTraeHome, readTraeConfig, TRAE_DEFAULT_MODEL_HOSTS, JCODE_DEFAULT_MODEL_HOSTS, type TraeConfig, resolveKimiHome, readKimiConfig, parseKimiToml, KIMI_DEFAULT_MODEL_HOSTS, type KimiConfig, type KimiProvider } from "./client-config.js";
+import { nonEmpty, resolvePiHome, resolveOmpHome, resolveDshHome, resolveCodexHome, loadClientConfig, collectModelWindows, type ClientConfig, type CodexConfig, resolveOpencodeConfigFile, readOpencodeConfigRoot, opencodePluginBaseDir, type OpencodeConfig, type OpencodeProvider, type HermesConfig, type HermesProvider, qoderIsCnSite, QODER_DEFAULT_MODEL_HOSTS, resolveTraeHome, readTraeConfig, TRAE_DEFAULT_MODEL_HOSTS, JCODE_DEFAULT_MODEL_HOSTS, type TraeConfig, resolveKimiHome, readKimiConfig, parseKimiToml, KIMI_DEFAULT_MODEL_HOSTS, type KimiConfig, type KimiProvider, readOpencodeProjectLayer, type OpencodeProjectLayer } from "./client-config.js";
 import { loadRoutes, resolveConfiguredContextLimit, lookupContextLimit, type ProviderRoutes } from "./config.js";
 import { contextFromRegistry } from "./registry.js";
 
@@ -97,6 +97,8 @@ export {
     readOpencodeConfigRoot,
     type OpencodeConfig,
     type OpencodeProvider,
+    readOpencodeProjectLayer,
+    type OpencodeProjectLayer,
     type CodebuddyConfig,
     readCodebuddyConfig,
     parseCodebuddyModelsJson,
@@ -1657,8 +1659,10 @@ export function opencodeMajorVersion(command: string): number {
  * paths before the copy is written — opencode resolves them against the
  * declaring file's dir, which the clone no longer is (#826). With pluginDirMode
  * (OpenCode 2.x), the plugin rides as a temp directory whose index.js
- * re-exports pluginPath — 2.x rejects bare file paths in `plugin`. Returns the
- * temp config FILE path (undefined when there is nothing to do).
+ * re-exports pluginPath — 2.x rejects bare file paths in `plugin`. Also strips
+ * opencode-acp entries (#920; see below), recording the first stripped spec in
+ * env["BILI_OPENCODE_ACP_SPEC"]. Returns the temp config FILE path (undefined
+ * when there is nothing to do).
  */
 export function prepareOpencodeHttpRewrite(
     userRoot: Record<string, unknown> | undefined,
@@ -1713,15 +1717,42 @@ export function prepareOpencodeHttpRewrite(
         ...(existingCompaction && typeof existingCompaction === "object" && !Array.isArray(existingCompaction) ? existingCompaction as Record<string, unknown> : {}),
         auto: false,
     };
+    // #920: strip opencode-acp entries from the clone — the host must not load
+    // it armed (its config hook globally self-disables on /bili/ baseURLs and
+    // eagerly adopts every session). The thin plugin imports the same package
+    // as a library instead and gates its hooks on legacy sessions. The first
+    // stripped spec is handed to the child via env so the bridge imports the
+    // exact copy the host would have loaded (state-format compatibility).
+    let strippedAcpSpec: string | undefined;
     for (const key of ["plugin", "plugins"] as const) {
-        if (Array.isArray(root[key])) {
-            const baseDir = opencodePluginBaseDir(env, key);
-            root[key] = (root[key] as unknown[]).map((entry) => absolutizePluginEntry(baseDir, entry));
-        }
+        if (!Array.isArray(root[key])) continue;
+        const baseDir = opencodePluginBaseDir(env, key);
+        root[key] = (root[key] as unknown[])
+            .filter((entry) => {
+                const spec = opencodeAcpPluginSpec(entry);
+                if (spec === undefined) return true;
+                strippedAcpSpec ??= spec;
+                return false;
+            })
+            .map((entry) => absolutizePluginEntry(baseDir, entry));
     }
+    if (strippedAcpSpec) env["BILI_OPENCODE_ACP_SPEC"] = strippedAcpSpec;
     const tmpFile = path.join(tmp, "opencode.json");
     fs.writeFileSync(tmpFile, JSON.stringify(root));
     return tmpFile;
+}
+
+/** Returns the plugin spec when `entry` references the opencode-acp package
+ *  (npm spec, local path, or github spec), else undefined. Matches the package
+ *  name exactly — `my-opencode-acp-fork` does not match. */
+function opencodeAcpPluginSpec(entry: unknown): string | undefined {
+    let spec: unknown;
+    if (typeof entry === "string") spec = entry;
+    else if (Array.isArray(entry) && typeof entry[0] === "string") spec = entry[0];
+    else if (entry !== null && typeof entry === "object" && !Array.isArray(entry)) spec = (entry as Record<string, unknown>).package;
+    if (typeof spec !== "string" || spec.length === 0) return undefined;
+    const base = path.basename(spec);
+    return base === "opencode-acp" || base.startsWith("opencode-acp@") ? spec : undefined;
 }
 
 function isRelativeLocalPluginSpec(spec: unknown): spec is string {
@@ -1742,6 +1773,50 @@ function absolutizePluginEntry(baseDir: string, entry: unknown): unknown {
         if (isRelativeLocalPluginSpec(obj.package)) return { ...obj, package: path.resolve(baseDir, obj.package as string) };
     }
     return entry;
+}
+
+export function opencodeEffectiveCwd(clientArgs: readonly string[]): string {
+    for (let i = 0; i < clientArgs.length; i++) {
+        const arg = clientArgs[i];
+        if (arg === "--dir") return path.resolve(clientArgs[i + 1] ?? ".");
+        if (arg.startsWith("--dir=")) return path.resolve(arg.slice("--dir=".length));
+    }
+    return process.cwd();
+}
+
+function isBiliRouted(baseURL: string, httpsDomains: ReadonlySet<string>): boolean {
+    if (unwrapUpstream(baseURL) !== baseURL) return true;
+    let url: URL;
+    try {
+        url = new URL(baseURL);
+    } catch {
+        return false;
+    }
+    return url.protocol === "https:" && httpsDomains.has(url.hostname.toLowerCase());
+}
+
+// #843: project-layer opencode config outranks the launcher's $OPENCODE_CONFIG
+// rewrite delivery, so providers defined there bypass the proxy silently.
+export function opencodeProjectBypassWarnings(
+    layer: OpencodeProjectLayer,
+    routes: DiscoveredRoutes,
+): string[] {
+    const warnings: string[] = [];
+    const httpsDomains = new Set(routes.httpsDomains.map((d) => d.toLowerCase()));
+    const rewrittenKeys = new Set([...routes.httpRewrites, ...routes.httpsRewrites].map((r) => r.key));
+    for (const [name, view] of Object.entries(layer.providers)) {
+        if (!view.baseURL || isBiliRouted(view.baseURL, httpsDomains)) continue;
+        if (rewrittenKeys.has(name)) {
+            warnings.push(
+                `bili: ${view.file} redefines provider "${name}" in opencode's project layer, which outranks the launcher's rewritten $OPENCODE_CONFIG — "${name}" traffic will NOT go through the proxy (no compression). Move the provider to your global opencode config to restore compression.`,
+            );
+        } else {
+            warnings.push(
+                `bili: provider "${name}" is defined only in opencode's project layer (${view.file}) — the launcher never sees it, so no rewrite was applied and "${name}" traffic will NOT go through the proxy (no compression). Move it to your global opencode config to enable compression.`,
+            );
+        }
+    }
+    return warnings;
 }
 
 function dedupeInOrder(list: string[]): string[] {
@@ -2349,7 +2424,7 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         // at extension load from the env manifest (registerProvider; see
         // buildPiEnv), and the old settings.json compaction-off generation is
         // replaced by the extension's session_before_compact cancel.
-        env = buildPiEnv(origin, ca, process.env, routes.httpRewrites, routes.httpsRewrites);
+        env = buildPiEnv(origin, ca, stripInheritedProxy(process.env), routes.httpRewrites, routes.httpsRewrites);
         // #535: never let a stale inherited overlay redirect (from a legacy
         // launch or a shell exported inside one) leak into the child — pi
         // always runs on its REAL home now.
@@ -2367,12 +2442,13 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         // #535 phase 3: file-free — omp is pi-based and runs on its REAL home
         // (no overlay, no PI_CODING_AGENT_DIR redirect). Provider baseUrls are
         // overridden at extension load from the env manifest (omp's fork keeps
-        // pi's registerProvider), and native compaction — auto AND manual — is
-        // cancelled by the extension's session_before_compact handler (omp's
-        // event carries no reason field, so under bili every compaction is
-        // cancelled; the native summarizer would destroy the ACP-tagged
-        // context). https upstreams ride cert-MITM like pi.
-        env = buildPiEnv(origin, ca, process.env, routes.httpRewrites);
+        // pi's registerProvider), and AUTO native compaction is cancelled by
+        // the extension (#851): session_before_compact carries no reason field,
+        // so the plugin cancels only passes announced via auto_compaction_start
+        // (the native summarizer would destroy the ACP-tagged context); manual
+        // /compact stays user-owned and its surviving summary is archived by
+        // the proxy on session_compact. https upstreams ride cert-MITM like pi.
+        env = buildPiEnv(origin, ca, stripInheritedProxy(process.env), routes.httpRewrites);
         delete env.PI_CODING_AGENT_DIR;
         const ompExt = selfDistFile("agent/omp.js");
         if (ompExt && fs.existsSync(ompExt) && !ompPluginLoadedFrom(ompRealHome)) {
@@ -2381,14 +2457,23 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
     } else if (base === "opencode") {
         // opencode: HTTPS upstreams ride cert-MITM (HTTPS_PROXY + CA); plaintext
         // HTTP upstreams get a /bili/-rewritten copy of opencode.json via
-        // OPENCODE_CONFIG (real config untouched). BILLION_CONTEXT_PROXY makes
-        // opencode-acp self-disable so the proxy owns the ACP tools.
-        env = { ...process.env, HTTPS_PROXY: origin, NODE_EXTRA_CA_CERTS: ca, BILLION_CONTEXT_PROXY: origin };
+        // OPENCODE_CONFIG (real config untouched). #920: the temp-config clone
+        // strips any opencode-acp entry — the thin plugin imports that package
+        // as a library instead (legacy sessions keep working in-process), and
+        // loading it armed would re-arm its global /bili/ self-disable.
+        // BILLION_CONTEXT_PROXY activates the thin plugin itself. Base env is
+        // stripped like hermes/dsh/kimi/qoder/trae/jcode (#890): undici/Bun prefer
+        // lowercase http(s)_proxy over the uppercase injected below, so an
+        // inherited lowercase var would silently route model traffic around bili.
+        env = { ...stripInheritedProxy(process.env), HTTPS_PROXY: origin, NODE_EXTRA_CA_CERTS: ca, BILLION_CONTEXT_PROXY: origin };
         const opencodePlugin = selfDistFile("agent/opencode.js");
         const opencodePluginPath = opencodePlugin && fs.existsSync(opencodePlugin) ? opencodePlugin : undefined;
         const ocDirMode = opencodePluginPath !== undefined && opencodeMajorVersion(resolveClientCommand("opencode", process.env).command) >= 2;
-        opencodeTmpFile = prepareOpencodeHttpRewrite(readOpencodeConfigRoot(process.env), origin, routes.httpRewrites, routes.httpsRewrites, opencodePluginPath, ocDirMode);
+        opencodeTmpFile = prepareOpencodeHttpRewrite(readOpencodeConfigRoot(process.env), origin, routes.httpRewrites, routes.httpsRewrites, opencodePluginPath, ocDirMode, env);
         if (opencodeTmpFile) env.OPENCODE_CONFIG = opencodeTmpFile;
+        for (const warning of opencodeProjectBypassWarnings(readOpencodeProjectLayer(opencodeEffectiveCwd(clientArgs)), routes)) {
+            console.error(warning);
+        }
     } else if (base === "hermes") {
         // #535 phase 2: file-free — no overlay HERMES_HOME, no config.yaml
         // runs on its REAL home — including a user-set HERMES_HOME (discovery
@@ -2539,7 +2624,7 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         if (directUrl) {
             env = { ...process.env, BILLION_CONTEXT_PROXY: origin };
         } else {
-            env = buildCodexEnv(origin, resolveCombinedCaPath(process.env), process.env);
+            env = buildCodexEnv(origin, resolveCombinedCaPath(process.env), stripInheritedProxy(process.env));
             clientArgs = buildCodexArgs(origin, routes.httpRewrites, routes.httpsRewrites, clientArgs);
             const budgetArgs = await resolveCodexBudgetArgs({
                 model: config.codex?.model,
@@ -2565,7 +2650,7 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
             if (inj.warning) console.error(`bili: ${inj.warning}`);
         }
     } else if (base === "codebuddy") {
-        env = buildCodebuddyEnv(origin, ca, routes.httpRewrites, routes.httpsRewrites, process.env);
+        env = buildCodebuddyEnv(origin, ca, routes.httpRewrites, routes.httpsRewrites, stripInheritedProxy(process.env));
         const codebuddyBudget = await resolveCodebuddyBudgetEnv({
             model: config.codebuddy?.model,
             userAutoCompactWindow: config.codebuddy?.autoCompactWindow,
@@ -2652,7 +2737,7 @@ export async function runTestPi(params: RunTestPiParams, deps: LauncherDeps = {}
     }
 
     const ca = resolveCaCertPath(process.env);
-    const env = buildPiEnv(handle.origin, ca, process.env);
+    const env = buildPiEnv(handle.origin, ca, stripInheritedProxy(process.env));
     const sessionDir = path.join(os.tmpdir(), `bili-pi-test-${Date.now()}`);
     fs.mkdirSync(sessionDir, { recursive: true });
     const args = [
