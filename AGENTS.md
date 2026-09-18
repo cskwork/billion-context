@@ -321,7 +321,9 @@ time, not the registry.
 
 Releases are **fully automated via CI** (`.github/workflows/release.yml`).
 The Agent prepares a release PR; merging it triggers CI which builds, tests,
-publishes to npm, creates a git tag, and creates a GitHub Release.
+publishes to npm, creates a git tag, and creates a GitHub Release. For
+routine patch releases there is also a one-click fast path — see
+“One-click manual release” below.
 
 ### Branch Naming
 
@@ -366,6 +368,33 @@ The Agent does steps 1–5, the human does step 6 (merge).
    ```bash
    npm view billion-context version
    ```
+
+### One-click manual release (fast path)
+
+For routine patch releases, skip the branch/PR dance: **Actions →
+“Release (one-click)” → Run workflow** (`.github/workflows/release-manual.yml`).
+The `version` input is optional — blank means auto next-patch over the npm
+latest; type a full semver for minor/major/prerelease bumps. The workflow:
+
+1. **Drift guard**: master's `package.json` version must equal the npm latest,
+   else it aborts (never release off a drifted tree). It also rejects a target
+   version that is already published.
+2. Bumps ONLY `package.json` + `package-lock.json` and commits
+   `release v{VERSION}` — the same one-version-one-commit discipline as the
+   Version Bumps section above.
+3. Runs the full pre-flight gate (`npm ci` + typecheck + test + build).
+4. Pushes the release commit directly to `master` (GITHUB_TOKEN, fast-forward
+   only). If branch protection blocks direct pushes, it falls back to opening
+   a release PR — merge that to publish via the standard flow.
+5. Publishes to npm (`latest`, or `dev` for prerelease), tags `v{VERSION}`,
+   and creates the GitHub Release with notes generated from `git log` since
+   the last tag.
+
+A successful one-click run does NOT double-trigger `release.yml`: its check
+only matches release-branch merges / date-prefixed commits, never a plain
+`release v{VERSION}` commit. The standard branch/PR flow above remains the
+canonical path for anything non-trivial (updater changes, cross-repo bumps,
+or whenever a human wants the review gate).
 
 ### CI publish mechanism (what release.yml does)
 
