@@ -299,10 +299,19 @@ contract:
    on `@opencode/cli` 2.0.3 (native `acp_status` executed through the plugin
    endpoint, zero wire-level injection).
 - **Native (no launcher):** with the package installed from npm, run
-  `bili plugin install opencode` — it writes a self-spawning plugin into your
-  real opencode config (`<configDir>/plugins/billion-context/index.js` →
-  `dist/agent/opencode-native.js`) and sets `compaction.auto: false`, after
-  which plain `opencode` works as-is. At load the plugin bootstraps its own
+  `bili plugin install opencode` — it registers a self-spawning plugin in your
+  real opencode config and sets `compaction.auto: false`, after which plain
+  `opencode` works as-is. The entry form depends on how THIS bili was
+  installed: an **npm install** writes the bare package name (`"plugin":
+  ["billion-context"]`) — the package publishes `exports["./server"]` →
+  `dist/agent/opencode-native.js`, so opencode loads it through its own
+  Npm.add machinery and manages install/upgrade itself; zero absolute paths,
+  portable across machines. A **git checkout / dev build** has no published
+  entry and falls back to a local shim dir
+  (`<configDir>/plugins/billion-context/index.js` → this checkout's
+  `dist/agent/opencode-native.js`) — machine-local by construction, not
+  portable; re-running install from an npm install migrates the entry back to
+  the bare name. At load the plugin bootstraps its own
   proxy (attaches to a healthy instance instead of doubling; parent-pid
   watchdog kills it when opencode exits), routes model-API traffic to
   `<proxy>/bili/<upstream-url>`, and exposes the same native bili tools as

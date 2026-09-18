@@ -9,6 +9,9 @@
 //   codex    ~/.codex/config.toml        [mcp_servers.bili]
 //   opencode <cfg>/opencode.json{c}|config.json (highest-precedence existing; #927)
 //            mcp.bili + native plugin dir + compaction.auto=false
+//          (plugin entry #925: bare "billion-context" for npm installs — opencode
+//           loads it via exports["./server"] and manages install/upgrade itself;
+//           local shim dir for checkout/dev installs, which are not portable)
 // Installers throw on failure (bad/locked config, missing host CLI); the CLI
 // layer catches, prints `bili plugin: <msg>` and exits 1.
 
@@ -625,6 +628,52 @@ function stripLegacyOpencodeAcp(data: Record<string, unknown>, notes: string[], 
     }
 }
 
+// #925: how THIS bili was installed decides which plugin entry install can
+// publish. An npm-form install (package root under node_modules — npm/pnpm/
+// yarn, both path-separator styles) ships its entry through package.json
+// exports["./server"], so opencode loads the bare package name via its own
+// Npm.add machinery (host-managed install + upgrade, portable config). Any
+// other form (git checkout / dev build) has no published entry — local shim dir.
+export function isNpmInstallForm(root: string): boolean {
+    return /(^|[/\\])node_modules[/\\]/.test(root);
+}
+
+export const OPENCODE_NPM_ENTRY = "billion-context";
+
+const DEV_FORM_NOTE = "dev form: machine-local shim, not portable across machines — an npm install writes the bare package name instead";
+
+// #925: pick + apply the plugin entry for this install form. Replaces any
+// existing entry of either form (single owner), returns note(s). #927: the
+// entry lands in the host's effective key (`plugin` on OpenCode 1.x,
+// `plugins` on 2.x) — pass `key`; default keeps the v1 spelling for callers
+// and tests that predate the probe.
+export function applyOpencodePluginEntry(args: { data: Record<string, unknown>; root: string; shimDir: string; agentJs: string; key?: "plugin" | "plugins"; touched?: Set<string> }): string[] {
+    const { data, root, shimDir, agentJs } = args;
+    const key = args.key ?? "plugin";
+    const touched = args.touched ?? new Set<string>();
+    const ours = [OPENCODE_NPM_ENTRY, shimDir];
+    const plugins = pluginEntries(data, key);
+    const replaced = plugins.filter((p) => ours.includes(p));
+    const kept = plugins.filter((p) => !ours.includes(p));
+    const write = (v: string[]): void => {
+        data[key] = v;
+        touched.add(key);
+    };
+    if (isNpmInstallForm(root)) {
+        write([...kept, OPENCODE_NPM_ENTRY]);
+        if (replaced.includes(shimDir)) fs.rmSync(shimDir, { recursive: true, force: true });
+        if (replaced.length === 0) return [`plugin -> ${OPENCODE_NPM_ENTRY}`];
+        if (replaced.every((p) => p === OPENCODE_NPM_ENTRY)) return ["plugin present"];
+        return [`plugin -> ${OPENCODE_NPM_ENTRY} (replaced ${replaced.join(", ")})`];
+    }
+    fs.mkdirSync(shimDir, { recursive: true });
+    fs.writeFileSync(path.join(shimDir, "index.js"), `export { default } from ${JSON.stringify(agentJs)};\n`);
+    write([...kept, shimDir]);
+    if (replaced.length === 0) return [`plugin -> ${shimDir}`, DEV_FORM_NOTE];
+    if (replaced.every((p) => p === shimDir)) return ["plugin present"];
+    return [`plugin -> ${shimDir} (replaced ${replaced.join(", ")})`, DEV_FORM_NOTE];
+}
+
 function opencodeInstall(): string {
     const file = opencodeTargetFile();
     const { original, data } = loadOpencodeConfig(file);
@@ -653,26 +702,18 @@ function opencodeInstall(): string {
         notes.push(`mcp.bili skipped (${err instanceof Error ? err.message : String(err)})`);
     }
 
-    // Native plugin (#820): self-spawned proxy + http.request URL rewrite.
-    const agentJs = path.join(selfPackageRoot(), "dist", "agent", "opencode-native.js");
+    // Native plugin (#820/#925): self-spawned proxy + http.request URL rewrite.
+    // Entry form depends on how THIS bili was installed — npm → bare package
+    // name (exports["./server"], host-managed), checkout/dev → local shim dir.
+    const root = selfPackageRoot();
+    const agentJs = path.join(root, "dist", "agent", "opencode-native.js");
     requireDistFile(agentJs);
     // Single compression owner FIRST: drop any opencode-acp entry before
     // adding ours, so both never load armed in one host (#918). The write
     // below snapshots the original config to .bili-bak (first write only).
     stripLegacyOpencodeAcp(data, notes, touched);
-    const dir = opencodePluginDir(file);
-    fs.mkdirSync(dir, { recursive: true });
-    fs.writeFileSync(path.join(dir, "index.js"), `export { default } from ${JSON.stringify(agentJs)};\n`);
-    // #927: the single effective key for this host — see pickPluginKey.
-    const key = pickPluginKey(detectOpencodeMajor());
-    const existing = pluginEntries(data, key);
-    if (!existing.includes(dir)) {
-        data[key] = [...existing, dir];
-        touched.add(key);
-        notes.push(`${key} -> ${dir}`);
-    } else {
-        notes.push(`${key} present`);
-    }
+    // #927 entry key for this host + #925 entry form for this install form.
+    notes.push(...applyOpencodePluginEntry({ data, root, shimDir: opencodePluginDir(file), agentJs, key: pickPluginKey(detectOpencodeMajor()), touched }));
 
     // Single compression owner: with the native plugin installed, ACP owns
     // compression — disable host auto-compaction (merge-preserving; the key is
@@ -707,21 +748,23 @@ function opencodeRemove(): string {
         notes.push("mcp.bili removed");
     }
 
-    // #927: clean our entry out of whichever key spelling carries it.
+    // #927: clean our entry out of whichever key spelling carries it; the
+    // entry may be either form (#925) — bare npm name or shim dir.
     const dir = opencodePluginDir(file);
-    let dirRemoved = false;
+    const removed: string[] = [];
     for (const key of PLUGIN_KEYS) {
         const entries = pluginEntries(data, key);
-        if (!entries.includes(dir)) continue;
-        const remaining = entries.filter((p) => p !== dir);
+        const hit = entries.filter((p) => p === OPENCODE_NPM_ENTRY || p === dir);
+        if (hit.length === 0) continue;
+        const remaining = entries.filter((p) => p !== OPENCODE_NPM_ENTRY && p !== dir);
         if (remaining.length === 0) delete data[key];
         else data[key] = remaining;
         touched.add(key);
-        dirRemoved = true;
+        removed.push(...hit);
     }
-    if (dirRemoved) {
-        fs.rmSync(dir, { recursive: true, force: true });
-        notes.push(`plugin dir removed (${dir})`);
+    if (removed.length > 0) {
+        if (removed.includes(dir)) fs.rmSync(dir, { recursive: true, force: true });
+        notes.push(`plugin removed (${removed.join(", ")})`);
     }
 
     if (notes.length > 0) {
@@ -758,7 +801,7 @@ function opencodeStatus(): string {
     const { data } = loadOpencodeConfig(file);
     const mcp = data.mcp;
     const dir = opencodePluginDir(file);
-    const listed = PLUGIN_KEYS.some((k) => pluginEntries(data, k).includes(dir));
+    const listed = PLUGIN_KEYS.some((k) => pluginEntries(data, k).some((p) => p === OPENCODE_NPM_ENTRY || p === dir));
     return (isPlainMcpObject(mcp) && "bili" in mcp) || listed ? "installed" : "not installed";
 }
 
