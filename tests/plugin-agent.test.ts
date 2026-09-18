@@ -877,12 +877,20 @@ test("plugin install/remove roundtrips for pi/omp/codex/opencode under a fake HO
         assert.match(pluginInstall("codex"), /already installed/);
         assert.match(pluginRemove("codex"), /removed/);
 
-        assert.match(pluginInstall("opencode"), /installed/);
-        const oc = JSON.parse(fs.readFileSync(path.join(home, ".config/opencode/opencode.json"), "utf8")) as { mcp: Record<string, { command: string[]; environment?: Record<string, string> }> };
+        // #926: opencode default writes NO mcp.bili (the native plugin owns
+        // the tools); only --with-mcp adds the surface. hintEnv pins
+        // BILI_MCP_PROXY, so --with-mcp persists that pinned value here.
+        const ocFile = path.join(home, ".config/opencode/opencode.json");
+        fs.mkdirSync(path.dirname(ocFile), { recursive: true });
+        fs.writeFileSync(ocFile, "{}");
+        assert.match(pluginInstall("opencode"), /nothing to install/);
+        assert.equal((JSON.parse(fs.readFileSync(ocFile, "utf8")) as { mcp?: unknown }).mcp, undefined);
+        assert.match(pluginInstall("opencode", { withMcp: true }), /installed/);
+        const oc = JSON.parse(fs.readFileSync(ocFile, "utf8")) as { mcp: Record<string, { command: string[]; environment?: Record<string, string> }> };
         assert.equal(oc.mcp.bili.command[1]!.endsWith(path.join("dist", "mcp.js")), true);
         assert.equal(oc.mcp.bili.environment?.BILI_MCP_PROXY, "http://127.0.0.1:8787");
         assert.match(pluginRemove("opencode"), /removed/);
-        assert.equal((JSON.parse(fs.readFileSync(path.join(home, ".config/opencode/opencode.json"), "utf8")) as { mcp?: unknown }).mcp, undefined);
+        assert.equal((JSON.parse(fs.readFileSync(ocFile, "utf8")) as { mcp?: unknown }).mcp, undefined);
 
         assert.throws(() => pluginInstall("claude"), /claude: install failed/);
         // The CLAUDE stub above keeps that assertion deterministic even on
@@ -895,6 +903,52 @@ test("plugin install/remove roundtrips for pi/omp/codex/opencode under a fake HO
         assert.deepEqual(PLUGIN_AGENTS, ["pi", "omp", "claude", "codex", "opencode"]);
     });
     fs.rmSync(home, { recursive: true, force: true });
+});
+
+test("#926: opencode install never freezes a stale origin; --with-mcp auto-discovers", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-plugin-opencode-926-"));
+    const ocDir = path.join(home, ".config/opencode");
+    fs.mkdirSync(ocDir, { recursive: true });
+    const ocFile = path.join(ocDir, "opencode.json");
+    const mcpJs = path.join(selfPackageRoot(), "dist", "mcp.js");
+    try {
+        await withEnv({ OPENCODE_CONFIG: ocFile, BILI_MCP_PROXY: undefined }, async () => {
+            // (a) default install writes nothing and preserves unrelated config
+            fs.writeFileSync(ocFile, JSON.stringify({ $schema: "https://opencode.ai/config.json", theme: "dark" }));
+            assert.match(pluginInstall("opencode"), /nothing to install/);
+            const kept = JSON.parse(fs.readFileSync(ocFile, "utf8")) as Record<string, unknown>;
+            assert.equal(kept.$schema, "https://opencode.ai/config.json");
+            assert.equal(kept.theme, "dark");
+            assert.equal(kept.mcp, undefined);
+
+            // (b) --with-mcp without a pinned env omits the environment field entirely
+            assert.match(pluginInstall("opencode", { withMcp: true }), /installed/);
+            let oc = JSON.parse(fs.readFileSync(ocFile, "utf8")) as { mcp: { bili: { command: string[]; environment?: Record<string, string> } } };
+            assert.equal(oc.mcp.bili.command[1], mcpJs);
+            assert.equal(oc.mcp.bili.environment, undefined);
+            // idempotent refresh stays origin-free
+            assert.match(pluginInstall("opencode", { withMcp: true }), /refreshed/);
+            oc = JSON.parse(fs.readFileSync(ocFile, "utf8")) as typeof oc;
+            assert.equal(oc.mcp.bili.environment, undefined);
+
+            // (c) self-heal: a stale frozen-origin entry (dead port) is removed, siblings preserved
+            fs.writeFileSync(ocFile, JSON.stringify({ mcp: { foo: { type: "remote", url: "https://foo.example/sse" }, bili: { type: "local", command: [process.execPath, mcpJs], environment: { BILI_MCP_PROXY: "http://127.0.0.1:18787" }, enabled: true } } }));
+            assert.match(pluginInstall("opencode"), /removed stale mcp\.bili/);
+            const healed = JSON.parse(fs.readFileSync(ocFile, "utf8")) as { mcp: Record<string, unknown> };
+            assert.equal(healed.mcp.bili, undefined);
+            assert.ok("foo" in healed.mcp);
+
+            // (d) a hand-authored (non-ours) mcp.bili is never clobbered
+            fs.writeFileSync(ocFile, JSON.stringify({ mcp: { bili: { type: "remote", url: "https://example.invalid/sse" } } }));
+            assert.match(pluginInstall("opencode"), /left your existing mcp\.bili untouched/);
+            const untouched = JSON.parse(fs.readFileSync(ocFile, "utf8")) as { mcp: { bili: { url: string } } };
+            assert.equal(untouched.mcp.bili.url, "https://example.invalid/sse");
+            // --with-mcp refuses to overwrite a foreign entry
+            assert.throws(() => pluginInstall("opencode", { withMcp: true }), /refusing to overwrite/);
+        });
+    } finally {
+        fs.rmSync(home, { recursive: true, force: true });
+    }
 });
 
 test("omp plugin: scoped matching, existence check, overlay redirect (issue #392)", async () => {

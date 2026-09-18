@@ -439,18 +439,68 @@ function isPlainMcpObject(v: unknown): v is Record<string, unknown> {
     return v !== null && typeof v === "object" && !Array.isArray(v);
 }
 
-function opencodeInstall(): string {
-    const file = opencodeJson();
+// #926: "ours" = command loads a bili dist/mcp.js (this install or an npm
+// install). Only such entries are removed/rewritten below; a hand-authored
+// mcp.bili is never clobbered (§7.3).
+const BILI_MCP_JS_RE = /(^|[/\\])billion-context[/\\]dist[/\\]mcp\.js$/;
+
+function isOurOpencodeMcpEntry(entry: unknown): boolean {
+    if (entry === null || typeof entry !== "object") return false;
+    const cmd = (entry as { command?: unknown }).command;
+    if (!Array.isArray(cmd)) return false;
     const mcpJs = path.join(selfPackageRoot(), "dist", "mcp.js");
-    requireDistFile(mcpJs);
+    return cmd.some((c) => typeof c === "string" && (c === mcpJs || BILI_MCP_JS_RE.test(c)));
+}
+
+export interface OpencodeInstallOptions {
+    withMcp?: boolean;
+}
+
+// #926: opencode has a native plugin API — the V2 plugin (`bili opencode`)
+// already registers the bili tools natively with auto session binding, so a
+// second MCP surface here is redundant and its frozen BILI_MCP_PROXY goes
+// stale when the launcher's ephemeral proxy restarts. Default: write nothing
+// (heal a stale generated entry away). withMcp (`--with-mcp`): write the
+// surface WITHOUT freezing the origin — resolveProxyOrigin() discovers the
+// live proxy; only a user-pinned BILI_MCP_PROXY env persists.
+
+function opencodeInstall(opts: OpencodeInstallOptions = {}): string {
+    const file = opencodeJson();
     const data = readJson(file);
     if (data.mcp != null && !isPlainMcpObject(data.mcp)) return `opencode: mcp.bili skipped ("mcp" is not an object) -> ${file}`;
     const mcp = (data.mcp as Record<string, unknown> | undefined) ?? {};
-    if ("bili" in mcp) return `opencode: already installed (${file})`;
-    mcp.bili = { type: "local", command: [process.execPath, mcpJs], environment: { BILI_MCP_PROXY: proxyOriginForInstall() }, enabled: true };
+    const existing = "bili" in mcp ? mcp.bili : undefined;
+    const ours = existing !== undefined && isOurOpencodeMcpEntry(existing);
+
+    if (!opts.withMcp) {
+        if (ours) {
+            delete mcp.bili;
+            if (Object.keys(mcp).length === 0) delete data.mcp;
+            else data.mcp = mcp;
+            writeJson(file, data);
+            return `opencode: removed stale mcp.bili from ${file} (opencode uses the built-in plugin — launch via \`bili opencode\`; pass --with-mcp to restore the MCP surface)`;
+        }
+        if (existing !== undefined) {
+            return `opencode: left your existing mcp.bili untouched (${file}); pass --with-mcp to manage the bili MCP surface`;
+        }
+        return `opencode: nothing to install — opencode uses the built-in plugin (launch via \`bili opencode\`); pass --with-mcp to add the MCP surface`;
+    }
+
+    const mcpJs = path.join(selfPackageRoot(), "dist", "mcp.js");
+    requireDistFile(mcpJs);
+    const pinned = process.env.BILI_MCP_PROXY?.trim() ?? "";
+    const environment: Record<string, string> = {};
+    if (pinned.length > 0) environment.BILI_MCP_PROXY = pinned;
+    const entry: Record<string, unknown> = { type: "local", command: [process.execPath, mcpJs], enabled: true };
+    if (Object.keys(environment).length > 0) entry.environment = environment;
+    if ("bili" in mcp && !ours) {
+        throw new Error(`${file}: mcp.bili exists but is not a bili-managed entry — refusing to overwrite it (remove it first or rename yours)`);
+    }
+    const verb = "bili" in mcp ? "refreshed" : "installed";
+    mcp.bili = entry;
     data.mcp = mcp;
     writeJson(file, data);
-    return `opencode: installed -> ${file} mcp.bili`;
+    return `opencode: ${verb} ${verb === "refreshed" ? "mcp.bili in" : "->"} ${file} mcp.bili${pinned.length > 0 ? "" : " (origin auto-discovered from the live proxy)"}`;
 }
 
 function opencodeRemove(): string {
@@ -475,8 +525,8 @@ export function isPluginAgent(value: string): value is PluginAgent {
     return (PLUGIN_AGENTS as readonly string[]).includes(value);
 }
 
-export function pluginInstall(agent: PluginAgent): string {
-    return agent === "pi" ? piInstall() : agent === "omp" ? ompInstall() : agent === "claude" ? claudeInstall() : agent === "codex" ? codexInstall() : opencodeInstall();
+export function pluginInstall(agent: PluginAgent, opts: OpencodeInstallOptions = {}): string {
+    return agent === "pi" ? piInstall() : agent === "omp" ? ompInstall() : agent === "claude" ? claudeInstall() : agent === "codex" ? codexInstall() : opencodeInstall(opts);
 }
 
 export function pluginRemove(agent: PluginAgent): string {
