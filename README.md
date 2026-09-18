@@ -153,7 +153,7 @@ Pick by your client:
 | **opencode 1.x** | `bili plugin install opencode` (self-spawning native plugin — pre-migration [`opencode-acp`](https://github.com/ranxianglei/opencode-acp) sessions keep working, see "OpenCode 1.x") or `bili opencode` (launcher) or standalone `opencode-acp` (in-process extension) |
 | **opencode 2.0+** | `bili opencode` (built-in V2 plugin — native tools, no separate package) or `bili plugin install opencode` (self-spawning native plugin, no launcher) |
 | **omp** | [`billion-context`](https://github.com/ranxianglei/billion-context) via `bili omp` (built-in plugin) |
-| **dsh** | `bili dsh` (launcher — full native plugin via `--patch`: tools, session-bound `/acp`, fetch intercept) or `bili plugin install dsh` (self-spawning native plugin, no launcher — writes the cordis patch into every profile under `~/.dsh/profiles/*/cordis.patch.yml`) |
+| **dsh** | `bili dsh` (launcher — full native plugin via `--patch`: tools, session-bound `/acp`, fetch intercept) or `bili plugin install dsh` (self-spawning native plugin, no launcher — writes the cordis patch into every profile under `~/.dsh/profiles/*/cordis.patch.yml`) or `dsh plugin --profile <name> add billion-context` (dsh-side install, no bili commands — mounts the bundled patch layer from npm) |
 | **everything else** (no context hook) | [`billion-context`](https://github.com/ranxianglei/billion-context) — `bili <client>` (launcher, preferred) or `/bili/` prefix |
 
 **Native mode vs standalone extensions.** The host-native plugins (`bili plugin install pi` / `opencode` — they spawn the proxy inside the host process) and the standalone in-process extensions (`billion-context-pi`, `opencode-acp`) are **mutually exclusive**: both active means double compression. The installer makes the switch: `bili plugin install pi` replaces the legacy `npm:billion-context-pi` entry (with a reminder that a project-scope entry in `<project>/.pi/settings.json` from `pi install -l` lives outside the global settings), and `bili plugin install opencode` strips legacy `opencode-acp` entries from the global opencode.json — bare name, `npm:` alias, versioned (`opencode-acp@stable`), or path form, array or object shape; the original config is snapshotted to `.bili-bak` once. A **project-local** install (`opencode plugin opencode-acp` writes `<project>/.opencode/opencode.json`, not the global config) is not touched — remove it by hand; the installer note reminds you. As a runtime safety net for manual installs, the native entries set `BILLION_CONTEXT_NATIVE=<host>` synchronously at load so a standalone extension can stand down at action time — its own load-time `BILLION_CONTEXT_PROXY` check cannot see a proxy that native mode spawns asynchronously, and its `/bili/` baseUrl check never sees the fetch-layer rewrite. On the pi side the marker needs `billion-context-pi` **0.1.72+** (the per-event re-check landed after 0.1.71); the pi-native entry additionally scans both pi settings files once its proxy is up and warns loudly when it spots a co-resident legacy entry the installer never saw — that warning is the only visible signal while an old `billion-context-pi` silently double-compresses.
@@ -432,6 +432,16 @@ Two lanes, same plugin (#941):
   manifest tools verbatim, and gates plugin-mode headers on tool readiness
   (round 1 rides wire mode). Opt-out: `BILI_NATIVE_DSH=0`. Remove with
   `bili plugin remove dsh`.
+- **dsh-side install (no `bili` command needed):** `dsh plugin --profile
+  <name> add billion-context` installs the npm package into the profile via
+  pnpm and mounts the bundled patch layer (`dsh.bundle.patch.yml`)
+  automatically — same plugin, same behavior as the native lane, zero bili
+  commands. The installer, the `bili dsh` launcher overlay, and
+  `plugin status` all detect bundle-installed profiles and leave them alone
+  (cordis rejects duplicate entry ids across layers, so a second
+  `id: bili-native` insert would hard-fail dsh boot). Remove with
+  `dsh plugin --profile <name> remove billion-context`. Requires a published
+  release that carries `dsh.bundle.patch.yml`.
 
 Under a `bili dsh` launch the plugin ATTACHES to the launcher's proxy (no
 second spawn). Raw upstream URLs rewrite to `<proxy>/bili/<url>` like
