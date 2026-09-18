@@ -18,6 +18,17 @@ fs.mkdirSync(WORK_ROOT, { recursive: true });
 const CWD_ROOT = path.join(os.tmpdir(), "billion-context-e2e");
 fs.mkdirSync(CWD_ROOT, { recursive: true });
 
+function repoDocLeak(dir: string): string | null {
+	let d = dir;
+	for (;;) {
+		if (fs.existsSync(path.join(d, ".git")) || fs.existsSync(path.join(d, "AGENTS.md"))) return d;
+		const parent = path.dirname(d);
+		if (parent === d) return null;
+		d = parent;
+	}
+}
+const cwdLeakDir = repoDocLeak(CWD_ROOT);
+
 function codexAvailable(): boolean {
 	try { return spawnSync(CODEX_BIN, ["--version"], { timeout: 15_000 }).status === 0; } catch { return false; }
 }
@@ -25,6 +36,9 @@ const run = process.env.ACP_TEST_E2E_FAKE === "1";
 const skipReason = !run
 	? "set ACP_TEST_E2E_FAKE=1 (real codex + local fake upstream; deterministic, zero tokens)"
 	: (!codexAvailable() ? `codex binary "${CODEX_BIN}" not found on PATH` : undefined);
+const overflowSkipReason = skipReason ?? (cwdLeakDir
+	? `#815 precondition broken: ${cwdLeakDir} holds .git/AGENTS.md above the hermetic cwd, so repo docs would leak into every payload and skew the calibrated window; point TMPDIR outside any repository`
+	: undefined);
 
 /** Deterministic filler: unique per index, bulky, carried verbatim in the prompt. */
 function filler(i: number, lines: number): string {
@@ -185,17 +199,17 @@ function turn(ctx: Ctx, prompt: string): Promise<{ code: number; last: string }>
 	});
 }
 
-test("overflow: compression really happens in codex; bulk folded, sentinels retained", { skip: skipReason }, async (t) => {
-	// Window must clear the real codex warmup floor — system prompt + tools +
-	// injected prompts, counted once input[] developer items are included in
-	// the overhead estimate (#829). Preflight fail-fast compares that local
-	// estimate, not upstream-reported tokens: 12k 502'd on the warmup turn in
-	// CI, and master's 10k (calibrated on ~14k reported tokens after #815's
-	// hermetic cwd removed the repo AGENTS.md from the payload) would fail the
-	// same way. 24k clears the measured ~18.4k pre-#815 floor (the hermetic
-	// cwd only lowers it) while per-turn filler still crosses it within a
-	// couple of load turns, keeping the forwarded payload bounded (below).
-	const ctx = await startCtx(24_000);
+test("overflow: compression really happens in codex; bulk folded, sentinels retained", { skip: overflowSkipReason }, async (t) => {
+	// Window calibration for the #829-corrected estimate (input[] developer/
+	// system items now count): clean-env turn-1 estimate ≈15.3k, overhead-only
+	// floor ≈14k (pinned codex 0.147.0, hermetic cwd). 18k clears both — no
+	// warmup fail-fast 502, preflight still engages early. 10k/12k were
+	// calibrated on the old under-counting estimate or reported tokens and
+	// 502 on the warmup turn once the system prompt counts. The 600-line
+	// filler (~5k tokens) makes the crossing decisive by turn 2 so repeated
+	// folds fit inside the five load turns; the forwarded payload must stay
+	// bounded as a result (assertion below).
+	const ctx = await startCtx(18_000);
 	t.after(() => teardown(ctx));
 
 	const planted = [4781, 2903, 6577];
@@ -203,7 +217,7 @@ test("overflow: compression really happens in codex; bulk folded, sentinels reta
 	assert.equal(warm.code, 0, `warmup failed (code=${warm.code}); log:\n${logs(ctx)}`);
 
 	for (let k = 2; k <= 5; k += 1) {
-		const r = await turn(ctx, `${filler(k, 300)}\n\n请确认已读取档案#k, 只回复: 收到#${k}`);
+		const r = await turn(ctx, `${filler(k, 600)}\n\n请确认已读取档案#k, 只回复: 收到#${k}`);
 		assert.equal(r.code, 0, `load turn ${k} failed (code=${r.code}); log:\n${logs(ctx)}`);
 	}
 
@@ -219,7 +233,7 @@ test("overflow: compression really happens in codex; bulk folded, sentinels reta
 	const lens = mains.map((m) => m.inputLen);
 	const minLen = Math.min(...lens);
 	const peak = Math.max(...lens);
-	assert.ok(peak <= minLen * 1.3, `despite ~10KB filler injected on every load turn the forwarded payload must stay bounded (min=${minLen}, peak=${peak}); unbounded growth would mean compression is not folding the bulk`);
+	assert.ok(peak <= minLen * 1.3, `despite ~20KB filler injected on every load turn the forwarded payload must stay bounded (min=${minLen}, peak=${peak}); unbounded growth would mean compression is not folding the bulk`);
 
 	const lastMain = allInputText(mains[mains.length - 1].input);
 	assert.match(lastMain, /\[Compressed conversation section\]/, "final payload must carry the summary block");
