@@ -138,6 +138,8 @@ dsh 用户可以完全不用 bili：`dsh plugin --profile <name> add billion-con
 
 窗口解析顺序:`anthropic-beta` 协商 > 逐请求 plugin 头 > runtime-info 表(agent+model 必须匹配) > launcher 环境变量 > 路由配置 > models.dev 注册表 > 内置表。上报的 `maxOutput` 仅在请求体自带输出预算缺席时兜底。现有实现:`src/agent/pi.ts`、`src/agent/opencode-native.ts`(v1)、`src/agent/opencode-v2.ts`、`src/agent/dsh-native.ts` —— 其他客户端接入请遵循同一协议。
 
+首次模型请求之前会话尚不存在,`/acp` 面板会探测 `GET /__bili/plugin/status?conversationId=<agent>&fallback=latest`,代理从 runtime-info 表应答(`phase: "pre-first-request"`)而不是返回 404 —— 上报的配置立即可见,流量落地后由真实会话接管。
+
 注意:
 
 - 原生模式与独立进程内扩展(`billion-context-pi`、`opencode-acp`)**互斥** —— 安装器负责换条目并把原配置快照(`.bili-bak`);迁移细节见上方客户端表(pi 需 `billion-context-pi` 0.1.72+ 才能干净退让)。

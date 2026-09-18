@@ -246,6 +246,21 @@ async function statusOutcome(ctx: PluginContext): Promise<CommandOutcome> {
     if (status && typeof panel === "string" && panel.length > 0) {
         return { kind: "success", text: panel };
     }
+    // #955: pre-first-request view — the proxy answers from the runtime-info
+    // table this plugin populated at bootstrap, so /acp shows the client's
+    // own model config before any model request has sized a session.
+    const ri = status?.runtimeInfo as { model?: unknown; contextWindow?: unknown; maxOutput?: unknown; source?: unknown } | null | undefined;
+    if (status !== undefined && ri !== null && ri !== undefined && (typeof ri.model === "string" || typeof ri.contextWindow === "number")) {
+        const parts: string[] = [];
+        if (typeof ri.model === "string") parts.push(`model=${ri.model}`);
+        if (typeof ri.contextWindow === "number") parts.push(`window=${ri.contextWindow}`);
+        if (typeof ri.maxOutput === "number") parts.push(`maxOut=${ri.maxOutput}`);
+        const version = await fetchProxyVersion(base);
+        return {
+            kind: "success",
+            text: `billion-context${version ? `@${version}` : ""} — proxy connected, compression armed. Runtime info${typeof ri.source === "string" ? ` (${ri.source})` : ""}: ${parts.join(" ")}. No model request yet; send one, then run /acp again for the full panel.`,
+        };
+    }
     const version = await fetchProxyVersion(base);
     if (version) {
         return {

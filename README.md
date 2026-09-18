@@ -233,6 +233,12 @@ of its own. Implementations: `src/agent/pi.ts`, `src/agent/opencode-native.ts`
 (v1), `src/agent/opencode-v2.ts`, `src/agent/dsh-native.ts` — other client
 integrations should follow the same protocol.
 
+Before the first model request there is no session yet, so the `/acp` panel
+probes `GET /__bili/plugin/status?conversationId=<agent>&fallback=latest`,
+which answers from the runtime table (`phase: "pre-first-request"`) instead
+of 404ing — the reported config is visible immediately, and the real session
+takes over once traffic lands.
+
 Notes:
 
 - Native mode is **mutually exclusive** with the standalone in-process

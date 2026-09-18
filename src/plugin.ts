@@ -586,15 +586,22 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
             // #656: name the conversation that was actually resolved — the
             // caller asked with a stale id and must learn the real one.
             resolvedConversationId = conversationIdForSession(latest.id) ?? conversationId;
-        } else {
-            res.writeHead(404, { "content-type": "application/json" });
-            res.end(JSON.stringify({ ok: false, error: "no session with activity since boot — issue a model request or pass the conversation id" }));
-            return;
         }
     }
     if (!session) {
+        // Runtime-info protocol (#955): no session exists yet, but the client
+        // may have reported its model config at bootstrap — answer from the
+        // agent-keyed runtime table so /acp works pre-first-request. Clients
+        // without a stable conversation id before their first request probe
+        // with their agent name (dsh's fetchStatusLatest sends "dsh").
+        const pre = pluginRuntimeTable.get(conversationId);
+        if (pre !== undefined) {
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: true, conversationId, phase: "pre-first-request", model: pre.model, contextLimit: pre.contextWindow ?? null, runtimeInfo: pre, panel: null }));
+            return;
+        }
         res.writeHead(404, { "content-type": "application/json" });
-        res.end(JSON.stringify({ ok: false, error: "unknown plugin conversation" }));
+        res.end(JSON.stringify({ ok: false, error: fallbackLatest ? "no session with activity since boot — issue a model request or pass the conversation id" : "unknown plugin conversation" }));
         return;
     }
     if (entry) entry.lastSeen = Date.now();

@@ -221,7 +221,7 @@ test("dshProfileDirs: skips node_modules, errors when profiles root is absent", 
 
 type MockTool = { name: string; description?: string; inputSchema: unknown };
 
-function startMockProxy(toolCalls: Array<{ conversationId: string; tool: string; args: unknown }>): Promise<{ origin: string; close: () => void }> {
+function startMockProxy(toolCalls: Array<{ conversationId: string; tool: string; args: unknown }>, statusResponder?: (url: string) => unknown | undefined): Promise<{ origin: string; close: () => void }> {
     const manifestTools: MockTool[] = [
         {
             name: "compress",
@@ -248,8 +248,14 @@ function startMockProxy(toolCalls: Array<{ conversationId: string; tool: string;
             return;
         }
         if (url.startsWith("/__bili/plugin/status")) {
+            const body = statusResponder === undefined ? { panel: "PANEL-OK" } : statusResponder(url);
+            if (body === undefined) {
+                res.writeHead(404);
+                res.end("{}");
+                return;
+            }
             res.writeHead(200, { "content-type": "application/json" });
-            res.end(JSON.stringify({ panel: "PANEL-OK" }));
+            res.end(JSON.stringify(body));
             return;
         }
         res.writeHead(404);
@@ -455,6 +461,41 @@ test("apply() runtime-info (#955): model services stamp model/window/max-output 
             assert.equal(headers?.["x-bili-plugin-model"], "qwen-ri");
             assert.equal(headers?.["x-bili-plugin-context-window"], "262144");
             assert.equal(headers?.["x-bili-plugin-max-output"], "32768");
+        });
+    } finally {
+        proxy.close();
+        fs.rmSync(home, { recursive: true, force: true });
+        _resetRegisterForTest(undefined);
+    }
+});
+
+test("apply() /acp pre-first-request (#955): renders the runtime-table entry before any model request", async () => {
+    const pre = {
+        ok: true,
+        conversationId: "dsh",
+        phase: "pre-first-request",
+        model: "qwen-ri",
+        contextLimit: 262144,
+        runtimeInfo: { agent: "dsh", model: "qwen-ri", contextWindow: 262144, maxOutput: 32768, source: "client-config" },
+        panel: null,
+    };
+    // no initiator session → statusOutcome takes the fetchStatusLatest path
+    // (conversationId=dsh&fallback=latest), which the proxy answers from the
+    // agent-keyed runtime table pre-first-request
+    const proxy = await startMockProxy([], (url) => (url.includes("conversationId=dsh&fallback=latest") ? pre : undefined));
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-pre-"));
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin }, async () => {
+            _resetRegisterForTest(proxy.origin);
+            const ctx = mockCtx();
+            apply(ctx);
+            assert.equal(ctx.registeredCommands.length, 1);
+            const out = await ctx.registeredCommands[0].handler();
+            assert.equal(out.kind, "success");
+            assert.match(out.text, /model=qwen-ri/);
+            assert.match(out.text, /window=262144/);
+            assert.match(out.text, /maxOut=32768/);
+            assert.match(out.text, /client-config/);
         });
     } finally {
         proxy.close();

@@ -4,6 +4,9 @@
 // registry/table guessing in the native-window chain.
 import assert from "node:assert/strict";
 import http from "node:http";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { once } from "node:events";
 import { afterEach, beforeEach, describe, it } from "node:test";
 
@@ -11,6 +14,7 @@ import { defaultConfig } from "acp-kernel";
 import { startServer, type ProxyOptions } from "../src/server.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
+import { _resetSessionsForTest } from "../src/session.ts";
 import {
     _resetPluginStateForTest,
     handlePluginRuntimeInfo,
@@ -148,6 +152,11 @@ interface Harness {
 }
 
 async function startHarness(): Promise<Harness> {
+    // isolate the state dir: prefix-affinity hydration reattaches anonymous
+    // sessions from disk, which would defeat the "no session yet" preconditions
+    const stateHome = fs.mkdtempSync(path.join(os.tmpdir(), "bili-ri-state-"));
+    const prevStateHome = process.env.XDG_STATE_HOME;
+    process.env.XDG_STATE_HOME = stateHome;
     const upstream = http.createServer((req, res) => {
         req.resume();
         req.on("end", () => {
@@ -162,6 +171,7 @@ async function startHarness(): Promise<Harness> {
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
     _resetPluginStateForTest();
+    _resetSessionsForTest();
     const proxy = await startServer({
         port: 0,
         host: "127.0.0.1",
@@ -185,6 +195,9 @@ async function startHarness(): Promise<Harness> {
             proxy.close();
             upstream.close();
             await Promise.allSettled([once(proxy, "close"), once(upstream, "close")]);
+            if (prevStateHome === undefined) delete process.env.XDG_STATE_HOME;
+            else process.env.XDG_STATE_HOME = prevStateHome;
+            fs.rmSync(stateHome, { recursive: true, force: true });
         },
     };
 }
@@ -250,5 +263,65 @@ describe("runtime-info in the native-window chain (#955, e2e)", () => {
         assert.equal(resp.status, 200);
         const status = await (await fetch(`http://127.0.0.1:${h!.proxyPort}/__bili/plugin/status?conversationId=conv-ri-3`)).json() as { windowSource: string | null };
         assert.notEqual(status.windowSource, "runtime-info");
+    });
+});
+
+// ---- E2E: pre-first-request /acp served from the runtime table ----
+
+describe("runtime-info pre-first-request status (#955)", () => {
+    let h: Harness | undefined;
+    beforeEach(async () => {
+        h = await startHarness();
+    });
+    afterEach(async () => {
+        await h?.close();
+        h = undefined;
+    });
+
+    it("answers from the agent-keyed table before any session exists", async () => {
+        const report = await fetch(`http://127.0.0.1:${h!.proxyPort}/__bili/plugin/runtime-info`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ agent: "dsh", model: "test-model", contextWindow: 262144, maxOutput: 32768, source: "client-config" }),
+        });
+        assert.equal(report.status, 200);
+
+        // clients without a stable conversation id probe with their agent name
+        // (fetchStatusLatest hardcodes conversationId=dsh&fallback=latest)
+        const resp = await fetch(`http://127.0.0.1:${h!.proxyPort}/__bili/plugin/status?conversationId=dsh&fallback=latest`);
+        assert.equal(resp.status, 200);
+        const json = (await resp.json()) as { ok: boolean; phase?: string; model: string | null; contextLimit: number | null; runtimeInfo: { maxOutput?: number } | null; panel: unknown };
+        assert.equal(json.ok, true);
+        assert.equal(json.phase, "pre-first-request");
+        assert.equal(json.model, "test-model");
+        assert.equal(json.contextLimit, 262144);
+        assert.equal(json.runtimeInfo?.maxOutput, 32768);
+        assert.equal(json.panel, null);
+    });
+
+    it("still 404s when nothing was reported", async () => {
+        const resp = await fetch(`http://127.0.0.1:${h!.proxyPort}/__bili/plugin/status?conversationId=dsh&fallback=latest`);
+        assert.equal(resp.status, 404);
+        const json = (await resp.json()) as { error: string };
+        assert.match(json.error, /no session with activity since boot/);
+    });
+
+    it("yields to the real session once a model request lands", async () => {
+        await fetch(`http://127.0.0.1:${h!.proxyPort}/__bili/plugin/runtime-info`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ agent: "dsh", model: "test-model", contextWindow: 262144, source: "client-config" }),
+        });
+        const req = await fetch(`http://127.0.0.1:${h!.proxyPort}/bili/http://127.0.0.1:${h!.upstreamPort}/v1/chat/completions`, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-bili-plugin": "dsh", "x-bili-plugin-conversation": "conv-pre-1" },
+            body: JSON.stringify({ model: "test-model", stream: false, messages: [{ role: "user", content: "hello" }] }),
+        });
+        assert.equal(req.status, 200);
+        const resp = await fetch(`http://127.0.0.1:${h!.proxyPort}/__bili/plugin/status?conversationId=dsh&fallback=latest`);
+        assert.equal(resp.status, 200);
+        const json = (await resp.json()) as { phase?: string; conversationId: string };
+        assert.equal(json.phase, undefined);
+        assert.equal(json.conversationId, "conv-pre-1");
     });
 });
