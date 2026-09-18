@@ -109,15 +109,25 @@ jobs:
           fi
           echo "::error::direct push to master was blocked (branch protection). Fallback: opening a release PR."
           BR="$(date -u +%Y-%m-%d)_release-v${VER}"
-          git push -q origin "HEAD:$BR"
-          curl -sS -f -X POST \
+          if ! git push -q origin "HEAD:$BR"; then
+            echo "::error::fallback branch push to ${BR} failed — nothing published, aborting."
+            exit 1
+          fi
+          RESP_FILE="$(mktemp)"
+          HTTP_CODE=$(curl -sS -o "$RESP_FILE" -w '%{http_code}' -X POST \
             -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
             -H "Content-Type: application/json" \
             "https://api.github.com/repos/${{ github.repository }}/pulls" \
-            -d "{\"title\":\"release v${VER}\",\"head\":\"${BR}\",\"base\":\"master\",\"body\":\"Auto-fallback from the one-click release workflow: direct push to master was blocked by branch protection. Merging this PR publishes via the standard release.yml flow.\\n\\n<!-- ework-agent-pr -->\"}"
+            -d "{\"title\":\"release v${VER}\",\"head\":\"${BR}\",\"base\":\"master\",\"body\":\"Auto-fallback from the one-click release workflow: direct push to master was blocked by branch protection. Merging this PR publishes via the standard release.yml flow.\\n\\n<!-- ework-agent-pr -->\"}")
+          PR_URL=$(node -e 'try{console.log(JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).html_url||"")}catch(e){console.log("")}' "$RESP_FILE")
+          echo "POST /pulls HTTP: $HTTP_CODE"
+          if [ -z "$PR_URL" ]; then
+            echo "::error::failed to open the fallback PR automatically (HTTP $HTTP_CODE): $(cat "$RESP_FILE")"
+          fi
           echo ""
-          echo "::error::nothing was published. Merge the fallback PR to finish the release."
+          echo "::notice::nothing was published yet. Finish the release by merging:"
+          echo "::notice::${PR_URL:-https://github.com/${{ github.repository }}/pull/new/${BR}}"
           exit 1
 
       - name: Check if prerelease
