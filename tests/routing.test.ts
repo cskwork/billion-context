@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { writeFileSync, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { loadOptions, lookupContextLimit, resolveContextLimit, resolveConfiguredContextLimit, resolveCompressProtocol, parseRouteEntry, parsePromptCacheRouting } from "../src/config.ts";
+import { loadOptions, lookupContextLimit, resolveContextLimit, resolveConfiguredContextLimit, resolveConfiguredOutputLimit, resolveCompressProtocol, parseRouteEntry, parsePromptCacheRouting } from "../src/config.ts";
 
 const TMP = (s: string) => join(tmpdir(), `test-acp-${process.pid}-${s}.json`);
 const writeRoutes = (name: string, obj: unknown) => {
@@ -175,6 +175,21 @@ test("configured context lookup stays separate from registry/built-in fallbacks"
     const routes = { "https://api.openai.com": { models: {} } };
     assert.equal(resolveConfiguredContextLimit(routes, "https://api.openai.com/v1/responses", "gpt-5"), undefined);
     assert.equal(resolveContextLimit(routes, "https://api.openai.com/v1/responses", "gpt-5"), 400_000);
+});
+
+// #924: configured ModelEntry.output feeds the output-headroom fallback chain
+// (request carries no budget → configured output → registry ceiling → 0).
+test("resolveConfiguredOutputLimit mirrors the context-limit resolution", () => {
+    const routes = {
+        "https://api.openai.com": { models: { "gpt-5": { context: 400_000, output: 128_000 } } },
+        "https://api.openai.com/v1/responses": { models: { "gpt-5": { output: 64_000 } } },
+    };
+    assert.equal(resolveConfiguredOutputLimit(routes, "https://api.openai.com/v1/responses", "gpt-5"), 64_000, "longest key wins");
+    assert.equal(resolveConfiguredOutputLimit(routes, "https://api.openai.com/v1/chat/completions", "gpt-5"), 128_000);
+    assert.equal(resolveConfiguredOutputLimit(routes, "https://api.openai.com", "other-model"), undefined, "undeclared model");
+    assert.equal(resolveConfiguredOutputLimit(routes, "https://api.other.com", "gpt-5"), undefined, "unmatched route");
+    assert.equal(resolveConfiguredOutputLimit({ "https://api.openai.com": { models: { "gpt-5": { context: 400_000 } } } }, "https://api.openai.com", "gpt-5"), undefined, "context-only entry has no output");
+    assert.equal(resolveConfiguredOutputLimit({ "https://api.openai.com": { models: { "gpt-5": { output: 0 } } } }, "https://api.openai.com", "gpt-5"), undefined, "non-positive output ignored");
 });
 
 test("no matching key and unknown model returns undefined", () => {

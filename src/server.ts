@@ -10,8 +10,8 @@ import { DEFAULT_STRIP_IMAGES_KEEP_RECENT, stripHistoricalImages } from "./strip
 import type { ProxyOptions } from "./config.js";
 import { loadOptions, loadRoutes } from "./config.js";
 import { resetProxyCache } from "./upstream-proxy.js";
-import { FALLBACK_EFFECTIVE_WINDOW_FLOOR, findRoute, lookupContextLimit, resolveConfiguredContextLimit, resolveCompressProtocol } from "./config.js";
-import { contextFromRegistry, loadRegistry, peekRegistryContext } from "./registry.js";
+import { FALLBACK_EFFECTIVE_WINDOW_FLOOR, findRoute, lookupContextLimit, resolveConfiguredContextLimit, resolveConfiguredOutputLimit, resolveCompressProtocol } from "./config.js";
+import { contextFromRegistry, loadRegistry, peekRegistryContext, peekRegistryOutputLimit } from "./registry.js";
 import { codexAlignedWindow } from "./codex-models.js";
 import { fetchWithTimeout, MAX_REQUEST_BYTES, upstreamTimeoutMs } from "./fetch-util.js";
 import { formatUpstreamError, getUpstreamConnectionStatus, recordUpstreamConnection, resolveProxy, resolveProxyDecision, proxyDispatcher, type UpstreamProxyDecision } from "./upstream-proxy.js";
@@ -585,6 +585,10 @@ function adminTrustedHosts(bindHost: string, port: number): Set<string> {
     }
     return set;
 }
+
+// #924: one-time-per-model log for the output-budget fallback (request carries
+// no budget → configured/registry max output) — same pattern as windowSourceLogged.
+const headroomFallbackLogged = new Set<string>();
 
 async function handle(
     req: http.IncomingMessage,
@@ -1422,8 +1426,10 @@ async function handle(
         // exempt: its input limit is enforced independently of max_tokens
         // (separate output budget), so reserving would shift every band down by
         // maxOutput on every session for no safety gain — see
-        // shouldReserveOutputHeadroom. max_tokens is the exact output budget
-        // requested for THIS turn, so the reservation is precise and per-request.
+        // shouldReserveOutputHeadroom. The request's own budget field is the exact
+        // output budget requested for THIS turn, so it is precise and per-request;
+        // when the harness omits every budget field (#924 fallback below) the
+        // model's declared max output stands in for it.
         // #896: headroomCap (compress.outputHeadroomMaxPct, default 0.25, aligned
         // with billion-context-pi #207) caps the reservation at headroomCap × window
         // — reserved = min(maxOutput, headroomCap × window). Replies longer than the
@@ -1436,7 +1442,35 @@ async function handle(
         if (shouldReserveOutputHeadroom(protocol)) {
             const p = parsed as Record<string, unknown>;
             const rawMax = p.max_tokens ?? p.max_completion_tokens ?? p.max_output_tokens;
-            const maxOutput = typeof rawMax === "number" ? rawMax : 0;
+            let maxOutput = typeof rawMax === "number" ? rawMax : 0;
+            // #924: harnesses that omit every output-budget field (Codex native
+            // Responses sends no max_output_tokens — openai/codex#36180) still get
+            // the upstream's own default output cap applied, so reserving nothing
+            // leaves the nudge/truncate bands able to overflow with one long
+            // reply. Fall back to the model's declared max output — per-route
+            // config first (operator-declared, outranks auto-fetched data, same
+            // order as the window resolution #344), then the models.dev registry
+            // ceiling (cache-only + bundled-snapshot floor, never fetches — the
+            // source preflight's summary cap uses, #853) — through the SAME capped
+            // reservation below. Unknown model → 0 → today's behavior.
+            if (!(maxOutput > 0)) {
+                const fbModel = (parsed as { model?: string }).model;
+                if (fbModel) {
+                    let host: string | undefined;
+                    try { host = route?.rewrittenUrl ? new URL(route.rewrittenUrl).host : undefined; } catch { host = undefined; }
+                    const cfgOut = resolveConfiguredOutputLimit(opts.routes, route?.rewrittenUrl, fbModel);
+                    const regOut = peekRegistryOutputLimit(fbModel, host);
+                    const budget = cfgOut !== undefined ? cfgOut : regOut;
+                    if (typeof budget === "number" && budget > 0) {
+                        maxOutput = budget;
+                        const source = cfgOut !== undefined ? "configured" : "registry";
+                        if (!headroomFallbackLogged.has(`${fbModel}|${source}`)) {
+                            headroomFallbackLogged.add(`${fbModel}|${source}`);
+                            log("info", `[headroom] model=${fbModel}: request carries no output budget; reserving against ${source} max output ${budget} (#924)`);
+                        }
+                    }
+                }
+            }
             let reserved = reserveOutputHeadroom(reqConfig.modelContextLimit, maxOutput, headroomCap);
             // Fallback-derived windows are optimistic guesses: never let the
             // output-headroom reservation push the effective window below the
