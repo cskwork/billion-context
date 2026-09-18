@@ -2362,7 +2362,8 @@ test("writeDshAcpPatch: writes insert overlay with file:// plugin URL into <home
         assert.equal(file, path.join(`${dir}-bili`, ".bili-acp.patch.yml"));
         const txt = fs.readFileSync(file, "utf8");
         assert.ok(txt.startsWith("- insert:\n"));
-        assert.match(txt, /^ {4}- name: file:\/\/.+dsh-acp\.js\n$/m);
+        assert.match(txt, /^ {4}- id: bili-native\n {6}name: file:\/\/.+dsh-native\.js$/m);
+        assert.match(txt, /^- id: compaction-basic\n  config:\n    auto: false\n$/m);
         fs.rmSync(`${dir}-bili`, { recursive: true, force: true });
     } finally {
         fs.rmSync(dir, { recursive: true, force: true });
@@ -2608,7 +2609,8 @@ test("runLaunch dsh: non-loopback upstreams ride proxy envs, loopback keeps the 
         assert.ok(fs.existsSync(patchFile));
         const patchTxt = fs.readFileSync(patchFile, "utf8");
         assert.ok(patchTxt.startsWith("- insert:\n"));
-        assert.ok(/- name: file:\/\/\/.*dsh-acp\.js\n/.test(patchTxt));
+        assert.ok(/- id: bili-native\n {6}name: file:\/\/\/.*dsh-native\.js\n/.test(patchTxt));
+        assert.match(patchTxt, /^- id: compaction-basic\n  config:\n    auto: false\n$/m);
         assert.deepEqual(argsSeen[0], ["--patch", patchFile, "--profile", "headless", "task"]);
         fs.rmSync(overlay, { recursive: true, force: true });
     } finally {

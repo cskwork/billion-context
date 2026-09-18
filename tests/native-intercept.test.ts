@@ -239,3 +239,133 @@ test("install: a consumed-body Request throws without triggering a respawn", asy
         _resetForTest();
     }
 });
+
+test("routedBiliModelUrl: extracts the embedded model URL from /bili/ form", async () => {
+    const { routedBiliModelUrl } = await import("../src/agent/native-intercept.ts");
+    assert.equal(routedBiliModelUrl("http://127.0.0.1:40001/bili/http://127.0.0.1:8199/v1/messages"), "http://127.0.0.1:8199/v1/messages");
+    assert.equal(routedBiliModelUrl("http://127.0.0.1:40001/bili/https://api.anthropic.com/v1/messages?beta=1"), "https://api.anthropic.com/v1/messages?beta=1");
+    // non-model embedded targets and plugin endpoints do not count
+    assert.equal(routedBiliModelUrl("http://127.0.0.1:40001/bili/https://registry.npmjs.org/pkg"), undefined);
+    assert.equal(routedBiliModelUrl("http://127.0.0.1:40001/__bili/plugin/manifest"), undefined);
+    assert.equal(routedBiliModelUrl("http://127.0.0.1:8199/v1/messages"), undefined);
+});
+
+test("install: headersFor stamps an already-routed /bili/ request without rewriting (#941)", async () => {
+    const saved = globalThis.fetch;
+    _resetForTest();
+    const seen: Array<{ url: string; headers: Record<string, string> }> = [];
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input instanceof URL ? input.href : (input as Request).url;
+        const headers: Record<string, string> = {};
+        if (init?.headers instanceof Headers) {
+            init.headers.forEach((v, k) => (headers[k] = v));
+        } else if (Array.isArray(init?.headers)) {
+            for (const [k, v] of init?.headers as Array<[string, string]>) headers[k] = v;
+        } else if (init?.headers && typeof init.headers === "object") {
+            Object.assign(headers, init.headers as Record<string, string>);
+        }
+        seen.push({ url, headers });
+        return new Response("{}", { status: 200 });
+    }) as typeof fetch;
+    try {
+        const state: NativeInterceptState = {
+            origin: "http://127.0.0.1:40001",
+            ready: Promise.resolve("http://127.0.0.1:40001"),
+            headersFor: () => ({ "x-bili-plugin": "dsh", "x-bili-plugin-conversation": "session-1" }),
+        };
+        assert.equal(installNativeFetchIntercept(state), true);
+        await globalThis.fetch("http://127.0.0.1:40001/bili/http://127.0.0.1:8199/v1/messages", { method: "POST", headers: { "content-type": "application/json" } });
+        assert.equal(seen.length, 1);
+        assert.equal(seen[0].url, "http://127.0.0.1:40001/bili/http://127.0.0.1:8199/v1/messages");
+        assert.equal(seen[0].headers["x-bili-plugin"], "dsh");
+        assert.equal(seen[0].headers["x-bili-plugin-conversation"], "session-1");
+        assert.equal(seen[0].headers["content-type"], "application/json");
+    } finally {
+        globalThis.fetch = saved;
+        _resetForTest();
+    }
+});
+
+test("install: attach mode never rewrites, only stamps (#941)", async () => {
+    const saved = globalThis.fetch;
+    _resetForTest();
+    const seen: Array<{ url: string; headers: Record<string, string> }> = [];
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input instanceof URL ? input.href : (input as Request).url;
+        const headers: Record<string, string> = {};
+        const h = init?.headers;
+        if (h instanceof Headers) {
+            h.forEach((v, k) => (headers[k] = v));
+        } else if (Array.isArray(h)) {
+            for (const [k, v] of h as Array<[string, string]>) headers[k] = v;
+        } else if (h && typeof h === "object") {
+            Object.assign(headers, h as Record<string, string>);
+        } else if (input instanceof Request) {
+            input.headers.forEach((v, k) => (headers[k] = v));
+        }
+        seen.push({ url, headers });
+        return new Response("{}", { status: 200 });
+    }) as typeof fetch;
+    try {
+        const state: NativeInterceptState = {
+            origin: "http://127.0.0.1:40001",
+            ready: Promise.resolve("http://127.0.0.1:40001"),
+            attach: true,
+            headersFor: (url) => (url.includes("8199") ? { "x-bili-plugin": "dsh" } : undefined),
+        };
+        assert.equal(installNativeFetchIntercept(state), true);
+        // plain-object init headers
+        await globalThis.fetch("http://127.0.0.1:8199/v1/messages", { method: "POST", headers: { "x-keep": "1" } });
+        // Headers-instance init headers
+        await globalThis.fetch("http://127.0.0.1:8199/v1/messages", { method: "POST", headers: new Headers({ "x-keep": "2" }) });
+        // entries-array init headers
+        await globalThis.fetch("http://127.0.0.1:8199/v1/messages", { method: "POST", headers: [["x-keep", "3"]] });
+        // no init at all
+        await globalThis.fetch("http://127.0.0.1:8199/v1/messages");
+        assert.deepEqual(
+            seen.map((s) => s.url),
+            [
+                "http://127.0.0.1:8199/v1/messages",
+                "http://127.0.0.1:8199/v1/messages",
+                "http://127.0.0.1:8199/v1/messages",
+                "http://127.0.0.1:8199/v1/messages",
+            ],
+        );
+        for (const [i, s] of seen.entries()) {
+            assert.equal(s.headers["x-bili-plugin"], "dsh", `call ${i}`);
+            if (i < 3) assert.equal(s.headers["x-keep"], String(i + 1), `call ${i}`);
+        }
+        // headersFor undefined → untouched send (no plugin headers)
+        const state2URL = "http://127.0.0.1:9000/v1/messages";
+        await globalThis.fetch(state2URL);
+        assert.equal(seen[4].url, state2URL);
+        assert.equal(seen[4].headers["x-bili-plugin"], undefined);
+    } finally {
+        globalThis.fetch = saved;
+        _resetForTest();
+    }
+});
+
+test("install: spawn mode stamps headers on the rewritten request (#941)", async () => {
+    const saved = globalThis.fetch;
+    _resetForTest();
+    let headerDump = "";
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+        const h = new Headers(init?.headers);
+        headerDump = h.get("x-bili-plugin") ?? "";
+        return new Response("{}", { status: 200 });
+    }) as typeof fetch;
+    try {
+        const state: NativeInterceptState = {
+            origin: "http://127.0.0.1:40001",
+            ready: Promise.resolve("http://127.0.0.1:40001"),
+            headersFor: () => ({ "x-bili-plugin": "dsh" }),
+        };
+        assert.equal(installNativeFetchIntercept(state), true);
+        await globalThis.fetch("http://127.0.0.1:8199/v1/messages", { method: "POST", headers: { "content-type": "application/json" } });
+        assert.equal(headerDump, "dsh");
+    } finally {
+        globalThis.fetch = saved;
+        _resetForTest();
+    }
+});

@@ -21,8 +21,17 @@ export interface NativeInterceptState {
     onGiveUp?: () => void;
     /** Attach mode (#809): route through a user-supplied external proxy at
      *  state.origin instead of a spawned one — no respawn, fail-closed on
-     *  death. Set by the host entry when BILLION_CONTEXT_ATTACH is present. */
+     *  death. Set by the host entry when BILLION_CONTEXT_ATTACH is present.
+     *  In attach mode the patch NEVER rewrites the URL (the launcher's proxy
+     *  envs / settings overlay own routing) — it only stamps headers. */
     attach?: boolean;
+    /** Optional header hook (#941): called synchronously per model-API
+     *  request with the (pre-rewrite) target URL. A non-undefined return is
+     *  merged into the outgoing request headers — dsh-native uses it to
+     *  stamp x-bili-plugin* once its tools are registered, gating plugin
+     *  mode exactly like pi.ts's before_provider_headers stamp. Returning
+     *  undefined sends the request untouched (wire mode). */
+    headersFor?: (url: string) => Record<string, string> | undefined;
     /** How long a pre-ready model request waits for the bootstrap before
      *  falling back to a direct (uncompressed) send. */
     readyTimeoutMs?: number;
@@ -56,6 +65,18 @@ export function isModelApiUrl(url: string): boolean {
     }
 }
 
+/** A URL already routed by a bili proxy in `/bili/` rewrite form
+ *  (`${proxy}/bili/${upstream}`): returns the embedded upstream URL when it
+ *  is model-API shaped, else undefined. The launcher's settings overlay
+ *  produces these; the patch does not rewrite them (routing is already
+ *  done) but DOES stamp plugin headers on them. */
+export function routedBiliModelUrl(url: string): string | undefined {
+    if (!/^https?:\/\//i.test(url) || url.includes("/__bili/") || url.includes("/__acp/")) return undefined;
+    const m = /^https?:\/\/[^/]+\/bili\/(https?:\/.+)$/i.exec(url);
+    if (m === null) return undefined;
+    return isModelApiUrl(m[1]) ? m[1] : undefined;
+}
+
 function fetchUrlOf(input: string | URL | Request): string | undefined {
     try {
         if (typeof input === "string") return input;
@@ -67,6 +88,39 @@ function fetchUrlOf(input: string | URL | Request): string | undefined {
         // fallthrough
     }
     return undefined;
+}
+
+/** Merge extra headers into a (input, init) pair, preserving all three
+ *  init.headers forms (Headers instance, entries array, plain object) and
+ *  rebuilding a Request-object input with the merged headers (its body
+ *  stream passes through explicitly — undici refuses to copy a body-bearing
+ *  Request without duplex). Returns the original pair unchanged when there
+ *  is nothing to merge. */
+function withHeaders(input: string | URL | Request, init: RequestInit | undefined, extra: Record<string, string> | undefined): { input: string | URL | Request; init: RequestInit | undefined } {
+    if (extra === undefined || Object.keys(extra).length === 0) return { input, init };
+    if (input instanceof Request) {
+        try {
+            const headers = new Headers(input.headers);
+            for (const [k, v] of Object.entries(extra)) headers.set(k, v);
+            const rebuilt = new Request(input.url, { method: input.method, headers, body: input.body, duplex: "half" });
+            return { input: rebuilt, init };
+        } catch {
+            return { input, init };
+        }
+    }
+    if (init?.headers === undefined) return { input, init: { ...init, headers: { ...extra } } };
+    if (init.headers instanceof Headers) {
+        const headers = new Headers(init.headers);
+        for (const [k, v] of Object.entries(extra)) headers.set(k, v);
+        return { input, init: { ...init, headers } };
+    }
+    if (Array.isArray(init.headers)) {
+        return { input, init: { ...init, headers: [...init.headers, ...Object.entries(extra)] } };
+    }
+    if (typeof init.headers === "object" && init.headers !== null) {
+        return { input, init: { ...init, headers: { ...(init.headers as Record<string, string>), ...extra } } };
+    }
+    return { input, init };
 }
 
 async function withTimeout(p: Promise<string | undefined>, ms: number): Promise<string | undefined> {
@@ -98,7 +152,17 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
 
     const patched = async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
         const url = fetchUrlOf(input);
-        if (url === undefined || !isModelApiUrl(url)) return orig(input, init);
+        if (url === undefined) return orig(input, init);
+        // Already-routed `/bili/` model requests (launcher settings overlay):
+        // routing is done, but plugin headers still decide wire vs plugin
+        // mode — stamp and pass through untouched otherwise.
+        const routedTarget = routedBiliModelUrl(url);
+        if (routedTarget !== undefined) {
+            const stamped = withHeaders(input, init, state.headersFor?.(routedTarget));
+            state.onDispatch?.(url, "self");
+            return orig(stamped.input, stamped.init);
+        }
+        if (!isModelApiUrl(url)) return orig(input, init);
 
         // Rebuild a Request-object input against the rewritten target. A
         // caller-side defect here (already-consumed or locked body) must not
@@ -118,6 +182,14 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
             state.onDispatch?.(url, "direct");
             return orig(input, init);
         }
+        // Attach mode: the launcher/user-supplied proxy owns routing (proxy
+        // envs, settings overlay, MITM) — leave the URL exactly as written
+        // and only stamp headers when the host says so.
+        if (state.attach === true) {
+            const stamped = withHeaders(input, init, state.headersFor?.(url));
+            state.onDispatch?.(url, "rewrite");
+            return orig(stamped.input, stamped.init);
+        }
         if (url.startsWith(`${origin}/`)) {
             state.onDispatch?.(url, "self");
             return orig(input, init);
@@ -125,7 +197,8 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
         const first = makeTarget(`${origin}/bili/${url}`);
         state.onDispatch?.(`${origin}/bili/${url}`, "rewrite");
         try {
-            return await orig(first, init);
+            const stamped = withHeaders(first, init, state.headersFor?.(url));
+            return await orig(stamped.input, stamped.init);
         } catch (err) {
             // The spawned proxy can die mid-session (its parent watchdog
             // fires when the FIRST owning pi exits while later sessions
@@ -138,7 +211,8 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
                 if (again !== undefined) {
                     const retried = makeTarget(`${again}/bili/${url}`);
                     state.onDispatch?.(`${again}/bili/${url}`, "retry");
-                    return await orig(retried, init);
+                    const stamped = withHeaders(retried, init, state.headersFor?.(url));
+                    return await orig(stamped.input, stamped.init);
                 }
                 // Respawn failed — this session runs direct for its lifetime.
                 // Degrade exactly like a bootstrap failure: actually send the

@@ -19,9 +19,9 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { execFileSync } from "node:child_process";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { applyEdits, modify as jsoncModify, parse as jsoncParse, type ParseError } from "jsonc-parser";
-import { resolvePiHome } from "./client-config.js";
+import { resolveDshHome, resolvePiHome } from "./client-config.js";
 import { isPidAlive, isProxyInstanceFile, readProxyInstanceFile } from "./instance.js";
 
 /** #403: never freeze a dead or unverifiable origin into a client's
@@ -41,7 +41,7 @@ function proxyOriginForInstall(): string {
     return inst.origin;
 }
 
-export const PLUGIN_AGENTS = ["pi", "omp", "claude", "codex", "opencode"] as const;
+export const PLUGIN_AGENTS = ["pi", "omp", "claude", "codex", "opencode", "dsh"] as const;
 export type PluginAgent = (typeof PLUGIN_AGENTS)[number];
 
 export function selfPackageRoot(): string {
@@ -857,6 +857,136 @@ function opencodeStatus(): string {
     return (isPlainMcpObject(mcp) && "bili" in mcp) || listed ? "installed" : "not installed";
 }
 
+// — dsh ————————————————————————————————————————————————————————————————
+
+const DSH_PATCH_BEGIN = "# bili begin (managed by billion-context — `bili plugin install dsh`)";
+const DSH_PATCH_END = "# bili end";
+
+const DSH_PATCH_HEADER = "# Your patch layer for this dsh profile, applied after every bundle layer:\n# a top-level YAML array of loader patch entries (id-targeted config\n# overrides, disables, and insert lists; `!!js` expressions allowed).\n";
+
+/** Every profile's user-layer cordis.patch.yml under $DSH_HOME/profiles/*.
+ *  dsh creates a profile dir per `--profile` on first boot; a missing
+ *  profiles root means dsh has never run. Returns the dirs that exist (the
+ *  patch file itself may still be absent — dsh materializes it lazily). */
+export function dshProfileDirs(env: NodeJS.ProcessEnv = process.env): string[] {
+    const profiles = path.join(resolveDshHome(env), "profiles");
+    let entries: fs.Dirent[];
+    try {
+        entries = fs.readdirSync(profiles, { withFileTypes: true });
+    } catch (err) {
+        if ((err as { code?: string }).code === "ENOENT") {
+            throw new Error(`no dsh profiles found under ${profiles} — run dsh once (any profile) so the profile dirs exist, then retry`);
+        }
+        throw err;
+    }
+    return entries.filter((e) => e.isDirectory() && e.name !== "node_modules").map((e) => path.join(profiles, e.name));
+}
+
+/** The managed block text appended to every profile's cordis.patch.yml:
+ *  the native plugin insert (id bili-native, file:// URL to this install's
+ *  dist/agent/dsh-native.js) plus the compaction-basic auto:false override —
+ *  dsh's native auto-compaction stands down because the bili proxy owns
+ *  compression. A patch replaces the target row's whole `config`, and
+ *  dsh-base ships compaction-basic with no config, so {auto:false} is
+ *  complete. */
+export function dshManagedPatchBlock(root: string): string {
+    const pluginUrl = pathToFileURL(path.join(root, "dist", "agent", "dsh-native.js")).href;
+    return `${DSH_PATCH_BEGIN}\n- insert:\n    - id: bili-native\n      name: ${pluginUrl}\n- id: compaction-basic\n  config:\n    auto: false\n${DSH_PATCH_END}\n`;
+}
+
+/** Text-level managed-block strip: everything from the begin marker through
+ *  the end marker (inclusive). Text-level (not YAML-parse-level) on purpose —
+ *  the file is user-authored and must keep every comment and entry we did
+ *  not write. */
+export function stripDshManagedPatch(text: string): string {
+    const begin = text.indexOf(DSH_PATCH_BEGIN);
+    if (begin < 0) return text;
+    const endMarker = text.indexOf(DSH_PATCH_END, begin);
+    if (endMarker < 0) return text.slice(0, begin);
+    let after = endMarker + DSH_PATCH_END.length;
+    if (text[after] === "\n") after += 1;
+    return text.slice(0, begin) + text.slice(after);
+}
+
+/** Merge the managed block into one profile's patch text: strip any previous
+ *  block, drop a placeholder `[]` root (appending list items after `[]`
+ *  would be invalid YAML), re-append the current block. Comment header and
+ *  user entries survive untouched. */
+export function mergeDshManagedPatch(text: string, block: string): string {
+    let base = stripDshManagedPatch(text).replace(/\n+$/, "\n");
+    const meaningful = base.split("\n").filter((l) => l.trim().length > 0 && !l.trimStart().startsWith("#"));
+    if (meaningful.length === 0 || (meaningful.length === 1 && meaningful[0].trim() === "[]")) {
+        // empty / comment-only / placeholder root — comments only survive
+        base = base.split("\n").filter((l) => l.trimStart().startsWith("#")).join("\n");
+        base = base.length > 0 ? `${base.replace(/\n+$/, "")}\n` : DSH_PATCH_HEADER;
+    }
+    return base + block;
+}
+
+/** Restore the pristine comment-header + `[]` shape after removal when the
+ *  remainder carries no real entries (a comment-only file parses as null,
+ *  and an empty file surprises nobody — but dsh's own first-boot materializes
+ *  exactly this shape, so match it). */
+function restoreDshPatchPlaceholder(text: string): string {
+    const meaningful = text.split("\n").filter((l) => l.trim().length > 0 && !l.trimStart().startsWith("#"));
+    if (meaningful.length > 0) return text.replace(/\n+$/, "\n");
+    const comments = text.split("\n").filter((l) => l.trimStart().startsWith("#")).join("\n");
+    const header = comments.length > 0 ? `${comments}\n` : DSH_PATCH_HEADER;
+    return `${header}[]\n`;
+}
+
+function dshInstall(): string {
+    const root = selfPackageRoot();
+    requireDistFile(path.join(root, "dist", "agent", "dsh-native.js"));
+    const block = dshManagedPatchBlock(root);
+    const notes: string[] = [];
+    let touched = 0;
+    for (const dir of dshProfileDirs()) {
+        const file = path.join(dir, "cordis.patch.yml");
+        let text: string;
+        try {
+            text = fs.readFileSync(file, "utf8");
+        } catch {
+            text = DSH_PATCH_HEADER;
+        }
+        fs.writeFileSync(file, mergeDshManagedPatch(text, block));
+        touched += 1;
+    }
+    if (fs.existsSync(resolveDshHome(process.env)) && touched === 0) notes.push("no profile directories found");
+    return `wrote bili-native plugin + compaction off into ${touched} dsh profile(s) under ${path.join(resolveDshHome(process.env), "profiles")}${notes.length > 0 ? ` (${notes.join("; ")})` : ""} — restart dsh to load it`;
+}
+
+function dshRemove(): string {
+    let touched = 0;
+    for (const dir of dshProfileDirs()) {
+        const file = path.join(dir, "cordis.patch.yml");
+        let text: string;
+        try {
+            text = fs.readFileSync(file, "utf8");
+        } catch {
+            continue;
+        }
+        if (!text.includes(DSH_PATCH_BEGIN)) continue;
+        fs.writeFileSync(file, restoreDshPatchPlaceholder(stripDshManagedPatch(text)));
+        touched += 1;
+    }
+    return `removed the bili patch from ${touched} dsh profile(s) — restart dsh to finish`;
+}
+
+function dshStatus(): string {
+    const dirs = dshProfileDirs();
+    const withBlock = dirs.filter((dir) => {
+        try {
+            return fs.readFileSync(path.join(dir, "cordis.patch.yml"), "utf8").includes(DSH_PATCH_BEGIN);
+        } catch {
+            return false;
+        }
+    });
+    if (withBlock.length === dirs.length && dirs.length > 0) return "installed";
+    if (withBlock.length > 0) return `installed in ${withBlock.length}/${dirs.length} profiles — rerun install to fix`;
+    return "not installed";
+}
+
 // — dispatch ————————————————————————————————————————————————————————————
 
 export function isPluginAgent(value: string): value is PluginAgent {
@@ -864,11 +994,11 @@ export function isPluginAgent(value: string): value is PluginAgent {
 }
 
 export function pluginInstall(agent: PluginAgent, opts: { withMcp?: boolean } = {}): string {
-    return agent === "pi" ? piInstall() : agent === "omp" ? ompInstall() : agent === "claude" ? claudeInstall() : agent === "codex" ? codexInstall() : opencodeInstall(opts.withMcp === true);
+    return agent === "pi" ? piInstall() : agent === "omp" ? ompInstall() : agent === "claude" ? claudeInstall() : agent === "codex" ? codexInstall() : agent === "dsh" ? dshInstall() : opencodeInstall(opts.withMcp === true);
 }
 
 export function pluginRemove(agent: PluginAgent): string {
-    return agent === "pi" ? piRemove() : agent === "omp" ? ompRemove() : agent === "claude" ? claudeRemove() : agent === "codex" ? codexRemove() : opencodeRemove();
+    return agent === "pi" ? piRemove() : agent === "omp" ? ompRemove() : agent === "claude" ? claudeRemove() : agent === "codex" ? codexRemove() : agent === "dsh" ? dshRemove() : opencodeRemove();
 }
 
 export function pluginStatusAll(): Array<{ agent: string; status: string }> {
@@ -878,6 +1008,7 @@ export function pluginStatusAll(): Array<{ agent: string; status: string }> {
         ["claude", claudeStatus],
         ["codex", codexStatus],
         ["opencode", opencodeStatus],
+        ["dsh", dshStatus],
     ];
     return checks.map(([agent, check]) => {
         try {

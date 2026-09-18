@@ -943,8 +943,8 @@ test("plugin install/remove roundtrips for pi/omp/codex/opencode under a fake HO
         assert.match(pluginRemove("claude"), /not installed/);
 
         const rows = pluginStatusAll();
-        assert.equal(rows.length, 5);
-        assert.deepEqual(PLUGIN_AGENTS, ["pi", "omp", "claude", "codex", "opencode"]);
+        assert.equal(rows.length, 6);
+        assert.deepEqual(PLUGIN_AGENTS, ["pi", "omp", "claude", "codex", "opencode", "dsh"]);
     });
     fs.rmSync(home, { recursive: true, force: true });
 });
@@ -1222,7 +1222,7 @@ test("plugin list survives a broken host config (per-row error, no crash)", asyn
     await withEnv(hintEnv(home, piAgentDir), async () => {
         fs.writeFileSync(path.join(home, ".claude.json"), "{ broken json");
         const rows = pluginStatusAll();
-        assert.equal(rows.length, 5);
+        assert.equal(rows.length, 6);
         const claude = rows.find((r) => r.agent === "claude")!;
         assert.match(claude.status, /error: .*not valid JSON/);
         const pi = rows.find((r) => r.agent === "pi")!;
