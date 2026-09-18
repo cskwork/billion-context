@@ -150,7 +150,7 @@ Pick by your client:
 | Client | Use |
 |---|---|
 | **pi** | [`billion-context-pi`](https://github.com/ranxianglei/billion-context-pi) (in-process extension) |
-| **opencode 1.x** | [`opencode-acp`](https://github.com/ranxianglei/opencode-acp) (in-process extension, V1 plugin API) or `bili opencode` |
+| **opencode 1.x** | `bili plugin install opencode` (V1 `.server()` hooks — same wrapper as 2.x) or `bili opencode` (launcher) or [`opencode-acp`](https://github.com/ranxianglei/opencode-acp) (in-process extension) |
 | **opencode 2.0+** | `bili opencode` (built-in V2 plugin — native tools, no separate package) or `bili plugin install opencode` (self-spawning native plugin, no launcher) |
 | **omp** | [`billion-context`](https://github.com/ranxianglei/billion-context) via `bili omp` (built-in plugin) |
 | **everything else** (no context hook) | [`billion-context`](https://github.com/ranxianglei/billion-context) — `bili <client>` (launcher, preferred) or `/bili/` prefix |
@@ -274,13 +274,28 @@ contract:
   `dist/agent/opencode-native.js`) and sets `compaction.auto: false`, after
   which plain `opencode` works as-is. At load the plugin bootstraps its own
   proxy (attaches to a healthy instance instead of doubling; parent-pid
-  watchdog kills it when opencode exits), routes model-API traffic through the
-  `http.request` hook to `<proxy>/bili/<upstream-url>`, and exposes the same
-  native bili tools as launcher mode — no fixed port, no env var, no launcher.
+  watchdog kills it when opencode exits), routes model-API traffic to
+  `<proxy>/bili/<upstream-url>`, and exposes the same native bili tools as
+  launcher mode — no fixed port, no env var, no launcher.
   Opt-out: `BILI_NATIVE_OPENCODE=0`. If no proxy can be made healthy, requests
   go direct (uncompressed) with a one-time warning and recover automatically.
   Under a `bili opencode` launch this entry is skipped entirely (the launcher
   owns the proxy).
+
+  The same wrapper serves **OpenCode 1.x** through the V1 `.server()` hooks
+  (verified on 1.14.46 and 1.18.31): the `config` hook mutates the shared
+  config object in-process to rewrite every provider `options.baseURL` to
+  `<proxy>/bili/…` and sets `compaction.auto: false`; `chat.headers` stamps
+  the plugin headers per request; `tool` registers the bili tools with real
+  zod shapes (zod is a runtime dependency — when it cannot be resolved the
+  plugin degrades to plain proxy mode: rewrite only, wire-injected tools);
+  the `/acp` command renders the same status panel. Providers **without**
+  an explicit `baseURL` (SDK defaults, e.g. bare `@ai-sdk/openai` →
+  api.openai.com) are caught by a global `fetch` patch (the pi-native
+  mechanism) that reroutes model-API calls to the proxy — verified end-to-end
+  on 1.14.46 and 1.18.31 (log: `v1: fetch patch installed`), including the
+  OpenAI Responses endpoint. The patch is idempotent and passes
+  `/bili/`-wrapped URLs through untouched.
 - **Pure proxy:** point the provider baseURL at the proxy like any other
   client:
 

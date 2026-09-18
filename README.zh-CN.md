@@ -78,9 +78,12 @@ AI 编程助手的<strong>通用上下文压缩代理</strong>
 | 客户端 | 用这个 |
 |---|---|
 | **pi** | [`billion-context-pi`](https://github.com/ranxianglei/billion-context-pi)(进程内扩展) |
-| **opencode** | [`opencode-acp`](https://github.com/ranxianglei/opencode-acp)(进程内扩展) |
+| **opencode 1.x** | [`billion-context`](https://github.com/ranxianglei/billion-context) —— `bili plugin install opencode`(V1 `.server()` 钩子,与 2.x 同一个包装器)或 `bili opencode`(启动器);[`opencode-acp`](https://github.com/ranxianglei/opencode-acp)(进程内扩展)仍可用 |
+| **opencode 2.0+** | `bili opencode`(内置 V2 插件 —— 原生工具,无需另装包)或 `bili plugin install opencode`(自拉起原生插件,免启动器) |
 | **omp** | [`billion-context`](https://github.com/ranxianglei/billion-context),`bili omp`(内置插件) |
 | **其余所有**(没有上下文 hook) | [`billion-context`](https://github.com/ranxianglei/billion-context) —— `bili <client>`(启动器,优先)或 `/bili/` 前缀 |
+
+**原生模式 vs 独立扩展。** 宿主原生插件(`bili plugin install pi` / `opencode` —— 代理在宿主进程内拉起)与独立进程内扩展(`billion-context-pi`、`opencode-acp`)**互斥**:两者同时生效意味着双重压缩。安装器负责切换(`bili plugin install pi` 会替换旧的 `npm:billion-context-pi` 条目);作为手动安装的运行期安全网,原生入口在加载时同步设置 `BILLION_CONTEXT_NATIVE=<host>`,让独立扩展在动作时自动退出 —— 它自己的加载期 `BILLION_CONTEXT_PROXY` 检查看不见原生模式异步拉起的代理,`/bili/` baseURL 检查也看不见 fetch 层改写。
 
 ## 安装
 
@@ -112,7 +115,7 @@ bili pi                               # 拉起 pi,走代理 —— file-free(#53
 bili codex                            # 拉起 codex
 bili claude                           # 拉起 claude
 bili omp                              # pi 同款,file-free(#535):环境变量 + 扩展 registerProvider + 压缩取消,真实 ~/.omp 不动
-bili opencode                         # HTTPS 走 MITM + 临时 opencode.json(HTTP 走 /bili/)+ 轻量 /acp 插件
+bili opencode                         # HTTPS 走 MITM + 临时 opencode.json(HTTP 走 /bili/)+ 轻量 /acp 插件;OpenCode 2.0+:内置 V2 插件带原生 bili 工具,自动关掉原生 auto-compaction。详见下方「OpenCode 专属说明」
 bili hermes                           # file-free(#535):hermes 代理环境变量(HTTPS_PROXY + HERMES_CA_BUNDLE)—— https 走 CONNECT MITM,http 走绝对形式转发;真实 ~/.hermes 不动
 bili dsh                              # deepseek-harness:非回环上游走代理 env(https MITM、http absolute-form),回环上游保留 overlay DSH_HOME(~/.dsh-bili)改写(#535),内置 deepseek 路由走 DEEPSEEK_BASE_URL,经 --patch 注入原生 /acp 命令
 bili codebuddy                        # Tencent CodeBuddy Code CLI:CODEBUDDY_BASE_URL /bili/ 重写(OpenAI chat completions wire),预算对齐走 CODEBUDDY_AUTO_COMPACT_WINDOW;真实 ~/.codebuddy 不动
@@ -158,6 +161,34 @@ curl -s http://localhost:8787/__bili/stats
 然后从助手发一条消息,观察日志(`~/.local/state/billion-context/bili.log`,
 同时也打到 stderr)。每个请求应该看到一行 `processTurn`,等对话变长后
 会出现 `[acp-usage] round N input=X cached=Y (cache hit Z%)` + `compress` 事件。
+
+### OpenCode 专属说明
+
+OpenCode 2.0 换了新插件 API(`@opencode/plugin`);独立扩展 `opencode-acp` 仅支持 V1,在 2.0 下不加载。bili 的两种模式在 2.0 都能用。2.x 插件 API 面在不同 build 间仍在变动(相邻的 npm `dev` 构建 `ctx` 形状不同),下面列的钩子/工具细节是针对具体版本的观察,不是稳定契约:
+
+- **启动器:** `bili opencode` 用法不变。在 2.x 宿主上,它把内置 V2 插件(`dist/agent/opencode.js`)以临时包装目录的形式注入临时配置(目录入口 `index.js` 再 re-export 插件文件 —— 2.x 拒绝配置 `plugin` 数组里的裸文件路径;1.x 宿主用裸文件路径)。宿主代次用 `--version` 探测(探测失败默认 1.x 形状)。V2 插件在宿主内原生注册 bili 工具 —— compress / decompress / search_context / acp_status(另加 absorb),JSON-Schema 入参 —— 并在每个 provider 请求上盖章代理头,压缩走插件模式,不做 wire 级工具注入;原生 auto-compaction 自动关闭(`compaction.auto: false`)。所有注册都是防御式的(可选链):任一 2.x build 上接缝缺失或未触发时,插件保持情性,会话透明回退纯代理模式(wire 级注入)而不是报错 —— 在两个相邻 `dev` build(2026-09-13 / 2026-09-14)上观察到过 API 面不同(#754 评审探针);反之在 `@opencode/cli` 2.0.3 上端到端验证过(原生 `acp_status` 经插件端点执行,零 wire 注入)。
+- **原生(免启动器):** npm 装好包后跑 `bili plugin install opencode` —— 它往真实 opencode 配置写一个自拉起插件(`<configDir>/plugins/billion-context/index.js` → `dist/agent/opencode-native.js`)并设 `compaction.auto: false`,之后直接跑 `opencode` 即可。加载时插件自拉起自己的代理(健康的已有实例直接复用不重复起;父进程 pid 看门狗在 opencode 退出时收掉它),把模型流量路由到 `<proxy>/bili/<upstream-url>`,并暴露与启动器模式相同的原生 bili 工具 —— 无固定端口、无环境变量、免启动器。退出:`BILI_NATIVE_OPENCODE=0`。若没有任何代理能拉到健康状态,请求直连(不压缩)并给一次性告警,之后自动恢复。在 `bili opencode` 启动下该入口整体跳过(代理归启动器管)。
+
+  同一个包装器也服务 **OpenCode 1.x**(V1 `.server()` 钩子;在 1.14.46 和 1.18.31 上验证):`config` 钩子在进程内直接改共享配置对象,把每个 provider 的 `options.baseURL` 改写为 `<proxy>/bili/…` 并设 `compaction.auto: false`;`chat.headers` 每次请求盖章插件头;`tool` 用真实 zod 形状注册 bili 工具(zod 是运行时依赖 —— 解析不到时插件降级纯代理模式:只改写、wire 注入工具);`/acp` 命令渲染同一张状态面板。**没有显式 `baseURL`** 的 provider(SDK 默认值,如裸 `@ai-sdk/openai` → api.openai.com)由全局 `fetch` 补丁(pi-native 同机制)兑住 —— 模型 API 调用重路由到代理(日志:`v1: fetch patch installed`),在 1.14.46 / 1.18.31 上含 OpenAI Responses 端点端到端验证;补丁幂等,`/bili/` 包装过的 URL 原样直通。
+- **纯代理:** 与其它客户端一样,把 provider baseURL 指向代理:
+
+  ```json
+  {
+    "provider": {
+      "myprovider": {
+        "npm": "@ai-sdk/openai-compatible",
+        "options": {
+          "baseURL": "http://localhost:8787/bili/http://upstream.example/v1",
+          "apiKey": "sk-any"
+        }
+      }
+    }
+  }
+  ```
+
+  注意:2.0 AI-SDK provider 即使本地端点从不校验也要求 `apiKey` 字段 —— 随便填个非空值。
+
+注意事项:2.x 系列以 npm 包 `@opencode/cli` 发布。命令支持随 build 而定:某个预发布版只暴露 list/get/update/remove,而 2.0.x 稳定版允许插件经 `ctx.command.transform((editor) => editor.add(...))` 新增命令 —— TUI 里接受斜杠菜单补全(Tab + Enter)即可调用;注意 `opencode run` 模式完全不派发斜杠命令(它们会透传给模型)。内置插件在两种形状上都刻意不注册命令。
 
 ## 运行代理
 

@@ -12,19 +12,23 @@
 // setup comes from the shared factory src/agent/opencode-v2.ts, which the
 // native npm entry (opencode-native.ts) reuses so both deployment modes share
 // one protocol implementation. The V2 runtime-API facts live in that file.
+//
+// The /acp command hooks themselves live in src/agent/opencode-acp-command.ts
+// and are shared with the native V1 entry (opencode-native.ts).
 
+import { createAcpCommandHooks } from "./opencode-acp-command.js";
 import { createOpencodeV2Setup } from "./opencode-v2.js";
-import { fetchProxyVersion } from "./shared.js";
+import { installNativeFetchIntercept, type NativeInterceptState } from "./native-intercept.js";
 
-interface OpencodeCommandConfig {
-    template: string;
-    description?: string;
-}
-
-interface OpencodeConfig {
-    command?: Record<string, OpencodeCommandConfig>;
-    [key: string]: unknown;
-}
+export { showAcpText } from "./opencode-acp-command.js";
+export type {
+    OpencodeCommandConfig,
+    OpencodeConfig,
+    OpencodePromptPart,
+    OpencodeClient,
+    OpencodeCommandInput,
+    OpencodeAcpHooks,
+} from "./opencode-acp-command.js";
 
 interface OpencodeSessionInfo {
     id?: unknown;
@@ -39,99 +43,33 @@ interface OpencodeEventInput {
     event?: OpencodeEvent;
 }
 
-interface OpencodeCommandInput {
-    command: string;
-    sessionID: string;
-    arguments?: string;
-}
-
-interface OpencodePromptPart {
-    type: string;
-    text: string;
-    ignored?: boolean;
-}
-
-interface OpencodeClient {
-    session?: {
-        prompt?: (args: {
-            path: { id: string };
-            body: { noReply: boolean; parts: OpencodePromptPart[] };
-        }) => Promise<unknown>;
-    };
-}
-
 interface OpencodePluginContext {
-    client?: OpencodeClient;
+    client?: import("./opencode-acp-command.js").OpencodeClient;
 }
 
 interface OpencodeHooks {
-    config?: (input: OpencodeConfig) => Promise<void>;
+    config?: (input: import("./opencode-acp-command.js").OpencodeConfig) => Promise<void>;
     event?: (input: OpencodeEventInput) => Promise<void>;
-    "command.execute.before"?: (input: OpencodeCommandInput, output: { parts: unknown[] }) => Promise<void>;
+    "command.execute.before"?: (input: import("./opencode-acp-command.js").OpencodeCommandInput, output: { parts: unknown[] }) => Promise<void>;
 }
 
 const proxyBase = process.env.BILLION_CONTEXT_PROXY ?? "";
 
-async function showText(ctx: OpencodePluginContext, sid: string, text: string): Promise<void> {
-        // Direct method call — `const p = ctx.client.session.prompt; p(...)` loses `this` (this._client) and throws.
-        const session = ctx.client?.session;
-        if (!session || typeof session.prompt !== "function") {
-            console.error("[bili-opencode] /acp render failed: session.prompt unavailable");
-            return;
-        }
-        try {
-            await session.prompt({
-                path: { id: sid },
-                body: { noReply: true, parts: [{ type: "text", text, ignored: true }] },
-            });
-        } catch (err) {
-            console.error(`[bili-opencode] /acp render failed: ${err instanceof Error ? err.message : String(err)}`);
-        }
-}
-
 const server = async (ctx: OpencodePluginContext): Promise<OpencodeHooks> => {
     if (!proxyBase) return {};
     console.log("[bili-opencode] plugin active (proxy " + proxyBase + ")");
+    // V1 host: same SDK-default-baseURL gap as the native entry — the
+    // launcher's config-file rewrite only catches explicit baseURLs. Global
+    // fetch patch catches the rest; `origin` is already resolved (the
+    // launcher owns the proxy lifecycle, no respawn hooks needed).
+    const intercept: NativeInterceptState = { origin: proxyBase, ready: Promise.resolve(proxyBase) };
+    if (installNativeFetchIntercept(intercept)) {
+        console.log("[bili-opencode] v1: fetch patch installed (catches providers without an explicit baseURL)");
+    }
     return {
-        config: async (opencodeConfig) => {
-            opencodeConfig.command ??= {};
-            opencodeConfig.command["acp"] = {
-                template: "",
-                description: "Show ACP status (billion-context proxy)",
-            };
-        },
-        "command.execute.before": async (input) => {
-            if (input.command !== "acp") return;
-            const sid = input.sessionID;
-            let text: string;
-            try {
-                const res = await fetch(`${proxyBase}/__bili/plugin/status?conversationId=${encodeURIComponent(sid)}&fallback=latest`);
-                const status = (await res.json()) as { ok?: boolean; panel?: string; error?: string };
-                if (typeof status.panel === "string" && status.panel.length > 0) {
-                    text = status.panel;
-                } else if (status.ok === false) {
-                    // zero sessions on the proxy (fresh launch) — friendly idle notice
-                    let version: string | undefined;
-                    try {
-                        version = await fetchProxyVersion(proxyBase);
-                    } catch {
-                        version = undefined;
-                    }
-                    text = version !== undefined
-                        ? `billion-context@${version} — proxy connected, no ACP session yet. Send a model request, then run /acp again.`
-                        : "bili: no ACP session yet (send a model request first, then run /acp)";
-                } else {
-                    text = "bili: proxy returned no status panel";
-                }
-            } catch (err) {
-                text = `bili: /acp failed (${err instanceof Error ? err.message : String(err)})`;
-            }
-            await showText(ctx, sid, text);
-            throw new Error("__BILI_ACP_HANDLED__");
-        },
+        ...createAcpCommandHooks(() => proxyBase, ctx),
     };
 };
-
 
 const setup = createOpencodeV2Setup();
 
