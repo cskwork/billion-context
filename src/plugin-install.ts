@@ -125,22 +125,36 @@ export function isBiliPiEntry(entry: string, root: string): boolean {
         || /(^|[/\\])billion-context$/.test(entry);
 }
 
+// #925 pi form of the npm-standard entry: for npm installs (package root
+// under node_modules) the settings entry is the pi-managed npm spec, not
+// the machine-local abs path — pi auto-installs it at startup (resource
+// loader resolve() installs missing npm sources), `pi update` upgrades it,
+// and the config survives node prefix moves across machines. A dev/checkout
+// install keeps the abs root (pi loads local package dirs directly).
+export const PI_NPM_ENTRY = "npm:billion-context";
+
+export function piEntryFor(root: string): string {
+    return isNpmInstallForm(root) ? PI_NPM_ENTRY : root;
+}
+
 function piInstall(): string {
     const root = selfPackageRoot();
     const file = piSettingsFile();
     const settings = readJson(file);
     const packages = Array.isArray(settings.packages) ? (settings.packages as unknown[]).map(String) : [];
-    if (packages.some((p) => p === root)) return `pi: already installed (${file})`;
+    const entry = piEntryFor(root);
+    if (packages.some((p) => p === entry)) return `pi: already installed (${file})`;
     const removed = packages.filter((p) => isPiEntry(p, root));
     const kept = packages.filter((p) => !isPiEntry(p, root));
-    kept.push(root);
+    kept.push(entry);
     settings.packages = kept;
     writeJson(file, settings);
     // #788: dropped entries must be visible — silently replacing a documented
     // setup (npm:billion-context-pi) left users with no compression and no
     // idea their config changed.
     const note = removed.length > 0 ? `\npi: replaced existing entries: ${removed.join(", ")}` : "";
-    return `pi: installed -> ${file} packages += ${root}${note}`;
+    const form = entry === PI_NPM_ENTRY ? " (pi-managed — pi installs/updates it; `pi update` upgrades)" : "";
+    return `pi: installed -> ${file} packages += ${entry}${form}${note}`;
 }
 
 function piRemove(): string {
@@ -160,7 +174,9 @@ function piStatus(): string {
     const root = selfPackageRoot();
     const packages = readJson(piSettingsFile()).packages;
     const list = Array.isArray(packages) ? (packages as unknown[]).map(String) : [];
-    return list.some((p) => p === root) ? "installed" : "not installed";
+    // Any entry that loads THIS package's plugin counts (npm: form or abs
+    // root); the legacy billion-context-pi package deliberately does not.
+    return list.some((p) => isBiliPiEntry(p, root) || p === piEntryFor(root)) ? "installed" : "not installed";
 }
 
 // — omp ———————————————————————————————————————————————————————————————
