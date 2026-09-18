@@ -461,12 +461,9 @@ function isLegacyOpencodeAcpEntry(entry: string): boolean {
     }
     const normalized = entry.replace(/\\/g, "/");
     const segments = normalized.split("/").filter((s) => s.length > 0);
-    const last = segments[segments.length - 1];
-    const parent = segments[segments.length - 2];
-    if (last === undefined) return false;
-    if (last.startsWith("opencode-acp@")) return true;
-    if (last === "opencode-acp") return true;
-    return last === "index.js" && parent !== undefined && parent.startsWith("opencode-acp");
+    // Any path segment naming the package identifies an acp install — covers
+    // dir specs, <dir>/index.js, and deeper entry paths like dist/index.js.
+    return segments.some((s) => s === "opencode-acp" || s.startsWith("opencode-acp@"));
 }
 
 function stripLegacyOpencodeAcp(data: Record<string, unknown>, notes: string[]): void {

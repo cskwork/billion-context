@@ -577,7 +577,10 @@ const server = async (ctx: V1PluginContext): Promise<V1Hooks> => {
     // bili-only mode (legacy sessions degrade to read-only, documented).
     let legacy: LegacyAcpModule | undefined;
     try {
-        legacy = await loadLegacyAcp({ directory: ctx.directory, client: ctx.client });
+        // Pass the host's full ctx object through: V1PluginContext types only
+        // what bili uses (client/directory), but the runtime object may carry
+        // extra host fields acp's hooks need at action time.
+        legacy = await loadLegacyAcp(ctx);
     } catch {
         legacy = undefined;
     }

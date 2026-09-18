@@ -951,9 +951,9 @@ test("plugin install opencode replaces legacy opencode-acp entries — array and
     fs.mkdirSync(path.dirname(ocFile), { recursive: true });
     try {
         await withEnv({ OPENCODE_CONFIG: ocFile, BILI_MCP_PROXY: undefined, XDG_STATE_HOME: path.join(home, "state") }, async () => {
-            // array shape: bare name, npm: alias, path, versioned
+            // array shape: bare name, npm: alias, path (incl. deep entry path), versioned
             fs.writeFileSync(ocFile, JSON.stringify({
-                plugin: ["opencode-acp", "npm:opencode-acp", "/opt/other-plugin", path.join(home, "ext/opencode-acp/index.js"), "opencode-acp@stable"],
+                plugin: ["opencode-acp", "npm:opencode-acp", "/opt/other-plugin", path.join(home, "ext/opencode-acp/index.js"), path.join(home, "ext2/opencode-acp/dist/index.js"), "opencode-acp@stable"],
             }));
             let msg = pluginInstall("opencode");
             assert.match(msg, /replaced opencode-acp plugin entries/);
