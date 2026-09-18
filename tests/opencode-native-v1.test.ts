@@ -254,3 +254,171 @@ describe("createV1ServerHooks", () => {
         );
     });
 });
+
+// ---------------------------------------------------------------------------
+// #920 legacy lane routing: absorbed opencode-acp serves pre-migration
+// sessions; new sessions go to the proxy.
+// ---------------------------------------------------------------------------
+
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import {
+    callLegacyAcpConfig,
+    isLegacyAcpSession,
+    legacyAcpStatePath,
+    type LegacyAcpModule,
+} from "../src/agent/opencode-legacy.js";
+
+function fakeLegacyModule(events: string[]): LegacyAcpModule {
+    const hooks: Record<string, unknown> = {
+        config: async (cfg: Record<string, unknown>) => {
+            events.push(`legacy-config:${JSON.stringify(Object.keys(cfg))}`);
+            cfg.permission = { deny: ["dcp_*"] };
+        },
+        "command.execute.before": async (input: { command: string; sessionID: string }) => {
+            events.push(`legacy-command:${input.command}:${input.sessionID}`);
+        },
+        "experimental.chat.system.transform": async (input: { sessionID: string }) => {
+            events.push(`legacy-system:${input.sessionID}`);
+        },
+        "experimental.chat.messages.transform": async (_i: unknown, output: { messages: unknown[] }) => {
+            const last = output.messages[output.messages.length - 1] as { info?: { sessionID?: string } };
+            events.push(`legacy-messages:${last?.info?.sessionID}`);
+        },
+        "experimental.text.complete": async (input: { sessionID: string }) => {
+            events.push(`legacy-text:${input.sessionID}`);
+        },
+        tool: {
+            compress: {
+                description: "legacy compress",
+                args: { content: { __fake: "string" } },
+                execute: async (args: Record<string, unknown>, ctx: { sessionID: string }) => {
+                    events.push(`legacy-compress:${ctx.sessionID}`);
+                    return "legacy-compressed";
+                },
+            },
+            acp_status: {
+                description: "legacy status",
+                args: {},
+                execute: async (_a: Record<string, unknown>, ctx: { sessionID: string }) => {
+                    events.push(`legacy-status:${ctx.sessionID}`);
+                    return "legacy-status";
+                },
+            },
+        },
+    };
+    return { hooks, tools: hooks.tool as LegacyAcpModule["tools"], configHook: hooks.config as LegacyAcpModule["configHook"], commandHook: hooks["command.execute.before"] as LegacyAcpModule["commandHook"], source: "/fake/opencode-acp/dist/index.js" };
+}
+
+describe("createV1ServerHooks legacy routing (#920)", () => {
+    it("routes tools, headers, command and transforms per session lane", async () => {
+        const events: string[] = [];
+        const legacy = fakeLegacyModule(events);
+        const forwarded: { sid: string; tool: string; args: unknown }[] = [];
+        const hooks = createV1ServerHooks("http://127.0.0.1:19999", {}, {
+            z: fakeZ,
+            legacy,
+            isLegacy: (sid) => sid === "ses_legacy",
+            forward: async (_o, sid, tool, args) => {
+                forwarded.push({ sid, tool, args });
+                return "proxied";
+            },
+            log: () => {},
+        });
+
+        // legacy session: tool executes via absorbed acp
+        const r1 = await hooks.tool?.compress.execute({ content: [] }, { sessionID: "ses_legacy" });
+        assert.equal(r1, "legacy-compressed");
+        assert.deepEqual(forwarded, []);
+        // new session: forwarded to the proxy
+        const r2 = await hooks.tool?.compress.execute({ content: [] }, { sessionID: "ses_new" });
+        assert.equal(r2, "proxied");
+        assert.deepEqual(forwarded, [{ sid: "ses_new", tool: "compress", args: { content: [] } }]);
+
+        // headers: legacy bypasses, new stamps plugin mode
+        const h1: Record<string, string> = {};
+        await hooks["chat.headers"]?.({ sessionID: "ses_legacy" } as never, { headers: h1 });
+        assert.equal(h1["x-bili-plugin"], undefined);
+        assert.equal(h1["x-bili-plugin-bypass"], "1");
+        const h2: Record<string, string> = {};
+        await hooks["chat.headers"]?.({ sessionID: "ses_new" } as never, { headers: h2 });
+        assert.equal(h2["x-bili-plugin"], "opencode");
+        assert.equal(h2["x-bili-plugin-conversation"], "ses_new");
+        assert.equal(h2["x-bili-plugin-bypass"], undefined);
+
+        // /acp command: legacy session -> acp handler (no throw); new -> bili handler (throws __BILI_ACP_HANDLED__ after render)
+        await hooks["command.execute.before"]?.({ command: "acp", sessionID: "ses_legacy", arguments: "" });
+        assert.ok(events.includes("legacy-command:acp:ses_legacy"));
+        events.length = 0;
+        await assert.rejects(hooks["command.execute.before"]?.({ command: "acp", sessionID: "ses_new", arguments: "" }), /__BILI_ACP_HANDLED__/);
+        assert.equal(events.filter((e) => e.startsWith("legacy-command")).length, 0);
+
+        // transforms gated to legacy sessions only
+        await hooks["experimental.chat.system.transform"]?.({ sessionID: "ses_new" });
+        assert.equal(events.filter((e) => e === "legacy-system:ses_new").length, 0);
+        await hooks["experimental.chat.system.transform"]?.({ sessionID: "ses_legacy" });
+        assert.ok(events.includes("legacy-system:ses_legacy"));
+        await hooks["experimental.chat.messages.transform"]?.({}, { messages: [{ role: "user" }, { role: "assistant", info: { sessionID: "ses_new" } }] });
+        assert.equal(events.filter((e) => e === "legacy-messages:ses_new").length, 0);
+        await hooks["experimental.chat.messages.transform"]?.({}, { messages: [{ info: { sessionID: "ses_legacy" } }] });
+        assert.ok(events.includes("legacy-messages:ses_legacy"));
+        await hooks["experimental.text.complete"]?.({ sessionID: "ses_new" });
+        await hooks["experimental.text.complete"]?.({ sessionID: "ses_legacy" });
+        assert.equal(events.filter((e) => e === "legacy-text:ses_new").length, 0);
+        assert.ok(events.includes("legacy-text:ses_legacy"));
+    });
+
+    it("config hook hides providers from absorbed acp and still rewrites", async () => {
+        const events: string[] = [];
+        const legacy = fakeLegacyModule(events);
+        const cfg: V1Config = {
+            provider: { testprov: { options: { baseURL: "http://127.0.0.1:19998/v1" } } },
+        };
+        await createV1ServerHooks("http://127.0.0.1:19999", {}, {
+            z: fakeZ,
+            legacy,
+            isLegacy: () => false,
+            forward: async () => "proxied",
+            log: () => {},
+        }).config?.(cfg);
+        // legacy saw no provider key (shadow had provider: undefined)
+        assert.ok(events.some((e) => e.startsWith("legacy-config:") && !e.includes("provider")));
+        // its permission write survived the merge
+        assert.deepEqual(cfg.permission, { deny: ["dcp_*"] });
+        // and the rewrite still happened
+        assert.equal((cfg.provider.testprov?.options as V1ProviderOptions).baseURL, "http://127.0.0.1:19999/bili/http://127.0.0.1:19998/v1");
+    });
+});
+
+describe("legacy session state file (#920)", () => {
+    it("detects legacy sessions by acp state file and sanitizes ids", () => {
+        const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-legacy-state-"));
+        process.env.XDG_DATA_HOME = path.join(home, "data");
+        try {
+            fs.mkdirSync(path.dirname(legacyAcpStatePath("ses_old")), { recursive: true });
+            fs.writeFileSync(legacyAcpStatePath("ses_old"), "{}");
+            assert.equal(isLegacyAcpSession("ses_old"), true);
+            assert.equal(isLegacyAcpSession("ses_fresh"), false);
+            assert.equal(isLegacyAcpSession(undefined), false);
+            assert.equal(isLegacyAcpSession(""), false);
+            assert.equal(isLegacyAcpSession("../../etc"), false);
+        } finally {
+            delete process.env.XDG_DATA_HOME;
+            fs.rmSync(home, { recursive: true, force: true });
+        }
+    });
+
+    it("callLegacyAcpConfig merges only owned top-level keys", async () => {
+        const cfg: Record<string, unknown> = { provider: { p: 1 }, agent: { keep: true } };
+        await callLegacyAcpConfig(async (shadow) => {
+            assert.equal((shadow as { provider?: unknown }).provider, undefined);
+            shadow.experimental = { replaced: true }; // reference change → owned
+            (shadow as { permission?: unknown }).permission = { deny: ["x"] };
+        }, cfg);
+        assert.equal((cfg.provider as { p?: number }).p, 1); // untouched
+        assert.deepEqual(cfg.agent, { keep: true }); // not an owned key
+        assert.deepEqual(cfg.experimental, { replaced: true });
+        assert.deepEqual(cfg.permission, { deny: ["x"] });
+    });
+});

@@ -85,7 +85,12 @@ AI 编程助手的<strong>通用上下文压缩代理</strong>
 
 **原生模式 vs 独立扩展。** 宿主原生插件(`bili plugin install pi` / `opencode` —— 代理在宿主进程内拉起)与独立进程内扩展(`billion-context-pi`、`opencode-acp`)**互斥**:两者同时生效意味着双重压缩。安装器负责切换:`bili plugin install pi` 会替换旧的 `npm:billion-context-pi` 条目;`bili plugin install opencode` 会从全局 opencode.json 里剔除旧的 `opencode-acp` 条目 —— 裸名、`npm:` 别名、带版本号(`opencode-acp@stable`)、路径形式都认,数组/对象两种形态都处理;原配置会快照到 `opencode.json.bili-bak`。**项目级**安装(`opencode plugin opencode-acp` 写的是 `<project>/.opencode/opencode.json`,不是全局配置)不会被碰 —— 需手动移除,安装器输出里会提醒。作为手动安装的运行期安全网,原生入口在加载时同步设置 `BILLION_CONTEXT_NATIVE=<host>`,让独立扩展在动作时自动退出 —— 它自己的加载期 `BILLION_CONTEXT_PROXY` 检查看不见原生模式异步拉起的代理,`/bili/` baseURL 检查也看不见 fetch 层改写。
 
-**从 opencode-acp 迁移旧会话。** 旧会话保留其 `<acp>` 标签,但引用号空间存在 opencode-acp 自己的存储里;billion-context 对每个会话从零开始。后果:对旧 ref 调 `decompress` 返回 `[Block … not found]`,新 ref 从 m00001 重新编号 —— 旧历史和新输出里同一个号可能指不同消息。磁盘上不会损坏任何东西,但切换后请把迁移前的会话当只读存档,新开会话干活。
+**从 opencode-acp 迁移旧会话（v1 泳道路由）。** 在 OpenCode 1.x 上，`bili plugin install opencode` 让迁移前的旧会话继续可用：原生入口会吸收已安装的 `opencode-acp` 包（直接从 `node_modules` 导入 —— `.opencode/node_modules`、项目 `node_modules`、全局 npm root、opencode 配置级 modules，先到先得），并按会话路由。会话属于 legacy ⟺ opencode-acp 的持久化状态文件存在（`<XDG_DATA_HOME>/opencode/storage/plugin/acp/<sessionID>.json`）：
+
+- **旧会话** —— 压缩由被吸收的 opencode-acp 执行（它自己的 `<dcp-message-id>` 引用号与块存储照常工作：`compress` / `decompress` / `search_context` / `acp_status` / `acp_context_recap` 全部在它里面执行）。其模型请求带 `x-bili-plugin-bypass: 1`，代理原样转发 —— 不注入 wire 工具、不注 nudge、不绑定会话。
+- **新会话** —— bili 接管：工具调用转发到代理的 plugin 端点（plugin 模式）。模型看到的工具槽位带 DCP schema（v1 进程级每个名字仅一份定义），但执行器按会话分泳道：新会话的 `compress` 发到代理，旧会话的发给 opencode-acp。`acp_context_recap` 没有代理端对应 —— 新会话调用会收到代理的 unknown-tool 消息。
+
+`/acp` 与 `/dcp` 同样路由。新会话被 opencode-acp 注册表收编的可能被其 transform 门控（system / messages / text.complete 都过 legacy 谓词）阻断。退化路径：opencode-acp 包缺失或导入失败时 bili 单独运行，旧会话退化为只读存档（旧 `<acp>` 标签照常渲染、`decompress` 返回 `[Block … not found]`、新引用号从 m00001 重新开始）。
 
 ## 安装
 

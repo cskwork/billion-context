@@ -48,6 +48,11 @@ const PROXY_VERSION = (() => {
 
 export const PLUGIN_AGENT_HEADER = "x-bili-plugin";
 export const PLUGIN_CONVERSATION_HEADER = "x-bili-plugin-conversation";
+/** #920: legacy-lane marker. Set by the absorbed opencode-acp wrapper for
+ *  sessions that still run through the legacy DCP machinery — the proxy
+ *  forwards such requests VERBATIM (no wire injection, no session binding,
+ *  no compress loop): the legacy extension owns compression for them. */
+export const PLUGIN_BYPASS_HEADER = "x-bili-plugin-bypass";
 export const PLUGIN_CONTEXT_WINDOW_HEADER = "x-bili-plugin-context-window";
 
 export const PLUGIN_PROTOCOL_VERSION = 1;
@@ -75,6 +80,10 @@ export function pluginAgentHeader(headers: Record<string, string | string[] | un
 
 export function pluginConversationHeader(headers: Record<string, string | string[] | undefined>): string | undefined {
     return headerValue(headers, PLUGIN_CONVERSATION_HEADER);
+}
+
+export function pluginBypassHeader(headers: Record<string, string | string[] | undefined>): string | undefined {
+    return headerValue(headers, PLUGIN_BYPASS_HEADER);
 }
 
 /** The plugin reports its agent's own model context window (what the agent

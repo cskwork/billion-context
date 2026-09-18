@@ -73,7 +73,7 @@ import { emitPreflightError, emitStreamError } from "./stream-error.js";
 import { affinityToken, clientConversationHeader, codexTurnIdentity, preferPromptCacheKeyIdentity, type ConversationIdentity } from "./session-id.js";
 import { prefixAffinity, type AnonymousAffinity } from "./prefix-affinity.js";
 import { flushPrefixAffinity, hydratePrefixAffinity, scheduleAffinityPersist } from "./affinity-persist.js";
-import { consumePluginRegisterFor, flushConversations, handlePluginCompact, handlePluginManifest, handlePluginRegister, handlePluginStatus, handlePluginTool, loadConversations, pipePluginChatWithStrip, pipePluginJson, pipePluginResponsesWithStrip, pluginAgentHeader, pluginConversationHeader, pluginReportedContextWindow, recordPluginSession, rememberPluginMessages, takePendingPluginRegister } from "./plugin.js";
+import { consumePluginRegisterFor, flushConversations, handlePluginCompact, handlePluginManifest, handlePluginRegister, handlePluginStatus, handlePluginTool, loadConversations, pipePluginChatWithStrip, pipePluginJson, pipePluginResponsesWithStrip, pluginAgentHeader, pluginBypassHeader, pluginConversationHeader, pluginReportedContextWindow, recordPluginSession, rememberPluginMessages, takePendingPluginRegister } from "./plugin.js";
 import { setupMitm, readMitmUpstream } from "./mitm.js";
 import type { BiliMessage } from "acp-kernel/wire";
 import { hardenOpenaiAssistantContent, isLoopbackAddress, inspectContextOverflow, reserveOutputHeadroom, shouldReserveOutputHeadroom, systemToUser, usageTotals, type WireProtocol } from "./util.js";
@@ -1024,13 +1024,21 @@ async function handle(
     // requests whose upstream URL matches a provider route with
     // `passthrough: true` (upstreams that fingerprint the request body).
     const routePassthrough = !opts.passthrough && findRoute(opts.routes, route?.rewrittenUrl)?.passthrough === true;
+    // #920 legacy lane: an absorbed-agent request marked x-bili-plugin-bypass
+    // belongs to a session still running through the legacy extension's own
+    // machinery — verbatim forward (same treatment as #300 hopMarker / #661
+    // route-passthrough: prepared stays null).
+    const bypassMarker = pluginBypassHeader(req.headers);
+    if (bypassMarker !== undefined && !opts.passthrough && !routePassthrough && hopMarker === undefined) {
+        log("info", `[plugin-bypass] legacy-lane session — forwarding verbatim, kernel bypassed`);
+    }
     if (routePassthrough && hopMarker === undefined && protocol && parsed) {
         log("info", `[route-passthrough] ${maskUrlsInText(route?.rewrittenUrl ?? "")} matches a passthrough route — forwarding verbatim, kernel bypassed`);
     }
     // #300: `hopMarker !== undefined` means an upstream bili already processed
     // this request — skip the whole pipeline (prepared stays null) so the
     // passthrough path below forwards it verbatim.
-    if (!opts.passthrough && !routePassthrough && hopMarker === undefined && protocol && parsed && typeof parsed === "object") {
+    if (!opts.passthrough && !routePassthrough && hopMarker === undefined && bypassMarker === undefined && protocol && parsed && typeof parsed === "object") {
         const sessionHeader = headerValue(req, opts.sessionHeader);
         // Plugin mode (issue #1, "内外呼应"): a cooperative agent-side plugin
         // announces itself with x-bili-plugin. The proxy then treats the

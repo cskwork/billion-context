@@ -69,6 +69,7 @@ import { createAcpCommandHooks } from "./opencode-acp-command.js";
 import { markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, singleFlight } from "./native-bootstrap.js";
 import { installNativeFetchIntercept, isModelApiUrl, readyOrigin, type NativeInterceptState } from "./native-intercept.js";
 import { createOpencodeV2Setup, type V2HttpRequestEvent, type V2State } from "./opencode-v2.js";
+import { callLegacyAcpConfig, isLegacyAcpSession, loadLegacyAcp, type LegacyAcpModule } from "./opencode-legacy.js";
 
 /** Decides whether the native bootstrap should run in this process. */
 export function shouldBootstrapNativeOpencode(env: NodeJS.ProcessEnv): boolean {
@@ -303,10 +304,15 @@ export interface V1Hooks {
     "chat.headers"?: (input: V1ChatHeadersInput, output: { headers: Record<string, string> }) => Promise<void>;
     "command.execute.before"?: (input: { command: string; sessionID: string; arguments?: string }, output?: { parts: unknown[] }) => Promise<void>;
     tool?: Record<string, V1Tool>;
+    event?: (input: { event?: unknown }) => Promise<void>;
+    "experimental.chat.system.transform"?: (input: { sessionID?: string }) => Promise<void>;
+    "experimental.chat.messages.transform"?: (input: unknown, output: { messages?: unknown }) => Promise<void>;
+    "experimental.text.complete"?: (input: { sessionID: string }) => Promise<void>;
 }
 
 export interface V1PluginContext {
     client?: import("./opencode-acp-command.js").OpencodeClient;
+    directory?: string;
 }
 
 /** JSON-schema (ACP_TOOLS_OPENAI parameters) → zod raw shape. Only the shapes
@@ -398,28 +404,90 @@ export interface V1NativeDeps {
     z?: ZodLike;
     /** Tool forwarder (tests inject; runtime POSTs /__bili/plugin/tool). */
     forward?: (origin: string, conversationId: string, tool: string, args: unknown) => Promise<string>;
+    /** Absorbed opencode-acp for legacy sessions (#920); when present its DCP
+     *  tool slots serve BOTH lanes (legacy → acp executor, new → forward). */
+    legacy?: LegacyAcpModule;
+    /** Legacy-session predicate (tests inject; runtime = state file exists). */
+    isLegacy?: (sessionId: string | undefined) => boolean;
+    log?: (msg: string) => void;
 }
 
 /** Build the V1 hooks for a RESOLVED proxy origin. `deps.z` present → plugin
  *  mode (tools + header stamping); absent → proxy mode (rewrite only, the
  *  proxy injects wire tools). Exported for tests; the `server` export below
  *  wires the real bootstrap + zod. */
+function lastSessionFromMessages(messages: unknown): string | undefined {
+    if (!Array.isArray(messages)) return undefined;
+    for (let i = messages.length - 1; i >= 0; i--) {
+        const info = (messages[i] as { info?: { sessionID?: unknown } } | undefined)?.info;
+        if (typeof info?.sessionID === "string") return info.sessionID;
+    }
+    return undefined;
+}
+
 export function createV1ServerHooks(origin: string, ctx: V1PluginContext, deps: V1NativeDeps = {}): V1Hooks {
     const acp = createAcpCommandHooks(() => origin, ctx);
+    const legacy = deps.legacy;
+    const isLegacy = deps.isLegacy ?? isLegacyAcpSession;
+    const log = deps.log ?? ((msg: string) => console.log(msg));
     let windows = new Map<string, number>();
     const hooks: V1Hooks = {
         config: async (cfg) => {
+            if (legacy?.configHook !== undefined) {
+                await callLegacyAcpConfig(legacy.configHook, cfg);
+            }
             await acp.config?.(cfg);
             const n = rewriteV1Providers(cfg, origin);
-            if (n > 0) console.log(`[bili-opencode-native] v1: rewrote ${n} provider baseURL(s) -> ${origin}/bili/`);
+            if (n > 0) log(`[bili-opencode-native] v1: rewrote ${n} provider baseURL(s) -> ${origin}/bili/`);
             windows = extractV1Windows(cfg);
         },
         "command.execute.before": async (input, _output) => {
+            if ((input.command === "acp" || input.command === "dcp") && legacy?.commandHook !== undefined && isLegacy(input.sessionID)) {
+                await legacy.commandHook(input);
+                return;
+            }
             await acp["command.execute.before"]?.(input);
         },
     };
-    if (deps.z !== undefined) {
+    if (legacy !== undefined) {
+        // Legacy lane (#920): route acp's own transforms to legacy sessions
+        // only — new sessions never enter acp's registry (no adoption).
+        const sys = legacy.hooks["experimental.chat.system.transform"];
+        if (typeof sys === "function") {
+            hooks["experimental.chat.system.transform"] = async (input) => {
+                if (!isLegacy(input.sessionID)) return;
+                await (sys as (i: unknown) => Promise<void>)(input);
+            };
+        }
+        const msgT = legacy.hooks["experimental.chat.messages.transform"];
+        if (typeof msgT === "function") {
+            hooks["experimental.chat.messages.transform"] = async (input, output) => {
+                if (!isLegacy(lastSessionFromMessages(output?.messages))) return;
+                await (msgT as (i: unknown, o: unknown) => Promise<void>)(input, output);
+            };
+        }
+        const textC = legacy.hooks["experimental.text.complete"];
+        if (typeof textC === "function") {
+            hooks["experimental.text.complete"] = async (input) => {
+                if (!isLegacy(input.sessionID)) return;
+                await (textC as (i: unknown) => Promise<void>)(input);
+            };
+        }
+        // Event hook carries no session (acp uses it only for compress timing
+        // on message.part.updated) — pass through ungated, state-independent.
+        const evt = legacy.hooks.event;
+        if (typeof evt === "function") {
+            hooks.event = evt as V1Hooks["event"];
+        }
+    }
+    if (deps.z !== undefined || legacy !== undefined) {
         hooks["chat.headers"] = async (input, output) => {
+            if (isLegacy(input.sessionID)) {
+                // Legacy sessions run through absorbed acp; the proxy must
+                // forward their traffic verbatim (no injection, no binding).
+                output.headers["x-bili-plugin-bypass"] = "1";
+                return;
+            }
             output.headers["x-bili-plugin"] = "opencode";
             output.headers["x-bili-plugin-conversation"] = input.sessionID;
             const model = input.model;
@@ -429,18 +497,42 @@ export function createV1ServerHooks(origin: string, ctx: V1PluginContext, deps: 
             }
         };
         const forward = deps.forward ?? ((o, conversationId, tool, args) => import("./shared.js").then((m) => m.forwardTool(o, conversationId, tool, args)));
-        const tools: Record<string, V1Tool> = {};
-        for (const t of ACP_TOOLS_OPENAI) {
-            const fn = t.function;
-            tools[fn.name] = {
-                description: fn.description ?? fn.name,
-                args: jsonSchemaToZodShape(fn.parameters, deps.z),
-                execute: async (args, v1ctx) => forward(origin, v1ctx.sessionID, fn.name, args),
-            };
+        if (legacy !== undefined) {
+            // Tool slots carry acp's DCP schemas (kernel-parseable object form)
+            // for BOTH lanes; executors route per session. acp_context_recap
+            // has no proxy counterpart — legacy-only, forwarded calls fail
+            // with the endpoint's unknown-tool message (documented).
+            const tools: Record<string, V1Tool> = {};
+            for (const [name, def] of Object.entries(legacy.tools)) {
+                const exec = typeof def.execute === "function" ? def.execute : undefined;
+                tools[name] = {
+                    description: typeof def.description === "string" ? def.description : name,
+                    args: (def.args ?? {}) as Record<string, unknown>,
+                    execute: async (args, v1ctx) => {
+                        if (exec !== undefined && isLegacy(v1ctx.sessionID)) {
+                            return String((await exec(args, v1ctx)) ?? "");
+                        }
+                        return forward(origin, v1ctx.sessionID, name, args);
+                    },
+                };
+            }
+            hooks.tool = tools;
+        } else {
+            const tools: Record<string, V1Tool> = {};
+            if (deps.z !== undefined) {
+                for (const t of ACP_TOOLS_OPENAI) {
+                    const fn = t.function;
+                    tools[fn.name] = {
+                        description: fn.description ?? fn.name,
+                        args: jsonSchemaToZodShape(fn.parameters, deps.z),
+                        execute: async (args, v1ctx) => forward(origin, v1ctx.sessionID, fn.name, args),
+                    };
+                }
+            } else {
+                console.error("[bili-opencode-native] v1: zod unavailable — plugin tools skipped; sessions run in proxy mode (wire-injected compress)");
+            }
+            if (Object.keys(tools).length > 0) hooks.tool = tools;
         }
-        hooks.tool = tools;
-    } else {
-        console.error("[bili-opencode-native] v1: zod unavailable — plugin tools skipped; sessions run in proxy mode (wire-injected compress)");
     }
     return hooks;
 }
@@ -480,7 +572,16 @@ const server = async (ctx: V1PluginContext): Promise<V1Hooks> => {
     } catch {
         z = undefined;
     }
-    return createV1ServerHooks(origin, ctx, { z });
+    // Legacy lane (#920): absorb the installed opencode-acp so pre-migration
+    // sessions keep their DCP machinery. Absent/failing package → undefined →
+    // bili-only mode (legacy sessions degrade to read-only, documented).
+    let legacy: LegacyAcpModule | undefined;
+    try {
+        legacy = await loadLegacyAcp({ directory: ctx.directory, client: ctx.client });
+    } catch {
+        legacy = undefined;
+    }
+    return createV1ServerHooks(origin, ctx, { z, legacy });
 };
 
 export default { id: "billion-context-opencode-native", setup: createOpencodeV2Setup({ route: createNativeRoute(state) }), server };
