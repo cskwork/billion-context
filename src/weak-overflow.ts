@@ -8,10 +8,21 @@ import { log as loggerLog } from "./logger.js";
  * sglang-style backends an oversized input manifests exactly this way: the
  * prompt is accepted, then the stream cuts with no completion event. Those
  * failures carry no window number, so they can never teach the proxy
- * anything on their own. What we CAN observe: the request was at high usage
- * AND it kept failing. A single truncation is indistinguishable from network
- * noise (that is why the loop retries it once, #413); three high-usage
- * truncations inside a quarter hour are a pattern.
+ * anything on their own. What we CAN observe: the failure kept happening at
+ * or above demonstrated capability. A single truncation is indistinguishable
+ * from network noise (that is why the loop retries it once, #413); three
+ * such truncations inside a quarter hour are a pattern.
+ *
+ * #901: "demonstrated capability" — NOT the trusted window. The counting
+ * baseline is the largest input a recent successful turn actually got through
+ * (recordProvenInput on genuine completions only). A failure at or below that
+ * level cannot be a window overflow: the upstream demonstrably accepts larger
+ * payloads, so the cut is instability noise and is dropped. With no success
+ * sample yet, capability is unknown and the failure counts — an oversized
+ * FIRST request under an inflated trusted window must still be learnable,
+ * which the old ≥90%-of-trusted gate made structurally impossible (every
+ * overflow failure landed below the gate, so the learner starved exactly
+ * where the deployment was broken).
  *
  * When the pattern fires we learn the failing input size as a conservative
  * window (shrink-only, mirroring the 400-without-window path: the payload
@@ -42,7 +53,10 @@ import { log as loggerLog } from "./logger.js";
  *     resets it to exactly the learned window).
  */
 
-const MIN_USAGE = 0.9;
+// #901: how many recent successful turns feed the capability baseline per
+// model/scalar. A bounded ring (not a sticky max) so a mid-life upstream
+// resize drains out within PROVEN_MAX_SAMPLES smaller successes.
+const PROVEN_MAX_SAMPLES = 100;
 const WINDOW_MS = 15 * 60 * 1000;
 const MIN_EVENTS = 3;
 const MAX_TRACKED_SESSIONS = 512;
@@ -94,6 +108,11 @@ export function resolveLearnedLimit(session: Session, model?: string): number | 
 export function retractStaleLearnedLimits(session: Session, model?: string): boolean {
     const x = session.stats?.lastInputTokens ?? 0;
     if (!(x > 0)) return false;
+    // #857: retraction's premise is "a later turn SUCCEEDED with reported
+    // input above" — only a usage-grounded measurement can prove that. An
+    // estimate-derived (or legacy-unmarked) baseline exceeding a REAL
+    // confirmed window is #857's poison pattern, not staleness evidence.
+    if (session.stats?.lastInputTokensSource !== "usage") return false;
     const stale = (v: unknown): v is number =>
         typeof v === "number" && v > 0 && x - v >= Math.max(RETRACT_MIN_DELTA, v * RETRACT_MARGIN_PCT);
     const md = (session.metadata ?? {}) as Record<string, unknown>;
@@ -122,21 +141,96 @@ function resolvedWindow(session: Session, model?: string): number {
     return Math.min(...candidates);
 }
 
+// #901: capability baseline storage (metadata persists wholesale via
+// persist.ts — additive fields, no format version bump).
+const PROVEN_INPUTS_KEY = "provenInputs";
+const PROVEN_INPUT_KEY = "provenInput";
+
+function pushProvenSample(arr: number[], total: number): void {
+    arr.push(total);
+    if (arr.length > PROVEN_MAX_SAMPLES) arr.shift();
+}
+
+/** #901: record that a completed turn got `total` input tokens through the
+ *  upstream — demonstrated capability for the counting baseline. Call ONLY on
+ *  genuine completions (terminal event / clean JSON), never on abort or settle
+ *  paths: a truncated round's own sniffed usage would poison the baseline with
+ *  the failing request's size and make `input > baseline` false for that very
+ *  failure. */
+export function recordProvenInput(session: Session, total: number, model?: string): void {
+    if (!(total > 0)) return;
+    const md = (session.metadata ?? {}) as Record<string, unknown>;
+    if (model) {
+        const map = (md[PROVEN_INPUTS_KEY] ?? {}) as Record<string, number[]>;
+        const arr = map[model] ?? [];
+        pushProvenSample(arr, total);
+        map[model] = arr;
+        md[PROVEN_INPUTS_KEY] = map;
+    } else {
+        const arr = (md[PROVEN_INPUT_KEY] ?? []) as number[];
+        pushProvenSample(arr, total);
+        md[PROVEN_INPUT_KEY] = arr;
+    }
+    session.metadata = md;
+    markDirty(session);
+}
+
+/** #901: the capability baseline — largest recent successful input for the
+ *  model, falling back to the session scalar (same convention as the
+ *  learned/confirmed resolvers). Undefined when no success sample exists: the
+ *  caller then treats capability as unknown and counts the failure. */
+export function resolveProvenBaseline(session: Session, model?: string): number | undefined {
+    const md = (session.metadata ?? {}) as Record<string, unknown>;
+    let samples: number[] | undefined;
+    if (model) {
+        const map = md[PROVEN_INPUTS_KEY] as Record<string, number[]> | undefined;
+        samples = map?.[model];
+    }
+    if (!samples || samples.length === 0) samples = md[PROVEN_INPUT_KEY] as number[] | undefined;
+    return provenMax(samples);
+}
+
+/** #901: display aid (web session page / stats endpoint) — the proven max
+ *  across ALL models of the session, so the trusted-vs-demonstrated window
+ *  gap is visible without knowing which model ran. */
+export function sessionProvenMax(session: Session): number | undefined {
+    const md = (session.metadata ?? {}) as Record<string, unknown>;
+    const all: number[] = [...((md[PROVEN_INPUT_KEY] as number[] | undefined) ?? [])];
+    const map = md[PROVEN_INPUTS_KEY] as Record<string, number[]> | undefined;
+    if (map) for (const v of Object.values(map)) all.push(...v);
+    return provenMax(all);
+}
+
+function provenMax(samples: number[] | undefined): number | undefined {
+    if (!samples || samples.length === 0) return undefined;
+    let max = 0;
+    for (const v of samples) if (typeof v === "number" && v > max) max = v;
+    return max > 0 ? max : undefined;
+}
+
 /**
  * Record a non-400 stream failure (truncation / timeout) for this session.
- * Only counts when usage was already high; arms the emergency shrink after
- * MIN_EVENTS repeats inside WINDOW_MS. `inputTokens` is the failing request's
- * input size when known (usage already sniffed), else the last known input.
+ * Counts against the capability baseline (#901): a failure above the largest
+ * recent successful input (or with no success sample yet) may be an overflow;
+ * at or below it, it is instability noise. Arms the emergency shrink after
+ * MIN_EVENTS counted repeats inside WINDOW_MS. `inputTokens` is the failing
+ * request's input size when known (usage already sniffed), else the last known
+ * input.
  */
 export function noteWeakOverflow(
     session: Session,
     opts: { inputTokens?: number; model?: string; reason: string },
 ): void {
-    const window = resolvedWindow(session, opts.model);
-    if (window <= 0) return;
     const input = opts.inputTokens && opts.inputTokens > 0 ? opts.inputTokens : session.stats?.lastInputTokens ?? 0;
     if (input <= 0) return;
-    if (input / window < MIN_USAGE) return;
+    // #901: see header — the trusted window no longer gates counting.
+    const baseline = resolveProvenBaseline(session, opts.model);
+    if (baseline !== undefined && input <= baseline) {
+        loggerLog("warn", `[${session.id}] weak overflow cut below proven capability (input ${input} ≤ baseline ${baseline}, ${opts.reason}) — not counted`);
+        return;
+    }
+    const window = resolvedWindow(session, opts.model);
+    const usagePct = window > 0 ? `usage ${Math.round((input / window) * 100)}%` : "no configured window";
 
     if (states.size > MAX_TRACKED_SESSIONS) {
         const oldest = states.keys().next().value;
@@ -148,7 +242,7 @@ export function noteWeakOverflow(
     state.events.push(now);
     states.set(session.id, state);
     if (state.events.length < MIN_EVENTS) {
-        loggerLog("warn", `[${session.id}] weak overflow signal ${state.events.length}/${MIN_EVENTS} (usage ${Math.round((input / window) * 100)}%, ${opts.reason})`);
+        loggerLog("warn", `[${session.id}] weak overflow signal ${state.events.length}/${MIN_EVENTS} (${usagePct}, ${opts.reason})`);
         return;
     }
     states.delete(session.id);
@@ -182,8 +276,13 @@ export function noteWeakOverflow(
             loggerLog("warn", `[${session.id}] weak overflow confirmed (${MIN_EVENTS}× high-usage failures, ${opts.reason}) — conservative window ${input} not below learned ${prev}; arming emergency shrink only`);
         }
     }
-    if (!session.stats) session.stats = { lastInputTokens: armInput } as Session["stats"];
-    else session.stats.lastInputTokens = Math.max(session.stats.lastInputTokens, armInput);
+    if (!session.stats) session.stats = { lastInputTokens: armInput, lastInputTokensSource: "estimate" } as Session["stats"];
+    else if (armInput > session.stats.lastInputTokens) {
+        // #857: armInput is an upper bound on the failing request's input size,
+        // not an upstream usage report — tag it so evidence-grade consumers skip it.
+        session.stats.lastInputTokens = armInput;
+        session.stats.lastInputTokensSource = "estimate";
+    }
     markDirty(session);
 }
 

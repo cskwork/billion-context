@@ -10,6 +10,7 @@ import { startServer, type ProxyOptions } from "../src/server.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { listSessions } from "../src/session.ts";
+import { MAX_SUMMARY_CALLS_PER_PREFLIGHT } from "../src/preflight.ts";
 
 // #574/#569: preflight used to try exactly ONE range per round (the oldest)
 // and declare GLOBAL exhaustion when that single range yielded no applied
@@ -198,9 +199,10 @@ test("#574 budget cap: many unusable ranges → exactly MAX_SUMMARY_CALLS_PER_PR
         assert.equal(json.error?.code, "preflight_compress_failed");
         assert.equal(json.error?.retryable, false);
         assert.match(json.error?.message ?? "", /summarization budget/i, `the budget variant is reported (got: ${json.error?.message})`);
+        assert.match(json.error?.message ?? "", /compressible range\(s\) still visible/, `reports how many compressible ranges remain (got: ${json.error?.message})`);
 
         const summaryCalls = calls.filter((c) => !c.stream);
-        assert.equal(summaryCalls.length, 8, `exactly MAX_SUMMARY_CALLS_PER_PREFLIGHT summary calls (got ${summaryCalls.length})`);
+        assert.equal(summaryCalls.length, MAX_SUMMARY_CALLS_PER_PREFLIGHT, `the call cap bounds the walk (got ${summaryCalls.length})`);
         assert.equal(calls.filter((c) => c.stream).length, 0, "the over-window payload was NOT forwarded");
 
         const s = listSessions()[0];

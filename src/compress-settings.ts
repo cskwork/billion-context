@@ -57,6 +57,7 @@ export function mergeCompress(
     const reasoningGuardLevels = [global?.reasoningGuard, provider?.reasoningGuard, model?.reasoningGuard].filter(Boolean) as NonNullable<CompressSettings["reasoningGuard"]>[];
     return {
         modelContextLimit: pick("modelContextLimit"),
+        outputHeadroomMaxPct: pick("outputHeadroomMaxPct"),
         maxContextLimit: pick("maxContextLimit"),
         emergencyThresholdPercent: pick("emergencyThresholdPercent"),
         nudgeGrowthTokens: pick("nudgeGrowthTokens"),
@@ -70,6 +71,7 @@ export function mergeCompress(
 
 stripImages: pick("stripImages"),
         stripImagesKeepRecent: pick("stripImagesKeepRecent"),
+        visibilityMarkers: pick("visibilityMarkers"),
         // `reasoning` is a third nested-object field merged sub-field-wise
         // exactly like `absorb`/`prompts`: a model-level `threshold` must not
         // discard a provider-level `drop: false`.

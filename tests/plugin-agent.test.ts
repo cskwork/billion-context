@@ -11,7 +11,7 @@ process.env.NODE_ENV = "test";
 import { proxyBaseFromUrl, proxyBaseFromEnv, detectProxyBase, fetchManifest, forwardTool, fetchStatus } from "../src/agent/shared.ts";
 import biliPlugin, { createBiliPlugin } from "../src/agent/pi.ts";
 import ompPlugin from "../src/agent/omp.ts";
-import { pluginInstall, pluginRemove, pluginStatusAll, PLUGIN_AGENTS, selfPackageRoot } from "../src/plugin-install.ts";
+import { pluginInstall, pluginRemove, pluginStatusAll, PLUGIN_AGENTS, selfPackageRoot, pickPluginKey, detectOpencodeMajor } from "../src/plugin-install.ts";
 import { resolveProxyOrigin, forwardTool as mcpForwardTool } from "../src/mcp.ts";
 
 function withEnv(vars: Record<string, string | undefined>, fn: () => void | Promise<void>): Promise<void> {
@@ -257,7 +257,7 @@ test("#535: non-http(s) manifest entries are dropped", () => {
     }
 });
 
-test("#535: session_before_compact cancels only pi auto compaction under bili launch", () => {
+test("#535/#851: session_before_compact cancels only auto compaction under bili launch", () => {
     const prevProxy = process.env.BILLION_CONTEXT_PROXY;
     process.env.BILLION_CONTEXT_PROXY = "http://127.0.0.1:8787";
     try {
@@ -270,17 +270,24 @@ test("#535: session_before_compact cancels only pi auto compaction under bili la
         assert.equal(handler({ reason: "manual" }, undefined), undefined, "manual /compact stays user-owned");
         assert.equal(handler({ reason: "startup" }, undefined), undefined, "unknown reason → not cancelled");
 
-        // omp: the event carries no reason field, so under bili ALL compaction
-        // is cancelled (manual native /compact would destroy the ACP-tagged
-        // context just like the auto path; the host shows "Compaction
-        // cancelled" and the user should reach for /acp instead).
+        // omp: the hook event carries no reason field, so the plugin tracks
+        // the auto_compaction_start announcement instead — only announced
+        // (auto) passes are cancelled, manual stays user-owned (#851).
         const omp = makeFakePi();
         createBiliPlugin("omp")(omp as never);
         const ompHandler = omp.events.get("session_before_compact");
-        assert.ok(ompHandler, "omp under bili launch: cancel-all handler registered");
-        assert.deepEqual(ompHandler({}, undefined), { cancel: true });
-        assert.deepEqual(ompHandler({ reason: "manual" }, undefined), { cancel: true });
-        assert.deepEqual(ompHandler({ reason: "threshold" }, undefined), { cancel: true });
+        assert.ok(ompHandler, "omp under bili launch: handler registered");
+        assert.equal(ompHandler({}, undefined), undefined, "unannounced (manual) compaction stays user-owned");
+        const ompStart = omp.events.get("auto_compaction_start");
+        const ompEnd = omp.events.get("auto_compaction_end");
+        assert.ok(ompStart, "omp tracks auto_compaction_start announcements");
+        assert.ok(ompEnd, "omp tracks auto_compaction_end announcements");
+        ompStart({}, undefined);
+        assert.deepEqual(ompHandler({}, undefined), { cancel: true }, "announced auto compaction is cancelled");
+        assert.equal(ompHandler({}, undefined), undefined, "the announcement is consumed by the cancel");
+        ompStart({}, undefined);
+        ompEnd({}, undefined);
+        assert.equal(ompHandler({}, undefined), undefined, "aborted auto pass (end before hook) leaves manual unblocked");
     } finally {
         if (prevProxy === undefined) delete process.env.BILLION_CONTEXT_PROXY;
         else process.env.BILLION_CONTEXT_PROXY = prevProxy;
@@ -882,27 +889,30 @@ test("plugin install/remove roundtrips for pi/omp/codex/opencode under a fake HO
         assert.match(pluginRemove("codex"), /removed/);
 
         // #820: pre-seed user settings — install must merge around them and remove must restore them.
+        // #927: seed under whichever key this host's opencode generation uses, so the
+        // round-trip assertions hold on both 1.x ("plugin") and 2.x ("plugins") machines.
+        const ocKey = pickPluginKey(detectOpencodeMajor());
         const ocFile = path.join(home, ".config/opencode/opencode.json");
         fs.mkdirSync(path.dirname(ocFile), { recursive: true });
-        fs.writeFileSync(ocFile, JSON.stringify({ $schema: "https://opencode.ai/config.json", compaction: { auto: true, buffer: 100 }, plugin: ["some-other-plugin"] }));
+        fs.writeFileSync(ocFile, JSON.stringify({ $schema: "https://opencode.ai/config.json", compaction: { auto: true, buffer: 100 }, [ocKey]: ["some-other-plugin"] }));
         const ocPluginDir = path.join(home, ".config/opencode/plugins/billion-context");
         const ocInstallMsg = pluginInstall("opencode");
         assert.match(ocInstallMsg, /installed/);
         assert.match(ocInstallMsg, /mcp\.bili written/);
-        let oc = JSON.parse(fs.readFileSync(ocFile, "utf8")) as { mcp?: Record<string, { command: string[]; environment?: Record<string, string> }>; plugin?: string[]; compaction?: Record<string, unknown>; $schema?: string };
+        let oc = JSON.parse(fs.readFileSync(ocFile, "utf8")) as { mcp?: Record<string, { command: string[]; environment?: Record<string, string> }>; compaction?: Record<string, unknown>; $schema?: string } & Record<string, unknown>;
         assert.equal(oc.mcp?.bili.command[1]!.endsWith(path.join("dist", "mcp.js")), true);
         assert.equal(oc.mcp?.bili.environment?.BILI_MCP_PROXY, "http://127.0.0.1:8787");
-        assert.deepEqual(oc.plugin, ["some-other-plugin", ocPluginDir]);
-        assert.match(fs.readFileSync(path.join(ocPluginDir, "index.js"), "utf8"), /agent[\\/]opencode-native\.js/);
+        assert.deepEqual(oc[ocKey], ["some-other-plugin", ocPluginDir]);
+        assert.match(fs.readFileSync(path.join(ocPluginDir, "index.js"), "utf8").replace(/\\+/g, "/"), /agent\/opencode-native\.js/);
         assert.deepEqual(oc.compaction, { auto: false, buffer: 100 });
         const ocAgain = pluginInstall("opencode");
         assert.match(ocAgain, /mcp\.bili present/);
-        assert.match(ocAgain, /plugin present/);
+        assert.match(ocAgain, new RegExp(`${ocKey} present`));
         assert.match(pluginRemove("opencode"), /removed/);
-        oc = JSON.parse(fs.readFileSync(ocFile, "utf8"));
+        oc = JSON.parse(fs.readFileSync(ocFile, "utf8")) as Record<string, unknown>;
         assert.equal(oc.mcp, undefined);
         // only the bili entry is dropped — the user's other plugin survives
-        assert.deepEqual(oc.plugin, ["some-other-plugin"]);
+        assert.deepEqual(oc[ocKey], ["some-other-plugin"]);
         assert.deepEqual(oc.compaction, { auto: true, buffer: 100 });
         assert.equal(oc.$schema, "https://opencode.ai/config.json");
         assert.equal(fs.existsSync(ocPluginDir), false);
@@ -925,20 +935,70 @@ test("plugin install opencode without a live proxy: MCP shell skipped, native pl
     const ocFile = path.join(home, ".config/opencode/opencode.json");
     try {
         await withEnv({ OPENCODE_CONFIG: ocFile, BILI_MCP_PROXY: undefined, XDG_STATE_HOME: path.join(home, "state") }, async () => {
+            const ocKey = pickPluginKey(detectOpencodeMajor());
             const msg = pluginInstall("opencode");
             assert.match(msg, /installed/);
             assert.match(msg, /mcp\.bili skipped/);
             assert.match(msg, /no bili proxy origin found/);
-            const data = JSON.parse(fs.readFileSync(ocFile, "utf8")) as { mcp?: unknown; plugin?: string[]; compaction?: Record<string, unknown> };
+            const data = JSON.parse(fs.readFileSync(ocFile, "utf8")) as { mcp?: unknown; compaction?: Record<string, unknown> } & Record<string, unknown>;
             assert.equal(data.mcp, undefined);
-            assert.deepEqual(data.plugin, [path.join(home, ".config/opencode/plugins/billion-context")]);
+            assert.deepEqual(data[ocKey], [path.join(home, ".config/opencode/plugins/billion-context")]);
             assert.deepEqual(data.compaction, { auto: false });
             assert.ok(fs.existsSync(path.join(home, ".config/opencode/plugins/billion-context/index.js")));
             assert.match(pluginRemove("opencode"), /removed/);
             const after = JSON.parse(fs.readFileSync(ocFile, "utf8")) as Record<string, unknown>;
             assert.equal(after.mcp, undefined);
-            assert.equal(after.plugin, undefined);
+            assert.equal(after[ocKey], undefined);
             assert.equal(after.compaction, undefined);
+        });
+    } finally {
+        fs.rmSync(home, { recursive: true, force: true });
+    }
+});
+
+test("plugin install opencode replaces legacy opencode-acp entries — array and object shapes (#918)", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-oc-acp-"));
+    const ocFile = path.join(home, ".config/opencode/opencode.json");
+    fs.mkdirSync(path.dirname(ocFile), { recursive: true });
+    try {
+        await withEnv({ OPENCODE_CONFIG: ocFile, BILI_MCP_PROXY: undefined, XDG_STATE_HOME: path.join(home, "state") }, async () => {
+            const ocKey = pickPluginKey(detectOpencodeMajor());
+            const otherKey = ocKey === "plugin" ? "plugins" : "plugin";
+            const dir = path.join(home, ".config/opencode/plugins/billion-context");
+            // array shape: bare name, npm: alias, path (incl. deep entry path), versioned
+            fs.writeFileSync(ocFile, JSON.stringify({
+                [ocKey]: ["opencode-acp", "npm:opencode-acp", "/opt/other-plugin", path.join(home, "ext/opencode-acp/index.js"), path.join(home, "ext2/opencode-acp/dist/index.js"), "opencode-acp@stable"],
+            }));
+            let msg = pluginInstall("opencode");
+            assert.match(msg, /replaced opencode-acp plugin entries/);
+            let data = JSON.parse(fs.readFileSync(ocFile, "utf8")) as Record<string, unknown>;
+            assert.deepEqual(data[ocKey], ["/opt/other-plugin", dir]);
+            assert.ok(fs.existsSync(`${ocFile}.bili-bak`));
+            pluginRemove("opencode");
+
+            // object shape: version-map form (defensive; normalized to keys)
+            fs.writeFileSync(ocFile, JSON.stringify({ [ocKey]: { "opencode-acp": "stable", "other": "1.0" } }));
+            msg = pluginInstall("opencode");
+            assert.match(msg, /replaced opencode-acp plugin entries \(opencode-acp\)/);
+            data = JSON.parse(fs.readFileSync(ocFile, "utf8"));
+            // sibling object entries survive as bare array specs + our dir
+            assert.deepEqual(data[ocKey], ["other", dir]);
+            pluginRemove("opencode");
+
+            // #927: legacy entries under the OTHER spelling are stripped too
+            fs.writeFileSync(ocFile, JSON.stringify({ [otherKey]: ["npm:opencode-acp", "/opt/other-plugin"], [ocKey]: ["/opt/mine"] }));
+            msg = pluginInstall("opencode");
+            assert.match(msg, /replaced opencode-acp plugin entries \(npm:opencode-acp\)/);
+            data = JSON.parse(fs.readFileSync(ocFile, "utf8"));
+            assert.deepEqual(data[otherKey], ["/opt/other-plugin"]);
+            assert.deepEqual(data[ocKey], ["/opt/mine", dir]);
+            pluginRemove("opencode");
+
+            // no legacy entries -> no note, plugin untouched
+            fs.writeFileSync(ocFile, JSON.stringify({ [ocKey]: ["/opt/other-plugin"] }));
+            msg = pluginInstall("opencode");
+            assert.doesNotMatch(msg, /replaced opencode-acp/);
+            assert.equal(msg.includes("other-plugin"), false);
         });
     } finally {
         fs.rmSync(home, { recursive: true, force: true });
@@ -951,16 +1011,17 @@ test("plugin install/remove/status survive a non-object mcp in opencode.json (#8
     fs.mkdirSync(path.dirname(ocFile), { recursive: true });
     try {
         await withEnv({ OPENCODE_CONFIG: ocFile, BILI_MCP_PROXY: undefined, XDG_STATE_HOME: path.join(home, "state") }, async () => {
+            const ocKey = pickPluginKey(detectOpencodeMajor());
             fs.writeFileSync(ocFile, JSON.stringify({ mcp: "totally-broken-string" }));
             const msg = pluginInstall("opencode");
             assert.match(msg, /installed/);
             let data = JSON.parse(fs.readFileSync(ocFile, "utf8")) as Record<string, unknown>;
-            assert.deepEqual(data.plugin, [path.join(home, ".config/opencode/plugins/billion-context")]);
+            assert.deepEqual(data[ocKey], [path.join(home, ".config/opencode/plugins/billion-context")]);
             assert.deepEqual(data.compaction, { auto: false });
             assert.equal(pluginStatusAll().find((r) => r.agent === "opencode")?.status, "installed");
             assert.doesNotThrow(() => pluginRemove("opencode"));
             data = JSON.parse(fs.readFileSync(ocFile, "utf8")) as Record<string, unknown>;
-            assert.equal(data.plugin, undefined);
+            assert.equal(data[ocKey], undefined);
             assert.equal(data.compaction, undefined);
             assert.ok(!fs.existsSync(path.join(home, ".config/opencode/plugins/billion-context/index.js")));
             assert.equal(pluginStatusAll().find((r) => r.agent === "opencode")?.status, "not installed");
@@ -1076,6 +1137,60 @@ test("plugin install refuses to touch broken or non-object configs", async () =>
         fs.mkdirSync(ocDir, { recursive: true });
         fs.writeFileSync(path.join(ocDir, "opencode.json"), "nope{");
         assert.throws(() => pluginInstall("opencode"), /not valid JSON/);
+    });
+    fs.rmSync(home, { recursive: true, force: true });
+});
+
+// #836 (found in #809 N4): a non-object `mcp` (e.g. bare string) made
+// `"bili" in mcp` throw — crashing remove (stranding a half-install) and
+// surfacing "error:" from status. All three opencode sites must degrade
+// gracefully instead of throwing.
+test("plugin opencode survives a non-object mcp (issue #836 / #809 N4)", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-plugin-home-"));
+    const piAgentDir = path.join(home, ".pi/agent");
+    await withEnv(hintEnv(home, piAgentDir), async () => {
+        const ocDir = path.join(home, ".config/opencode");
+        fs.mkdirSync(ocDir, { recursive: true });
+        const ocFile = path.join(ocDir, "opencode.json");
+        const malformed = JSON.stringify({ mcp: "bogus-string", other: 1 });
+        fs.writeFileSync(ocFile, malformed);
+
+        assert.doesNotThrow(() => pluginRemove("opencode"));
+        assert.match(pluginRemove("opencode"), /not installed/);
+        assert.equal(pluginStatusAll().find((r) => r.agent === "opencode")!.status, "not installed");
+        assert.equal(fs.readFileSync(ocFile, "utf8"), malformed);
+
+        // New installer (#919/#927): a bogus mcp key skips ONLY the mcp shell —
+        // the native plugin entry + compaction.auto still land, and sibling
+        // keys survive untouched.
+        assert.doesNotThrow(() => pluginInstall("opencode"));
+        assert.match(pluginInstall("opencode"), /skipped/i);
+        const data = JSON.parse(fs.readFileSync(ocFile, "utf8")) as Record<string, unknown>;
+        assert.equal(data.mcp, "bogus-string");
+        assert.equal(data.other, 1);
+        const ocKey = pickPluginKey(detectOpencodeMajor());
+        assert.deepEqual(data[ocKey], [path.join(ocDir, "plugins", "billion-context")]);
+        assert.deepEqual(data.compaction, { auto: false });
+    });
+    fs.rmSync(home, { recursive: true, force: true });
+});
+
+// #839 (found while reviewing #837): same bug class as #836 on the claude side
+// — a non-object `mcpServers` in .claude.json made `"bili" in mcpServers` throw
+// in claudeStatus(), crashing remove (which calls status first) and surfacing
+// "error:" from status.
+test("plugin claude survives a non-object mcpServers (issue #839)", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-plugin-home-"));
+    const piAgentDir = path.join(home, ".pi/agent");
+    await withEnv(hintEnv(home, piAgentDir), async () => {
+        const cFile = path.join(home, ".claude.json");
+        const malformed = JSON.stringify({ mcpServers: "bogus-string", other: 1 });
+        fs.writeFileSync(cFile, malformed);
+
+        assert.doesNotThrow(() => pluginRemove("claude"));
+        assert.match(pluginRemove("claude"), /not installed/);
+        assert.equal(pluginStatusAll().find((r) => r.agent === "claude")!.status, "not installed");
+        assert.equal(fs.readFileSync(cFile, "utf8"), malformed);
     });
     fs.rmSync(home, { recursive: true, force: true });
 });

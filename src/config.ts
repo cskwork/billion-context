@@ -4,6 +4,7 @@ import { dirname } from "node:path";
 import { configFile } from "./paths.js";
 import { log as loggerLog } from "./logger.js";
 import { validateHttpProxy, type ProxyFallbackOptions } from "./upstream-proxy.js";
+import { resolveOutputHeadroomCap } from "./util.js";
 
 import { parseCompatRoles } from "./compat-roles.js";
 import type { ImageBillingMode } from "./image-tokens.js";
@@ -95,6 +96,18 @@ export type CompressSettings = {
      *  table / registry and the legacy `modelContextLimit` / per-model
      *  `context`. See {@link resolveContextLimitValue}. */
     modelContextLimit?: number | string;
+    /** Cap on the output-headroom reservation as a fraction of the context
+     *  window: reserved = min(max_tokens, pct × window), so the kernel's
+     *  nudge/truncate bands sit below (window − reserved). Accepts a ratio
+     *  (0.25) or percent string ("25%"). Default: 0.25 (aligned with
+     *  billion-context-pi #207). Set 0 to disable the reservation entirely;
+     *  >= 1 restores the legacy full-capability reservation (input + a response
+     *  using its ENTIRE output budget always fits — what strict backends like
+     *  SGLang/vLLM enforce). A reply longer than the reservation overflows
+     *  once; the overflow self-heal recovers it next turn (#896). Negative or
+     *  unparseable values reject the whole compress block. Anthropic wire is
+     *  exempt (its input limit is enforced independently of max_tokens). */
+    outputHeadroomMaxPct?: number | string;
     /** Context usage percentage that triggers forced compression nudges
      *  (bypasses growth-gate + cadence). Accepts a ratio (0.75) or percent
      *  string ("75%"). Maps to kernel `nudge.maxContextLimitPct`. */
@@ -127,6 +140,12 @@ export type CompressSettings = {
     minCompressRange?: number;
     /** Enable multi-tier (T2/T3) distillation (kernel `tiers.enabled`). */
     tiers?: boolean;
+    /** Emit 📦/❌ ACP visibility markers after proxy tool executions
+     *  (compress / decompress / search_context / acp_status) — both the marker
+     *  line streamed to the client and the marker message re-injected into
+     *  rebuilt history. `false` suppresses them entirely, for deployments where
+     *  models imitate or narrate around the markers (#862). Default `true`. */
+    visibilityMarkers?: boolean;
     /** Override the kernel's compression prompt text (compressPhilosophy /
      *  howToCompressRules / tier2DistillRules / tier3CondenseRules). All four
      *  fields are LOAD-BEARING: the kernel rules were tuned in production and
@@ -214,7 +233,10 @@ export type UpstreamProxyMode = "auto" | "manual" | "direct";
  *  prefix. This is a FALLBACK used when the per-route model declaration in
  *  providers.json does not cover a model. The per-route declaration (which
  *  the user controls) always wins, because the same model name can have
- *  different windows behind different relays. */
+ *  different windows behind different relays. Generic family guesses (no
+ *  specific known window) default to 200k, not 128k — a too-small guess
+ *  strands the session in the preflight fail-fast loop while a too-large
+ *  one self-heals on the first upstream overflow (#852). */
 const CONTEXT_LIMIT_TABLE: Array<{ match: RegExp; limit: number }> = [
     { match: /^claude-/i, limit: 200_000 },
     { match: /^gpt-5/i, limit: 400_000 },
@@ -226,12 +248,14 @@ const CONTEXT_LIMIT_TABLE: Array<{ match: RegExp; limit: number }> = [
     { match: /^gemini-1\.5/i, limit: 1_000_000 },
     { match: /^glm-4\.6/i, limit: 128_000 },
     { match: /^glm-5/i, limit: 1_000_000 },
-    { match: /^glm-/i, limit: 128_000 },
-    { match: /^deepseek/i, limit: 128_000 },
+    { match: /^glm-/i, limit: 200_000 },
+    // DeepSeek: flagship line (chat/reasoner/v4*/flash) is 1M on models.dev; only legacy r1/v3/ocr stay ~128k (#852).
+    { match: /^deepseek-(r1|v3|ocr)/i, limit: 128_000 },
+    { match: /^deepseek/i, limit: 1_000_000 },
     { match: /^minimax/i, limit: 204_800 },
-    { match: /^qwen/i, limit: 128_000 },
-    { match: /^kimi/i, limit: 128_000 },
-    { match: /^llama-/i, limit: 128_000 },
+    { match: /^qwen/i, limit: 200_000 },
+    { match: /^kimi/i, limit: 200_000 },
+    { match: /^llama-/i, limit: 200_000 },
 ];
 
 export function lookupContextLimit(model: string | undefined): number | undefined {
@@ -359,6 +383,10 @@ export type ProxyOptions = {
      *  hosts are TLS-terminated locally and fed back into the same request
      *  pipeline; all other hosts are blind-tunnelled. */
     mitm: { enabled: boolean; domains: string[] };
+    /** Mask non-public target hosts in proxy logs (#255, default on when
+     *  omitted). Opt out for local debugging with env BILI_LOG_MASK_HOSTS=0
+     *  or `maskHosts: false` (#897); credential masking stays on either way. */
+    maskHosts?: boolean;
 };
 
 /** Re-read ONLY the routes from the current config sources, returning a fresh
@@ -499,6 +527,7 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
                 ...splitCsv(env.BILI_MITM_DOMAINS),
             ]),
         },
+        maskHosts: (env.BILI_LOG_MASK_HOSTS ?? (fileConfig.maskHosts === false ? "0" : "1")) !== "0",
     };
 }
 
@@ -534,6 +563,9 @@ type FileConfig = {
     compress?: CompressSettings & { injectTool?: boolean; injectNudge?: boolean };
     promptCache?: { routing?: string };
     mitm?: { enabled?: boolean; domains?: string[] };
+    /** Set `false` to log real (non-public) target hosts instead of the
+     *  `<private-host>` placeholder (#897; env BILI_LOG_MASK_HOSTS=0 wins). */
+    maskHosts?: boolean;
     /** Global wire-compat block. `roles` maps message roles to the role name
      *  upstreams accept (e.g. `{"developer":"system"}`) — applied to the
      *  final forwarded body for openai/responses requests (#552). */
@@ -666,6 +698,15 @@ export function parseCompressSettings(v: unknown): (CompressSettings & { injectT
     for (const key of ["nudgeGrowthTokens", "preserveRecentMessages", "preserveRecentTokens", "minCompressRange", "minCompressRangeChars", "stripImagesKeepRecent"] as const) {
         takeNumber(key);
     }
+    if ("outputHeadroomMaxPct" in obj) {
+        const v = obj.outputHeadroomMaxPct;
+        if (typeof v !== "number" && typeof v !== "string") ok = false;
+        else {
+            const pct = resolveOutputHeadroomCap(v);
+            if (!Number.isFinite(pct) || pct < 0) ok = false;
+            else out.outputHeadroomMaxPct = v;
+        }
+    }
     if ("tiers" in obj) {
         if (typeof obj.tiers !== "boolean") ok = false;
         else out.tiers = obj.tiers;
@@ -673,6 +714,10 @@ export function parseCompressSettings(v: unknown): (CompressSettings & { injectT
     if ("stripImages" in obj) {
         if (typeof obj.stripImages !== "boolean") ok = false;
         else out.stripImages = obj.stripImages;
+    }
+    if ("visibilityMarkers" in obj) {
+        if (typeof obj.visibilityMarkers !== "boolean") ok = false;
+        else out.visibilityMarkers = obj.visibilityMarkers;
     }
     // Injection toggles are file-level fields (FileConfig.compress) honored by
     // loadOptions via `=== false`; the web UI shows them from the raw file

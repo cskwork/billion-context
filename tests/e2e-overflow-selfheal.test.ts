@@ -371,8 +371,9 @@ test("e2e #570: failed-turn arms above the true window do not retract the learne
         const sess = listSessions().find((x) => !before.has(x.id));
         assert.ok(sess, "warmup request created the session");
 
-        // Three high-usage mid-stream deaths at 370k — above the true window
-        // (128000), >= 90% of the configured 400k: the #570 KV-pressure pattern.
+        // Three mid-stream deaths at 370k — above the true window (128000) and
+        // above the warmup turn's demonstrated capability (5k): the #570
+        // KV-pressure pattern. (#901: counted against capability, not usage.)
         for (const r of ["r1", "r2", "r3"]) {
             noteWeakOverflow(sess!, { inputTokens: 370_000, model: "claude-test", reason: r });
         }

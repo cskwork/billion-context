@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import fs from "node:fs";
 import net from "node:net";
+import os from "node:os";
 import path from "node:path";
 import { strict as assert } from "node:assert";
 import { test } from "node:test";
@@ -18,6 +19,9 @@ const FORGE = process.env.E2E_FORGE === "1";
 const WORK_ROOT = path.join(process.cwd(), "tmp");
 fs.mkdirSync(WORK_ROOT, { recursive: true });
 const WORK = fs.mkdtempSync(path.join(WORK_ROOT, "e2e-codex-"));
+// codex discovers AGENTS.md by walking UP from its spawn cwd (#815): keep the
+// cwd outside the repo tree or the whole repo doc leaks into every request.
+const CODEX_CWD = fs.mkdtempSync(path.join(os.tmpdir(), "billion-context-e2e-"));
 
 /** Deterministic filler for payload turns: unique per index.
  * Carried verbatim in user messages so context growth is fully deterministic
@@ -131,7 +135,7 @@ function turn(ctx: Ctx, prompt: string, extra: string[] = []): Promise<{ code: n
     args.push(prompt);
     return new Promise((resolve, reject) => {
         const child = spawn(CODEX_BIN, args, {
-            cwd: WORK,
+            cwd: CODEX_CWD,
             env: { ...process.env, CODEX_HOME: ctx.codexHome, E2E_UPSTREAM_KEY: UPSTREAM_KEY, RUST_LOG: "error" },
             stdio: ["ignore", "ignore", "pipe"],
         });

@@ -277,27 +277,45 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
         // fires alongside bili's ACP compression — the in-extension
         // replacement for the old compaction-off config injection. pi's event
         // carries `reason`: cancel only threshold + overflow so manual
-        // /compact stays user-owned. omp's event has no reason field, so omp
-        // cancels ALL compaction — under bili, manual native /compact is
-        // equally harmful (the native summarizer would destroy the
-        // ACP-tagged context), the host shows "Compaction cancelled", and
-        // the user should reach for /acp instead. Whether we own compression
-        // is decided at EVENT time, not load time: in native mode (#519) the
-        // proxy origin lands in BILLION_CONTEXT_PROXY only after the async
-        // bootstrap finishes, so a load-time check would leave the cancel
-        // disarmed for the whole session. Plain pi/omp with the plugin
-        // installed but NO reachable proxy (incl. a failed bootstrap) stays
-        // fully native.
+        // /compact stays user-owned. omp (#851): session_before_compact
+        // carries NO reason field, so at hook level manual compaction
+        // (/compact, plan-mode "Approve and compact context") is
+        // indistinguishable from auto — but every auto pass announces itself
+        // first via auto_compaction_start (reason threshold|overflow|idle|
+        // incomplete), which omp emits (awaited) before the hook fires;
+        // manual paths never do. Track the announcement: announced passes
+        // stay cancelled, unannounced ones are left user-owned. A surviving
+        // native compaction is safe: the proxy archives the unreachable
+        // blocks on session_compact (#395).
+        // Whether we own compression is decided at EVENT time, not load time:
+        // in native mode (#519) the proxy origin lands in
+        // BILLION_CONTEXT_PROXY only after the async bootstrap finishes, so a
+        // load-time check would leave the cancel disarmed for the whole
+        // session. Plain pi/omp with the plugin installed but NO reachable
+        // proxy (incl. a failed bootstrap) stays fully native.
         if (agent === "pi" || agent === "omp") {
-            pi.on("session_before_compact", (event, ctx) => {
-                if (proxyBaseForCtx(ctx) === undefined) return undefined;
-                if (agent === "pi") {
+            if (agent === "pi") {
+                pi.on("session_before_compact", (event, ctx) => {
+                    if (proxyBaseForCtx(ctx) === undefined) return undefined;
                     const reason = (event as unknown as { reason?: unknown }).reason;
                     if (reason === "threshold" || reason === "overflow") return { cancel: true };
                     return undefined;
-                }
-                return { cancel: true };
-            });
+                });
+            } else {
+                let autoPending = false;
+                pi.on("auto_compaction_start", () => {
+                    autoPending = true;
+                });
+                pi.on("auto_compaction_end", () => {
+                    autoPending = false;
+                });
+                pi.on("session_before_compact", (event, ctx) => {
+                    if (proxyBaseForCtx(ctx) === undefined) return undefined;
+                    if (!autoPending) return undefined;
+                    autoPending = false;
+                    return { cancel: true };
+                });
+            }
         }
         // #535 omp-only: omp resolves modelRoles.default into options.model
         // from the PRE-extension static catalog (main.ts: "scope is resolved

@@ -8,7 +8,8 @@ import {
 import { mkdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
-import { preCompactionArchiveOf, type Session } from "./session.js";
+import { preCompactionArchiveOf, peekSession, findSessionByCanonicalId, type Session } from "./session.js";
+import { getStore } from "./persist.js";
 
 /** Bounded retention for large-decompress temp files. Each decompress with
  *  body > 10000 writes one file under tmpdir(); the reaper unlinks oldest past
@@ -114,10 +115,22 @@ export function resolveDecompress(
             reapTempFiles();
             return `${header}\nContent (${body.length} chars) written to: ${outPath}\nUse the read tool to access it.`;
         } catch (e) {
-            return `${header}\n[Failed to write to ${outPath}: ${String(e)}]\n${body.slice(0, 4000)}...`;
+            return `${header}\n[Failed to write to ${outPath}: ${String(e)}]\n${safePrefix(body, 4000)}...`;
         }
     }
     return `${header}\n${body}`;
+}
+
+// Back off a cut that lands between the two halves of a surrogate pair, so the
+// truncated prefix never ends on a lone high surrogate (#816: strict-UTF-8
+// gateways 500 deterministically on re-encoded request bodies).
+function safePrefix(text: string, n: number): string {
+    let cut = Math.min(n, text.length);
+    if (cut > 0 && cut < text.length) {
+        const c = text.charCodeAt(cut - 1);
+        if (c >= 0xD800 && c <= 0xDBFF) cut -= 1;
+    }
+    return text.slice(0, cut);
 }
 
 /** Shared search_context execution for all wire paths. Distinguishes "no active
@@ -128,19 +141,50 @@ export function executeSearchContext(
     args: Record<string, unknown>,
     core: CompressionCore,
     state: CompressionState,
+    foreignSessionId?: string,
 ): string {
     const query = typeof args.query === "string" ? args.query : "";
     if (query.length === 0) return "[search_context FAILED: query is required]";
+    const scope = foreignSessionId ? ` in session ${foreignSessionId}` : "";
     const limit = typeof args.limit === "number" && args.limit > 0 ? Math.floor(args.limit) : 5;
     const blocks = core.search(query, state).slice(0, limit);
     if (blocks.length === 0) {
-        if (!state.blocks.some((b) => b.active)) return "[No compressed blocks exist yet — nothing to search.]";
-        return `[No blocks matched "${query}"]`;
+        if (!state.blocks.some((b) => b.active)) return `[No compressed blocks exist yet${scope} — nothing to search.]`;
+        return `[No blocks matched "${query}"${scope}]`;
     }
     const lines = blocks.map((b) => {
         const topic = b.topic ?? "(no topic)";
-        const preview = b.summary.length > 200 ? b.summary.slice(0, 200) + "..." : b.summary;
+        const preview = b.summary.length > 200 ? safePrefix(b.summary, 200) + "..." : b.summary;
         return `${b.blockId} (T${b.tier}) "${topic}"\n  ${preview}`;
     });
-    return `Found ${blocks.length} block(s) for "${query}":\n\n${lines.join("\n\n")}`;
+    const note = foreignSessionId
+        ? `\n\n[Read-only search of historical session ${foreignSessionId}. Block ids are per-session namespaces — decompress acts on the current session only. For bulk content use bili export ${foreignSessionId} [--full].]`
+        : "";
+    return `Found ${blocks.length} block(s) for "${query}"${scope}:\n\n${lines.join("\n\n")}${note}`;
+}
+
+// #841: resolve a requested session id to its compression state without
+// touching it — resident memory first (verbatim id or canonical alias), then
+// the persisted store. Never creates, reloads or marks anything dirty.
+export function resolveForeignSessionState(id: string): CompressionState | null {
+    const resident = peekSession(id) ?? findSessionByCanonicalId(id);
+    if (resident) return resident.state;
+    return getStore().loadStateForSearch(id);
+}
+
+export function executeSearchContextTarget(
+    args: Record<string, unknown>,
+    core: CompressionCore,
+    sessionId: string,
+    state: CompressionState,
+): string {
+    const requested = typeof args.conversation_id === "string" ? args.conversation_id.trim() : "";
+    if (!requested || requested === sessionId) return executeSearchContext(args, core, state);
+    // A self-reference under an alias form (canonical pfa-* id) keeps plain
+    // current-session semantics — no "historical session" framing.
+    const self = peekSession(requested) ?? findSessionByCanonicalId(requested);
+    if (self?.id === sessionId) return executeSearchContext(args, core, state);
+    const foreign = resolveForeignSessionState(requested);
+    if (!foreign) return `[search_context FAILED: unknown session "${requested}"]`;
+    return executeSearchContext(args, core, foreign, requested);
 }
