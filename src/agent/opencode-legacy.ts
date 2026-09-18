@@ -41,7 +41,7 @@
 // caller falls back to bili's own V1 tools (current behavior); legacy
 // sessions then degrade as documented (read-only archives).
 
-import { existsSync } from "node:fs";
+import { existsSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -66,17 +66,38 @@ export interface LegacyAcpModule {
 }
 
 /** Candidate `opencode-acp/dist/index.js` paths, most specific first:
- *  project plugin scope (v1 `opencode plugin opencode-acp`), plain project
- *  node_modules, global user npm root, opencode's config-scope node_modules. */
+ *  project plugin scope, plain project node_modules, opencode's v1 package
+ *  cache (`opencode plugin opencode-acp` — global AND project installs land
+ *  in `~/.cache/opencode/packages/opencode-acp@<ver>/node_modules`; every
+ *  version present is offered, newest first), global user npm root, and
+ *  opencode's config-scope node_modules. */
 export function legacyAcpCandidates(cwd: string | undefined): string[] {
     const dirs: string[] = [];
     if (cwd !== undefined && cwd.length > 0) {
         dirs.push(path.join(cwd, ".opencode", "node_modules"));
         dirs.push(path.join(cwd, "node_modules"));
     }
-    dirs.push(path.join(homedir(), ".local", "lib", "node_modules"));
-    dirs.push(path.join(process.env.XDG_CONFIG_HOME ?? path.join(homedir(), ".config"), "opencode", "node_modules"));
-    return dirs.map((d) => path.join(d, "opencode-acp", "dist", "index.js"));
+    const out: string[] = [];
+    const pushDir = (d: string): void => {
+        out.push(path.join(d, "opencode-acp", "dist", "index.js"));
+    };
+    for (const d of dirs) pushDir(d);
+    const cacheHome = process.env.XDG_CACHE_HOME ?? path.join(homedir(), ".cache");
+    const packages = path.join(cacheHome, "opencode", "packages");
+    try {
+        const versions = readdirSync(packages)
+            .filter((e) => e.startsWith("opencode-acp@"))
+            .sort()
+            .reverse();
+        for (const v of versions) {
+            pushDir(path.join(packages, v, "node_modules"));
+        }
+    } catch {
+        // no package cache
+    }
+    pushDir(path.join(homedir(), ".local", "lib", "node_modules"));
+    pushDir(path.join(process.env.XDG_CONFIG_HOME ?? path.join(homedir(), ".config"), "opencode", "node_modules"));
+    return out;
 }
 
 /** acp's default persisted-state location for a session id. */

@@ -305,9 +305,9 @@ export interface V1Hooks {
     "command.execute.before"?: (input: { command: string; sessionID: string; arguments?: string }, output?: { parts: unknown[] }) => Promise<void>;
     tool?: Record<string, V1Tool>;
     event?: (input: { event?: unknown }) => Promise<void>;
-    "experimental.chat.system.transform"?: (input: { sessionID?: string }) => Promise<void>;
+    "experimental.chat.system.transform"?: (input: { sessionID?: string }, output: { system?: unknown[] }) => Promise<void>;
     "experimental.chat.messages.transform"?: (input: unknown, output: { messages?: unknown }) => Promise<void>;
-    "experimental.text.complete"?: (input: { sessionID: string }) => Promise<void>;
+    "experimental.text.complete"?: (input: { sessionID: string }, output: { text?: unknown }) => Promise<void>;
 }
 
 export interface V1PluginContext {
@@ -441,9 +441,9 @@ export function createV1ServerHooks(origin: string, ctx: V1PluginContext, deps: 
             if (n > 0) log(`[bili-opencode-native] v1: rewrote ${n} provider baseURL(s) -> ${origin}/bili/`);
             windows = extractV1Windows(cfg);
         },
-        "command.execute.before": async (input, _output) => {
+        "command.execute.before": async (input, output) => {
             if ((input.command === "acp" || input.command === "dcp") && legacy?.commandHook !== undefined && isLegacy(input.sessionID)) {
-                await legacy.commandHook(input);
+                await legacy.commandHook(input, output);
                 return;
             }
             await acp["command.execute.before"]?.(input);
@@ -454,9 +454,9 @@ export function createV1ServerHooks(origin: string, ctx: V1PluginContext, deps: 
         // only — new sessions never enter acp's registry (no adoption).
         const sys = legacy.hooks["experimental.chat.system.transform"];
         if (typeof sys === "function") {
-            hooks["experimental.chat.system.transform"] = async (input) => {
+            hooks["experimental.chat.system.transform"] = async (input, output) => {
                 if (!isLegacy(input.sessionID)) return;
-                await (sys as (i: unknown) => Promise<void>)(input);
+                await (sys as (i: unknown, o: unknown) => Promise<void>)(input, output);
             };
         }
         const msgT = legacy.hooks["experimental.chat.messages.transform"];
@@ -468,9 +468,9 @@ export function createV1ServerHooks(origin: string, ctx: V1PluginContext, deps: 
         }
         const textC = legacy.hooks["experimental.text.complete"];
         if (typeof textC === "function") {
-            hooks["experimental.text.complete"] = async (input) => {
+            hooks["experimental.text.complete"] = async (input, output) => {
                 if (!isLegacy(input.sessionID)) return;
-                await (textC as (i: unknown) => Promise<void>)(input);
+                await (textC as (i: unknown, o: unknown) => Promise<void>)(input, output);
             };
         }
         // Event hook carries no session (acp uses it only for compress timing
@@ -580,7 +580,7 @@ const server = async (ctx: V1PluginContext): Promise<V1Hooks> => {
         // Pass the host's full ctx object through: V1PluginContext types only
         // what bili uses (client/directory), but the runtime object may carry
         // extra host fields acp's hooks need at action time.
-        legacy = await loadLegacyAcp(ctx);
+        legacy = await loadLegacyAcp(ctx, (msg) => console.log(msg));
     } catch {
         legacy = undefined;
     }
