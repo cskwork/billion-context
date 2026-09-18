@@ -22,13 +22,16 @@
 //
 // Liveness gate (differs from pi by design): an http.request hook CANNOT
 // observe send failures (the host swallows them; #809 verification list), so
-// unlike pi's post-failure respawn, every outgoing request first probes
-// `/__bili/health` (bounded) of the current origin and respawns if dead. If
-// no origin can be made healthy the request goes DIRECT (uncompressed) and a
-// one-time stderr warning fires — recovery is automatic once a proxy is
-// healthy again (no permanent latch; each request re-verifies). Bootstrap
-// retries are rate-limited to one attempt per RESPAWN_COOLDOWN_MS so a
-// persistently failing spawn does not become a per-request spawn storm.
+// unlike pi's post-failure respawn, each outgoing request checks
+// `/__bili/health` of the current origin and respawns if dead. The verdict is
+// TTL-cached per origin (#928): steady-state requests reuse the last result
+// and re-probe only after HEALTH_PROBE_TTL_MS, so a healthy proxy costs no
+// per-request RTT and a dead one is found within at most one TTL. If no origin
+// can be made healthy the request goes DIRECT (uncompressed) and a one-time
+// stderr warning fires — recovery is automatic once a proxy is healthy again
+// (no permanent latch; re-checked at least every TTL). Bootstrap retries are
+// rate-limited to one attempt per RESPAWN_COOLDOWN_MS so a persistently
+// failing spawn does not become a per-request spawn storm.
 //
 // Skipped when opted out (BILI_NATIVE_OPENCODE=0 / BILLION_CONTEXT_PLUGIN=0)
 // or when a `bili` /bili/ launch owns routing (BILI_PROVIDER_REWRITES). A
@@ -95,6 +98,10 @@ export function planNativeOpencode(env: NodeJS.ProcessEnv): { mode: "off" | "att
 
 const HEALTH_TIMEOUT_MS = 1500;
 const RESPAWN_COOLDOWN_MS = 15_000;
+/** Probe-verdict trust window (#928). Far below RESPAWN_COOLDOWN_MS: that
+ *  cooldown already assumes multi-second proxy stability, so a few-second
+ *  detection horizon is consistent with it while removing the per-request RTT. */
+const HEALTH_PROBE_TTL_MS = 2_000;
 
 async function probeHealth(origin: string): Promise<boolean> {
     try {
@@ -105,17 +112,38 @@ async function probeHealth(origin: string): Promise<boolean> {
     }
 }
 
+/** Wrap a probe in a per-origin TTL cache (#928). Both verdicts are cached: a
+ *  healthy hit skips the steady-state loopback RTT; a dead hit avoids re-paying
+ *  the full HEALTH_TIMEOUT_MS on every request across the death+cooldown window.
+ *  Stale entries for other origins are evicted on insert, keeping the map bounded. */
+function withProbeTtl(probe: (origin: string) => Promise<boolean>, ttlMs: number): (origin: string) => Promise<boolean> {
+    const cache = new Map<string, { ok: boolean; at: number }>();
+    return (origin) => {
+        const now = Date.now();
+        const hit = cache.get(origin);
+        if (hit !== undefined && now - hit.at < ttlMs) return Promise.resolve(hit.ok);
+        return probe(origin).then((ok) => {
+            const t = Date.now();
+            for (const [key, entry] of cache) if (t - entry.at >= ttlMs) cache.delete(key);
+            cache.set(origin, { ok, at: t });
+            return ok;
+        });
+    };
+}
+
 export interface OpencodeNativeRouteDeps {
     probe?: (origin: string) => Promise<boolean>;
     /** Bootstrap retry interval when no live origin is held (tests shrink it). */
     respawnCooldownMs?: number;
+    /** Probe-verdict cache TTL; defaults to HEALTH_PROBE_TTL_MS (tests shrink it). */
+    probeTtlMs?: number;
 }
 
 /** Build the native-mode route callback consumed by createOpencodeV2Setup.
  *  The probe is injectable for tests; the default does a bounded GET of
  *  /__bili/health. */
 export function createNativeRoute(state: NativeInterceptState, deps: OpencodeNativeRouteDeps = {}): (e: V2HttpRequestEvent, s: V2State) => Promise<void> {
-    const probe = deps.probe ?? probeHealth;
+    const probe = withProbeTtl(deps.probe ?? probeHealth, deps.probeTtlMs ?? HEALTH_PROBE_TTL_MS);
     const respawnCooldownMs = deps.respawnCooldownMs ?? RESPAWN_COOLDOWN_MS;
     let warned = false;
     let attachWarned = false;

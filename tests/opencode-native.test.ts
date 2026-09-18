@@ -367,3 +367,51 @@ test("native route: attach mode leaves non-model requests untouched", async () =
     assert.equal(e.request, req);
     assert.equal(s.proxyBase, undefined);
 });
+
+// #928: the health verdict is TTL-cached per origin. Steady-state requests must
+// reuse the last result instead of paying a loopback RTT on every request.
+test("route: healthy origin triggers a single health probe across N steady-state requests (#928)", async () => {
+    const origin = "http://127.0.0.1:9999";
+    let calls = 0;
+    const state: NativeInterceptState = { origin, ready: Promise.resolve(origin) };
+    const route = createNativeRoute(state, { probe: async () => { calls++; return true; }, probeTtlMs: 10_000 });
+    const s: V2State = {};
+    for (let i = 0; i < 5; i++) {
+        const e: V2HttpRequestEvent = { request: new Request(MODEL_URL) };
+        await route(e, s);
+        assert.equal((e.request as Request).url, `${origin}/bili/${MODEL_URL}`);
+    }
+    assert.equal(calls, 1, "expected exactly one probe for N requests within the TTL");
+});
+
+test("route: re-probes once the probe TTL elapses rather than latching forever (#928)", async () => {
+    const origin = "http://127.0.0.1:9999";
+    let calls = 0;
+    const state: NativeInterceptState = { origin, ready: Promise.resolve(origin) };
+    const route = createNativeRoute(state, { probe: async () => { calls++; return true; }, probeTtlMs: 20 });
+    const s: V2State = {};
+    await route({ request: new Request(MODEL_URL) }, s);
+    assert.equal(calls, 1);
+    await sleep(45);
+    await route({ request: new Request(MODEL_URL) }, s);
+    assert.equal(calls, 2, "expected a fresh probe after the TTL elapsed");
+});
+
+test("route: a proxy that dies is detected within one TTL and degrades to direct (#928)", async () => {
+    const origin = "http://127.0.0.1:9999";
+    let alive = true;
+    let calls = 0;
+    const state: NativeInterceptState = { origin, ready: Promise.resolve(origin) };
+    const route = createNativeRoute(state, { probe: async () => { calls++; return alive; }, probeTtlMs: 30 });
+    const s: V2State = {};
+    const up: V2HttpRequestEvent = { request: new Request(MODEL_URL) };
+    await route(up, s);
+    assert.equal((up.request as Request).url, `${origin}/bili/${MODEL_URL}`);
+    assert.equal(calls, 1);
+    alive = false;
+    await sleep(45);
+    const down: V2HttpRequestEvent = { request: new Request(MODEL_URL) };
+    await route(down, s);
+    assert.equal((down.request as Request).url, MODEL_URL, "expected an unrewritten (direct) request after the proxy died");
+    assert.ok(calls >= 2, "expected a re-probe within one TTL that observed the dead proxy");
+});
