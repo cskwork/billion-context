@@ -17,6 +17,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      pull-requests: write
     steps:
       - uses: actions/checkout@v4
         with:
@@ -107,7 +108,7 @@ jobs:
             exit 0
           fi
           echo "::error::direct push to master was blocked (branch protection). Fallback: opening a release PR."
-          BR="manual-release-v${VER}-$(date -u +%Y%m%d%H%M%S)"
+          BR="$(date -u +%Y-%m-%d)_release-v${VER}"
           git push -q origin "HEAD:$BR"
           curl -sS -f -X POST \
             -H "Authorization: Bearer $GH_TOKEN" \
