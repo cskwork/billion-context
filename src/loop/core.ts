@@ -92,6 +92,12 @@ export interface LoopCtx {
     // compute the true context total correctly (Anthropic reports
     // input_tokens as NEW-only; OpenAI/Responses report the TOTAL).
     protocol?: WireProtocol;
+    /** #862: when `false`, suppress the 📦/❌ ACP visibility markers emitted
+     *  after proxy tool executions — both the marker line streamed to the
+     *  client (`emitMarker`) and the orphan marker message re-injected into
+     *  rebuilt history. Default (undefined) keeps markers on. Paired
+     *  tool-call/tool-result messages are unaffected. */
+    visibilityMarkers?: boolean;
 }
 
 export interface RequestOptions {
@@ -569,7 +575,7 @@ export async function* runCompressLoop(
                     }
                     const result = executeProxyTool(call.name, parsedArgs, ctx, call.callId);
                     proxyResults.push({ name: call.name, callId: call.callId, result, arguments: call.arguments });
-                    yield adapter.emitMarker(call.name, result);
+                    if (ctx.visibilityMarkers !== false) yield adapter.emitMarker(call.name, result);
                 } else {
                     realToolCalls.push(call);
                     realCalls += 1;
@@ -643,7 +649,7 @@ export async function* runCompressLoop(
                             toolCallId: pr.callId,
                             text: pr.result,
                         });
-                    } else {
+                    } else if (ctx.visibilityMarkers !== false) {
                         coreMessages.push({
                             id: `acp_loop_r${round}_marker_${pr.callId}`,
                             role: "system",
