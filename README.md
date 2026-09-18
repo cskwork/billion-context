@@ -198,6 +198,11 @@ bili plugin install dsh         # appends a managed block to every ~/.dsh/profil
 bili plugin remove <client>     # undo (dsh restores the placeholder; config snapshots go to .bili-bak)
 ```
 
+dsh users can skip bili entirely: `dsh plugin --profile <name> add
+billion-context` installs the same native plugin through dsh's own plugin
+channel (pnpm into the profile, bundled patch layer) — see the dsh section
+below.
+
 At load the plugin **spawns its own proxy** (or attaches to a healthy
 running one — a parent-pid watchdog tears it down when the client exits),
 rewrites model traffic to `<proxy>/bili/<upstream-url>`, registers

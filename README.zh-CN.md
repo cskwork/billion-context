@@ -123,6 +123,8 @@ bili plugin install dsh         # 往每个 ~/.dsh/profiles/*/cordis.patch.yml �
 bili plugin remove <client>     # 卸载(dsh 还原占位符;配置快照存 .bili-bak)
 ```
 
+dsh 用户可以完全不用 bili：`dsh plugin --profile <name> add billion-context` 经 dsh 自己的插件通道装上同一个原生插件（pnpm 装进 profile、挂载包内 patch 层）—— 见下文 dsh 段。
+
 插件加载时**自拉起自己的代理**(已有健康实例则直接复用 —— 父进程 pid 看门狗在客户端退出时收掉它),把模型流量改写到 `<proxy>/bili/<上游URL>`,并把 `compress` / `decompress` / `acp_status` 注册为客户端原生工具(plugin 模式),`/acp` 面板绑定当前会话。退出开关:`BILI_NATIVE_PI=0`、`BILI_NATIVE_OPENCODE=0`、`BILI_NATIVE_DSH=0`。
 
 注意:
