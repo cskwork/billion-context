@@ -42,6 +42,22 @@ function startFakeProxyV2(): Promise<{ origin: string; toolCalls: Array<{ conver
             });
             return;
         }
+        if ((req.url ?? "").startsWith("/__bili/plugin/status")) {
+            if ((req.url ?? "").includes("ses_acp_idle")) {
+                res.writeHead(404, { "content-type": "application/json" });
+                res.end(JSON.stringify({ ok: false, error: "unknown plugin conversation" }));
+                return;
+            }
+            res.writeHead(200, { "content-type": "application/json" });
+            const panel = (req.url ?? "").includes("ses_acp_long") ? "X".repeat(1500) : "ACP-PANEL-OK";
+            res.end(JSON.stringify({ ok: true, panel }));
+            return;
+        }
+        if ((req.url ?? "") === "/__bili/plugin/manifest") {
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(JSON.stringify({ version: "9.9.9-test" }));
+            return;
+        }
         res.writeHead(404);
         res.end("{}");
     });
@@ -62,12 +78,20 @@ interface FakeAddedTool {
     execute: (input: Record<string, unknown>, ctx: { sessionID: string }) => Promise<{ content: string }>;
 }
 
+interface FakeAddedCommand {
+    name: string;
+    description?: string;
+    execute: (input: Record<string, unknown>) => Promise<void>;
+}
+
 function makeFakeCtx() {
     const eventQueue: Array<{ type?: unknown; data?: Record<string, unknown> }> = [];
     let wake: (() => void) | undefined;
     let closed = false;
     let signal: AbortSignal | undefined;
     const addedTools: FakeAddedTool[] = [];
+    const addedCommands: FakeAddedCommand[] = [];
+    const syntheticCalls: Array<{ sessionID: string; text: string; description?: string; resume?: boolean }> = [];
     let modelRequestCb: ((e: Record<string, unknown>) => void | Promise<void>) | undefined;
     const disposed: number[] = [];
 
@@ -78,11 +102,21 @@ function makeFakeCtx() {
                 modelRequestCb = cb;
                 return { dispose: () => { disposed.push(1); } };
             },
+            synthetic: async (input: { sessionID: string; text: string; description?: string; resume?: boolean }) => {
+                syntheticCalls.push(input);
+                return {};
+            },
         },
         tool: {
             transform: async (cb: (editor: { add: (t: FakeAddedTool) => void }) => void) => {
                 cb({ add: (t) => addedTools.push(t) });
                 return { dispose: () => { disposed.push(2); } };
+            },
+        },
+        command: {
+            transform: async (cb: (editor: { add: (c: FakeAddedCommand) => void }) => void) => {
+                cb({ add: (c) => addedCommands.push(c) });
+                return { dispose: () => { disposed.push(3); } };
             },
         },
         event: {
@@ -126,6 +160,8 @@ function makeFakeCtx() {
         },
         pushEvent: (evt: { type?: unknown; data?: Record<string, unknown> }) => { eventQueue.push(evt); wake?.(); },
         get addedTools() { return addedTools; },
+        get addedCommands() { return addedCommands; },
+        get syntheticCalls() { return syntheticCalls; },
         get disposed() { return disposed; },
     };
 }
@@ -249,8 +285,15 @@ test("v2 setup: activates from /bili/ baseURL on round 1, stamps headers, forwar
                 assert.equal(proxy.toolCalls.at(-1)?.conversationId, "ses_v2_1");
                 assert.equal(proxy.toolCalls.at(-1)?.tool, "compress");
 
-                const statusOut = await fake.addedTools.find((t) => t.name === "acp_status")!.execute({}, { sessionID: "ses_other" });
+                // Panel-first: acp_status returns the status panel when the
+                // proxy serves one for this conversation (ses_other gets the
+                // generic "ACP-PANEL-OK"), and falls back to the forwarded
+                // kernel tool when the status endpoint 404s (ses_acp_idle).
+                const panelOut = await fake.addedTools.find((t) => t.name === "acp_status")!.execute({}, { sessionID: "ses_other" });
+                assert.equal(panelOut.content, "ACP-PANEL-OK");
+                const statusOut = await fake.addedTools.find((t) => t.name === "acp_status")!.execute({}, { sessionID: "ses_acp_idle" });
                 assert.equal(statusOut.content, "STATUS-RESULT");
+                assert.equal(proxy.toolCalls.at(-1)?.tool, "acp_status");
             } finally {
                 cleanup();
             }
@@ -313,6 +356,195 @@ test("v2 setup: cleanup aborts event subscription and disposes registrations", a
         });
     } finally {
         await proxy.close();
+    }
+});
+
+test("v2 setup: /acp command registered and renders proxy status panel via synthetic", async () => {
+    const proxy = await startFakeProxyV2();
+    const fake = makeFakeCtx();
+    try {
+        await withEnv({ BILLION_CONTEXT_PROXY: proxy.origin, BILLION_CONTEXT_PLUGIN: undefined }, async () => {
+            const cleanup = await biliOpencodePlugin.setup(fake.ctx as never);
+            try {
+                const acp = fake.addedCommands.find((c) => c.name === "acp");
+                assert.ok(acp, "/acp command registered");
+                assert.equal(typeof acp!.execute, "function");
+                await acp!.execute({ sessionID: "ses_acp_1" });
+                await until(() => fake.syntheticCalls.length === 1);
+                assert.equal(fake.syntheticCalls[0].sessionID, "ses_acp_1");
+                assert.match(fake.syntheticCalls[0].description!, /ACP-PANEL-OK/);
+                assert.match(fake.syntheticCalls[0].text, /displayed in your terminal/);
+                assert.match(fake.syntheticCalls[0].text, /not an instruction/);
+                assert.equal(fake.syntheticCalls[0].resume, false);
+            } finally {
+                cleanup();
+            }
+        });
+    } finally {
+        await proxy.close();
+    }
+});
+
+test("v2 setup: /acp reports no proxy detected via synthetic when no proxy", async () => {
+    const fake = makeFakeCtx();
+    await withEnv({ BILLION_CONTEXT_PROXY: undefined, BILLION_CONTEXT_PLUGIN: undefined }, async () => {
+        const cleanup = await biliOpencodePlugin.setup(fake.ctx as never);
+        try {
+            const acp = fake.addedCommands.find((c) => c.name === "acp")!;
+            await acp.execute({ sessionID: "s_nopx" });
+            await until(() => fake.syntheticCalls.length === 1);
+            assert.match(fake.syntheticCalls[0].description!, /no proxy detected/);
+            assert.match(fake.syntheticCalls[0].text, /not an instruction/);
+            assert.equal(fake.syntheticCalls[0].resume, false);
+        } finally {
+            cleanup();
+        }
+    });
+});
+
+test("v2 setup: first /acp before any model request shows the idle notice (proxy 404s the conversation)", async () => {
+    const proxy = await startFakeProxyV2();
+    const fake = makeFakeCtx();
+    try {
+        await withEnv({ BILLION_CONTEXT_PROXY: proxy.origin, BILLION_CONTEXT_PLUGIN: undefined }, async () => {
+            const cleanup = await biliOpencodePlugin.setup(fake.ctx as never);
+            try {
+                const acp = fake.addedCommands.find((c) => c.name === "acp")!;
+                await acp.execute({ sessionID: "ses_acp_idle" });
+                await until(() => fake.syntheticCalls.length === 1);
+                assert.match(fake.syntheticCalls[0].description!, /billion-context@9\.9\.9-test \u2014 proxy connected, no ACP session yet/);
+                assert.match(fake.syntheticCalls[0].text, /not an instruction/);
+                assert.equal(fake.syntheticCalls[0].resume, false);
+            } finally {
+                cleanup();
+            }
+        });
+    } finally {
+        await proxy.close();
+    }
+});
+
+
+test("v2 setup: /acp truncates long panels to the TUI notice cap", async () => {
+    const proxy = await startFakeProxyV2();
+    const fake = makeFakeCtx();
+    try {
+        await withEnv({ BILLION_CONTEXT_PROXY: proxy.origin, BILLION_CONTEXT_PLUGIN: undefined }, async () => {
+            const cleanup = await biliOpencodePlugin.setup(fake.ctx as never);
+            try {
+                const acp = fake.addedCommands.find((c) => c.name === "acp")!;
+                await acp.execute({ sessionID: "ses_acp_long" });
+                await until(() => fake.syntheticCalls.length === 1);
+                const desc = fake.syntheticCalls[0].description ?? "";
+                assert.ok(desc.length > 0 && desc.length <= 1024);
+                assert.match(desc, /\[panel truncated\]$/);
+                assert.match(fake.syntheticCalls[0].text, /not an instruction/);
+            } finally {
+                cleanup();
+            }
+        });
+    } finally {
+        await proxy.close();
+    }
+});
+
+test("v2 /acp: host omits sessionID → warn once, render nothing (never an empty-id synthetic)", async () => {
+    const warns: string[] = [];
+    const origWarn = console.warn;
+    console.warn = (msg?: unknown) => { warns.push(String(msg)); };
+    try {
+        for (const plugin of ["0", undefined]) {
+            const f = makeFakeCtx();
+            await withEnv({ BILLION_CONTEXT_PROXY: undefined, BILLION_CONTEXT_PLUGIN: plugin }, async () => {
+                const cleanup = await biliOpencodePlugin.setup(f.ctx as never);
+                try {
+                    const acp = f.addedCommands.find((c) => c.name === "acp")!;
+                    await acp.execute({});
+                    await new Promise((r) => setTimeout(r, 20));
+                    assert.equal(f.syntheticCalls.length, 0, `no synthetic for missing sessionID (BILLION_CONTEXT_PLUGIN=${String(plugin)})`);
+                } finally {
+                    cleanup();
+                }
+            });
+        }
+        assert.equal(warns.filter((w) => w.includes("sessionID")).length, 2, "one warning per no-sessionID invocation");
+    } finally {
+        console.warn = origWarn;
+    }
+});
+
+test("v2 /acp: disabled + valid session still renders the 'disabled' notice", async () => {
+    const fake = makeFakeCtx();
+    await withEnv({ BILLION_CONTEXT_PROXY: undefined, BILLION_CONTEXT_PLUGIN: "0" }, async () => {
+        const cleanup = await biliOpencodePlugin.setup(fake.ctx as never);
+        try {
+            const acp = fake.addedCommands.find((c) => c.name === "acp")!;
+            await acp.execute({ sessionID: "ses_dis" });
+            await until(() => fake.syntheticCalls.length === 1);
+            assert.match(fake.syntheticCalls[0].description!, /disabled/);
+            assert.equal(fake.syntheticCalls[0].sessionID, "ses_dis");
+        } finally {
+            cleanup();
+        }
+    });
+});
+
+test("v2 /acp: surfaces status.error when the proxy returns no panel", async () => {
+    const server = http.createServer((req, res) => {
+        if ((req.url ?? "").startsWith("/__bili/plugin/status")) {
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: true, error: "backend-busy" }));
+            return;
+        }
+        res.writeHead(404);
+        res.end("{}");
+    });
+    server.listen(0, "127.0.0.1");
+    await once(server, "listening");
+    const origin = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+    const fake = makeFakeCtx();
+    try {
+        await withEnv({ BILLION_CONTEXT_PROXY: origin, BILLION_CONTEXT_PLUGIN: undefined }, async () => {
+            const cleanup = await biliOpencodePlugin.setup(fake.ctx as never);
+            try {
+                const acp = fake.addedCommands.find((c) => c.name === "acp")!;
+                await acp.execute({ sessionID: "ses_err" });
+                await until(() => fake.syntheticCalls.length === 1);
+                assert.match(fake.syntheticCalls[0].description!, /no status panel/);
+                assert.match(fake.syntheticCalls[0].description!, /backend-busy/);
+            } finally {
+                cleanup();
+            }
+        });
+    } finally {
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+});
+
+test("v2 /acp: a throwing command editor degrades to no-/acp without killing setup", async () => {
+    const fake = makeFakeCtx();
+    const ctxObj = fake.ctx as unknown as { command?: unknown };
+    ctxObj.command = {
+        transform: async (cb: (editor: { add: (c: unknown) => void }) => void) => {
+            cb({ add: () => { throw new Error("command editor has no add"); } });
+            return { dispose: () => {} };
+        },
+    };
+    const warns: string[] = [];
+    const origWarn = console.warn;
+    console.warn = (msg?: unknown) => { warns.push(String(msg)); };
+    try {
+        await withEnv({ BILLION_CONTEXT_PROXY: undefined, BILLION_CONTEXT_PLUGIN: undefined }, async () => {
+            const cleanup = await biliOpencodePlugin.setup(fake.ctx as never);
+            try {
+                assert.ok(typeof cleanup === "function", "setup resolved despite the command editor throwing");
+            } finally {
+                cleanup();
+            }
+        });
+        assert.ok(warns.some((w) => w.includes("/acp")), "degradation logged");
+    } finally {
+        console.warn = origWarn;
     }
 });
 

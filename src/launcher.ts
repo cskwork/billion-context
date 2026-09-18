@@ -173,6 +173,14 @@ export interface LauncherDeps {
     spawnImpl?: SpawnFn;
     now?: () => number;
     sleep?: (ms: number) => Promise<void>;
+    /** #519 native mode: the proxy entry script to spawn. The launcher
+     *  default (process.argv[1]) is WRONG inside a host process like pi —
+     *  pi-native.ts passes its own package's dist/index.js instead. */
+    scriptPath?: string;
+    /** #819: explicit Node executable for spawning the proxy. Inside a host
+     *  process (opencode/pi native binary) process.execPath is NOT Node;
+     *  defaults to resolveNodeRuntime(). */
+    nodeRuntime?: string;
 }
 
 export function isLaunchClient(value: string): value is ClientName {
@@ -1987,6 +1995,40 @@ function proxyStartArgs(opts: LaunchOptions): string[] {
     return args;
 }
 
+/** #819: resolve the executable that runs the proxy entry script. In a plain
+ *  Node CLI, process.execPath is correct; inside a host process (the opencode
+ *  or pi native binary) it is the HOST executable — spawning it with a .js
+ *  argv passes the script to the wrong program. A live Node always wins, then
+ *  an explicit BILLION_CONTEXT_NODE override, then a PATH search. */
+export function resolveNodeRuntime(
+    execPath: string = process.execPath,
+    env: NodeJS.ProcessEnv = process.env,
+    platform: NodeJS.Platform = process.platform,
+    existsImpl: (p: string) => boolean = fs.existsSync,
+): string {
+    const base = path.basename(execPath).toLowerCase();
+    if (base === "node" || base === "node.exe") return execPath;
+    const override = typeof env.BILLION_CONTEXT_NODE === "string" ? env.BILLION_CONTEXT_NODE.trim() : "";
+    if (override.length > 0 && existsImpl(override)) return override;
+    // join with the SIMULATED platform's separators: a posix-style PATH on
+    // win32 (and vice versa) must not be normalized through the host's
+    // path.join, or the candidates no longer match what existsImpl expects.
+    const sep = platform === "win32" ? ";" : ":";
+    const names = platform === "win32" ? ["node.exe"] : ["node"];
+    for (const dir of (env.PATH ?? "").split(sep)) {
+        if (!dir) continue;
+        for (const name of names) {
+            // separator-preserving concatenation: never normalize — win32
+            // accepts forward slashes, and normalizing through path.join
+            // would rewrite a posix-style entry on a win32 host (or the
+            // reverse), missing the file existsImpl would find.
+            const candidate = dir.endsWith("/") || dir.endsWith("\\") ? dir + name : dir + "/" + name;
+            if (existsImpl(candidate)) return candidate;
+        }
+    }
+    throw new Error("bili: cannot find a Node runtime to spawn the proxy (this process is not Node) — set BILLION_CONTEXT_NODE");
+}
+
 export async function ensureProxyRunning(
     opts: LaunchOptions,
     deps: LauncherDeps = {},
@@ -2042,7 +2084,7 @@ export async function ensureProxyRunning(
     // pointed there only ever reach an explicitly-started `bili start`.
     // The child's EADDRINUSE retry covers the pick/spawn race.
     const port = opts.port > 0 ? opts.port : await pickEphemeralPort(opts.host);
-    const script = process.argv[1];
+    const script = deps.scriptPath ?? process.argv[1];
     if (!script) throw new Error("bili: cannot resolve launcher script path");
     const logPath = path.join(os.tmpdir(), `bili-proxy-${port}.log`);
     const logFd = fs.openSync(logPath, "a");
@@ -2076,7 +2118,7 @@ export async function ensureProxyRunning(
         let child: SpawnChild;
         try {
             child = spawnImpl(
-                process.execPath,
+                deps.nodeRuntime ?? resolveNodeRuntime(),
                 [script, ...proxyStartArgs({ ...opts, port })],
                 {
                     detached: true,
@@ -2107,16 +2149,23 @@ export async function ensureProxyRunning(
         // healthy — otherwise a startup crash (bad config, missing upstream, …)
         // burns the whole SPAWN_WAIT_MS poll window before erroring.
         let childExit: { code: number | null; signal: string | null } | undefined;
+        // #809/D: an async spawn failure (EACCES/ENOENT on the resolved runtime)
+        // emits 'error', not 'exit'. Unhandled, it becomes an uncaughtException
+        // that kills the host process; capture it so we fail fast with the cause.
+        let childError: unknown;
         child.on?.("exit", (...rest: unknown[]) => {
             childExit = {
                 code: typeof rest[0] === "number" ? rest[0] : null,
                 signal: typeof rest[1] === "string" ? rest[1] : null,
             };
         });
+        child.on?.("error", (...rest: unknown[]) => {
+            childError = rest[0];
+        });
 
         const deadline = now() + SPAWN_WAIT_MS;
         while (now() < deadline) {
-            if (childExit) break;
+            if (childExit || childError !== undefined) break;
             await sleepImpl(HEALTH_POLL_INTERVAL_MS);
             const inst = readInstance();
             if (isProxyInstanceFile(inst) && inst.launchToken === launchToken) {
@@ -2134,6 +2183,10 @@ export async function ensureProxyRunning(
             if (stale && (await probeHealth(proxyOrigin(opts.host, port), fetchImpl))) {
                 return { origin: proxyOrigin(opts.host, port), port, child, logPath };
             }
+        }
+        if (childError !== undefined) {
+            const detail = childError instanceof Error ? childError.message : String(childError);
+            throw new Error(`bili: proxy spawn failed (${detail}) (log: ${logPath})`);
         }
         if (childExit) {
             const detail = childExit.code !== null

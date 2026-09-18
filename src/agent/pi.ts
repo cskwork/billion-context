@@ -59,8 +59,8 @@ function agentName(override: string | undefined): string {
     return process.env.BILLION_CONTEXT_PLUGIN_AGENT === "omp" ? "omp" : "pi";
 }
 
-function proxyBaseForCtx(ctx: Ctx): string | undefined {
-    return detectProxyBase(ctx.model?.baseUrl);
+function proxyBaseForCtx(ctx: Ctx | undefined): string | undefined {
+    return detectProxyBase(ctx?.model?.baseUrl);
 }
 
 function sessionIdOf(ctx: Ctx): string | undefined {
@@ -275,23 +275,28 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
         }
         // #535: cancel the host's NATIVE compaction so its summarizer never
         // fires alongside bili's ACP compression — the in-extension
-        // replacement for the old compaction-off config injection. Only
-        // armed under `bili` launch: plain pi/omp with the plugin installed
-        // stays fully native.
-        // pi: the event carries `reason`; cancel only threshold + overflow so
-        // manual /compact stays user-owned.
-        // omp (#851): session_before_compact carries NO reason field, so at
-        // hook level manual compaction (/compact, plan-mode "Approve and
-        // compact context") is indistinguishable from auto — but every auto
-        // pass announces itself first via auto_compaction_start (reason
-        // threshold|overflow|idle|incomplete), which omp emits (awaited)
-        // before the hook fires; manual paths never do. Track the
-        // announcement: announced passes stay cancelled, unannounced ones
-        // are left user-owned. A surviving native compaction is safe: the
-        // proxy archives the unreachable blocks on session_compact (#395).
-        if ((agent === "pi" || agent === "omp") && process.env.BILLION_CONTEXT_PROXY !== undefined) {
+        // replacement for the old compaction-off config injection. pi's event
+        // carries `reason`: cancel only threshold + overflow so manual
+        // /compact stays user-owned. omp (#851): session_before_compact
+        // carries NO reason field, so at hook level manual compaction
+        // (/compact, plan-mode "Approve and compact context") is
+        // indistinguishable from auto — but every auto pass announces itself
+        // first via auto_compaction_start (reason threshold|overflow|idle|
+        // incomplete), which omp emits (awaited) before the hook fires;
+        // manual paths never do. Track the announcement: announced passes
+        // stay cancelled, unannounced ones are left user-owned. A surviving
+        // native compaction is safe: the proxy archives the unreachable
+        // blocks on session_compact (#395).
+        // Whether we own compression is decided at EVENT time, not load time:
+        // in native mode (#519) the proxy origin lands in
+        // BILLION_CONTEXT_PROXY only after the async bootstrap finishes, so a
+        // load-time check would leave the cancel disarmed for the whole
+        // session. Plain pi/omp with the plugin installed but NO reachable
+        // proxy (incl. a failed bootstrap) stays fully native.
+        if (agent === "pi" || agent === "omp") {
             if (agent === "pi") {
-                pi.on("session_before_compact", (event) => {
+                pi.on("session_before_compact", (event, ctx) => {
+                    if (proxyBaseForCtx(ctx) === undefined) return undefined;
                     const reason = (event as unknown as { reason?: unknown }).reason;
                     if (reason === "threshold" || reason === "overflow") return { cancel: true };
                     return undefined;
@@ -304,7 +309,8 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
                 pi.on("auto_compaction_end", () => {
                     autoPending = false;
                 });
-                pi.on("session_before_compact", () => {
+                pi.on("session_before_compact", (event, ctx) => {
+                    if (proxyBaseForCtx(ctx) === undefined) return undefined;
                     if (!autoPending) return undefined;
                     autoPending = false;
                     return { cancel: true };
