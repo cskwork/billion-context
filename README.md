@@ -301,8 +301,12 @@ contract:
 - **Native (no launcher):** with the package installed from npm, run
   `bili plugin install opencode` — it registers a self-spawning plugin in your
   real opencode config and sets `compaction.auto: false`, after which plain
-  `opencode` works as-is. The entry form depends on how THIS bili was
-  installed: an **npm install** writes the bare package name (`"plugin":
+  `opencode` works as-is. No `mcp.bili` MCP face is added by default (the
+  native plugin already provides the bili tools, session-bound); pass
+  `--with-mcp` to add one — the entry then carries no origin pin, so it
+  survives the plugin's ephemeral-port proxy restarts (#926). The entry form
+  depends on how THIS bili was installed: an **npm install** writes the bare
+  package name (`"plugin":
   ["billion-context"]`) — the package publishes `exports["./server"]` →
   `dist/agent/opencode-native.js`, so opencode loads it through its own
   Npm.add machinery and manages install/upgrade itself; zero absolute paths,

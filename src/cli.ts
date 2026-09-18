@@ -54,6 +54,8 @@ Usage:
   bili update                      check for & install a newer version now
   bili plugin install <agent>      install the thin plugin into a host (pi/omp/
                                     claude/codex/opencode; original backed up once)
+                                    --with-mcp (opencode only) also adds the mcp.bili
+                                    MCP face; default is the native plugin tools only
   bili plugin remove <agent>       remove it again
   bili plugin list                 show install status for every host
   bili mcp                         run the bili MCP server standalone (stdio)
@@ -118,6 +120,7 @@ type Parsed = {
     registerConversationId?: string;
     pluginAction?: "install" | "remove" | "list";
     pluginAgent?: PluginAgent;
+    pluginWithMcp?: boolean;
 };
 
 export function parseArgs(argv: string[]): Parsed {
@@ -133,6 +136,7 @@ export function parseArgs(argv: string[]): Parsed {
     let exportFull = false;
     let pluginAction: Parsed["pluginAction"];
     let pluginAgent: Parsed["pluginAgent"];
+    let pluginWithMcp = false;
 
     for (let i = 0; i < argv.length; i++) {
         const a = argv[i]!;
@@ -187,6 +191,9 @@ export function parseArgs(argv: string[]): Parsed {
                 exportOutput = val;
                 break;
             }
+            case "--with-mcp":
+                pluginWithMcp = true;
+                break;
             case "-F":
             case "--port":
             case "--host":
@@ -278,11 +285,11 @@ export function parseArgs(argv: string[]): Parsed {
         }
     }
 
-    return { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, registerConversationId, pluginAction, pluginAgent };
+    return { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, registerConversationId, pluginAction, pluginAgent, pluginWithMcp };
 }
 
 export async function main(): Promise<void> {
-    const { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, registerConversationId, pluginAction, pluginAgent } = parseArgs(process.argv.slice(2));
+    const { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, registerConversationId, pluginAction, pluginAgent, pluginWithMcp } = parseArgs(process.argv.slice(2));
     if (command === "help") {
         process.stdout.write(HELP);
         return;
@@ -333,7 +340,7 @@ export async function main(): Promise<void> {
         }
         if (pluginAction === "install") {
             try {
-                console.log(pluginInstall(pluginAgent!));
+                console.log(pluginInstall(pluginAgent!, { withMcp: pluginWithMcp }));
             } catch (error) {
                 console.error(`bili plugin: ${error instanceof Error ? error.message : String(error)}`);
                 process.exit(1);
