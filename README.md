@@ -153,6 +153,7 @@ Pick by your client:
 | **opencode 1.x** | `bili plugin install opencode` (self-spawning native plugin — pre-migration [`opencode-acp`](https://github.com/ranxianglei/opencode-acp) sessions keep working, see "OpenCode 1.x") or `bili opencode` (launcher) or standalone `opencode-acp` (in-process extension) |
 | **opencode 2.0+** | `bili opencode` (built-in V2 plugin — native tools, no separate package) or `bili plugin install opencode` (self-spawning native plugin, no launcher) |
 | **omp** | [`billion-context`](https://github.com/ranxianglei/billion-context) via `bili omp` (built-in plugin) |
+| **dsh** | `bili dsh` (launcher — full native plugin via `--patch`: tools, session-bound `/acp`, fetch intercept) or `bili plugin install dsh` (self-spawning native plugin, no launcher — writes the cordis patch into every profile under `~/.dsh/profiles/*/cordis.patch.yml`) |
 | **everything else** (no context hook) | [`billion-context`](https://github.com/ranxianglei/billion-context) — `bili <client>` (launcher, preferred) or `/bili/` prefix |
 
 **Native mode vs standalone extensions.** The host-native plugins (`bili plugin install pi` / `opencode` — they spawn the proxy inside the host process) and the standalone in-process extensions (`billion-context-pi`, `opencode-acp`) are **mutually exclusive**: both active means double compression. The installer makes the switch: `bili plugin install pi` replaces the legacy `npm:billion-context-pi` entry (with a reminder that a project-scope entry in `<project>/.pi/settings.json` from `pi install -l` lives outside the global settings), and `bili plugin install opencode` strips legacy `opencode-acp` entries from the global opencode.json — bare name, `npm:` alias, versioned (`opencode-acp@stable`), or path form, array or object shape; the original config is snapshotted to `.bili-bak` once. A **project-local** install (`opencode plugin opencode-acp` writes `<project>/.opencode/opencode.json`, not the global config) is not touched — remove it by hand; the installer note reminds you. As a runtime safety net for manual installs, the native entries set `BILLION_CONTEXT_NATIVE=<host>` synchronously at load so a standalone extension can stand down at action time — its own load-time `BILLION_CONTEXT_PROXY` check cannot see a proxy that native mode spawns asynchronously, and its `/bili/` baseUrl check never sees the fetch-layer rewrite. On the pi side the marker needs `billion-context-pi` **0.1.72+** (the per-event re-check landed after 0.1.71); the pi-native entry additionally scans both pi settings files once its proxy is up and warns loudly when it spots a co-resident legacy entry the installer never saw — that warning is the only visible signal while an old `billion-context-pi` silently double-compresses.
@@ -214,7 +215,7 @@ bili claude                           # launch claude through the proxy
 bili omp                              # pi-style, file-free (#535): env + extension registerProvider + compaction cancel, real ~/.omp untouched
 bili opencode                         # MITM for HTTPS + temp opencode.json (/bili/ for HTTP) + thin /acp plugin; OpenCode 1.x: existing opencode-acp sessions keep working (entries stripped from the clone, package imported as a library, #920); OpenCode 2.0+: built-in V2 plugin with native bili tools, native compaction auto-disabled. Reads the user's opencode.jsonc / opencode.json / config.json (JSONC comments accepted, merged the same way opencode itself merges them); relative local plugin specs (`./x`, `../x`) are re-anchored to absolute paths in the clone — opencode resolves them against the declaring config file's dir (#826)
 bili hermes                           # file-free (#535): hermes proxy env (HTTPS_PROXY + HERMES_CA_BUNDLE) — https via CONNECT MITM, http via absolute-form forward proxy; real ~/.hermes untouched
-bili dsh                              # deepseek-harness: non-loopback upstreams ride proxy envs (https MITM, http absolute-form), loopback keeps the overlay DSH_HOME (~/.dsh-bili) rewrite (#535), built-in deepseek route via DEEPSEEK_BASE_URL, native /acp command injected via --patch
+bili dsh                              # deepseek-harness: full native plugin injected via --patch (#941) — compress/decompress/acp_status registered as real dsh tools, requests stamped with the dsh session id (plugin mode), /acp session-bound; non-loopback upstreams ride proxy envs (https MITM, http absolute-form), loopback keeps the overlay DSH_HOME (~/.dsh-bili) rewrite (#535), built-in deepseek route via DEEPSEEK_BASE_URL; dsh native auto-compaction disabled (compaction-basic auto:false)
 bili codebuddy                        # Tencent CodeBuddy Code CLI: CODEBUDDY_BASE_URL /bili/ rewrite (OpenAI chat completions wire), budget aligned via CODEBUDDY_AUTO_COMPACT_WINDOW; real ~/.codebuddy untouched
 bili qoder                            # qoder: model endpoint is hardcoded https (no /bili/ rewrite possible) — cert-MITM via HTTPS_PROXY + NODE_EXTRA_CA_CERTS, default model hosts whitelisted (#653)
 bili trae                             # Trae CLI (ByteDance, closed Go binary, no base-URL override) — cert-MITM via HTTPS_PROXY + SSL_CERT_FILE, model host from TRAE_CLI_API_HOST or the default enterprise gateway (#655)
@@ -373,6 +374,36 @@ acp-kernel inside) because the proxy stays the single compression authority,
 which eliminates kernel-version drift between agent and proxy — it does not
 rely on the plugin API being unable to mutate context (that capability varies
 by 2.x build).
+
+#### dsh (deepseek-harness)
+
+Two lanes, same plugin (#941):
+
+- **Launcher:** `bili dsh` injects the full native plugin through a
+  `--patch` overlay (`~/.dsh-bili/.bili-acp.patch.yml`) — every profile
+  boots with the bili tools registered natively, model requests carry
+  `x-bili-plugin` + the dsh session id (plugin mode), and `/acp` is
+  session-bound. dsh's native auto-compaction is disabled in the same patch
+  (`compaction-basic` → `auto: false`); manual `/compact` stays available.
+- **Native (no launcher):** `bili plugin install dsh` appends a managed
+  block to every profile's `~/.dsh/profiles/<name>/cordis.patch.yml`
+  (markers `# bili begin` / `# bili end`; user entries and comments are
+  preserved, a placeholder `[]` root is replaced, removal restores it).
+  Run dsh once in each profile first so the profile dirs exist. The plugin
+  spawns its own proxy at load (attaches to a healthy one instead of
+  doubling; parent-pid watchdog), rewrites model-API traffic to
+  `<proxy>/bili/<upstream-url>` via a global fetch patch, registers the
+  manifest tools verbatim, and gates plugin-mode headers on tool readiness
+  (round 1 rides wire mode). Opt-out: `BILI_NATIVE_DSH=0`. Remove with
+  `bili plugin remove dsh`.
+
+Under a `bili dsh` launch the plugin ATTACHES to the launcher's proxy (no
+second spawn). Raw upstream URLs rewrite to `<proxy>/bili/<url>` like
+spawn mode (a loopback proxy target is never proxied, so the MITM envs are
+simply bypassed); already-routed `/bili/`-prefixed requests pass through
+untouched except for header stamping. Known limitation: manual
+`/compact` has no dsh-side event hook, so its boundary is left to the
+kernel's natural ingest diff (auto-compaction is off, so this is rare).
 
 ### Verify
 

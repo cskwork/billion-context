@@ -45,7 +45,7 @@ import {
     type ProxyInstanceFile,
     type ProxyStartingMarker,
 } from "./instance.js";
-import { selfPackageRoot, isBiliPiEntry, ompPluginLoadedFrom } from "./plugin-install.js";
+import { selfPackageRoot, isBiliPiEntry, ompPluginLoadedFrom, dshNativeInstalled } from "./plugin-install.js";
 
 /** Absolute path of a file inside our dist/, resolved via the package root
  * (import.meta.url-based) so it survives global-installed symlink bins
@@ -1601,21 +1601,29 @@ export function prepareCodexHome(codexHome: string, origin: string, conversation
     return overlay;
 }
 
-/** Write the `--patch` overlay file that inserts the bili /acp command
- *  plugin into whatever profile dsh boots. Lives in the persistent
+/** #941: the launcher's --patch overlay now carries the FULL native plugin
+ *  (tools + session-bound /acp + fetch intercept), not just the /acp panel —
+ *  plus the compaction-basic auto:false override so dsh's native
+ *  auto-compaction stands down for the bili proxy (a patch replaces the
+ *  target row's whole config, and dsh-base ships compaction-basic with no
+ *  config, so {auto:false} is complete). Lives in the persistent
  *  `<dshHome>-bili` dir, INDEPENDENT of the settings.yaml rewrite — the
- *  /acp command is injected even when the user has no custom providers
- *  (pure built-in deepseek route). Returns the patch file path (undefined
- *  when it could not be written — dsh then just boots without /acp). */
+ *  plugin is injected even when the user has no custom providers (pure
+ *  built-in deepseek route). Returns the patch file path (undefined when it
+ *  could not be written — dsh then just boots without the plugin). */
 export function writeDshAcpPatch(dshHome: string): string | undefined {
-    const pluginUrl = pathToFileURL(selfDistFile("agent/dsh-acp.js")).href;
+    const pluginUrl = pathToFileURL(selfDistFile("agent/dsh-native.js")).href;
     const dir = `${dshHome}-bili`;
     try {
         fs.mkdirSync(dir, { recursive: true });
     } catch {
         return undefined;
     }
-    writeOverlayFileAtomic(dir, ".bili-acp.patch.yml", `- insert:\n    - name: ${pluginUrl}\n`);
+    writeOverlayFileAtomic(
+        dir,
+        ".bili-acp.patch.yml",
+        `- insert:\n    - id: bili-native\n      name: ${pluginUrl}\n- id: compaction-basic\n  config:\n    auto: false\n`,
+    );
     const file = path.join(dir, ".bili-acp.patch.yml");
     try {
         return fs.existsSync(file) ? file : undefined;
@@ -2601,8 +2609,10 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
             );
         }
         // Native /acp command rides a --patch overlay (independent of the
-        // settings rewrite above), so it exists on every profile dsh boots.
-        const dshAcpPatch = writeDshAcpPatch(dshHomeDir);
+        // settings rewrite above) unless a persistent `bili plugin install dsh`
+        // already provides it — a second `id: bili-native` insert would trip
+        // cordis' duplicate-entry-id check and hard-fail dsh boot.
+        const dshAcpPatch = dshNativeInstalled() ? undefined : writeDshAcpPatch(dshHomeDir);
         if (dshAcpPatch) clientArgs = dshArgsWithPatch(clientArgs, dshAcpPatch);
     } else if (base === "kimi") {
         // #757: cert-MITM like hermes/dsh — Kimi Code honors standard proxy
