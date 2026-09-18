@@ -451,7 +451,13 @@ export function detectOpencodeMajor(): number {
     if (hit !== undefined) return hit;
     let major = 1;
     try {
-        const out = execFileSync(command, ["--version"], { timeout: 5000, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+        // Windows: npm global shims are .cmd/.bat — execFileSync cannot spawn
+        // those directly (EINVAL), so route through the shell with explicit
+        // quoting. Plain exes and POSIX shebang scripts go straight through.
+        const viaShell = process.platform === "win32" && /\.(cmd|bat)$/i.test(command);
+        const out = viaShell
+            ? execFileSync(`"${command}" --version`, { timeout: 5000, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] })
+            : execFileSync(command, ["--version"], { timeout: 5000, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
         const m = /(\d+)\s*\./.exec(out);
         if (m) major = parseInt(m[1], 10);
     } catch {}

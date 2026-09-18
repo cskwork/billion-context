@@ -67,16 +67,21 @@ test("pickPluginKey: 2.x writes plugins, 1.x and unknowns write plugin (#927)", 
 
 test("detectOpencodeMajor: honors BILI_CLIENT_BIN, fails soft to 1 (#927)", async () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-oc927-ver-"));
+    const isWin = process.platform === "win32";
     try {
-        const v2bin = path.join(home, "fake-opencode-v2");
-        fs.writeFileSync(v2bin, "#!/bin/sh\necho \"opencode 2.0.3\"\n");
-        fs.chmodSync(v2bin, 0o755);
+        // Windows: execFileSync cannot spawn shebang scripts — fake the npm
+        // global shim shape (.cmd) there, matching what BILI_CLIENT_BIN points
+        // at in the wild.
+        const ext = isWin ? ".cmd" : "";
+        const v2bin = path.join(home, `fake-opencode-v2${ext}`);
+        fs.writeFileSync(v2bin, isWin ? "@echo opencode 2.0.3\r\n" : "#!/bin/sh\necho \"opencode 2.0.3\"\n");
+        if (!isWin) fs.chmodSync(v2bin, 0o755);
         await withEnv({ BILI_CLIENT_BIN: v2bin }, async () => {
             assert.equal(detectOpencodeMajor(), 2);
         });
-        const deadBin = path.join(home, "fake-opencode-dead");
-        fs.writeFileSync(deadBin, "#!/bin/sh\nexit 3\n");
-        fs.chmodSync(deadBin, 0o755);
+        const deadBin = path.join(home, `fake-opencode-dead${ext}`);
+        fs.writeFileSync(deadBin, isWin ? "@exit /b 3\r\n" : "#!/bin/sh\nexit 3\n");
+        if (!isWin) fs.chmodSync(deadBin, 0o755);
         await withEnv({ BILI_CLIENT_BIN: deadBin }, async () => {
             assert.equal(detectOpencodeMajor(), 1);
         });
@@ -154,7 +159,9 @@ test("fresh config dir: creates plain opencode.json, remove restores pre-install
     try {
         await withEnv(env, async () => {
             const msg = pluginInstall("opencode");
-            assert.match(msg, new RegExp(`installed -> ${file} \\(`));
+            // plain includes(): `file` on win32 is a backslash path that must
+            // not be fed to a regex
+            assert.ok(msg.includes(`installed -> ${file} (`), msg);
             assert.match(msg, /compaction\.auto set to false/);
             const data = JSON.parse(fs.readFileSync(file, "utf8")) as Record<string, unknown>;
             assert.deepEqual(data.compaction, { auto: false });
@@ -182,7 +189,9 @@ test("only config.json present: installer edits it, does not spawn opencode.json
     try {
         await withEnv(env, async () => {
             const msg = pluginInstall("opencode");
-            assert.match(msg, new RegExp(`installed -> ${file} \\(`));
+            // plain includes(): `file` on win32 is a backslash path that must
+            // not be fed to a regex
+            assert.ok(msg.includes(`installed -> ${file} (`), msg);
             const data = JSON.parse(fs.readFileSync(file, "utf8")) as Record<string, unknown>;
             assert.equal(data.marker, "keep");
             assert.ok(Array.isArray(data[ocKey]));
@@ -206,7 +215,7 @@ test("jsonc + json both present: jsonc wins, sibling json stays byte-identical (
     try {
         await withEnv(env, async () => {
             const msg = pluginInstall("opencode");
-            assert.match(msg, new RegExp(`installed -> ${jsoncFile} \\(`));
+            assert.ok(msg.includes(`installed -> ${jsoncFile} (`), msg);
             const data = readJsonc(jsoncFile);
             assert.ok(Array.isArray(data[ocKey]));
             assert.equal(fs.readFileSync(jsonFile, "utf8"), siblingBytes, "sibling opencode.json untouched");
