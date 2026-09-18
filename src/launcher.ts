@@ -2010,12 +2010,19 @@ export function resolveNodeRuntime(
     if (base === "node" || base === "node.exe") return execPath;
     const override = typeof env.BILLION_CONTEXT_NODE === "string" ? env.BILLION_CONTEXT_NODE.trim() : "";
     if (override.length > 0 && existsImpl(override)) return override;
+    // join with the SIMULATED platform's separators: a posix-style PATH on
+    // win32 (and vice versa) must not be normalized through the host's
+    // path.join, or the candidates no longer match what existsImpl expects.
     const sep = platform === "win32" ? ";" : ":";
     const names = platform === "win32" ? ["node.exe"] : ["node"];
     for (const dir of (env.PATH ?? "").split(sep)) {
         if (!dir) continue;
         for (const name of names) {
-            const candidate = path.join(dir, name);
+            // separator-preserving concatenation: never normalize — win32
+            // accepts forward slashes, and normalizing through path.join
+            // would rewrite a posix-style entry on a win32 host (or the
+            // reverse), missing the file existsImpl would find.
+            const candidate = dir.endsWith("/") || dir.endsWith("\\") ? dir + name : dir + "/" + name;
             if (existsImpl(candidate)) return candidate;
         }
     }

@@ -903,7 +903,7 @@ test("plugin install/remove roundtrips for pi/omp/codex/opencode under a fake HO
         assert.equal(oc.mcp?.bili.command[1]!.endsWith(path.join("dist", "mcp.js")), true);
         assert.equal(oc.mcp?.bili.environment?.BILI_MCP_PROXY, "http://127.0.0.1:8787");
         assert.deepEqual(oc[ocKey], ["some-other-plugin", ocPluginDir]);
-        assert.match(fs.readFileSync(path.join(ocPluginDir, "index.js"), "utf8"), /agent[\\/]opencode-native\.js/);
+        assert.match(fs.readFileSync(path.join(ocPluginDir, "index.js"), "utf8").replace(/\\+/g, "/"), /agent\/opencode-native\.js/);
         assert.deepEqual(oc.compaction, { auto: false, buffer: 100 });
         const ocAgain = pluginInstall("opencode");
         assert.match(ocAgain, /mcp\.bili present/);
