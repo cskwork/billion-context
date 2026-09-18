@@ -324,6 +324,23 @@ export function resolveConfiguredContextLimit(
     return undefined;
 }
 
+/** #924: the operator-declared max OUTPUT of a model (ModelEntry.output,
+ *  documented as the model's max output size) — the mirror of
+ *  resolveConfiguredContextLimit for the output-headroom fallback chain. When
+ *  the request carries no output budget at all (Codex native Responses sends
+ *  no max_output_tokens), this outranks the auto-fetched models.dev ceiling —
+ *  same order as the window resolution (#344). */
+export function resolveConfiguredOutputLimit(
+    routes: ProviderRoutes,
+    upstreamUrl: string | undefined,
+    model: string | undefined,
+): number | undefined {
+    if (!model || !upstreamUrl) return undefined;
+    const m = findRoute(routes, upstreamUrl)?.models?.[model];
+    if (m?.output && m.output > 0) return m.output;
+    return undefined;
+}
+
 export function resolveCompressProtocol(routes: ProviderRoutes, upstreamUrl: string | undefined): "tools" | "marker" | undefined {
     return findRoute(routes, upstreamUrl)?.compressProtocol;
 }
