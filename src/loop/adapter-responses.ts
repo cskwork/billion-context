@@ -4,7 +4,7 @@ import { coreToResponsesWithToolImages as coreToResponses, patchResponsesInputWi
 import { buildVisibilityMarker } from "../compress-loop.js";
 import { hoistTrappedToolItems } from "../tool-pair-order.js";
 import { hashId } from "../util.js";
-import { composeStreamFilters, createMarkerLineFilter, createTagEchoFilter, stripResponsesText, containsMarkerLineText, containsRenderTagText, ACP_NAME_ALT } from "./tag-echo-filter.js";
+import { composeStreamFilters, createMarkerLineFilter, createTagEchoFilter, stripResponsesText, stripAcpTags, containsMarkerLineText, containsRenderTagText, ACP_NAME_ALT } from "./tag-echo-filter.js";
 import { degenerateTurnWarning } from "../degenerate-turn.js";
 import { log as loggerLog } from "../logger.js";
 import { ACP_TEXT_OPEN, ACP_TEXT_CLOSE, ACP_STATUS_OPEN, ACP_STATUS_CLOSE, ACP_SEARCH_OPEN, ACP_SEARCH_CLOSE, ACP_DECOMPRESS_OPEN, ACP_DECOMPRESS_CLOSE, COMPRESS_TOOL_NAME, PROXY_TOOL_NAMES } from "../compress-tool.js";
@@ -215,6 +215,7 @@ function buildMessageItemSequence(itemId: string, outputIndex: number, text: str
 }
 
 function buildFunctionCallEvents(fc: ToolCallEmit, itemId: string, outputIndex: number): Buffer {
+    const args = stripAcpTags(fc.arguments);
     return Buffer.from(
         [
             `event: response.output_item.added\ndata: ${JSON.stringify({
@@ -225,17 +226,17 @@ function buildFunctionCallEvents(fc: ToolCallEmit, itemId: string, outputIndex: 
             `event: response.function_call_arguments.delta\ndata: ${JSON.stringify({
                 type: "response.function_call_arguments.delta",
                 item_id: itemId,
-                delta: fc.arguments,
+                delta: args,
             })}\n\n`,
             `event: response.function_call_arguments.done\ndata: ${JSON.stringify({
                 type: "response.function_call_arguments.done",
                 item_id: itemId,
-                arguments: fc.arguments,
+                arguments: args,
             })}\n\n`,
             `event: response.output_item.done\ndata: ${JSON.stringify({
                 type: "response.output_item.done",
                 output_index: outputIndex,
-                item: { type: "function_call", id: itemId, call_id: fc.callId, name: fc.name, arguments: fc.arguments },
+                item: { type: "function_call", id: itemId, call_id: fc.callId, name: fc.name, arguments: args },
             })}\n\n`,
         ].join(""),
         "utf8",
@@ -380,17 +381,20 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
                                 arguments: "",
                             });
                         } else {
-                            yield { kind: "meta", chunk: rawBuf, firstRoundOnly: false } as ParsedStreamEvent;
+                            const chunk = (containsRenderTagText(eventStr) || containsMarkerLineText(eventStr)) ? rebuildResponsesEvent(type, stripResponsesText(obj)) : rawBuf;
+                            yield { kind: "meta", chunk, firstRoundOnly: false } as ParsedStreamEvent;
                         }
                     } else if (item?.type === "custom_tool_call") {
-                        yield { kind: "meta", chunk: rawBuf, firstRoundOnly: false } as ParsedStreamEvent;
+                        const chunk = (containsRenderTagText(eventStr) || containsMarkerLineText(eventStr)) ? rebuildResponsesEvent(type, stripResponsesText(obj)) : rawBuf;
+                        yield { kind: "meta", chunk, firstRoundOnly: false } as ParsedStreamEvent;
                     } else if (item?.type === "message" && round > 1 && !suppressTextLifecycle) {
                         const origId = typeof item.id === "string" ? item.id : "";
                         const mapped = { id: `msg-proxy-${round}-${hashId(origId || String(outputIndex))}`, index: outputIndex++ };
                         if (origId) remapped.set(origId, mapped);
                         yield { kind: "meta", chunk: rewriteItemEvent(type, obj, mapped), firstRoundOnly: false } as ParsedStreamEvent;
                     } else if (item?.type !== "message" || !suppressTextLifecycle) {
-                        yield { kind: "meta", chunk: rawBuf, firstRoundOnly: true } as ParsedStreamEvent;
+                        const chunk = (containsRenderTagText(eventStr) || containsMarkerLineText(eventStr)) ? rebuildResponsesEvent(type, stripResponsesText(obj)) : rawBuf;
+                        yield { kind: "meta", chunk, firstRoundOnly: true } as ParsedStreamEvent;
                     }
                 } else if (
                     type === "response.content_part.added" ||
@@ -428,13 +432,19 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
                     const delta = typeof obj.delta === "string" ? obj.delta : "";
                     const fc = pending.get(itemId);
                     if (fc) fc.arguments += delta;
-                    else yield { kind: "meta", chunk: rawBuf, firstRoundOnly: false } as ParsedStreamEvent;
+                    else {
+                        const chunk = (containsRenderTagText(eventStr) || containsMarkerLineText(eventStr)) ? rebuildResponsesEvent(type, stripResponsesText(obj)) : rawBuf;
+                        yield { kind: "meta", chunk, firstRoundOnly: false } as ParsedStreamEvent;
+                    }
                 } else if (type === "response.function_call_arguments.done") {
                     const itemId = typeof obj.item_id === "string" ? obj.item_id : "";
                     const args = typeof obj.arguments === "string" ? obj.arguments : "";
                     const fc = pending.get(itemId);
                     if (fc && args) fc.arguments = args;
-                    else yield { kind: "meta", chunk: rawBuf, firstRoundOnly: false } as ParsedStreamEvent;
+                    else {
+                        const chunk = (containsRenderTagText(eventStr) || containsMarkerLineText(eventStr)) ? rebuildResponsesEvent(type, stripResponsesText(obj)) : rawBuf;
+                        yield { kind: "meta", chunk, firstRoundOnly: false } as ParsedStreamEvent;
+                    }
                 } else if (type === "response.output_item.done") {
                     const item = obj.item as Record<string, unknown> | undefined;
                     if (item?.type === "function_call") {
@@ -448,21 +458,23 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
                                 kind: "tool_call",
                                 name: fc.name,
                                 callId: fc.callId,
-                                arguments: fc.arguments,
+                                arguments: stripAcpTags(fc.arguments),
                             } as ParsedStreamEvent;
                         } else {
-                            yield { kind: "meta", chunk: rawBuf, firstRoundOnly: false } as ParsedStreamEvent;
+                            const chunk = (containsRenderTagText(eventStr) || containsMarkerLineText(eventStr)) ? rebuildResponsesEvent(type, stripResponsesText(obj)) : rawBuf;
+                            yield { kind: "meta", chunk, firstRoundOnly: false } as ParsedStreamEvent;
                             toolCallsEmitted++;
                             yield {
                                 kind: "tool_call",
                                 name: typeof item.name === "string" ? item.name : "",
                                 callId: typeof item.call_id === "string" ? item.call_id : "",
-                                arguments: typeof item.arguments === "string" ? item.arguments : "",
+                                arguments: typeof item.arguments === "string" ? stripAcpTags(item.arguments) : "",
                                 passthrough: true,
                             } as ParsedStreamEvent;
                         }
                     } else if (item?.type === "custom_tool_call") {
-                        yield { kind: "meta", chunk: rawBuf, firstRoundOnly: false } as ParsedStreamEvent;
+                        const chunk = (containsRenderTagText(eventStr) || containsMarkerLineText(eventStr)) ? rebuildResponsesEvent(type, stripResponsesText(obj)) : rawBuf;
+                        yield { kind: "meta", chunk, firstRoundOnly: false } as ParsedStreamEvent;
                     } else if (item?.type === "message") {
                         const origId = typeof item.id === "string" ? item.id : "";
                         const mapped = remapped.get(origId);
@@ -474,7 +486,8 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
                             yield { kind: "meta", chunk, firstRoundOnly: true } as ParsedStreamEvent;
                         }
                     } else if (item?.type !== "message" || !suppressTextLifecycle) {
-                        yield { kind: "meta", chunk: rawBuf, firstRoundOnly: true } as ParsedStreamEvent;
+                        const chunk = (containsRenderTagText(eventStr) || containsMarkerLineText(eventStr)) ? rebuildResponsesEvent(type, stripResponsesText(obj)) : rawBuf;
+                        yield { kind: "meta", chunk, firstRoundOnly: true } as ParsedStreamEvent;
                     }
                 } else if (type === "response.completed") {
                     yield* flushFilter();

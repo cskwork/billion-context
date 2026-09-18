@@ -1,7 +1,7 @@
 import type { CoreMessage } from "acp-kernel";
 import { coreToOpenai, injectOpenaiSystem } from "acp-kernel/wire";
 import { buildVisibilityMarker } from "../compress-loop.js";
-import { composeStreamFilters, createMarkerLineFilter, createTagEchoFilter } from "./tag-echo-filter.js";
+import { composeStreamFilters, createMarkerLineFilter, createTagEchoFilter, stripAcpTags } from "./tag-echo-filter.js";
 import { degenerateTurnWarning } from "../degenerate-turn.js";
 import { log as loggerLog } from "../logger.js";
 import { hardenOpenaiAssistantContent, systemToUser } from "../util.js";
@@ -253,7 +253,7 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
                             kind: "tool_call",
                             name: tc.name,
                             callId: tc.id,
-                            arguments: tc.arguments,
+                            arguments: stripAcpTags(tc.arguments),
                         } as ParsedStreamEvent;
                     }
                 }
@@ -282,16 +282,70 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
                             kind: "tool_call",
                             name: tc.name,
                             callId: tc.id,
-                            arguments: tc.arguments,
+                            arguments: stripAcpTags(tc.arguments),
                             passthrough: true,
                         } as ParsedStreamEvent;
                     }
                 }
+                // #933: a render tag echoed into a real tool call's arguments
+                // may span fragment boundaries, so per-fragment stripping is not
+                // enough. Everything is buffered by settle time: rebuild each
+                // tainted index as one chunk carrying the clean full arguments,
+                // suppress its remaining fragments, leave clean calls verbatim.
+                const taintedIdx = new Set<number>();
+                for (const [idx, tc] of pending) {
+                    if (realIndexes.has(idx) && stripAcpTags(tc.arguments) !== tc.arguments) taintedIdx.add(idx);
+                }
+                const rebuiltTainted = new Set<number>();
+                const taintReplay = (obj: Record<string, unknown>): Buffer | null => {
+                    const chs = obj["choices"];
+                    if (!Array.isArray(chs)) return null;
+                    let changed = false;
+                    const outChoices = chs.map((c) => {
+                        if (!c || typeof c !== "object") return c;
+                        const co = c as Record<string, unknown>;
+                        const d = co["delta"];
+                        if (!d || typeof d !== "object") return c;
+                        const dd = d as Record<string, unknown>;
+                        const tcs = dd["tool_calls"];
+                        if (!Array.isArray(tcs)) return c;
+                        let chChanged = false;
+                        const outTcs: unknown[] = [];
+                        for (const tco of tcs) {
+                            if (tco && typeof tco === "object" && typeof (tco as Record<string, unknown>)["index"] === "number") {
+                                const idx = (tco as Record<string, unknown>)["index"] as number;
+                                if (taintedIdx.has(idx)) {
+                                    if (rebuiltTainted.has(idx)) continue;
+                                    rebuiltTainted.add(idx);
+                                    const pt = pending.get(idx);
+                                    outTcs.push({ index: idx, id: pt?.id ?? "", type: "function", function: { name: pt?.name ?? "", arguments: stripAcpTags(pt?.arguments ?? "") } });
+                                    chChanged = true;
+                                    continue;
+                                }
+                            }
+                            outTcs.push(tco);
+                        }
+                        if (!chChanged) return c;
+                        changed = true;
+                        return { ...co, delta: { ...dd, tool_calls: outTcs } };
+                    });
+                    if (!changed) return null;
+                    return Buffer.from("data: " + JSON.stringify({ ...obj, choices: outChoices }) + "\n\n", "utf8");
+                };
                 for (const { json, parsed } of rawToolChunks) {
                     const filtered = filterRealToolFragments(parsed, realIndexes);
+                    const obj = filtered === "keep" ? parsed : filtered;
+                    if (obj === null) continue;
+                    if (taintedIdx.size > 0) {
+                        const rebuilt = taintReplay(obj);
+                        if (rebuilt) {
+                            yield { kind: "meta", chunk: rebuilt } as ParsedStreamEvent;
+                            continue;
+                        }
+                    }
                     if (filtered === "keep") {
                         yield { kind: "meta", chunk: Buffer.from("data: " + json + "\n\n", "utf8") } as ParsedStreamEvent;
-                    } else if (filtered !== null) {
+                    } else {
                         yield { kind: "meta", chunk: Buffer.from("data: " + JSON.stringify(filtered) + "\n\n", "utf8") } as ParsedStreamEvent;
                     }
                 }
@@ -302,7 +356,7 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
                             kind: "tool_call",
                             name: tc.name,
                             callId: tc.id,
-                            arguments: tc.arguments,
+                            arguments: stripAcpTags(tc.arguments),
                         } as ParsedStreamEvent;
                     }
                 }
