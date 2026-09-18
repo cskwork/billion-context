@@ -448,6 +448,60 @@ function isPlainMcpObject(v: unknown): v is Record<string, unknown> {
     return v !== null && typeof v === "object" && !Array.isArray(v);
 }
 
+// Legacy opencode-acp plugin entries — both config shapes v1 accepts:
+//   array:  "opencode-acp" | "npm:opencode-acp" | "<path>/opencode-acp[/index.js]" | "opencode-acp@<ver>"
+//   object: { "opencode-acp": "stable", ... }
+// The in-process extension and the native plugin are two compression owners —
+// keeping both armed means double compression / ref-space fights (#918).
+function isLegacyOpencodeAcpEntry(entry: string): boolean {
+    if (entry === "opencode-acp" || entry.startsWith("opencode-acp@")) return true;
+    if (entry.startsWith("npm:")) {
+        const rest = entry.slice(4);
+        return rest === "opencode-acp" || rest.startsWith("opencode-acp@");
+    }
+    const normalized = entry.replace(/\\/g, "/");
+    const segments = normalized.split("/").filter((s) => s.length > 0);
+    const last = segments[segments.length - 1];
+    const parent = segments[segments.length - 2];
+    if (last === undefined) return false;
+    if (last.startsWith("opencode-acp@")) return true;
+    if (last === "opencode-acp") return true;
+    return last === "index.js" && parent !== undefined && parent.startsWith("opencode-acp");
+}
+
+function stripLegacyOpencodeAcp(data: Record<string, unknown>, notes: string[]): void {
+    const removed: string[] = [];
+    const plugin = data.plugin;
+    if (Array.isArray(plugin)) {
+        const kept = plugin.filter((x): x is string => typeof x === "string");
+        const survivors: string[] = [];
+        for (const entry of kept) {
+            if (isLegacyOpencodeAcpEntry(entry)) removed.push(entry);
+            else survivors.push(entry);
+        }
+        if (removed.length > 0) {
+            if (survivors.length === 0) delete data.plugin;
+            else data.plugin = survivors;
+        }
+    } else if (plugin !== null && typeof plugin === "object") {
+        const map = { ...(plugin as Record<string, unknown>) };
+        for (const key of Object.keys(map)) {
+            if (isLegacyOpencodeAcpEntry(key)) {
+                delete map[key];
+                removed.push(key);
+            }
+        }
+        if (removed.length > 0) {
+            if (Object.keys(map).length === 0) delete data.plugin;
+            else data.plugin = map;
+        }
+    }
+    if (removed.length > 0) {
+        notes.push(`replaced opencode-acp plugin entries (${removed.join(", ")}) — single compression owner; restore from the .bili-bak backup if that was intended`);
+        notes.push("also check <project>/.opencode/opencode.json — a LOCAL-scope opencode-acp install (opencode plugin opencode-acp) lives there, not in this global config");
+    }
+}
+
 function opencodeInstall(): string {
     const file = opencodeJson();
     const data = readJson(file);
@@ -477,6 +531,15 @@ function opencodeInstall(): string {
     // Native plugin (#820): self-spawned proxy + http.request URL rewrite.
     const agentJs = path.join(selfPackageRoot(), "dist", "agent", "opencode-native.js");
     requireDistFile(agentJs);
+    // Single compression owner FIRST: drop any opencode-acp entry before
+    // adding ours, so both never load armed in one host (#918). The writeJson
+    // below snapshots the original config to .bili-bak (first write only).
+    // Object-shaped plugin maps (defensive; v1 disk form is an array) are
+    // normalized to their keys so sibling entries survive the append below.
+    if (data.plugin !== null && typeof data.plugin === "object" && !Array.isArray(data.plugin)) {
+        data.plugin = Object.keys(data.plugin as Record<string, unknown>);
+    }
+    stripLegacyOpencodeAcp(data, notes);
     const dir = opencodePluginDir(file);
     fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(path.join(dir, "index.js"), `export { default } from ${JSON.stringify(agentJs)};\n`);

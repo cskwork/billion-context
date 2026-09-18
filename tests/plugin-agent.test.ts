@@ -945,6 +945,43 @@ test("plugin install opencode without a live proxy: MCP shell skipped, native pl
     }
 });
 
+test("plugin install opencode replaces legacy opencode-acp entries — array and object shapes (#918)", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-oc-acp-"));
+    const ocFile = path.join(home, ".config/opencode/opencode.json");
+    fs.mkdirSync(path.dirname(ocFile), { recursive: true });
+    try {
+        await withEnv({ OPENCODE_CONFIG: ocFile, BILI_MCP_PROXY: undefined, XDG_STATE_HOME: path.join(home, "state") }, async () => {
+            // array shape: bare name, npm: alias, path, versioned
+            fs.writeFileSync(ocFile, JSON.stringify({
+                plugin: ["opencode-acp", "npm:opencode-acp", "/opt/other-plugin", path.join(home, "ext/opencode-acp/index.js"), "opencode-acp@stable"],
+            }));
+            let msg = pluginInstall("opencode");
+            assert.match(msg, /replaced opencode-acp plugin entries/);
+            let data = JSON.parse(fs.readFileSync(ocFile, "utf8")) as { plugin: string[] };
+            assert.deepEqual(data.plugin, ["/opt/other-plugin", path.join(home, ".config/opencode/plugins/billion-context")]);
+            assert.ok(fs.existsSync(`${ocFile}.bili-bak`));
+            pluginRemove("opencode");
+
+            // object shape: version-map form (defensive; normalized to keys)
+            fs.writeFileSync(ocFile, JSON.stringify({ plugin: { "opencode-acp": "stable", "other": "1.0" } }));
+            msg = pluginInstall("opencode");
+            assert.match(msg, /replaced opencode-acp plugin entries \(opencode-acp\)/);
+            data = JSON.parse(fs.readFileSync(ocFile, "utf8")) as { plugin: string[] };
+            // sibling object entries survive as bare array specs + our dir
+            assert.deepEqual(data.plugin, ["other", path.join(home, ".config/opencode/plugins/billion-context")]);
+
+            // no legacy entries -> no note, plugin untouched
+            pluginRemove("opencode");
+            fs.writeFileSync(ocFile, JSON.stringify({ plugin: ["/opt/other-plugin"] }));
+            msg = pluginInstall("opencode");
+            assert.doesNotMatch(msg, /replaced opencode-acp/);
+            assert.equal(msg.includes("other-plugin"), false);
+        });
+    } finally {
+        fs.rmSync(home, { recursive: true, force: true });
+    }
+});
+
 test("plugin install/remove/status survive a non-object mcp in opencode.json (#809/N4)", async () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-oc-badmcp-"));
     const ocFile = path.join(home, ".config/opencode/opencode.json");
