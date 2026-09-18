@@ -218,6 +218,16 @@ type RegisteredTool = {
     execute: (args: Record<string, unknown>, exec: { agent?: { session?: { id?: unknown } }; signal?: AbortSignal }) => Promise<unknown>;
 };
 
+/** Poll until cond() holds (10ms ticks, 5s cap) — a fixed sleep races on
+ *  slow CI runners (windows loopback fetch can outlast 50ms). */
+async function waitFor(cond: () => boolean, what: string): Promise<void> {
+    const deadline = Date.now() + 5000;
+    while (!cond()) {
+        if (Date.now() > deadline) throw new Error(`timeout waiting for ${what}`);
+        await new Promise((r) => setTimeout(r, 10));
+    }
+}
+
 function mockCtx() {
     const tools: RegisteredTool[] = [];
     const commands: Array<{ name: string; handler: () => Promise<{ kind: string; text: string }> }> = [];
@@ -246,8 +256,7 @@ test("apply() attach mode: registers manifest tools verbatim, gates headers, for
 
             // headers gate on toolsReady — no session, no headers; and before
             // registration completes nothing is stamped
-            await new Promise((r) => setTimeout(r, 50));
-            assert.equal(ctx.registeredTools.length, 1);
+            await waitFor(() => ctx.registeredTools.length === 1, "manifest tool registration (ctx)");
             const tool = ctx.registeredTools[0];
             assert.equal(tool.name, "compress");
             // parameters pass through verbatim (the manifest's JSON Schema)
@@ -269,7 +278,7 @@ test("apply() attach mode: registers manifest tools verbatim, gates headers, for
                 process.env.BILLION_CONTEXT_PROXY = cap.origin;
                 const ctx2 = mockCtx();
                 apply(ctx2);
-                await new Promise((r) => setTimeout(r, 50));
+                await waitFor(() => ctx2.registeredTools.length === 1, "manifest tool registration (ctx2)");
                 const t2 = ctx2.registeredTools[0];
                 const out = await t2.execute({ summary: "s" }, { agent: { session: { id: "session-7" } } });
                 assert.equal(out, "compressed 42 tokens");
