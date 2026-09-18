@@ -7,10 +7,11 @@
 //      launcher preset, or a user-supplied external proxy) or spawn the
 //      package's own proxy (ensureProxyRunning, ephemeral port, parent-pid
 //      watchdog = this dsh process);
-//   2. patch globalThis.fetch (native-intercept.ts) — spawn mode rewrites
-//      model-API URLs to `<proxy>/bili/<url>`; attach mode leaves routing to
-//      the launcher (proxy envs / settings overlay / MITM) and only stamps
-//      headers; already-routed `/bili/` URLs get headers only;
+//   2. patch globalThis.fetch (native-intercept.ts) — model-API URLs are
+//      rewritten to `<proxy>/bili/<url>` in BOTH modes (attach shares
+//      #809 rewrite semantics; a loopback proxy target is never proxied,
+//      so launcher MITM envs are simply bypassed); already-routed `/bili/`
+//      URLs pass through untouched except for header stamping;
 //   3. register the proxy's tool manifest (compress/decompress/acp_status)
 //      as native dsh tools — parameters pass through verbatim (the manifest
 //      serves real JSON Schema, and ctx.tools.register projects

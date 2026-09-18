@@ -22,8 +22,10 @@ export interface NativeInterceptState {
     /** Attach mode (#809): route through a user-supplied external proxy at
      *  state.origin instead of a spawned one — no respawn, fail-closed on
      *  death. Set by the host entry when BILLION_CONTEXT_ATTACH is present.
-     *  In attach mode the patch NEVER rewrites the URL (the launcher's proxy
-     *  envs / settings overlay own routing) — it only stamps headers. */
+     *  Rewrites model URLs to the attach origin exactly like spawn mode
+     *  (opencode V1's fetch patch and #809's probe+rewrite semantics depend
+     *  on it); already-routed `/bili/` URLs still pass through untouched
+     *  except for headersFor stamping. */
     attach?: boolean;
     /** Optional header hook (#941): called synchronously per model-API
      *  request with the (pre-rewrite) target URL. A non-undefined return is
@@ -182,14 +184,13 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
             state.onDispatch?.(url, "direct");
             return orig(input, init);
         }
-        // Attach mode: the launcher/user-supplied proxy owns routing (proxy
-        // envs, settings overlay, MITM) — leave the URL exactly as written
-        // and only stamp headers when the host says so.
-        if (state.attach === true) {
-            const stamped = withHeaders(input, init, state.headersFor?.(url));
-            state.onDispatch?.(url, "rewrite");
-            return orig(stamped.input, stamped.init);
-        }
+        // Attach mode rewrites exactly like spawn mode (#809 semantics —
+        // opencode's attach probe+rewrite; the V1 fetch patch relies on it to
+        // catch providers without an explicit baseURL). For dsh under the
+        // `bili dsh` launcher this is doubly safe: settings-overlay URLs are
+        // already `/bili/`-shaped and take the routed branch above, and
+        // rewriting a raw upstream URL to the loopback proxy bypasses the
+        // MITM envs entirely (an http loopback target is never proxied).
         if (url.startsWith(`${origin}/`)) {
             state.onDispatch?.(url, "self");
             return orig(input, init);

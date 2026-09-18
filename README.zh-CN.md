@@ -170,7 +170,7 @@ bili
 - **启动器:** `bili dsh` 经 `--patch` overlay(`~/.dsh-bili/.bili-acp.patch.yml`)注入完整原生插件 —— 每个 profile 启动即注册 bili 工具，模型请求盖 `x-bili-plugin` + dsh 会话 id(plugin 模式)，`/acp` 会话绑定。同一份 patch 同时禁用 dsh 原生自动压缩(`compaction-basic` → `auto: false`);手动 `/compact` 仍可用。
 - **原生(免启动器):** `bili plugin install dsh` 往每个 profile 的 `~/.dsh/profiles/<name>/cordis.patch.yml` 追加受管块(标记 `# bili begin` / `# bili end`;用户条目与注释保留，占位 `[]` 根会被替换，卸载时还原)。先在每个 profile 里跑过一次 dsh 让目录存在。插件加载时自拉起代理(已有健康实例则附看，不重复拉;父进程 pid 看门狗)，经全局 fetch 补丁把模型流量改写为 `<proxy>/bili/<上游URL>`，原样注册清单工具，并按工具就绪门控 plugin 模式头(第一轮走 wire 模式)。退出开关:`BILI_NATIVE_DSH=0`。卸载:`bili plugin remove dsh`。
 
-`bili dsh` 启动下插件**附看**(attach)启动器的代理(不二次拉起):路由仍归启动器(代理 env / settings overlay)，fetch 补丁只盖章 —— 包括对已经路由的 `/bili/` 前缀请求。已知局限:手动 `/compact` 没有 dsh 侧事件钩子，其边界交给内核的自然 ingest diff(自动压缩已关，影响罕见)。
+`bili dsh` 启动下插件**附看**(attach)启动器的代理(不二次拉起)。裸上游 URL 与 spawn 模式一样重写为 `<proxy>/bili/<url>`(回环代理目标永不被代理 env 拦截，等于直接绕开 MITM)；已经路由的 `/bili/` 前缀请求原样放行、只盖章。已知局限:手动 `/compact` 没有 dsh 侧事件钩子，其边界交给内核的自然 ingest diff(自动压缩已关，影响罕见)。
 
 ### 验证
 

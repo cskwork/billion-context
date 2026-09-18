@@ -398,9 +398,10 @@ Two lanes, same plugin (#941):
   `bili plugin remove dsh`.
 
 Under a `bili dsh` launch the plugin ATTACHES to the launcher's proxy (no
-second spawn): routing stays with the launcher (proxy envs / settings
-overlay), the fetch patch only stamps headers — including on
-already-routed `/bili/`-prefixed requests. Known limitation: manual
+second spawn). Raw upstream URLs rewrite to `<proxy>/bili/<url>` like
+spawn mode (a loopback proxy target is never proxied, so the MITM envs are
+simply bypassed); already-routed `/bili/`-prefixed requests pass through
+untouched except for header stamping. Known limitation: manual
 `/compact` has no dsh-side event hook, so its boundary is left to the
 kernel's natural ingest diff (auto-compaction is off, so this is rare).
 

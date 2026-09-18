@@ -286,7 +286,7 @@ test("install: headersFor stamps an already-routed /bili/ request without rewrit
     }
 });
 
-test("install: attach mode never rewrites, only stamps (#941)", async () => {
+test("install: attach mode rewrites to the attach origin and stamps (#809 + #941)", async () => {
     const saved = globalThis.fetch;
     _resetForTest();
     const seen: Array<{ url: string; headers: Record<string, string> }> = [];
@@ -325,20 +325,19 @@ test("install: attach mode never rewrites, only stamps (#941)", async () => {
         assert.deepEqual(
             seen.map((s) => s.url),
             [
-                "http://127.0.0.1:8199/v1/messages",
-                "http://127.0.0.1:8199/v1/messages",
-                "http://127.0.0.1:8199/v1/messages",
-                "http://127.0.0.1:8199/v1/messages",
+                "http://127.0.0.1:40001/bili/http://127.0.0.1:8199/v1/messages",
+                "http://127.0.0.1:40001/bili/http://127.0.0.1:8199/v1/messages",
+                "http://127.0.0.1:40001/bili/http://127.0.0.1:8199/v1/messages",
+                "http://127.0.0.1:40001/bili/http://127.0.0.1:8199/v1/messages",
             ],
         );
         for (const [i, s] of seen.entries()) {
             assert.equal(s.headers["x-bili-plugin"], "dsh", `call ${i}`);
             if (i < 3) assert.equal(s.headers["x-keep"], String(i + 1), `call ${i}`);
         }
-        // headersFor undefined → untouched send (no plugin headers)
-        const state2URL = "http://127.0.0.1:9000/v1/messages";
-        await globalThis.fetch(state2URL);
-        assert.equal(seen[4].url, state2URL);
+        // headersFor undefined → no plugin headers, rewrite still happens
+        await globalThis.fetch("http://127.0.0.1:9000/v1/messages");
+        assert.equal(seen[4].url, "http://127.0.0.1:40001/bili/http://127.0.0.1:9000/v1/messages");
         assert.equal(seen[4].headers["x-bili-plugin"], undefined);
     } finally {
         globalThis.fetch = saved;
