@@ -29,6 +29,18 @@ import { DEGENERATE_RETRY_NUDGE } from "../degenerate-retry.js";
 
 export const MAX_LOOP_ROUNDS = 10;
 
+// #413 follow-up: when the stream dies AFTER visible text has already been
+// forwarded (final-report shape — heavy reasoning, then the answer starts,
+// then the relay cuts), a blind re-fetch would make the client watch the
+// answer regrow from scratch on top of the partial one. Instead, re-fetch
+// once with a continuation nudge that quotes the forwarded tail and asks the
+// model to pick up exactly where the text ended; the retry's output appends
+// seamlessly to what the client already has. Ephemeral like #732: never
+// committed to coreMessages/session state.
+const TRUNCATION_CONTINUATION_TAIL_CHARS = 800;
+const truncationContinuationNudge = (tail: string): string =>
+    `[billion-context] Your previous response was cut off mid-transmission by a network failure before the stream could complete. The client already received the response up to and including this text:\n\n---\n${tail}\n---\n\nContinue the response seamlessly from exactly where that text ends (mid-sentence if necessary). Do not repeat any part of the received text and do not start over — just pick up where it stopped and finish the response.`;
+
 function isLoopThinking(m: CoreMessage): boolean {
     return m.contentType === "reasoning" && typeof m.id === "string" && m.id.startsWith("acp_loop_");
 }
@@ -214,6 +226,12 @@ export async function* runCompressLoop(
     const coreMessages: CoreMessage[] = [...ctx.messages];
     let degradedRetried = false;
     let truncationRetried = false;
+    // Independent one-shot for the visible-text continuation retry (#413
+    // follow-up): the two retry shapes must not share a budget — a visible
+    // cut that continues and then cuts again invisibly still needs the blind
+    // re-fetch available, because the second attempt added nothing the
+    // client can see.
+    let continuationRetried = false;
     let degenerateRetried = false;
 
     const fetchUpstream = (body: Record<string, unknown>) =>
@@ -265,11 +283,13 @@ export async function* runCompressLoop(
             let suppressCompletion = false;
             let truncatedDone = false;
             let sawThinking = false;
-            let forwardedAny = false;
             // #821: on wires that stream reasoning verbatim (openai/anthropic) a thinking-only
-            // turn sets forwardedAny before done, making the #732 retry unreachable there. Track
-            // model-VISIBLE output separately: a reasoning prefix is invisible to host turn
+            // turn marks output forwarded before done, making the #732 retry unreachable there.
+            // Track model-VISIBLE output separately: a reasoning prefix is invisible to host turn
             // semantics, so the degenerate retry may still append a fresh attempt to the stream.
+            // forwardedAny counts every forwarded byte (incl. meta/framing) — the original
+            // #413 zero-side-effect condition.
+            let forwardedAny = false;
             let forwardedVisible = false;
             const fwd = (chunk: Buffer, visible = false): Buffer => {
                 forwardedAny = true;
@@ -355,24 +375,33 @@ export async function* runCompressLoop(
                     loggerLog("warn", `[acp-loop] upstream stream error: ${streamError}`);
                 }
 
-                // #413: zero-side-effect truncation — the client received
-                // nothing from this attempt (no text/reasoning/meta/tool
-                // bytes), so re-fetching the same round is invisible to it.
-                // One retry per request; 200+early-EOF flakiness (common on
-                // relays) no longer lands in the agent session.
-                // `truncatedDone` covers adapters that surface truncation as a
-                // synthetic failed done (responses) instead of ending with
-                // !sawDone (anthropic) — same retry, both shapes.
+                // #413: zero-side-effect truncation — re-fetching the same round is
+                // invisible to the client in two shapes:
+                // (a) NO bytes were forwarded at all (any wire — the original guarantee);
+                // (b) only INVISIBLE bytes were forwarded (reasoning/meta prefix):
+                //     invisible to host turn semantics, so a high-reasoning model that
+                //     thinks and then truncates still retries. OpenAI wire ONLY, whose
+                //     chunks are stateless — a re-fetched response duplicates nothing
+                //     client-side. Stateful wires keep shape (a) only: once anything was
+                //     forwarded their per-response identity framing is already live
+                //     (anthropic message_start with open content blocks, responses
+                //     response.created — #440's single-created invariant), and a
+                //     re-fetched response would emit it a second time.
+                // One retry per request; 200+early-EOF flakiness (common on relays) no
+                // longer lands in the agent session.
+                // `truncatedDone` covers adapters that surface truncation as a synthetic
+                // failed done (responses) instead of ending with !sawDone (anthropic) —
+                // same retry, both shapes.
                 if (
                     (!sawDone || truncatedDone) &&
-                    !forwardedAny &&
+                    (!forwardedAny || (ctx.protocol === "openai" && !forwardedVisible)) &&
                     calls.length === 0 &&
                     !(ctx.textProtocol && assistantText.length > 0) &&
                     !signal?.aborted &&
                     !truncationRetried
                 ) {
                     truncationRetried = true;
-                    ctx.log(`[acp-loop] round ${round}: upstream truncated before any content reached the client; retrying fetch once`);
+                    ctx.log(`[acp-loop] round ${round}: upstream truncated with no visible output reaching the client; retrying fetch once`);
                     try {
                         const respResult = await fetchUpstream(roundBody);
                         if (!respResult.response.body) {
@@ -390,6 +419,65 @@ export async function* runCompressLoop(
                         } else {
                             ctx.log(`[acp-loop] round ${round}: truncation retry failed (${e instanceof Error ? e.message : String(e)})`);
                         }
+                    }
+                }
+
+                // #413 follow-up: the stream died AFTER visible text already
+                // reached the client. A blind re-fetch would make it watch the
+                // answer regrow on top of the partial one, so re-fetch once with
+                // a continuation nudge quoting the forwarded tail: the retry's
+                // output appends seamlessly to what the client already has.
+                // Independent one-shot budget (continuationRetried), separate
+                // from #413's truncationRetried: a visible cut that continues
+                // and then cuts again invisibly must still leave the blind
+                // re-fetch available, because the second attempt added nothing
+                // the client can see. Gate keeps calls.length === 0 — a round
+                // with tool-call fragments falls through to the plain
+                // truncation error, since their semantics only survive a
+                // completed stream. OpenAI wire only: visible text means the
+                // stateful wires' identity framing (message_start /
+                // response.created) already reached the client, and a
+                // re-fetched response would duplicate it.
+                if (
+                    (!sawDone || truncatedDone) &&
+                    forwardedVisible &&
+                    ctx.protocol === "openai" &&
+                    !ctx.textProtocol &&
+                    assistantText.length > 0 &&
+                    calls.length === 0 &&
+                    !signal?.aborted &&
+                    !continuationRetried
+                ) {
+                    continuationRetried = true;
+                    const tail = assistantText.length <= TRUNCATION_CONTINUATION_TAIL_CHARS
+                        ? assistantText
+                        : `…${assistantText.slice(-TRUNCATION_CONTINUATION_TAIL_CHARS)}`;
+                    ctx.log(`[acp-loop] round ${round}: upstream truncated after ${assistantText.length} text chars reached the client; retrying once with continuation nudge`);
+                    const nudge: CoreMessage = {
+                        id: `acp_truncation_retry_r${round}`,
+                        role: "user",
+                        contentType: "text",
+                        text: truncationContinuationNudge(tail),
+                    };
+                    try {
+                        const retryBody = adapter.buildRequest([...coreMessages, nudge], systemPrompt, requestBody);
+                        const respResult = await fetchUpstream(retryBody);
+                        if (!respResult.response.body) {
+                            respResult.clearTimer();
+                            throw new UpstreamHttpError(respResult.response.status, "(empty response body)", 1);
+                        }
+                        currentUpstream = respResult.response.body as ReadableStream<Uint8Array>;
+                        roundBody = retryBody;
+                        if (activeClearTimer) activeClearTimer();
+                        activeClearTimer = respResult.clearTimer;
+                        continue;
+                    } catch (e) {
+                        if (e instanceof UpstreamHttpError) {
+                            ctx.log(`[acp-loop] round ${round}: continuation retry failed (upstream error ${e.status}: ${e.body.slice(0, 200)}); falling back to the truncation error`);
+                        } else {
+                            ctx.log(`[acp-loop] round ${round}: continuation retry failed (${e instanceof Error ? e.message : String(e)}); falling back to the truncation error`);
+                        }
+                        loggerLog("warn", `[acp-loop] truncation continuation retry failed round ${round}: ${e instanceof Error ? e.message : String(e)}`);
                     }
                 }
 
