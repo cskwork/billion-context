@@ -175,12 +175,48 @@ This installs the `bili` command (`bili-proxy` is kept as an alias).
 
 ## Quickstart
 
-Two ways to use it — pick one:
+Three ways to use it — pick one:
 
+- **Native plugin (no launcher):** `bili plugin install <client>` — bili
+  becomes a plugin inside the client; start the client as usual.
 - **Launcher (easiest):** one `bili <client>` command brings up the proxy and
   the client together — no real config file is ever touched.
 - **URL change (persistent):** prefix your client's baseURL with the proxy
   origin + `/bili/`.
+
+### Option 1 — Native plugin (`bili plugin install pi` / `opencode` / `dsh`)
+
+The proxy lives inside the client: install once, then start the client
+exactly as you always do — no launcher command, no env vars, no fixed port,
+no URL edits. Supported today for **pi**, **opencode** (1.x and 2.x) and
+**dsh**:
+
+```bash
+bili plugin install pi          # registers a "billion-context" entry in pi's settings (npm form when bili itself was npm-installed)
+bili plugin install opencode    # registers the plugin in opencode's real config + disables native auto-compaction
+bili plugin install dsh         # appends a managed block to every ~/.dsh/profiles/*/cordis.patch.yml
+bili plugin remove <client>     # undo (dsh restores the placeholder; config snapshots go to .bili-bak)
+```
+
+At load the plugin **spawns its own proxy** (or attaches to a healthy
+running one — a parent-pid watchdog tears it down when the client exits),
+rewrites model traffic to `<proxy>/bili/<upstream-url>`, registers
+`compress` / `decompress` / `acp_status` as native client tools (plugin
+mode), and binds the `/acp` panel to the current session. Opt-out envs:
+`BILI_NATIVE_PI=0`, `BILI_NATIVE_OPENCODE=0`, `BILI_NATIVE_DSH=0`.
+
+Notes:
+
+- Native mode is **mutually exclusive** with the standalone in-process
+  extensions (`billion-context-pi`, `opencode-acp`) — the installer swaps
+  the entries and snapshots the original config (`.bili-bak`); migration
+  details in the client table above (pi needs `billion-context-pi` 0.1.72+
+  to stand down cleanly).
+- On OpenCode 1.x, pre-migration `opencode-acp` sessions keep working
+  (v1 lane routing, #920) — see "OpenCode 1.x" below.
+- `claude` / `codex` / `omp` have companion installs too (an MCP shell and a
+  thin extension), but those need a running proxy — they are not native
+  mode.
 
 ### Injection priority — no files unless unavoidable (#535)
 
@@ -197,7 +233,7 @@ rewrite until dsh gains a settings-path env or an upstream loopback opt-out.
 Overlay dirs created by older versions are left in place and never merged back
 into the real home.
 
-### Option 1 — Launcher (`bili pi` / `bili codex` / `bili claude` / `bili omp` / `bili opencode` / `bili hermes` / `bili dsh` / `bili codebuddy` / `bili qoder` / `bili trae` / `bili jcode` / `bili kimi`)
+### Option 2 — Launcher (`bili pi` / `bili codex` / `bili claude` / `bili omp` / `bili opencode` / `bili hermes` / `bili dsh` / `bili codebuddy` / `bili qoder` / `bili trae` / `bili jcode` / `bili kimi`)
 
 The launcher wraps a client in one command: it starts a proxy on an
 independent port (a fresh instance is always spawned — a port is never
@@ -224,7 +260,7 @@ bili kimi                             # Kimi Code CLI (Moonshot): honors standar
 bili pi --mitm-domain api.foo.com     # add a domain to the MITM whitelist
 ```
 
-### Option 2 — URL change (`/bili/` prefix)
+### Option 3 — URL change (`/bili/` prefix)
 
 Start the proxy:
 

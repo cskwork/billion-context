@@ -104,18 +104,38 @@ npm install -g billion-context
 
 ## 快速上手
 
-2种方式 —— 任选其一:
+3种方式 —— 任选其一:
 
+- **原生插件(免启动器):** `bili plugin install <client>` —— bili 成为客户端内的插件,照常启动客户端即可.
 - **启动器(最省事):** `bili <client>` 一条命令拉起代理 + 客户端,不碰任何真实配置文件.
 - **改url(持久化):** 在客户端 baseURL 前面加上代理地址 + `/bili/`。
 
 
 
+### 方式 1 —— 原生插件(native,`bili plugin install pi` / `opencode` / `dsh`)
+
+代理住进客户端:装一次,之后照常启动客户端 —— 不用启动器命令、不用环境变量、不用固定端口、不用改 URL。目前支持 **pi**、**opencode**(1.x 与 2.x)、**dsh**:
+
+```bash
+bili plugin install pi          # 在 pi 的 settings 里注册 billion-context 条目(bili 自身为 npm 安装时写 npm 条目)
+bili plugin install opencode    # 在 opencode 真实配置里注册插件 + 关闭原生自动压缩
+bili plugin install dsh         # 往每个 ~/.dsh/profiles/*/cordis.patch.yml 追加受管块
+bili plugin remove <client>     # 卸载(dsh 还原占位符;配置快照存 .bili-bak)
+```
+
+插件加载时**自拉起自己的代理**(已有健康实例则直接复用 —— 父进程 pid 看门狗在客户端退出时收掉它),把模型流量改写到 `<proxy>/bili/<上游URL>`,并把 `compress` / `decompress` / `acp_status` 注册为客户端原生工具(plugin 模式),`/acp` 面板绑定当前会话。退出开关:`BILI_NATIVE_PI=0`、`BILI_NATIVE_OPENCODE=0`、`BILI_NATIVE_DSH=0`。
+
+注意:
+
+- 原生模式与独立进程内扩展(`billion-context-pi`、`opencode-acp`)**互斥** —— 安装器负责换条目并把原配置快照(`.bili-bak`);迁移细节见上方客户端表(pi 需 `billion-context-pi` 0.1.72+ 才能干净退让)。
+- OpenCode 1.x 上,迁移前的 `opencode-acp` 旧会话继续可用(v1 泳道路由,#920)—— 见下文 "OpenCode 1.x"。
+- `claude` / `codex` / `omp` 也有配套安装(MCP shell 与轻量扩展),但它们需要一个在跑的代理 —— 不属于原生模式。
+
 ### 注入优先级 —— 能不写文件就不写(#535)
 
 bili 永不拥有用户数据:每个被启动的客户端都跑在**真实 home** 上,运行期写入落在用户预期的位置。把客户端指向代理时,启动器按优先级选择——**优先 env 变量**(hermes/dsh/codex 的代理/CA env;pi/omp 的 `BILI_PROVIDER_REWRITES` URL 清单,由扩展加载时经 `registerProvider` 消费),其次 **CLI 参数或扩展 API**(codex `-c key=value`、opencode 插件),最后才是**生成文件**——目前仅剩 opencode 的临时 `opencode.json`(退出即删)和 dsh 的回环例外:dsh 的 fetch 栈对回环目标无条件绕过代理 env,所以本地上游保留持久 `~/.dsh-bili` overlay 改写,直到 dsh 提供 settings-path env 或上游支持回环 opt-out。旧版本创建的 overlay 目录原地保留,绝不合并回真实 home。
 
-### 方式 1 —— 启动器(`bili pi` / `bili codex` / `bili claude` / `bili omp` / `bili opencode` / `bili hermes` / `bili dsh` / `bili codebuddy` / `bili qoder` / `bili trae` / `bili jcode` / `bili kimi`)
+### 方式 2 —— 启动器(`bili pi` / `bili codex` / `bili claude` / `bili omp` / `bili opencode` / `bili hermes` / `bili dsh` / `bili codebuddy` / `bili qoder` / `bili trae` / `bili jcode` / `bili kimi`)
 
 启动器把客户端包进一条命令:在独立端口拉起一个代理(总是全新实例,绝不复用端口),再按客户端支持的机制把它指向代理 —— 能吃代理/CA 环境变量的走**证书 MITM**,不吃的走隔离的**`/bili/` 配置重写**。真实配置文件从不被修改;客户端自己的配置只被**读取**,用来发现它实际连接的 HTTPS 上游主机,把这些主机加入 MITM 白名单 —— 代理只 TLS 终结它们,其余流量盲透传。
 
@@ -146,7 +166,7 @@ bili pi --mitm-domain api.foo.com     # 向 MITM 白名单追加域名
 
 优雅降级：如果包无法找到/导入或不是 v1 版本，插件的行为与此更改之前完全一致——旧版会话的降级方式与 `opencode-acp` 在 `/bili/` baseURL 上自我禁用时的表现相同。
 
-### 方式 2 —— 改url(`/bili/` 前缀)
+### 方式 3 —— 改url(`/bili/` 前缀)
 
 启动代理:
 
