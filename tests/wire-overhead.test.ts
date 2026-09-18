@@ -49,6 +49,39 @@ test("estimateWireOverhead: responses instructions", () => {
     assert.ok(oh >= 1800 && oh <= 2400, `instructions ~2000 (got ${oh})`);
 });
 
+test("estimateWireOverhead: responses input[] developer/system counted, user/assistant not (#829)", () => {
+    const body = JSON.stringify({
+        input: [
+            { type: "message", role: "developer", content: "SYS ".repeat(300) },
+            { type: "message", role: "system", content: "SYS2 ".repeat(300) },
+            { type: "message", role: "user", content: "U".repeat(40000) },
+            { type: "message", role: "assistant", content: "A".repeat(40000) },
+        ],
+    });
+    const oh = estimateWireOverhead("responses", body);
+    assert.ok(oh >= 300 && oh <= 1500, `only developer/system items in input[] count, not the 20k user/assistant (got ${oh})`);
+});
+
+test("estimateWireOverhead: responses input[] developer with array-of-parts content (#829)", () => {
+    const body = JSON.stringify({
+        input: [
+            { type: "message", role: "developer", content: [{ type: "input_text", text: "P1 ".repeat(300) }, { type: "input_text", text: "P2 ".repeat(300) }] },
+            { type: "message", role: "user", content: "U".repeat(40000) },
+        ],
+    });
+    const oh = estimateWireOverhead("responses", body);
+    assert.ok(oh >= 300 && oh <= 1500, `array-of-parts developer content joined (got ${oh})`);
+});
+
+test("estimateWireOverhead: responses instructions AND input[] developer both counted (#829)", () => {
+    const body = JSON.stringify({
+        instructions: "I".repeat(4000),
+        input: [{ type: "message", role: "developer", content: "D".repeat(4000) }],
+    });
+    const oh = estimateWireOverhead("responses", body);
+    assert.ok(oh >= 1800 && oh <= 2600, `top-level instructions + input[] developer item summed (got ${oh})`);
+});
+
 test("estimateWireOverhead: unparseable body → 0, not a crash", () => {
     assert.equal(estimateWireOverhead("anthropic", "not json {"), 0);
     assert.equal(estimateWireOverhead("openai", Buffer.from("}{"), ), 0);

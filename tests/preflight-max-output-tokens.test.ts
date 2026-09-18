@@ -131,7 +131,11 @@ function longResponsesInput(count: number) {
     return input;
 }
 
-function startProxy(upstreamPort: number, models: Record<string, { context: number }>): Promise<http.Server> {
+// #829: limit defaults to the historical 10_000; the #663 tests pass 15_000
+// because the corrected overhead (developer item now counts the injected
+// compress prompt + ACP tools) raises the post-fold residual — the window must
+// clear it while staying below the grown raw payload so preflight still fires.
+function startProxy(upstreamPort: number, models: Record<string, { context: number }>, limit = 10_000): Promise<http.Server> {
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
     return startServer({
@@ -139,8 +143,8 @@ function startProxy(upstreamPort: number, models: Record<string, { context: numb
         host: "127.0.0.1",
         upstream: "http://127.0.0.1",
         routes: { [`http://127.0.0.1:${upstreamPort}`]: { models } },
-        modelContextLimit: 10_000,
-        kernelConfig: defaultConfig(10_000),
+        modelContextLimit: limit,
+        kernelConfig: defaultConfig(limit),
         compress: { injectTool: true, injectNudge: true },
         promptCache: { routing: "auto" },
         sessionHeader: "x-acp-session",
@@ -171,7 +175,7 @@ test("e2e #663 (order A, stream-first): learn both rejections, summary recovers,
     await once(upstream, "listening");
     const upstreamPort = (upstream.address() as { port: number }).port;
 
-    const proxy = await startProxy(upstreamPort, { "gpt-6-astra": { context: 10_000 } });
+    const proxy = await startProxy(upstreamPort, { "gpt-6-astra": { context: 15_000 } }, 15_000);
     await once(proxy, "listening");
     const proxyPort = (proxy.address() as { port: number }).port;
     const upstreamUrl = `http://127.0.0.1:${upstreamPort}/responses`;
@@ -339,7 +343,7 @@ test("e2e #663 (model scoping): rejection learned for model A keeps model B's 32
     await once(upstream, "listening");
     const upstreamPort = (upstream.address() as { port: number }).port;
 
-    const proxy = await startProxy(upstreamPort, { "gpt-6-astra": { context: 10_000 }, "gpt-6-standard": { context: 10_000 } });
+    const proxy = await startProxy(upstreamPort, { "gpt-6-astra": { context: 15_000 }, "gpt-6-standard": { context: 15_000 } }, 15_000);
     await once(proxy, "listening");
     const proxyPort = (proxy.address() as { port: number }).port;
     const upstreamUrl = `http://127.0.0.1:${upstreamPort}/responses`;

@@ -38,8 +38,10 @@ function fcEvents(callId: string, args: string): string {
         sse("response.output_item.done", { item: { type: "function_call", id: `fc_${callId}`, call_id: callId, name: "compress", arguments: args }, output_index: 0 }),
     ].join("");
 }
-// 7 messages × ~4400 chars (~1100 tokens each, ~7700 total). Below the 10k
-// window so preflight never fires; above the recent-tail protection so
+// 7 messages × ~4400 chars (~1100 tokens each, ~7700 total). Below the 15k
+// window so preflight never fires (the window must clear the rebuilt payload:
+// conversation + the developer item carrying instructions + injected compress/
+// absorb prompts + ACP tools — #829); above the recent-tail protection so
 // m00001/m00002 are compressible by the model.
 function conversation() {
     const input: { type: string; role: string; content: string }[] = [];
@@ -48,7 +50,7 @@ function conversation() {
     }
     return input;
 }
-// 14 messages ≈ 15.4k tokens — OVER the 10k window, so preflight WOULD fire
+// 14 messages ≈ 15.4k tokens — OVER the 15k window, so preflight WOULD fire
 // if this payload went through the normal pipeline (#332 regression input).
 function bigConversation() {
     const input: { type: string; role: string; content: string }[] = [];
@@ -114,9 +116,9 @@ async function withHarness(opts: { mode?: string; firstTurnTokens: number; stric
         port: 0,
         host: "127.0.0.1",
         upstream: "http://127.0.0.1",
-        routes: { [`http://127.0.0.1:${upstreamPort}`]: { models: { "gpt-resp": { context: 10_000 } } } },
-        modelContextLimit: 10_000,
-        kernelConfig: defaultConfig(10_000),
+        routes: { [`http://127.0.0.1:${upstreamPort}`]: { models: { "gpt-resp": { context: 15_000 } } } },
+        modelContextLimit: 15_000,
+        kernelConfig: defaultConfig(15_000),
         compress: { injectTool: true, injectNudge: true },
         promptCache: { routing: "auto" },
         sessionHeader: "x-acp-session",
@@ -342,7 +344,7 @@ test("e2e E2 (endpoint form): intercept + healthy ACP → forged JSON {output}, 
 // Issue #332: a compaction_trigger request that is NOT intercepted must reach
 // upstream byte-identical — no preflight overflow-compress, no payload
 // rebuild, no window clamp, no session-state folding as a side effect. The
-// oversized payload (14 msgs ≈ 15.4k > 10k window) is what made the old
+// oversized payload (14 msgs ≈ 15.4k > 15k window) is what made the old
 // ordering fire preflight before the compact detection ran.
 
 test("e2e #332 (trigger form): pass mode + oversized payload → forwarded byte-identical, no state mutation", async () => {
