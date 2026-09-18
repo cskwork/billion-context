@@ -1,5 +1,12 @@
 import { createHash } from "node:crypto";
 
+// #920: stamped per request by the opencode thin plugin for LEGACY
+// opencode-acp sessions (acp state on disk). The proxy (server.ts) forwards
+// such requests verbatim — no session binding, no tool injection, no
+// compression — because acp owns those sessions' context in-process. Clients
+// never send this header except through our own plugin.
+export const BILI_PLUGIN_BYPASS_HEADER = "x-bili-plugin-bypass";
+
 /**
  * Cryptographic hash of a string, truncated to a 64-bit id (16 hex chars).
  *

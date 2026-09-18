@@ -1911,21 +1911,25 @@ test("prepareOpencodeHttpRewrite: writes rewritten copy from a JSONC user config
         // lives in the global dir, so point that dir somewhere empty
         const root = readOpencodeConfigRoot({ XDG_CONFIG_HOME: path.join(dir, "empty-xdg"), OPENCODE_CONFIG: cfgFile });
         const rw = [{ key: "zhipuai-lb", realUpstream: "http://127.0.0.1:18081/v1" }];
-        const tmpFile = prepareOpencodeHttpRewrite(root, "http://127.0.0.1:8787", rw, []);
+        const spawnEnv: NodeJS.ProcessEnv = {};
+        const tmpFile = prepareOpencodeHttpRewrite(root, "http://127.0.0.1:8787", rw, [], undefined, false, spawnEnv);
         assert.ok(tmpFile);
         const rewritten = JSON.parse(fs.readFileSync(tmpFile, "utf8"));
         assert.equal(rewritten.provider["zhipuai-lb"].options.baseURL, "http://127.0.0.1:8787/bili/http://127.0.0.1:18081/v1");
-        assert.deepEqual(rewritten.plugin, ["opencode-acp@latest"]);
+        // #920: the acp entry is stripped from the clone — the thin plugin
+        // imports the package as a library; its spec rides along via env.
+        assert.deepEqual(rewritten.plugin, []);
+        assert.equal(spawnEnv["BILI_OPENCODE_ACP_SPEC"], "opencode-acp@latest");
         assert.deepEqual(rewritten.compaction, { auto: false });
         assert.equal(fs.readFileSync(cfgFile, "utf8"), original);
         // the caller's merged root must stay pristine (rewrite happens on a clone)
         assert.deepEqual(root, { plugin: ["opencode-acp@latest"], provider: { "zhipuai-lb": { options: { baseURL: "http://127.0.0.1:18081/v1" } } } });
         fs.rmSync(path.dirname(tmpFile), { recursive: true, force: true });
         assert.equal(prepareOpencodeHttpRewrite(root, "http://127.0.0.1:8787", [], []), undefined);
-        const withPlugin = prepareOpencodeHttpRewrite(root, "http://127.0.0.1:8787", [], [], "/opt/bili/dist/agent/opencode.js");
+        const withPlugin = prepareOpencodeHttpRewrite(root, "http://127.0.0.1:8787", [], [], "/opt/bili/dist/agent/opencode.js", false, { ...spawnEnv });
         assert.ok(withPlugin);
         const injected = JSON.parse(fs.readFileSync(withPlugin, "utf8"));
-        assert.deepEqual(injected.plugin, ["opencode-acp@latest", "/opt/bili/dist/agent/opencode.js"]);
+        assert.deepEqual(injected.plugin, ["/opt/bili/dist/agent/opencode.js"]);
         assert.equal(injected.provider["zhipuai-lb"].options.baseURL, "http://127.0.0.1:18081/v1");
         fs.rmSync(path.dirname(withPlugin), { recursive: true, force: true });
         const missingCfg = prepareOpencodeHttpRewrite(undefined, "http://127.0.0.1:8787", [], [], "/opt/bili/dist/agent/opencode.js");
@@ -1934,6 +1938,40 @@ test("prepareOpencodeHttpRewrite: writes rewritten copy from a JSONC user config
         assert.deepEqual(fromEmpty.plugin, ["/opt/bili/dist/agent/opencode.js"]);
         assert.deepEqual(fromEmpty.compaction, { auto: false });
         fs.rmSync(path.dirname(missingCfg), { recursive: true, force: true });
+    } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("prepareOpencodeHttpRewrite: strips opencode-acp entries in all spec forms (#920)", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "oc-rw3-"));
+    try {
+        const root = {
+            plugin: [
+                "opencode-acp@latest",
+                ["opencode-acp@1.2.3", { enabled: true }],
+                { package: "./local/opencode-acp" },
+                "my-opencode-acp-fork",
+                "some-other-plugin",
+            ],
+            plugins: ["/abs/path/to/node_modules/opencode-acp"],
+            provider: {},
+        };
+        const spawnEnv: NodeJS.ProcessEnv = {};
+        const tmpFile = prepareOpencodeHttpRewrite(root, "http://127.0.0.1:8787", [], [], "/opt/bili/dist/agent/opencode.js", false, spawnEnv);
+        assert.ok(tmpFile);
+        const out = JSON.parse(fs.readFileSync(tmpFile, "utf8"));
+        assert.deepEqual(out.plugin, ["my-opencode-acp-fork", "some-other-plugin", "/opt/bili/dist/agent/opencode.js"]);
+        assert.deepEqual(out.plugins, []);
+        // first stripped spec wins — the copy the host would have loaded first
+        assert.equal(spawnEnv["BILI_OPENCODE_ACP_SPEC"], "opencode-acp@latest");
+        fs.rmSync(path.dirname(tmpFile), { recursive: true, force: true });
+        // no acp entries → env untouched
+        const env2: NodeJS.ProcessEnv = {};
+        const plain = prepareOpencodeHttpRewrite({ plugin: ["other"], provider: {} }, "http://127.0.0.1:8787", [], [], "/opt/p.js", false, env2);
+        assert.ok(plain);
+        assert.equal(env2["BILI_OPENCODE_ACP_SPEC"], undefined);
+        fs.rmSync(path.dirname(plain), { recursive: true, force: true });
     } finally {
         fs.rmSync(dir, { recursive: true, force: true });
     }

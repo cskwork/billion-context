@@ -79,7 +79,7 @@ import { flushPrefixAffinity, hydratePrefixAffinity, scheduleAffinityPersist } f
 import { consumePluginRegisterFor, flushConversations, handlePluginCompact, handlePluginManifest, handlePluginRegister, handlePluginStatus, handlePluginTool, loadConversations, pipePluginChatWithStrip, pipePluginJson, pipePluginResponsesWithStrip, pluginAgentHeader, pluginConversationHeader, pluginReportedContextWindow, recordPluginSession, rememberPluginMessages, takePendingPluginRegister } from "./plugin.js";
 import { setupMitm, readMitmUpstream, getBlindTunnelStats } from "./mitm.js";
 import type { BiliMessage } from "acp-kernel/wire";
-import { hardenOpenaiAssistantContent, isLoopbackAddress, inspectContextOverflow, reserveOutputHeadroom, resolveOutputHeadroomCap, shouldReserveOutputHeadroom, systemToUser, usageTotals, type WireProtocol } from "./util.js";
+import { BILI_PLUGIN_BYPASS_HEADER, hardenOpenaiAssistantContent, isLoopbackAddress, inspectContextOverflow, reserveOutputHeadroom, resolveOutputHeadroomCap, shouldReserveOutputHeadroom, systemToUser, usageTotals, type WireProtocol } from "./util.js";
 import { recordProvenInput, resolveConfirmedLimit, resolveLearnedLimit, resolveSpeculativeLimit, retractStaleLearnedLimits, sessionProvenMax } from "./weak-overflow.js";
 import { BILI_TUNNEL_HEADER, checkTunnelDestination, tunnelAllowlistFromEnv } from "./tunnel-guard.js";
 import { dumpRejectedBody } from "./error-dump.js";
@@ -875,6 +875,15 @@ async function handle(
         log("warn", selfLoop
             ? `[chain] inbound request carries THIS instance's ${BILI_HOP_HEADER} marker (${hopMarker}) — self-loop detected. Passing through without processing; check your upstream config (it may point back to this instance).`
             : `[chain] inbound request carries ${BILI_HOP_HEADER} from another bili instance (${hopMarker}) — bili→bili chain detected. Passing through without processing to avoid double compression; keep only one bili instance in the chain.`);
+    }
+    // #920: legacy opencode-acp sessions bypass the whole pipeline. The thin
+    // plugin stamps this header per request for sessions with acp state on
+    // disk; acp owns their context in-process, so binding/injecting/compressing
+    // here would double-manage it. Raw forward, zero state touched.
+    if (headerValue(req, BILI_PLUGIN_BYPASS_HEADER) === "1") {
+        log("debug", `bypass: ${req.method ?? "?"} ${maskUrlForLog(req.url ?? "")} — raw passthrough (legacy in-process compression)`);
+        await forward(req, res, opts, bodyBuffer, null, core, config, log, route, instanceId, undefined);
+        return;
     }
     const countTokens = isCountTokensRequest(req.method ?? "GET", urlPath, bodyBuffer.length > 0);
     // Per-request context limit: look up body.model against the per-route model
@@ -2646,27 +2655,35 @@ function injectSystem(
     return buildSystem(full, parsed.system);
 }
 
+// #920: in proxy mode bili OWNS the compression tool names. Agent-side tools
+// with the same name (opencode-acp's statically-registered DCP set ships in
+// every opencode request body — the v1 tool registry is process-global and
+// cannot be filtered per request) are dropped here so the upstream sees
+// exactly one definition per name, and it is bili's (its arg schemas are what
+// the compress loop dispatches on). Plugin mode never calls these helpers.
 function injectTool(tools: unknown[] | undefined, extra?: { name: string }, toolPrompts?: ToolPrompts): unknown[] {
     const acp = applyAcpToolOverrides(BILI_ACP_TOOLS_ANTHROPIC, toolPrompts);
     if (!Array.isArray(tools)) return extra ? [...acp, extra] : [...acp];
-    const names = new Set(tools.map((t) => (t as { name?: string })?.name));
-    const missing = acp.filter((t) => !names.has(t.name));
-    const extraMissing = extra && !names.has(extra.name);
-    if (missing.length === 0 && !extraMissing) return tools;
-    return [...tools, ...missing, ...(extraMissing ? [extra] : [])];
+    const owned = new Set<string>(acp.map((t) => t.name));
+    if (extra) owned.add(extra.name);
+    const kept = tools.filter((t) => {
+        const n = (t as { name?: string })?.name;
+        return typeof n !== "string" || !owned.has(n);
+    });
+    return [...kept, ...acp, ...(extra ? [extra] : [])];
 }
 
 function injectOpenaiTool(tools: OpenAITool[] | undefined, extra?: OpenAITool, toolPrompts?: ToolPrompts): OpenAITool[] {
     const acp = applyAcpToolOverrides(BILI_ACP_TOOLS_OPENAI, toolPrompts) as OpenAITool[];
     if (!Array.isArray(tools)) return extra ? [...acp, extra] : ([...acp] as OpenAITool[]);
-    const present = new Set(
-        tools
-            .map((t) => t?.function?.name)
-            .filter((n): n is string => typeof n === "string"),
-    );
-    const additions = acp.filter((t) => !present.has(t.function.name));
-    const out = [...tools, ...(additions as OpenAITool[])];
-    if (extra && !out.some((t) => t?.function?.name === extra.function?.name)) out.push(extra);
+    const owned = new Set<string>(acp.map((t) => t.function.name));
+    if (extra) owned.add(extra.function.name);
+    const kept = tools.filter((t) => {
+        const n = t?.function?.name;
+        return typeof n !== "string" || !owned.has(n);
+    });
+    const out = [...kept, ...acp];
+    if (extra) out.push(extra);
     return out;
 }
 
@@ -2682,13 +2699,13 @@ const FORCE_TEXT_PROTOCOL = process.env.ACP_COMPRESS_PROTOCOL === "text";
 function injectResponsesTool(tools: unknown[] | undefined, toolsToAdd: readonly { name: string }[] = BILI_ACP_TOOLS_RESPONSES, toolPrompts?: ToolPrompts): unknown[] {
     const base = applyAcpToolOverrides(toolsToAdd, toolPrompts);
     if (!Array.isArray(tools)) return [...base];
-    const present = new Set(
-        tools
-            .map((t) => (t as { name?: string })?.name)
-            .filter((n): n is string => typeof n === "string"),
-    );
-    const additions = base.filter((t) => !present.has(t.name));
-    return [...tools, ...additions];
+    // Same #920 rule as injectTool/injectOpenaiTool: bili owns these names.
+    const owned = new Set<string>(base.map((t) => t.name));
+    const kept = tools.filter((t) => {
+        const n = (t as { name?: string })?.name;
+        return typeof n !== "string" || !owned.has(n);
+    });
+    return [...kept, ...base];
 }
 
 type ForwardTarget = {
