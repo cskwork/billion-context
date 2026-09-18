@@ -18,6 +18,7 @@
 
 import { createAcpCommandHooks } from "./opencode-acp-command.js";
 import { createOpencodeV2Setup } from "./opencode-v2.js";
+import { installNativeFetchIntercept, type NativeInterceptState } from "./native-intercept.js";
 
 export { showAcpText } from "./opencode-acp-command.js";
 export type {
@@ -57,6 +58,14 @@ const proxyBase = process.env.BILLION_CONTEXT_PROXY ?? "";
 const server = async (ctx: OpencodePluginContext): Promise<OpencodeHooks> => {
     if (!proxyBase) return {};
     console.log("[bili-opencode] plugin active (proxy " + proxyBase + ")");
+    // V1 host: same SDK-default-baseURL gap as the native entry — the
+    // launcher's config-file rewrite only catches explicit baseURLs. Global
+    // fetch patch catches the rest; `origin` is already resolved (the
+    // launcher owns the proxy lifecycle, no respawn hooks needed).
+    const intercept: NativeInterceptState = { origin: proxyBase, ready: Promise.resolve(proxyBase) };
+    if (installNativeFetchIntercept(intercept)) {
+        console.log("[bili-opencode] v1: fetch patch installed (catches providers without an explicit baseURL)");
+    }
     return {
         ...createAcpCommandHooks(() => proxyBase, ctx),
     };

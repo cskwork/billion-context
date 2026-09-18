@@ -289,9 +289,13 @@ contract:
   the plugin headers per request; `tool` registers the bili tools with real
   zod shapes (zod is a runtime dependency — when it cannot be resolved the
   plugin degrades to plain proxy mode: rewrite only, wire-injected tools);
-  the `/acp` command renders the same status panel. V1 has no request-level
-  URL hook, so providers **without** an explicit `baseURL` (SDK defaults)
-  keep going direct — set a baseURL to be proxied.
+  the `/acp` command renders the same status panel. Providers **without**
+  an explicit `baseURL` (SDK defaults, e.g. bare `@ai-sdk/openai` →
+  api.openai.com) are caught by a global `fetch` patch (the pi-native
+  mechanism) that reroutes model-API calls to the proxy — verified end-to-end
+  on 1.14.46 and 1.18.31 (log: `v1: fetch patch installed`), including the
+  OpenAI Responses endpoint. The patch is idempotent and passes
+  `/bili/`-wrapped URLs through untouched.
 - **Pure proxy:** point the provider baseURL at the proxy like any other
   client:
 

@@ -46,7 +46,8 @@
 //   - config hook: receives the SHARED cached config object (Config.get →
 //     InstanceState.use) — mutating provider.<id>.options.baseURL persists
 //     for the process lifetime, no file writes needed. Providers WITHOUT an
-//     explicit baseURL (SDK defaults) cannot be caught this way — documented.
+//     explicit baseURL (SDK defaults) are caught by the global fetch patch
+//     installed in server() (see installNativeFetchIntercept below).
 //   - "chat.headers": per-LLM-request header mutation — the V1 equivalent of
 //     V2's stampHeaders (x-bili-plugin + conversation id).
 //   - tool: { [name]: { description, args, execute } } registers native tools;
@@ -66,7 +67,7 @@ import { ACP_TOOLS_OPENAI } from "../compress-tool.js";
 import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST, unwrapUpstream, wrapUpstream } from "../launcher.js";
 import { createAcpCommandHooks } from "./opencode-acp-command.js";
 import { markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, singleFlight } from "./native-bootstrap.js";
-import { isModelApiUrl, readyOrigin, type NativeInterceptState } from "./native-intercept.js";
+import { installNativeFetchIntercept, isModelApiUrl, readyOrigin, type NativeInterceptState } from "./native-intercept.js";
 import { createOpencodeV2Setup, type V2HttpRequestEvent, type V2State } from "./opencode-v2.js";
 
 /** Decides whether the native bootstrap should run in this process. */
@@ -460,6 +461,19 @@ const server = async (ctx: V1PluginContext): Promise<V1Hooks> => {
         return {};
     }
     console.log(`[bili-opencode-native] v1 active (proxy ${origin})`);
+    // Global fetch patch (pi-native's mechanism): the config-hook rewrite can
+    // only catch providers with an EXPLICIT baseURL — V1 has no request-level
+    // hook, and providers relying on the SDK default (e.g. bare
+    // `@ai-sdk/openai` → api.openai.com) would silently bypass the proxy.
+    // v1's provider stack resolves `fetch` late (`customFetch ?? fetch` inside
+    // the per-request wrapper, provider.ts), so a global patch catches those
+    // requests too. Idempotent (flag-guarded) and disjoint from the config
+    // rewrite: isModelApiUrl passes `/bili/`-prefixed URLs straight through,
+    // so already-rewritten providers never double-wrap. Proxy-death respawn /
+    // degrade-to-direct semantics come with the shared state.
+    if (installNativeFetchIntercept(state)) {
+        console.log("[bili-opencode-native] v1: fetch patch installed (catches providers without an explicit baseURL)");
+    }
     let z: ZodLike | undefined;
     try {
         z = (await import("zod")) as ZodLike;
