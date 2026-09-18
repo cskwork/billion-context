@@ -10,14 +10,18 @@ import {
     setLogCapture,
 } from "../src/logger.ts";
 
-/** Poll until the file's size is stable across a few checks (stream flushed). */
-async function settle(file: string, timeoutMs = 3000): Promise<void> {
+/** Poll until the file's size is stable across a few checks (stream flushed).
+ *  With minSize > 0 the size must also have reached it: stability alone can be
+ *  observed mid-flush when a write stalls (loaded runner, AV scan), and the
+ *  rotation decision in openStream() is stat-based — an incomplete flush then
+ *  skips the rename (CI flake on windows/22, #932). */
+async function settle(file: string, timeoutMs = 3000, minSize = 0): Promise<void> {
     const start = Date.now();
     let last = -1;
     let stable = 0;
     while (Date.now() - start < timeoutMs) {
         const size = fs.existsSync(file) ? fs.statSync(file).size : -1;
-        if (size === last) {
+        if (size >= minSize && size === last) {
             stable++;
             if (stable >= 3) return;
         } else {
@@ -98,7 +102,7 @@ test("internal 10MB rotation: post-rotation line lands in the fresh file", async
     configureLogger(file);
     try {
         log("info", "x".repeat(11 * 1024 * 1024));
-        await settle(file);
+        await settle(file, 10000, 11 * 1024 * 1024);
         log("info", "post-rotation");
         await settle(file);
 
