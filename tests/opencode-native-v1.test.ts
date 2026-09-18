@@ -276,18 +276,18 @@ function fakeLegacyModule(events: string[]): LegacyAcpModule {
             events.push(`legacy-config:${JSON.stringify(Object.keys(cfg))}`);
             cfg.permission = { deny: ["dcp_*"] };
         },
-        "command.execute.before": async (input: { command: string; sessionID: string }) => {
-            events.push(`legacy-command:${input.command}:${input.sessionID}`);
+        "command.execute.before": async (input: { command: string; sessionID: string }, output?: { parts?: unknown[] }) => {
+            events.push(`legacy-command:${input.command}:${input.sessionID}:${output === undefined ? "no-output" : "output"}`);
         },
-        "experimental.chat.system.transform": async (input: { sessionID: string }) => {
-            events.push(`legacy-system:${input.sessionID}`);
+        "experimental.chat.system.transform": async (input: { sessionID: string }, output?: { system?: unknown[] }) => {
+            events.push(`legacy-system:${input.sessionID}:${output === undefined ? "no-output" : "output"}`);
         },
         "experimental.chat.messages.transform": async (_i: unknown, output: { messages: unknown[] }) => {
             const last = output.messages[output.messages.length - 1] as { info?: { sessionID?: string } };
             events.push(`legacy-messages:${last?.info?.sessionID}`);
         },
-        "experimental.text.complete": async (input: { sessionID: string }) => {
-            events.push(`legacy-text:${input.sessionID}`);
+        "experimental.text.complete": async (input: { sessionID: string }, output?: { text?: unknown }) => {
+            events.push(`legacy-text:${input.sessionID}:${output === undefined ? "no-output" : "output"}`);
         },
         tool: {
             compress: {
@@ -348,25 +348,26 @@ describe("createV1ServerHooks legacy routing (#920)", () => {
         assert.equal(h2["x-bili-plugin-bypass"], undefined);
 
         // /acp command: legacy session -> acp handler (no throw); new -> bili handler (throws __BILI_ACP_HANDLED__ after render)
-        await hooks["command.execute.before"]?.({ command: "acp", sessionID: "ses_legacy", arguments: "" });
-        assert.ok(events.includes("legacy-command:acp:ses_legacy"));
+        // output must reach the absorbed acp handler (its handlers are two-arg (input, output))
+        await hooks["command.execute.before"]?.({ command: "acp", sessionID: "ses_legacy", arguments: "" }, { parts: [] });
+        assert.ok(events.includes("legacy-command:acp:ses_legacy:output"));
         events.length = 0;
         await assert.rejects(hooks["command.execute.before"]?.({ command: "acp", sessionID: "ses_new", arguments: "" }), /__BILI_ACP_HANDLED__/);
         assert.equal(events.filter((e) => e.startsWith("legacy-command")).length, 0);
 
-        // transforms gated to legacy sessions only
-        await hooks["experimental.chat.system.transform"]?.({ sessionID: "ses_new" });
-        assert.equal(events.filter((e) => e === "legacy-system:ses_new").length, 0);
-        await hooks["experimental.chat.system.transform"]?.({ sessionID: "ses_legacy" });
-        assert.ok(events.includes("legacy-system:ses_legacy"));
+        // transforms gated to legacy sessions only; output reaches acp on the legacy lane
+        await hooks["experimental.chat.system.transform"]?.({ sessionID: "ses_new" }, { system: [] });
+        assert.equal(events.filter((e) => e.startsWith("legacy-system:ses_new")).length, 0);
+        await hooks["experimental.chat.system.transform"]?.({ sessionID: "ses_legacy" }, { system: [] });
+        assert.ok(events.includes("legacy-system:ses_legacy:output"));
         await hooks["experimental.chat.messages.transform"]?.({}, { messages: [{ role: "user" }, { role: "assistant", info: { sessionID: "ses_new" } }] });
         assert.equal(events.filter((e) => e === "legacy-messages:ses_new").length, 0);
         await hooks["experimental.chat.messages.transform"]?.({}, { messages: [{ info: { sessionID: "ses_legacy" } }] });
         assert.ok(events.includes("legacy-messages:ses_legacy"));
-        await hooks["experimental.text.complete"]?.({ sessionID: "ses_new" });
-        await hooks["experimental.text.complete"]?.({ sessionID: "ses_legacy" });
-        assert.equal(events.filter((e) => e === "legacy-text:ses_new").length, 0);
-        assert.ok(events.includes("legacy-text:ses_legacy"));
+        await hooks["experimental.text.complete"]?.({ sessionID: "ses_new" }, { text: "" });
+        await hooks["experimental.text.complete"]?.({ sessionID: "ses_legacy" }, { text: "" });
+        assert.equal(events.filter((e) => e.startsWith("legacy-text:ses_new")).length, 0);
+        assert.ok(events.includes("legacy-text:ses_legacy:output"));
     });
 
     it("config hook hides providers from absorbed acp and still rewrites", async () => {
