@@ -4,6 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import http from "node:http";
+import { pathToFileURL } from "node:url";
 import { apply, planNativeDsh, shouldBootstrapNativeDsh, _resetRegisterForTest } from "../src/agent/dsh-native.ts";
 import { dshManagedPatchBlock, dshProfileDirs, mergeDshManagedPatch, stripDshManagedPatch, pluginInstall, pluginRemove, pluginStatusAll } from "../src/plugin-install.ts";
 
@@ -30,11 +31,14 @@ test("shouldBootstrapNativeDsh: spawn-gated by env shape", () => {
 
 const HEADER = "# Your patch layer for this dsh profile, applied after every bundle layer:\n# a top-level YAML array of loader patch entries (id-targeted config\n# overrides, disables, and insert lists; `!!js` expressions allowed).\n";
 
+// Platform-dependent by construction (win32 path shape) — mirror dshManagedPatchBlock, never hardcode a URL literal here.
+const pluginUrlOf = (root: string): string => pathToFileURL(path.join(root, "dist", "agent", "dsh-native.js")).href;
+
 test("mergeDshManagedPatch: placeholder [] is replaced, comments survive", () => {
     const block = dshManagedPatchBlock("/opt/bili");
     const merged = mergeDshManagedPatch(`${HEADER}[]\n`, block);
     assert.ok(merged.startsWith(HEADER));
-    assert.ok(merged.includes("- insert:\n    - id: bili-native\n      name: file:///opt/bili/dist/agent/dsh-native.js\n"));
+    assert.ok(merged.includes(`- insert:\n    - id: bili-native\n      name: ${pluginUrlOf("/opt/bili")}\n`));
     assert.ok(merged.includes("- id: compaction-basic\n  config:\n    auto: false\n"));
     assert.ok(!merged.includes("[]"));
 });
@@ -62,7 +66,7 @@ test("mergeDshManagedPatch/stripDshManagedPatch roundtrip restores the placehold
 test("mergeDshManagedPatch is idempotent and rewrites a moved install path", () => {
     const first = mergeDshManagedPatch(`${HEADER}[]\n`, dshManagedPatchBlock("/old/root"));
     const second = mergeDshManagedPatch(first, dshManagedPatchBlock("/new/root"));
-    assert.ok(second.includes("file:///new/root/dist/agent/dsh-native.js"));
+    assert.ok(second.includes(pluginUrlOf("/new/root")));
     assert.ok(!second.includes("/old/root"));
     assert.equal(second.match(/bili begin/g)?.length, 1);
     const third = mergeDshManagedPatch(second, dshManagedPatchBlock("/new/root"));
