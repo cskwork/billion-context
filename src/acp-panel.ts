@@ -15,15 +15,31 @@
 //    footer (unconditional, last line pushed).
 //  - renderAcpStatus (plugin fallback): first line exactly "📊 ACP status",
 //    every other line an indented field.
+//  - wrapCacheReport (#800, /acp-cache): explicit plugin-owned markers around
+//    the kernel's cache report — its shape is kernel-owned and variable-length
+//    (LINE ITEMS table up to the sample cap), so we cannot anchor on the
+//    renderer output the way we can for the two panels above.
 const PANEL_BOX_TOP = "\u256d";
 const PANEL_BOX_TITLE = "ACP Context Analysis";
 const PANEL_BOX_FOOTER = "Tag visibility: tags injected to LLM only (deep copy), not persisted in session, not shown in terminal.";
 const PANEL_FALLBACK_HEADER = "\u{1f4ca} ACP status";
 
+export const CACHE_REPORT_OPEN = "[acp-cache]";
+export const CACHE_REPORT_CLOSE = "[/acp-cache]";
+
+/** Wrap a cache report for persistent transcript display (see above). */
+export function wrapCacheReport(report: string): string {
+    return `${CACHE_REPORT_OPEN}\n${report}\n${CACHE_REPORT_CLOSE}`;
+}
+
 export function isAcpPanelText(text: string): boolean {
     const t = text.trim();
     if (t.length === 0) return false;
-    return isBoxPanel(t) || isFallbackPanel(t);
+    return isBoxPanel(t) || isFallbackPanel(t) || isCacheReport(t);
+}
+
+function isCacheReport(t: string): boolean {
+    return t.startsWith(CACHE_REPORT_OPEN) && t.endsWith(CACHE_REPORT_CLOSE);
 }
 
 function isBoxPanel(t: string): boolean {
