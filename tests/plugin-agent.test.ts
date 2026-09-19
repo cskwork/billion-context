@@ -1132,13 +1132,14 @@ test("plugin install opencode replaces legacy opencode-acp entries — array and
             assert.ok(fs.existsSync(`${ocFile}.bili-bak`));
             pluginRemove("opencode");
 
-            // object shape: version-map form (defensive; normalized to keys)
+            // object shape: version-map form (#1002: preserved as a map now —
+            // our key joins it, foreign values never collapse to bare keys)
             fs.writeFileSync(ocFile, JSON.stringify({ [ocKey]: { "opencode-acp": "stable", "other": "1.0" } }));
             msg = pluginInstall("opencode");
             assert.match(msg, /replaced opencode-acp plugin entries \(opencode-acp\)/);
             data = JSON.parse(fs.readFileSync(ocFile, "utf8"));
-            // sibling object entries survive as bare array specs + our dir
-            assert.deepEqual(data[ocKey], ["other", dir]);
+            // sibling map entries survive verbatim + our dir as a key
+            assert.deepEqual(data[ocKey], { other: "1.0", [dir]: true });
             pluginRemove("opencode");
 
             // #927: legacy entries under the OTHER spelling are stripped too

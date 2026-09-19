@@ -24,6 +24,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
+import crypto from "node:crypto";
 import { execFileSync, spawnSync } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { applyEdits, modify as jsoncModify, parse as jsoncParse, type ParseError } from "jsonc-parser";
@@ -66,10 +67,45 @@ function homeFile(rel: string, envOverride?: string): string {
     return path.join(base, rel);
 }
 
-function backupOnce(file: string): void {
-    if (fs.existsSync(file) && !fs.existsSync(`${file}.bili-bak`)) {
-        fs.copyFileSync(file, `${file}.bili-bak`);
+// #1002: backup = the state before bili's LATEST write, but only when the
+// file changed since bili's previous write — i.e. re-snapshot USER edits,
+// never bili's own consecutive writes. That keeps the restore-on-remove
+// chain intact (install → upgrade → remove still restores the user's
+// pre-install value instead of bili's own output) while fixing the
+// stale-forever backup: after any user edit, the next bili write re-snapshots.
+// `<file>.bili-last` carries the hash of what bili last wrote; "unchanged"
+// means the on-disk bytes still hash to that value.
+function hashText(text: string): string {
+    return crypto.createHash("sha256").update(text).digest("hex");
+}
+
+function backupBeforeWrite(file: string): void {
+    if (!fs.existsSync(file)) return;
+    const bak = `${file}.bili-bak`;
+    let cur: string;
+    try {
+        cur = hashText(fs.readFileSync(file, "utf8"));
+    } catch {
+        return;
     }
+    let prev: string | undefined;
+    try {
+        prev = fs.readFileSync(`${file}.bili-last`, "utf8").trim();
+    } catch {}
+    if (prev === cur && fs.existsSync(bak)) return;
+    fs.copyFileSync(file, bak);
+}
+
+// One writer discipline for every config write bili performs: snapshot per
+// backupBeforeWrite above, write, then record what we wrote so the NEXT
+// write can tell bili's own output apart from a user edit.
+function writeConfigText(file: string, text: string): void {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    backupBeforeWrite(file);
+    fs.writeFileSync(file, text);
+    try {
+        fs.writeFileSync(`${file}.bili-last`, `${hashText(text)}\n`);
+    } catch {}
 }
 
 function readJson(file: string): Record<string, unknown> {
@@ -93,9 +129,7 @@ function readJson(file: string): Record<string, unknown> {
 }
 
 function writeJson(file: string, data: unknown): void {
-    fs.mkdirSync(path.dirname(file), { recursive: true });
-    backupOnce(file);
-    fs.writeFileSync(file, JSON.stringify(data, null, 2) + "\n");
+    writeConfigText(file, JSON.stringify(data, null, 2) + "\n");
 }
 
 function requireDistFile(file: string): void {
@@ -274,8 +308,7 @@ function ompRemove(): string {
     );
     if (drop.size === 0) return `omp: not installed (${file})`;
     const cleaned = lines.filter((_, i) => !drop.has(i)).join("\n");
-    backupOnce(file);
-    fs.writeFileSync(file, cleaned);
+    writeConfigText(file, cleaned);
     return `omp: removed from ${file}`;
 }
 
@@ -335,8 +368,11 @@ function ompInstall(): string {
     if (occurrences !== 1) {
         throw new Error(`${file}: edit would leave ${occurrences} copies of the entry — aborting without writing`);
     }
-    backupOnce(file);
+    backupBeforeWrite(file);
     fs.writeFileSync(file, out);
+    try {
+        fs.writeFileSync(`${file}.bili-last`, `${hashText(out)}\n`);
+    } catch {}
     const note = replaced.length > 0 ? ` (replaced ${replaced.join(", ")})` : "";
     return `omp: installed -> ${file} extensions += ${entry}${note}`;
 }
@@ -661,14 +697,16 @@ function codexInstall(): string {
         const canonical = codexBlock().replace(/^\n/, "");
         if (block.trimEnd() === canonical.trimEnd()) return `codex: already installed (${file})`;
         const refreshed = text.slice(0, existing.index) + canonical + text.slice(existing.index + block.length);
-        backupOnce(file);
-        fs.writeFileSync(file, refreshed);
+        writeConfigText(file, refreshed);
         const healed = malformedCodexArgs(block) ? " (repaired args: was not an array)" : "";
         return `codex: refreshed [mcp_servers.bili] -> ${file}${healed}`;
     }
     fs.mkdirSync(path.dirname(file), { recursive: true });
-    backupOnce(file);
+    backupBeforeWrite(file);
     fs.writeFileSync(file, text + (text.endsWith("\n") || text.length === 0 ? "" : "\n") + codexBlock());
+    try {
+        fs.writeFileSync(`${file}.bili-last`, `${hashText(fs.readFileSync(file, "utf8"))}\n`);
+    } catch {}
     return `codex: installed -> ${file} [mcp_servers.bili]`;
 }
 
@@ -687,8 +725,7 @@ function codexRemove(): string {
     const nextTable = firstNewline < 0 ? -1 : after.slice(firstNewline + 1).search(/^[ \t]*\[/m);
     const end = nextTable >= 0 ? start + firstNewline + 1 + nextTable : text.length;
     const cleaned = (text.slice(0, lineStart).replace(/\n+$/, "\n") + text.slice(end)).replace(/^\n+/, "");
-    backupOnce(file);
-    fs.writeFileSync(file, cleaned);
+    writeConfigText(file, cleaned);
     return `codex: removed from ${file}`;
 }
 
@@ -812,10 +849,8 @@ function loadOpencodeConfig(file: string): { original: string; data: Record<stri
 // byte-for-byte (#927). A no-op run (nothing touched) leaves the file alone.
 function writeOpencodeConfig(file: string, original: string, data: Record<string, unknown>, touched: ReadonlySet<string>): void {
     if (touched.size === 0) return;
-    fs.mkdirSync(path.dirname(file), { recursive: true });
-    backupOnce(file);
     if (original === "") {
-        fs.writeFileSync(file, JSON.stringify(data, null, 2) + "\n");
+        writeConfigText(file, JSON.stringify(data, null, 2) + "\n");
         return;
     }
     let strict = false;
@@ -824,14 +859,14 @@ function writeOpencodeConfig(file: string, original: string, data: Record<string
         strict = true;
     } catch {}
     if (strict) {
-        fs.writeFileSync(file, JSON.stringify(data, null, 2) + "\n");
+        writeConfigText(file, JSON.stringify(data, null, 2) + "\n");
         return;
     }
     let text = original;
     for (const key of touched) {
         text = applyEdits(text, jsoncModify(text, [key], data[key], { formattingOptions: { tabSize: 2, insertSpaces: true } }));
     }
-    fs.writeFileSync(file, text);
+    writeConfigText(file, text);
 }
 
 // Legacy opencode-acp plugin entries — both config shapes v1 accepts:
@@ -914,30 +949,50 @@ const DEV_FORM_NOTE = "dev form: machine-local shim, not portable across machine
 // entry lands in the host's effective key (`plugin` on OpenCode 1.x,
 // `plugins` on 2.x) — pass `key`; default keeps the v1 spelling for callers
 // and tests that predate the probe.
+// #1002: everything here operates on the RAW value — foreign entries (object
+// specs like {package, options}, plugin maps with per-key options, odd
+// scalars) are preserved verbatim in form and position. A strings-only
+// projection must never be written back, and "plugin present" must mean
+// the key was left untouched (no rewrite of the surrounding file either).
 export function applyOpencodePluginEntry(args: { data: Record<string, unknown>; root: string; shimDir: string; agentJs: string; key?: "plugin" | "plugins"; touched?: Set<string> }): string[] {
     const { data, root, shimDir, agentJs } = args;
     const key = args.key ?? "plugin";
     const touched = args.touched ?? new Set<string>();
     const ours = [OPENCODE_NPM_ENTRY, shimDir];
-    const plugins = pluginEntries(data, key);
-    const replaced = plugins.filter((p) => ours.includes(p));
-    const kept = plugins.filter((p) => !ours.includes(p));
-    const write = (v: string[]): void => {
-        data[key] = v;
-        touched.add(key);
+    const npmForm = isNpmInstallForm(root);
+    const entry = npmForm ? OPENCODE_NPM_ENTRY : shimDir;
+    const isOurs = (x: unknown): boolean => typeof x === "string" && ours.includes(x);
+    const raw = data[key];
+    const oursIn = (): string[] => {
+        if (Array.isArray(raw)) return raw.filter((x): x is string => isOurs(x));
+        if (raw !== null && typeof raw === "object") return Object.keys(raw as Record<string, unknown>).filter((k) => isOurs(k));
+        return [];
     };
-    if (isNpmInstallForm(root)) {
-        write([...kept, OPENCODE_NPM_ENTRY]);
-        if (replaced.includes(shimDir)) fs.rmSync(shimDir, { recursive: true, force: true });
+    const replaced = oursIn();
+    if (npmForm && replaced.includes(shimDir)) fs.rmSync(shimDir, { recursive: true, force: true });
+    if (!npmForm) {
+        fs.mkdirSync(shimDir, { recursive: true });
+        fs.writeFileSync(path.join(shimDir, "index.js"), `export { default } from ${JSON.stringify(agentJs)};\n`);
+    }
+    // Exactly our one entry, already the right form — nothing to migrate:
+    // leave the key (and the file) untouched.
+    if (replaced.length === 1 && replaced[0] === entry) return ["plugin present"];
+    if (Array.isArray(raw)) {
+        data[key] = [...raw.filter((x) => !isOurs(x)), entry];
+    } else if (raw !== null && typeof raw === "object") {
+        const map = raw as Record<string, unknown>;
+        for (const k of Object.keys(map)) if (isOurs(k)) delete map[k];
+        map[entry] = true;
+        data[key] = map;
+    } else {
+        data[key] = [entry];
+    }
+    touched.add(key);
+    if (npmForm) {
         if (replaced.length === 0) return [`plugin -> ${OPENCODE_NPM_ENTRY}`];
-        if (replaced.every((p) => p === OPENCODE_NPM_ENTRY)) return ["plugin present"];
         return [`plugin -> ${OPENCODE_NPM_ENTRY} (replaced ${replaced.join(", ")})`];
     }
-    fs.mkdirSync(shimDir, { recursive: true });
-    fs.writeFileSync(path.join(shimDir, "index.js"), `export { default } from ${JSON.stringify(agentJs)};\n`);
-    write([...kept, shimDir]);
     if (replaced.length === 0) return [`plugin -> ${shimDir}`, DEV_FORM_NOTE];
-    if (replaced.every((p) => p === shimDir)) return ["plugin present"];
     return [`plugin -> ${shimDir} (replaced ${replaced.join(", ")})`, DEV_FORM_NOTE];
 }
 
@@ -1047,18 +1102,33 @@ function opencodeRemove(): string {
     }
 
     // #927: clean our entry out of whichever key spelling carries it; the
-    // entry may be either form (#925) — bare npm name or shim dir.
+    // entry may be either form (#925) — bare npm name or shim dir. #1002:
+    // the key dies only when NOTHING raw survives — foreign object entries
+    // and map-form options are preserved verbatim, never collapsed.
     const dir = opencodePluginDir(file);
     const removed: string[] = [];
     for (const key of PLUGIN_KEYS) {
-        const entries = pluginEntries(data, key);
-        const hit = entries.filter((p) => p === OPENCODE_NPM_ENTRY || p === dir);
-        if (hit.length === 0) continue;
-        const remaining = entries.filter((p) => p !== OPENCODE_NPM_ENTRY && p !== dir);
-        if (remaining.length === 0) delete data[key];
-        else data[key] = remaining;
-        touched.add(key);
-        removed.push(...hit);
+        const v = data[key];
+        const hit = (x: string): boolean => x === OPENCODE_NPM_ENTRY || x === dir;
+        if (Array.isArray(v)) {
+            const survivors = v.filter((x) => !(typeof x === "string" && hit(x)));
+            if (survivors.length === v.length) continue;
+            for (const x of v) if (typeof x === "string" && hit(x)) removed.push(x);
+            if (survivors.length === 0) delete data[key];
+            else data[key] = survivors;
+            touched.add(key);
+        } else if (v !== null && typeof v === "object") {
+            const map = v as Record<string, unknown>;
+            const hits = Object.keys(map).filter(hit);
+            if (hits.length === 0) continue;
+            for (const k of hits) {
+                delete map[k];
+                removed.push(k);
+            }
+            if (Object.keys(map).length === 0) delete data[key];
+            else data[key] = map;
+            touched.add(key);
+        }
     }
     if (removed.length > 0) {
         if (removed.includes(dir)) fs.rmSync(dir, { recursive: true, force: true });
@@ -1284,7 +1354,7 @@ function kimiInstall(): string {
     fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(path.join(dir, "kimi.plugin.json"), `${JSON.stringify(kimiPluginManifest(root), null, 2)}\n`);
     const file = kimiRegistryFile();
-    backupOnce(file);
+    backupBeforeWrite(file);
     const reg = readKimiInstalledRegistry(file);
     const now = new Date().toISOString();
     const existing = reg.plugins.find((p) => p.id === KIMI_PLUGIN_ID);
