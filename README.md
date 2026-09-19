@@ -153,7 +153,7 @@ Pick by your client:
 | **opencode 1.x** | `bili plugin install opencode` (self-spawning native plugin — pre-migration [`opencode-acp`](https://github.com/ranxianglei/opencode-acp) sessions keep working, see "OpenCode 1.x") or `bili opencode` (launcher) or standalone `opencode-acp` (in-process extension) |
 | **opencode 2.0+** | `bili opencode` (built-in V2 plugin — native tools, no separate package) or `bili plugin install opencode` (self-spawning native plugin, no launcher) |
 | **omp** | [`billion-context`](https://github.com/ranxianglei/billion-context) via `bili omp` (built-in plugin) |
-| **dsh** | `bili dsh` (launcher — full native plugin via `--patch`: tools, session-bound `/acp`, fetch intercept) or `bili plugin install dsh` (self-spawning native plugin, no launcher — writes the cordis patch into every profile under `~/.dsh/profiles/*/cordis.patch.yml`) or `dsh plugin --profile <name> add billion-context` (dsh-side install, no bili commands — mounts the bundled patch layer from npm) |
+| **dsh** | `bili dsh` (launcher — full native plugin via `--patch`: tools, session-bound `/acp`, fetch intercept) or `bili plugin install dsh` ≡ `dsh plugin --profile <name> add billion-context` (one unified lane — pnpm-installs the package into each profile so dsh mounts the bundled patch layer; the bili form just drives dsh's own channel per profile and migrates legacy managed blocks) |
 | **claude** | `bili claude` (launcher) or `bili plugin install claude` (native posture, #964 — managed settings block + session-owned proxy; see the notes below) |
 | **everything else** (no context hook) | [`billion-context`](https://github.com/ranxianglei/billion-context) — `bili <client>` (launcher, preferred) or `/bili/` prefix |
 
@@ -195,14 +195,14 @@ no URL edits. Supported today for **pi**, **opencode** (1.x and 2.x) and
 ```bash
 bili plugin install pi          # registers a "billion-context" entry in pi's settings (npm form when bili itself was npm-installed)
 bili plugin install opencode    # registers the plugin in opencode's real config + disables native auto-compaction
-bili plugin install dsh         # appends a managed block to every ~/.dsh/profiles/*/cordis.patch.yml
-bili plugin remove <client>     # undo (dsh restores the placeholder; config snapshots go to .bili-bak)
+bili plugin install dsh         # runs 'dsh plugin --profile <name> add billion-context' for every existing profile
+bili plugin remove <client>     # undo (dsh removes through the same channel; config snapshots go to .bili-bak)
 ```
 
 dsh users can skip bili entirely: `dsh plugin --profile <name> add
-billion-context` installs the same native plugin through dsh's own plugin
-channel (pnpm into the profile, bundled patch layer) — see the dsh section
-below.
+billion-context` is the very command `bili plugin install dsh` drives per
+profile — same end state either way (pnpm into the profile, bundled patch
+layer mounted by dsh itself). See the dsh section below.
 
 At load the plugin **spawns its own proxy** (or attaches to a healthy
 running one — a parent-pid watchdog tears it down when the client exits),
@@ -481,27 +481,31 @@ Two lanes, same plugin (#941):
   `x-bili-plugin` + the dsh session id (plugin mode), and `/acp` is
   session-bound. dsh's native auto-compaction is disabled in the same patch
   (`compaction-basic` → `auto: false`); manual `/compact` stays available.
-- **Native (no launcher):** `bili plugin install dsh` appends a managed
-  block to every profile's `~/.dsh/profiles/<name>/cordis.patch.yml`
-  (markers `# bili begin` / `# bili end`; user entries and comments are
-  preserved, a placeholder `[]` root is replaced, removal restores it).
-  Run dsh once in each profile first so the profile dirs exist. The plugin
-  spawns its own proxy at load (attaches to a healthy one instead of
-  doubling; parent-pid watchdog), rewrites model-API traffic to
-  `<proxy>/bili/<upstream-url>` via a global fetch patch, registers the
+- **Profile install (no launcher) — one lane (#966):** `bili plugin install
+  dsh` runs `dsh plugin --profile <name> add billion-context` for every
+  existing profile — pnpm installs the package into each profile's own
+  `node_modules`, and dsh mounts the bundled patch layer
+  (`dsh.bundle.patch.yml`) automatically. The spec follows how bili itself
+  was installed (#925): an npm-form install passes the registry name, a
+  checkout/dev build passes its absolute path (a `link:` dependency, so
+  local work stays live). Legacy managed blocks (`# bili begin` /
+  `# bili end`, written by pre-#966 installs) are stripped on install and
+  remove — user entries and comments survive, an emptied file gets its
+  placeholder `[]` back. Run dsh once in each profile first so the profile
+  dirs exist. The plugin spawns its own proxy at load (attaches to a healthy
+  one instead of doubling; parent-pid watchdog), rewrites model-API traffic
+  to `<proxy>/bili/<upstream-url>` via a global fetch patch, registers the
   manifest tools verbatim, and gates plugin-mode headers on tool readiness
   (round 1 rides wire mode). Opt-out: `BILI_NATIVE_DSH=0`. Remove with
-  `bili plugin remove dsh`.
-- **dsh-side install (no `bili` command needed):** `dsh plugin --profile
-  <name> add billion-context` installs the npm package into the profile via
-  pnpm and mounts the bundled patch layer (`dsh.bundle.patch.yml`)
-  automatically — same plugin, same behavior as the native lane, zero bili
-  commands. The installer, the `bili dsh` launcher overlay, and
-  `plugin status` all detect bundle-installed profiles and leave them alone
-  (cordis rejects duplicate entry ids across layers, so a second
-  `id: bili-native` insert would hard-fail dsh boot). Remove with
-  `dsh plugin --profile <name> remove billion-context`. Requires a published
-  release that carries `dsh.bundle.patch.yml`.
+  `bili plugin remove dsh` or `dsh plugin --profile <name> remove
+  billion-context` — both go through the same channel. Registry installs
+  require a published release that carries `dsh.bundle.patch.yml`.
+- **Auto-update keeps profiles in lockstep:** after a global self-update,
+  bili scans `~/.dsh/profiles/*/package.json` and brings any registry-pinned
+  `billion-context` dependency back to the new global version, so the loaded
+  plugin and the proxy never drift apart again (#953); profiles pinned to a
+  local source are left alone. The refresh is best-effort and never fails the
+  update itself.
 
 Under a `bili dsh` launch the plugin ATTACHES to the launcher's proxy (no
 second spawn). Raw upstream URLs rewrite to `<proxy>/bili/<url>` like
