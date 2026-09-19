@@ -285,7 +285,7 @@ function runNodeCheck(file: string): Promise<{ code: number; stderr: string }> {
         execFile(
             process.execPath,
             ["--check", file],
-            { timeout: 15_000, maxBuffer: 4 * 1024 * 1024 },
+            { timeout: 15_000, maxBuffer: 4 * 1024 * 1024, windowsHide: true },
             (err, _stdout, stderr) => {
                 resolve({ code: err ? 1 : 0, stderr: String(stderr) });
             },
