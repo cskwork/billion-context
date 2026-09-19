@@ -45,7 +45,7 @@ import {
     type ProxyInstanceFile,
     type ProxyStartingMarker,
 } from "./instance.js";
-import { selfPackageRoot, isBiliPiEntry, ompPluginLoadedFrom, dshNativeInstalled } from "./plugin-install.js";
+import { selfPackageRoot, isBiliPiEntry, ompPluginLoadedFrom, dshNativeInstalled, claudeNativeInstalled } from "./plugin-install.js";
 
 /** Absolute path of a file inside our dist/, resolved via the package root
  * (import.meta.url-based) so it survives global-installed symlink bins
@@ -151,6 +151,11 @@ export interface LaunchOptions {
     passthrough: boolean;
     debug: boolean;
     mitmDomains?: string[];
+    /** Parent pid the spawned proxy's watchdog tracks (#964). Defaults to
+     *  the CALLER's pid (launcher process). The claude SessionStart hook
+     *  passes its OWN parent — claude's pid — because the hook process
+     *  itself exits immediately after bring-up. */
+    parentPid?: number;
     /** Per-model context windows read from the client's own config (pi
      *  models.json / omp models.yml / …). Handed to the spawned proxy via
      *  BILI_LAUNCHER_MODEL_WINDOWS so the nudge denominator matches the
@@ -160,6 +165,11 @@ export interface LaunchOptions {
      *  modelWindows. Handed to the spawned proxy via
      *  BILI_LAUNCHER_MODEL_MAX_OUTPUTS for the output-headroom reservation. */
     modelMaxOutputs?: Record<string, number>;
+    /** Pin opts.port: an EADDRINUSE at bind fails loud (child exits 1)
+     * instead of the launcher default of port-hopping +1 (#964 — the claude
+     * native posture dials a STATIC url baked into settings.json; a proxy
+     * that silently landed on port+1 would strand every model request). */
+    strictPort?: boolean;
 }
 
 export interface ProxyHandle {
@@ -2060,7 +2070,10 @@ export async function ensureProxyRunning(
     // doubled — two concurrent launches of the same client would otherwise
     // spawn two writers over one sessions dir.
     const existing = await probeExistingInstance(readInstance, fetchHealthInfo);
-    if (existing && instanceCompatible(existing, opts)) {
+    if (existing && instanceCompatible(existing, opts) && (!opts.strictPort || existing.port === opts.port)) {
+        // strictPort (#964): the client dials a STATIC url — attaching to a
+        // healthy proxy on a DIFFERENT port would strand every request. Only
+        // an instance already bound to the exact port may be shared.
         console.error(`bili: attaching to running proxy at ${existing.origin} (pid ${existing.pid})`);
         return { origin: existing.origin, port: existing.port, attached: true };
     }
@@ -2142,7 +2155,7 @@ export async function ensureProxyRunning(
                     env: {
                         ...stripInheritedProxy(process.env),
                         BILI_LAUNCH_TOKEN: launchToken,
-                        BILI_PARENT_PID: String(process.pid),
+                        BILI_PARENT_PID: String(opts.parentPid ?? process.pid),
                         ...(opts.mitmDomains && opts.mitmDomains.length
                             ? { BILI_MITM_DOMAINS: opts.mitmDomains.join(",") }
                             : {}),
@@ -2152,6 +2165,7 @@ export async function ensureProxyRunning(
                         ...(opts.modelMaxOutputs && Object.keys(opts.modelMaxOutputs).length > 0
                             ? { BILI_LAUNCHER_MODEL_MAX_OUTPUTS: JSON.stringify(opts.modelMaxOutputs) }
                             : {}),
+                        ...(opts.strictPort ? { BILI_STRICT_PORT: "1" } : {}),
                     },
                 },
             );
@@ -2751,6 +2765,25 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         Object.assign(env, claudeBudget);
         if (claudeBudget.CLAUDE_CODE_AUTO_COMPACT_WINDOW !== undefined) {
             console.error(`bili: claude budget aligned — CLAUDE_CODE_AUTO_COMPACT_WINDOW=${claudeBudget.CLAUDE_CODE_AUTO_COMPACT_WINDOW}`);
+        }
+        // #964 coexistence: a native install (`bili plugin install claude`)
+        // pins env.ANTHROPIC_BASE_URL to the STABLE port in user settings —
+        // without an override claude would dial the static port, where the
+        // SessionStart hook deliberately spawns nothing (BILLION_CONTEXT_PROXY
+        // is set below), and every model request would fail. Route claude at
+        // THIS launcher's own proxy instead: process env + `--settings` JSON
+        // both carry the same /bili/ URL (settings precedence: CLI > user, but
+        // belt-and-braces covers builds where the settings env block beats
+        // inherited process env). The upstream is the user's real relay
+        // (BILI_CLAUDE_UPSTREAM beats discovery), UNWRAPPED first — with the
+        // native block installed, discovery reads the managed static URL.
+        if (claudeNativeInstalled()) {
+            const relay = (env.BILI_CLAUDE_UPSTREAM?.trim() || undefined) ?? unwrapUpstream(config.claude?.anthropicBaseUrl ?? "https://api.anthropic.com");
+            const override = wrapUpstream(origin, relay);
+            env.ANTHROPIC_BASE_URL = override;
+            env.BILLION_CONTEXT_PROXY = origin;
+            clientArgs = ["--settings", JSON.stringify({ env: { ANTHROPIC_BASE_URL: override } }), ...clientArgs];
+            console.error(`bili: claude native install detected — overriding its static ANTHROPIC_BASE_URL with this launcher's proxy (${override}); the SessionStart hook stays dormant for this session.`);
         }
         if (injectMcp) {
             const mcpFile = path.join(os.tmpdir(), `bili-mcp-${Date.now()}.json`);

@@ -316,7 +316,11 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     // Launcher mode handshake (#407): the child self-binds and retries on
     // EADDRINUSE instead of dying, reporting the real origin via the instance
     // file (launchToken match). Manual `bili start` keeps fail-fast semantics.
+    // #964: BILI_STRICT_PORT (claude SessionStart hook) opts OUT of the retry
+    // — the native posture dials a static baked-in URL, so a port-hop
+    // "success" would strand every model request on the dead original port.
     const launchToken = process.env.BILI_LAUNCH_TOKEN?.trim();
+    const strictPort = process.env.BILI_STRICT_PORT === "1";
     const MAX_LISTEN_ATTEMPTS = 17;
     let listenAttempts = 0;
     let lastTriedPort = opts.port;
@@ -406,7 +410,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     // graceful-shutdown flush can run. Catch, log a human-readable message,
     // flush sessions, and exit cleanly (exit code 1 so callers/scripts notice).
     server.on("error", (err: NodeJS.ErrnoException) => {
-        if (err.code === "EADDRINUSE" && launchToken && listenAttempts < MAX_LISTEN_ATTEMPTS) {
+        if (err.code === "EADDRINUSE" && launchToken && !strictPort && listenAttempts < MAX_LISTEN_ATTEMPTS) {
             listenAttempts += 1;
             const next = listenAttempts === MAX_LISTEN_ATTEMPTS ? 0 : lastTriedPort + 1;
             log("warn", `port ${lastTriedPort} busy — ${next === 0 ? "retrying on an ephemeral port" : `retrying on port ${next}`}`);
@@ -415,7 +419,9 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         }
         const hint =
             err.code === "EADDRINUSE"
-                ? ` — port ${lastTriedPort} is already in use. Stop the other process or use --port <N>.`
+                ? strictPort
+                    ? ` — port ${lastTriedPort} is pinned (strict-port mode) but already in use. Free it or point the client at another port (e.g. BILI_CLAUDE_NATIVE_PORT for the claude native posture).`
+                    : ` — port ${lastTriedPort} is already in use. Stop the other process or use --port <N>.`
                 : err.code === "EACCES"
                   ? ` — port ${lastTriedPort} requires privileges. Use a port >= 1024.`
                   : "";

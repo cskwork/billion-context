@@ -154,6 +154,7 @@ Pick by your client:
 | **opencode 2.0+** | `bili opencode` (built-in V2 plugin — native tools, no separate package) or `bili plugin install opencode` (self-spawning native plugin, no launcher) |
 | **omp** | [`billion-context`](https://github.com/ranxianglei/billion-context) via `bili omp` (built-in plugin) |
 | **dsh** | `bili dsh` (launcher — full native plugin via `--patch`: tools, session-bound `/acp`, fetch intercept) or `bili plugin install dsh` (self-spawning native plugin, no launcher — writes the cordis patch into every profile under `~/.dsh/profiles/*/cordis.patch.yml`) or `dsh plugin --profile <name> add billion-context` (dsh-side install, no bili commands — mounts the bundled patch layer from npm) |
+| **claude** | `bili claude` (launcher) or `bili plugin install claude` (native posture, #964 — managed settings block + session-owned proxy; see the notes below) |
 | **everything else** (no context hook) | [`billion-context`](https://github.com/ranxianglei/billion-context) — `bili <client>` (launcher, preferred) or `/bili/` prefix |
 
 **Native mode vs standalone extensions.** The host-native plugins (`bili plugin install pi` / `opencode` — they spawn the proxy inside the host process) and the standalone in-process extensions (`billion-context-pi`, `opencode-acp`) are **mutually exclusive**: both active means double compression. The installer makes the switch: `bili plugin install pi` replaces the legacy `npm:billion-context-pi` entry (with a reminder that a project-scope entry in `<project>/.pi/settings.json` from `pi install -l` lives outside the global settings), and `bili plugin install opencode` strips legacy `opencode-acp` entries from the global opencode.json — bare name, `npm:` alias, versioned (`opencode-acp@stable`), or path form, array or object shape; the original config is snapshotted to `.bili-bak` once. A **project-local** install (`opencode plugin opencode-acp` writes `<project>/.opencode/opencode.json`, not the global config) is not touched — remove it by hand; the installer note reminds you. As a runtime safety net for manual installs, the native entries set `BILLION_CONTEXT_NATIVE=<host>` synchronously at load so a standalone extension can stand down at action time — its own load-time `BILLION_CONTEXT_PROXY` check cannot see a proxy that native mode spawns asynchronously, and its `/bili/` baseUrl check never sees the fetch-layer rewrite. On the pi side the marker needs `billion-context-pi` **0.1.72+** (the per-event re-check landed after 0.1.71); the pi-native entry additionally scans both pi settings files once its proxy is up and warns loudly when it spots a co-resident legacy entry the installer never saw — that warning is the only visible signal while an old `billion-context-pi` silently double-compresses.
@@ -256,9 +257,26 @@ Notes:
   to stand down cleanly).
 - On OpenCode 1.x, pre-migration `opencode-acp` sessions keep working
   (v1 lane routing, #920) — see "OpenCode 1.x" below.
-- `claude` / `codex` / `omp` have companion installs too (an MCP shell and a
-  thin extension), but those need a running proxy — they are not native
-  mode.
+- `codex` / `omp` have companion installs too (an MCP shell / a thin
+  extension), but those need a running proxy — they are not native mode.
+- `claude` also has a **native posture** (#964, hybrid): Claude Code has no
+  in-process extension point, so `bili plugin install claude` writes a
+  managed block into `~/.claude/settings.json` (env
+  `ANTHROPIC_BASE_URL=http://127.0.0.1:48787/bili/<upstream>`,
+  `DISABLE_AUTO_COMPACT=1`, and a `SessionStart` hook) plus the same
+  user-scope MCP shell as before, now pinned to that stable port. The hook
+  (fired before claude's first model request) attaches to a healthy proxy
+  on the port or spawns one whose pid watchdog tracks claude itself, so the
+  proxy lives and dies with the session. Port override:
+  `BILI_CLAUDE_NATIVE_PORT` > config `claude.nativePort` > 48787; upstream
+  override: `BILI_CLAUDE_UPSTREAM` (or the existing `claude.anthropicBaseUrl`
+  config). Opt out with `BILI_NATIVE_CLAUDE=0` — the hook then brings up a
+  **passthrough** proxy on the same port (verbatim forward, compression
+  off) so claude keeps working. The block is pure JSON merge/strip: foreign
+  keys are never touched, `bili plugin remove claude` restores exactly.
+  `bili claude` still works on a machine with the native block installed —
+  it overrides the static URL with its own ephemeral proxy and the hook
+  stays dormant.
 
 ### Injection priority — no files unless unavoidable (#535)
 
