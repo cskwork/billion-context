@@ -83,6 +83,7 @@ AI 编程助手的<strong>通用上下文压缩代理</strong>
 | **opencode** | [`billion-context`](https://github.com/ranxianglei/billion-context),`bili opencode`(新会话走 bili 代理;现有 [`opencode-acp`](https://github.com/ranxianglei/opencode-acp) 会话继续可用,见下文「OpenCode 1.x」) |
 | **omp** | [`billion-context`](https://github.com/ranxianglei/billion-context)，`bili omp`（内置插件）或 `bili plugin install omp`（自拉起原生插件，免启动器） |
 | **dsh** | [`billion-context`](https://github.com/ranxianglei/billion-context) —— `bili dsh`（启动器，经 `--patch` 注入完整原生插件：工具、会话绑定 `/acp`、fetch 拦截）或 `bili plugin install dsh` ≡ `dsh plugin --profile <name> add billion-context`（统一泳道 —— pnpm 把包装进各 profile、由 dsh 挂载包内 patch 层；bili 形式只是替你按 profile 驱动 dsh 自己的通道，并顺带迁移旧版受管块） |
+| **kimi** | `bili plugin install kimi`（自拉起原生插件，免启动器 —— 需 Kimi Code ≥ 2.0.0；每会话在 `~/.kimi-code/config.toml` 写入路由块）或 `bili kimi`（启动器，证书 MITM）或 `/bili/` 前缀 |
 | **claude** | `bili claude`(启动器)或 `bili plugin install claude`(原生姿态,#964 —— 受管 settings 块 + 会话自管代理;见下方"注意") |
 | **其余所有**（没有上下文 hook） | [`billion-context`](https://github.com/ranxianglei/billion-context) —— `bili <client>`（启动器，优先）或 `/bili/` 前缀 |
 
@@ -113,21 +114,22 @@ npm install -g billion-context
 
 
 
-### 方式 1 —— 原生插件(native,`bili plugin install pi` / `omp` / `opencode` / `dsh`)
+### 方式 1 —— 原生插件(native,`bili plugin install pi` / `omp` / `opencode` / `dsh` / `kimi`)
 
-代理住进客户端:装一次,之后照常启动客户端 —— 不用启动器命令、不用环境变量、不用固定端口、不用改 URL。目前支持 **pi**、**omp**、**opencode**(1.x 与 2.x)、**dsh**:
+代理住进客户端:装一次,之后照常启动客户端 —— 不用启动器命令、不用环境变量、不用固定端口、不用改 URL。目前支持 **pi**、**omp**、**opencode**(1.x 与 2.x)、**dsh** 与 **kimi**:
 
 ```bash
 bili plugin install pi          # 在 pi 的 settings 里注册 billion-context 条目(bili 自身为 npm 安装时写 npm 条目)
 bili plugin install omp         # 在 omp 的 config.yml(~/.omp/agent/config.yml)注册 extensions 条目
 bili plugin install opencode    # 在 opencode 真实配置里注册插件 + 关闭原生自动压缩
 bili plugin install dsh         # 对每个已存在的 profile 执行 'dsh plugin --profile <name> add billion-context'
+bili plugin install kimi        # 写 $KIMI_CODE_HOME/plugins/managed/billion-context/kimi.plugin.json(+ installed.json 记录);每会话路由块在首次启动时落到 config.toml(需 Kimi Code >= 2.0.0)
 bili plugin remove <client>     # 卸载(dsh 经同一通道移除;配置快照存 .bili-bak)
 ```
 
 dsh 用户可以完全不用 bili：`dsh plugin --profile <name> add billion-context` 正是 `bili plugin install dsh` 按 profile 驱动的那条命令 —— 两种走法终态一致（pnpm 装进 profile、patch 层由 dsh 自己挂载）—— 见下文 dsh 段。
 
-插件加载时**自拉起自己的代理**(已有健康实例则直接复用 —— 父进程 pid 看门狗在客户端退出时收掉它),把模型流量改写到 `<proxy>/bili/<上游URL>`,并把 `compress` / `decompress` / `acp_status` 注册为客户端原生工具(plugin 模式),`/acp` 面板绑定当前会话。插件还会把客户端**自己的模型配置**上报给代理(runtime-info 协议,#955),压缩预算用真实窗口而不是注册表猜测。退出开关:`BILI_NATIVE_PI=0`、`BILI_NATIVE_OMP=0`、`BILI_NATIVE_OPENCODE=0`、`BILI_NATIVE_DSH=0`。
+插件加载时**自拉起自己的代理**(已有健康实例则直接复用 —— 父进程 pid 看门狗在客户端退出时收掉它),把模型流量改写到 `<proxy>/bili/<上游URL>`,并把 `compress` / `decompress` / `acp_status` 注册为客户端原生工具(plugin 模式),`/acp` 面板绑定当前会话。插件还会把客户端**自己的模型配置**上报给代理(runtime-info 协议,#955),压缩预算用真实窗口而不是注册表猜测。退出开关:`BILI_NATIVE_PI=0`、`BILI_NATIVE_OMP=0`、`BILI_NATIVE_OPENCODE=0`、`BILI_NATIVE_DSH=0`、`BILI_NATIVE_KIMI=0`。
 
 #### Runtime-info 协议(#955)
 
@@ -138,7 +140,7 @@ dsh 用户可以完全不用 bili：`dsh plugin --profile <name> add billion-con
 | 逐请求头(门控在 `x-bili-plugin`) | 每次模型请求 | `x-bili-plugin-context-window`、`x-bili-plugin-max-output`、`x-bili-plugin-model` |
 | `POST /__bili/plugin/runtime-info`(回环地址) | 插件自举 + 模型切换 | `{agent, model, contextWindow?, maxOutput?, baseURL?, source}` |
 
-窗口解析顺序:`anthropic-beta` 协商 > 逐请求 plugin 头 > runtime-info 表(agent+model 必须匹配) > launcher 环境变量 > 路由配置 > models.dev 注册表 > 内置表。上报的 `maxOutput` 仅在请求体自带输出预算缺席时兜底。现有实现:`src/agent/pi.ts`(覆盖 pi 与 omp)、`src/agent/opencode-native.ts`(v1)、`src/agent/opencode-v2.ts`、`src/agent/dsh-native.ts` —— 其他客户端接入请遵循同一协议。
+窗口解析顺序:`anthropic-beta` 协商 > 逐请求 plugin 头 > runtime-info 表(agent+model 必须匹配) > launcher 环境变量 > 路由配置 > models.dev 注册表 > 内置表。上报的 `maxOutput` 仅在请求体自带输出预算缺席时兜底。现有实现:`src/agent/pi.ts`(覆盖 pi 与 omp)、`src/agent/opencode-native.ts`(v1)、`src/agent/opencode-v2.ts`、`src/agent/dsh-native.ts`、`src/kimi/native-mcp.ts`(仅自举时上报 —— kimi 的 provider `custom_headers` 是静态的,逐请求头会在模型切换后过期)—— 其他客户端接入请遵循同一协议。
 
 launcher 环境变量这档覆盖纯代理客户端(无进程内插件):`bili <client>` 启动时读客户端自己的模型配置(codex 的 `model_context_window` / `model_max_output_tokens`,pi / omp 的 `contextWindow` / `maxTokens`,opencode 的 `limit.context` / `limit.output`,codebuddy 的 `maxInputTokens` / `maxOutputTokens`),经 `BILI_LAUNCHER_MODEL_WINDOWS` / `BILI_LAUNCHER_MODEL_MAX_OUTPUTS` 交给代理(#971)。插件上报 —— 若存在 —— 永远优先于它。
 
@@ -148,8 +150,9 @@ launcher 环境变量这档覆盖纯代理客户端(无进程内插件):`bili <c
 
 - 原生模式与独立进程内扩展(`billion-context-pi`、`opencode-acp`)**互斥** —— 安装器负责换条目并把原配置快照(`.bili-bak`);迁移细节见上方客户端表(pi 需 `billion-context-pi` 0.1.72+ 才能干净退让)。
 - OpenCode 1.x 上,迁移前的 `opencode-acp` 旧会话继续可用(v1 泳道路由,#920)—— 见下文 "OpenCode 1.x"。
-- `codex` 也有配套安装(MCP shell),但它需要一个在跑的代理 —— 不属于原生模式。
+- `kimi` 仅在自举时上报 runtime-info(静态 `custom_headers` 无法承载逐请求的窗口/模型头,否则会在模型切换后过期),子代理会话按每次调用的 `conversation_id` 绑定 —— 完整机制见下文「Kimi Code」小节。
 - `claude` 有**原生姿态**(hybrid,#964):Claude Code 没有进程内扩展点,所以 `bili plugin install claude` 往 `~/.claude/settings.json` 写一个受管块(env `ANTHROPIC_BASE_URL=http://127.0.0.1:48787/bili/<upstream>`、`DISABLE_AUTO_COMPACT=1`、`SessionStart` hook),外加同样指向该稳定端口的用户级 MCP shell。hook 在首个模型请求前触发:附着到端口上健康的代理,或拉起一个 pid 看门狗追踪 claude 本身的代理 —— 代理随会话生灭。端口覆盖:`BILI_CLAUDE_NATIVE_PORT` > config `claude.nativePort` > 48787;上游覆盖:`BILI_CLAUDE_UPSTREAM`(或既有 `claude.anthropicBaseUrl`)。`BILI_NATIVE_CLAUDE=0` 退出 —— hook 改为拉起同端口的 **passthrough** 代理(原样转发、关闭压缩)。块是纯 JSON merge/strip:外部键从不触碰,`bili plugin remove claude` 精确还原。装有原生块的机器上 `bili claude` 仍可用 —— 它用自身临时代理覆盖静态 URL,hook 保持休眠。
+- `codex` / `omp` 也有配套安装(MCP shell 与轻量扩展),但它们需要一个在跑的代理 —— 不属于原生模式。
 
 ### 注入优先级 —— 能不写文件就不写(#535)
 
@@ -212,6 +215,16 @@ bili
 - **自动更新保持各 profile 同步:** 全局自更新完成后,bili 会扫描 `~/.dsh/profiles/*/package.json`,把注册表钉住的 `billion-context` 依赖刷新回新的全局版本 —— 加载的插件与代理从此不再漂移(#953);钉在本地源的 profile 不动。刷新是尽力而为,绝不会让更新本身失败。
 
 `bili dsh` 启动下插件**附看**(attach)启动器的代理(不二次拉起)。裸上游 URL 与 spawn 模式一样重写为 `<proxy>/bili/<url>`(回环代理目标永不被代理 env 拦截，等于直接绕开 MITM)；已经路由的 `/bili/` 前缀请求原样放行、只盖章。已知局限:手动 `/compact` 没有 dsh 侧事件钩子，其边界交给内核的自然 ingest diff(自动压缩已关，影响罕见)。
+
+#### Kimi Code(Moonshot)
+
+三种对齐模式:`bili kimi`(启动器,证书 MITM —— 方式 2)、`/bili/` URL 前缀,以及原生插件模式(`bili plugin install kimi`,#963)。Kimi Code v2 的插件体系是纯声明式的(`kimi.plugin.json`:MCP server、hooks、skills —— 没有进程内 JS 执行),所以 bili 无法像 pi/opencode/dsh 那样补丁客户端的 fetch 栈。取而代之,插件带两个小型 node 脚本,在客户端外围完成工作:
+
+- **安装:** `bili plugin install kimi` 写 `$KIMI_CODE_HOME/plugins/managed/billion-context/kimi.plugin.json`,声明一个 stdio MCP server(`node <root>/dist/kimi/native-mcp.js`)加一个 `SessionStart` hook(`node <root>/dist/kimi/bootstrap-hook.js`,超时 30 s),并在 `$KIMI_CODE_HOME/plugins/installed.json` 注册该插件。安装器要求 `kimi --version` ≥ 2.0.0,低于此版本拒绝安装(启动器模式不受影响)。卸载:`bili plugin remove kimi`(managed 目录 + 注册表记录 + 配置还原)。
+- **每会话自举:** kimi 为每个会话把 MCP server 作为直接子进程拉起;启动时它先附上健康的现有代理(`BILLION_CONTEXT_PROXY`),否则在临时端口自拉起一个,然后用幂等的逐行受管块改写 `~/.kimi-code/config.toml` 的路由:自有 provider `[providers.bili]`(`base_url = http://127.0.0.1:<port>/bili/<上游>`,原样克隆当前 provider 的 `oauth` / `api_key` 引用)、`[models.bili-kimi]` 别名、顶层 `default_model` 重定向(原值记录在块内)。原文件一次性快照到 `config.toml.bili-bak`;每次写入都在 mkdir 锁文件下进行,块外的用户内容绝不被触碰。Kimi 的配置热重载会把变更应用到存活会话。`SessionStart` hook 机会性地跑同样的自举(仅 attach —— 永不拉起代理);它的非阻塞竞态在设计上被容忍:第一轮可能走直连/wire 模式,不变量是绝不把 `base_url` 指向死端口。
+- **Plugin 模式盖章:** 只有当 ACP 工具清单已在存活代理上验证通过后,块里才会写入 `custom_headers = { x-bili-plugin = "kimi" }` —— 此前流量走 wire 模式。由于 `custom_headers` 按 provider 静态生效,无法承载逐请求的窗口/模型头(会在模型切换后过期),所以 runtime-info 上报只在自举时发生(客户端配置里有模型 + 上下文窗口 + 最大输出就一并上报)。
+- **看门狗与生命周期:** MCP 子进程每 30 s 探测一次代理。attach 模式下永远等待(绝不碰用户自己的代理);spawn 模式下代理死亡则重新拉起并把路由改写到新 origin。恢复失败时移除受管块,让流量退回直连上游而不是打到死端口。会话结束时 kimi 杀掉 MCP 子进程,父进程 pid 看门狗随之收掉拉起的代理。多个并发 TUI 共享第一个拉起的代理;它消失后其余会话自动重新拉起并改路。
+- **已知局限:** 子代理会话各自得到独立的派生代理会话(kimi 不暴露稳定的会话 id;工具调用经每次调用的 `conversation_id` 参数绑定);kimi 的原生自动压缩**没有**被推后 —— ACP 压缩只是先触发,与启动器模式一致。退出开关:`BILI_NATIVE_KIMI=0`。
 
 ### 验证
 
