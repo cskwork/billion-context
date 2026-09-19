@@ -85,12 +85,14 @@ test("ensureProxyRunning: proxy child gets BILI_INHERITED_* but NOT the raw prox
         modelWindows: {},
         launchToken,
     });
-    const prevHttps = process.env.https_proxy;
-    const prevNoProxy = process.env.no_proxy;
-    const prevNoProxyUpper = process.env.NO_PROXY;
-    process.env.https_proxy = "http://127.0.0.1:7897";
-    process.env.no_proxy = "localhost,.corp";
-    delete process.env.NO_PROXY;
+    // Windows env keys are CASE-INSENSITIVE: setting `no_proxy` then deleting
+    // `NO_PROXY` would delete the SAME slot. Use the uppercase spellings
+    // (capture prefers them anyway); the lowercase-vs-uppercase capture
+    // semantics are covered platform-independently by the pure test above.
+    const saved = ["https_proxy", "HTTPS_PROXY", "no_proxy", "NO_PROXY"].map((k) => [k, process.env[k]] as const);
+    for (const k of ["https_proxy", "HTTPS_PROXY", "no_proxy", "NO_PROXY"]) delete process.env[k];
+    process.env.HTTPS_PROXY = "http://127.0.0.1:7897";
+    process.env.NO_PROXY = "localhost,.corp";
     try {
         const handle = await ensureProxyRunning(
             { host: "127.0.0.1", port: 42422, passthrough: false, debug: false },
@@ -114,12 +116,8 @@ test("ensureProxyRunning: proxy child gets BILI_INHERITED_* but NOT the raw prox
         assert.equal(spawnedEnv.HTTPS_PROXY, undefined);
         assert.equal(spawnedEnv.no_proxy, undefined);
     } finally {
-        if (prevHttps === undefined) delete process.env.https_proxy;
-        else process.env.https_proxy = prevHttps;
-        if (prevNoProxy === undefined) delete process.env.no_proxy;
-        else process.env.no_proxy = prevNoProxy;
-        if (prevNoProxyUpper === undefined) delete process.env.NO_PROXY;
-        else process.env.NO_PROXY = prevNoProxyUpper;
+        for (const key of ["https_proxy", "HTTPS_PROXY", "no_proxy", "NO_PROXY"]) delete process.env[key];
+        for (const [key, value] of saved) if (value !== undefined) process.env[key] = value;
     }
 });
 
