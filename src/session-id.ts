@@ -158,3 +158,76 @@ export function codexTurnIdentity(headers: Record<string, string | string[] | un
     }
     return { value: threadHeader.trim(), threadSource };
 }
+
+/**
+ * Claude Code subagent split (#970).
+ *
+ * Claude Code stamps the SAME `x-claude-code-session-id` on every model
+ * request of a session — including requests made by Task-tool subagents —
+ * so the identity chain maps main turn and all subagents onto ONE session.
+ * Every request then serializes on that session's lock (withSessionLock
+ * covers prepare + forward + the streamed response), and a slow subagent
+ * first request head-of-line-blocks the main turn (and vice versa) for the
+ * full upstream latency.
+ *
+ * Discrimination is two-signal, both verified against live Claude Code
+ * 2.1.274 traffic (`-p` mode AND custom agent types like Explore):
+ *
+ * 1. HEADER: the request carries `x-claude-code-agent-id` and/or
+ *    `x-claude-code-parent-agent-id`. Main-turn requests carry agent-id only
+ *    from their second request on (the very first request and side requests
+ *    like title generation carry neither), so the header alone can't decide —
+ *    the parent header is NOT reliable (general-purpose `-p` subagents send
+ *    it, custom agent types like Explore do not).
+ *
+ * 2. SYSTEM: the MAIN agent's system always contains a block starting with
+ *    one of the MAIN_SYSTEM_PREFIXES ("You are Claude Code…" for interactive
+ *    sessions, "You are an interactive agent…" for -p/SDK sessions), while a
+ *    subagent's system blocks are its agent definition ("This session is a
+ *    background job…", "You are a file search specialist for…", …) — no
+ *    stable positive marker exists across agent types, so the check is
+ *    negative: none of the main prefixes may match.
+ *
+ * A request splits only when BOTH signals say subagent (header present AND
+ * no main prefix in system). Failure modes degrade in the safe direction:
+ * if a future Claude Code rewords its main prompts, subagents stop being
+ * split (back to today's serial behavior) — the main session can never be
+ * mis-split, because its prefixes are the gate and its system legitimately
+ * mutates turn to turn without ever losing the prefix block.
+ *
+ * Split sessions keep per-subagent compression state (a subagent is its own
+ * conversation; isolation matches the codex #316/#150 semantics) and get
+ * their own lock chain, so subagents stop queueing behind the main turn.
+ * The namespace format mirrors subagentNamespace's `<id>|sub:<hash>` on the
+ * Responses branch. Clients without these headers (older Claude Code, other
+ * agents, curl) are untouched.
+ */
+const MAIN_SYSTEM_PREFIXES = ["You are Claude Code", "You are an interactive agent"] as const;
+
+export function claudeSubagentAgentId(
+    headers: Record<string, string | string[] | undefined>,
+    systemBlocks: string[],
+): string | undefined {
+    // Node lowercases inbound header names; an array value (repeated header)
+    // is ambiguous and treated as absent, same posture as
+    // clientConversationHeader.
+    const agent = headers["x-claude-code-agent-id"];
+    const parent = headers["x-claude-code-parent-agent-id"];
+    const agentId = typeof agent === "string" && agent.trim().length > 0 ? agent.trim() : undefined;
+    const parentId = typeof parent === "string" && parent.trim().length > 0 ? parent.trim() : undefined;
+    if (agentId === undefined && parentId === undefined) return undefined;
+    const isMain = systemBlocks.some((block) => {
+        const t = block.trimStart();
+        return MAIN_SYSTEM_PREFIXES.some((p) => t.startsWith(p));
+    });
+    if (isMain) return undefined;
+    return agentId ?? parentId;
+}
+
+/** Derive the subagent session id `<id>|sub:<agent-id>`; unchanged when the
+ *  request is not a Claude Code subagent (no agent header, or main-turn
+ *  system prefixes present). */
+export function claudeSubagentSplit(id: string, headers: Record<string, string | string[] | undefined>, systemBlocks: string[]): string {
+    const agent = claudeSubagentAgentId(headers, systemBlocks);
+    return agent ? `${id}|sub:${agent}` : id;
+}
