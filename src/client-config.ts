@@ -20,12 +20,17 @@ export interface ClaudeSettings {
 export interface ModelWindow {
     id: string;
     contextWindow: number;
+    /** Configured max output for the model (#971), when the client's own
+ *  config declares it (codex model_max_output_tokens, pi/omp maxTokens,
+ *  opencode limit.output, codebuddy maxOutputTokens). */
+    maxOutput?: number;
 }
 
-function toModelWindow(id: unknown, contextWindow: unknown): ModelWindow | null {
-    return typeof id === "string" && id.length > 0 && typeof contextWindow === "number" && Number.isFinite(contextWindow) && contextWindow > 0
-        ? { id, contextWindow: Math.floor(contextWindow) }
-        : null;
+function toModelWindow(id: unknown, contextWindow: unknown, maxOutput?: unknown): ModelWindow | null {
+    if (typeof id !== "string" || id.length === 0 || typeof contextWindow !== "number" || !Number.isFinite(contextWindow) || contextWindow <= 0) return null;
+    const win: ModelWindow = { id, contextWindow: Math.floor(contextWindow) };
+    if (typeof maxOutput === "number" && Number.isFinite(maxOutput) && maxOutput > 0) win.maxOutput = Math.floor(maxOutput);
+    return win;
 }
 
 export interface CodexProvider {
@@ -41,6 +46,8 @@ export interface CodexConfig {
     contextWindow?: number;
     /** Top-level `model_auto_compact_token_limit` override (if set). */
     autoCompactLimit?: number;
+    /** Top-level `model_max_output_tokens` override (if set) (#971). */
+    maxOutput?: number;
     /** Top-level `model` + `model_context_window` override pair (if set). */
     modelWindows?: ModelWindow[];
     providers: Record<string, CodexProvider>;
@@ -318,7 +325,7 @@ export function parseCodebuddyModelsJson(obj: unknown): { models: ModelWindow[];
             seenUrl.add(url);
             out.urls.push(url);
         }
-        const win = toModelWindow(id, e.maxInputTokens);
+        const win = toModelWindow(id, e.maxInputTokens, e.maxOutputTokens);
         if (win) out.models.push(win);
     };
     if (!obj) return out;
@@ -517,6 +524,7 @@ export function parseCodexToml(text: string): CodexConfig {
     let codexModel: string | undefined;
     let codexContextWindow: number | undefined;
     let codexAutoCompactLimit: number | undefined;
+    let codexMaxOutput: number | undefined;
     for (const rawLine of text.split(/\r?\n/)) {
         const line = rawLine.trim();
         if (!line || line.startsWith("#")) continue;
@@ -546,12 +554,14 @@ export function parseCodexToml(text: string): CodexConfig {
         } else if (numMatch && table === "") {
             if (numMatch[1] === "model_context_window") codexContextWindow = Number(numMatch[2]);
             else if (numMatch[1] === "model_auto_compact_token_limit") codexAutoCompactLimit = Number(numMatch[2]);
+            else if (numMatch[1] === "model_max_output_tokens") codexMaxOutput = Number(numMatch[2]);
         }
     }
     if (codexModel) result.model = codexModel;
     if (codexContextWindow) result.contextWindow = codexContextWindow;
     if (codexAutoCompactLimit) result.autoCompactLimit = codexAutoCompactLimit;
-    const win = toModelWindow(codexModel, codexContextWindow);
+    if (codexMaxOutput) result.maxOutput = codexMaxOutput;
+    const win = toModelWindow(codexModel, codexContextWindow, codexMaxOutput);
     if (win) result.modelWindows = [win];
     return result;
 }
@@ -693,7 +703,8 @@ export function readPiConfig(piHome: string): PiConfig {
                 if (Array.isArray(models)) {
                     for (const m of models) {
                         if (!m || typeof m !== "object") continue;
-                        const win = toModelWindow((m as { id?: unknown }).id, (m as { contextWindow?: unknown }).contextWindow);
+                        const fields = m as { id?: unknown; contextWindow?: unknown; maxTokens?: unknown; maxOutputTokens?: unknown };
+                        const win = toModelWindow(fields.id, fields.contextWindow, fields.maxTokens ?? fields.maxOutputTokens);
                         if (win) windows.push(win);
                     }
                 }
@@ -722,7 +733,16 @@ export function parseOmpYaml(text: string): OmpConfig {
     // entry, a deeper `contextWindow: <n>` completes it.
     let modelsIndent = -1;
     let dashIndent = -1;
-    let currentModelId: string | undefined;
+    let pending: { id: string | undefined; contextWindow?: number; maxOutput?: number } | undefined;
+    const flushPending = (): void => {
+        if (pending === undefined || currentProvider === null) { pending = undefined; return; }
+        const win = toModelWindow(pending.id, pending.contextWindow, pending.maxOutput);
+        if (win) {
+            const prov = result.providers[currentProvider]!;
+            prov.models = [...(prov.models ?? []), win];
+        }
+        pending = undefined;
+    };
     for (const rawLine of text.split(/\r?\n/)) {
         const trimmed = rawLine.trim();
         if (!trimmed || trimmed.startsWith("#")) continue;
@@ -736,7 +756,7 @@ export function parseOmpYaml(text: string): OmpConfig {
         if (indent === providerIndent) {
             modelsIndent = -1;
             dashIndent = -1;
-            currentModelId = undefined;
+            flushPending();
             const m = /^([A-Za-z0-9_.-]+):/.exec(trimmed);
             if (m) {
                 currentProvider = m[1];
@@ -747,26 +767,25 @@ export function parseOmpYaml(text: string): OmpConfig {
         } else if (indent > providerIndent && currentProvider) {
             const idMatch = /^-\s+id:\s*(\S+)/.exec(trimmed);
             if (modelsIndent >= 0 && indent > modelsIndent && idMatch) {
-                currentModelId = idMatch[1];
+                flushPending();
+                pending = { id: idMatch[1] };
                 dashIndent = indent;
-            } else if (modelsIndent >= 0 && dashIndent >= 0 && indent > dashIndent && /^contextWindow:\s*([0-9]+)/.test(trimmed)) {
-                const n = Number(/^contextWindow:\s*([0-9]+)/.exec(trimmed)![1]);
-                const win = toModelWindow(currentModelId, n);
-                if (win) {
-                    const prov = result.providers[currentProvider];
-                    prov.models = [...(prov.models ?? []), win];
-                }
-                currentModelId = undefined;
+            } else if (modelsIndent >= 0 && dashIndent >= 0 && indent > dashIndent) {
+                const cw = /^contextWindow:\s*([0-9]+)/.exec(trimmed);
+                if (cw && pending !== undefined) pending.contextWindow = Number(cw[1]);
+                const mo = /^maxTokens:\s*([0-9]+)/.exec(trimmed);
+                if (mo && pending !== undefined) pending.maxOutput = Number(mo[1]);
             } else if (/^models:\s*(#.*)?$/.test(trimmed)) {
                 modelsIndent = indent;
                 dashIndent = -1;
-                currentModelId = undefined;
+                flushPending();
             } else if (modelsIndent < 0 || indent <= modelsIndent) {
                 const m = /^baseUrl:\s*(\S+)/.exec(trimmed);
-                if (m) result.providers[currentProvider].baseUrl = m[1];
+                if (m) result.providers[currentProvider]!.baseUrl = m[1];
             }
         }
     }
+    flushPending();
     return result;
 }
 
@@ -987,6 +1006,10 @@ export function parseOpencodeProviders(parsed: Record<string, unknown> | undefin
                         if (typeof limit === "number") {
                             const win = toModelWindow(modelId, limit);
                             if (win) windows.push(win);
+                        } else if (limit && typeof limit === "object" && !Array.isArray(limit)) {
+                            const l = limit as { context?: unknown; output?: unknown };
+                            const win = toModelWindow(modelId, l.context, l.output);
+                            if (win) windows.push(win);
                         }
                     }
                     if (windows.length > 0) providers[name].models = windows;
@@ -1143,6 +1166,35 @@ export function collectModelWindows(config: ClientConfig, scope?: ModelWindowSco
     const add = (wins: ModelWindow[] | undefined): void => {
         for (const w of wins ?? []) {
             if (!out[w.id] || w.contextWindow > out[w.id]) out[w.id] = w.contextWindow;
+        }
+    };
+    if (scope) {
+        if (scope === "codex") add(config.codex?.modelWindows);
+        else if (scope === "pi") for (const p of Object.values(config.pi?.providers ?? {})) add(p.models);
+        else if (scope === "omp") for (const p of Object.values(config.omp?.providers ?? {})) add(p.models);
+        else if (scope === "opencode") for (const p of Object.values(config.opencode?.providers ?? {})) add(p.models);
+        else if (scope === "codebuddy") add(config.codebuddy?.models);
+        else if (scope === "kimi") add(config.kimi?.models);
+        return out;
+    }
+    for (const p of Object.values(config.pi?.providers ?? {})) add(p.models);
+    for (const p of Object.values(config.omp?.providers ?? {})) add(p.models);
+    for (const p of Object.values(config.opencode?.providers ?? {})) add(p.models);
+    add(config.codex?.modelWindows);
+    add(config.codebuddy?.models);
+    add(config.kimi?.models);
+    return out;
+}
+
+/** Configured max output per model id (#971): the same sources as
+ *  collectModelWindows, reduced to the id → maxOutput map the launcher hands
+ *  the proxy via BILI_LAUNCHER_MODEL_MAX_OUTPUTS. */
+export function collectModelMaxOutputs(config: ClientConfig, scope?: ModelWindowScope): Record<string, number> {
+    const out: Record<string, number> = {};
+    const add = (wins: ModelWindow[] | undefined): void => {
+        for (const w of wins ?? []) {
+            if (w.maxOutput === undefined) continue;
+            if (!out[w.id] || w.maxOutput > out[w.id]) out[w.id] = w.maxOutput;
         }
     };
     if (scope) {
