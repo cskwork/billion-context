@@ -459,11 +459,25 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
             }
             void registerTools(pi, ctx, state, agent).catch((err: unknown) => console.error(`bili-plugin(${agent}): ${err instanceof Error ? err.message : String(err)}`));
         });
+        // omp never emits before_provider_headers — where pi stamps the
+        // x-bili-plugin-* headers and reports runtime info (#955) — so omp's
+        // report rides this per-request event instead: POST only, deduped per
+        // model switch, gated on toolsReady like pi's header path (ownership
+        // claim = ACP tools registered; round 1 rides wire mode).
+        function reportOmpRuntimeInfo(ctx: Ctx): void {
+            if (state.toolsReady !== true) return;
+            const modelId = ctx.model?.id;
+            if (typeof modelId !== "string" || modelId.length === 0) return;
+            const window = ctx.model?.contextWindow;
+            const maxOut = (ctx.model as { maxTokens?: unknown } | undefined)?.maxTokens;
+            reportRuntimeInfoOnChange(proxyBaseForCtx(ctx), { agent, model: modelId, contextWindow: typeof window === "number" && window > 0 ? Math.floor(window) : undefined, maxOutput: typeof maxOut === "number" && maxOut > 0 ? Math.floor(maxOut) : undefined, baseURL: ctx.model?.baseUrl, source: "client-config" });
+        }
         pi.on("before_provider_request", (event, ctx) => {
             // omp emits this per model request (but never before_provider_headers);
             // it doubles as the retry driver when the session_start manifest
             // fetch raced the proxy startup. Cached by sid, throttled by retryAt.
             void registerTools(pi, ctx, state, agent).catch((err: unknown) => console.error(`bili-plugin(${agent}): ${err instanceof Error ? err.message : String(err)}`));
+            if (agent === "omp") reportOmpRuntimeInfo(ctx);
             return stampPromptCacheKey(event, ctx, agent);
         });
         pi.on("session_start", (_event, ctx) => {

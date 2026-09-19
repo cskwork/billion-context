@@ -57,12 +57,14 @@ type FakeProxy = {
     origin: string;
     toolCalls: Array<{ conversationId: string; tool: string; args: unknown }>;
     registers: Array<{ conversationId: string; agent: string; identity: boolean }>;
+    runtimeInfos: Array<Record<string, unknown>>;
     close(): Promise<void>;
 };
 
 async function startFakeProxy(opts: { failRegister?: number } = {}): Promise<FakeProxy> {
     const toolCalls: FakeProxy["toolCalls"] = [];
     const registers: FakeProxy["registers"] = [];
+    const runtimeInfos: FakeProxy["runtimeInfos"] = [];
     const server = http.createServer((req, res) => {
         const url = req.url ?? "";
         if (url === "/__bili/plugin/manifest") {
@@ -104,6 +106,16 @@ async function startFakeProxy(opts: { failRegister?: number } = {}): Promise<Fak
             });
             return;
         }
+        if (url === "/__bili/plugin/runtime-info" && req.method === "POST") {
+            let body = "";
+            req.on("data", (c) => (body += c));
+            req.on("end", () => {
+                runtimeInfos.push(JSON.parse(body) as Record<string, unknown>);
+                res.writeHead(200, { "content-type": "application/json" });
+                res.end(JSON.stringify({ ok: true }));
+            });
+            return;
+        }
         if (url.startsWith("/__bili/plugin/status")) {
             res.writeHead(200, { "content-type": "application/json" });
             res.end(JSON.stringify({ ok: true, contextTokens: 1234 }));
@@ -115,7 +127,7 @@ async function startFakeProxy(opts: { failRegister?: number } = {}): Promise<Fak
     server.listen(0, "127.0.0.1");
     await once(server, "listening");
     const origin = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
-    return { origin, toolCalls, registers, close: () => new Promise<void>((resolve) => server.close(() => resolve())) };
+    return { origin, toolCalls, registers, runtimeInfos, close: () => new Promise<void>((resolve) => server.close(() => resolve())) };
 }
 
 test("shared manifest/tool/status against a fake proxy", async () => {
@@ -817,7 +829,7 @@ test("plugin install/remove roundtrips for pi/omp/codex/opencode under a fake HO
 
         // omp install/status/remove verify the entry's target exists, so
         // materialize the (gitignored) dist artifact for this sub-test.
-        const ompDistFile = path.join(root, "dist", "agent", "omp.js");
+        const ompDistFile = path.join(root, "dist", "agent", "omp-native.js");
         const createdOmpDist = !fs.existsSync(ompDistFile);
         if (createdOmpDist) {
             fs.mkdirSync(path.dirname(ompDistFile), { recursive: true });
@@ -828,7 +840,7 @@ test("plugin install/remove roundtrips for pi/omp/codex/opencode under a fake HO
         fs.writeFileSync(path.join(home, ".omp/agent/config.yml"), "extensions:\n  - /some/other/ext.js\nfirstRunComplete: true\n");
         assert.match(pluginInstall("omp"), /installed/);
         const ompText = fs.readFileSync(path.join(home, ".omp/agent/config.yml"), "utf8");
-        assert.match(ompText, /extensions:\n  - \/some\/other\/ext\.js\n  - .*dist[\\/]agent[\\/]omp\.js\nfirstRunComplete: true\n/);
+        assert.match(ompText, /extensions:\n  - \/some\/other\/ext\.js\n  - .*dist[\\/]agent[\\/]omp-native\.js\nfirstRunComplete: true\n/);
         assert.match(pluginInstall("omp"), /already installed/);
         assert.match(pluginRemove("omp"), /removed/);
         assert.equal(fs.readFileSync(path.join(home, ".omp/agent/config.yml"), "utf8"), "extensions:\n  - /some/other/ext.js\nfirstRunComplete: true\n");
@@ -836,19 +848,19 @@ test("plugin install/remove roundtrips for pi/omp/codex/opencode under a fake HO
         const noExtYml = "firstRunComplete: true\n";
         fs.writeFileSync(path.join(home, ".omp/agent/config.yml"), noExtYml);
         pluginInstall("omp");
-        assert.match(fs.readFileSync(path.join(home, ".omp/agent/config.yml"), "utf8"), /firstRunComplete: true\nextensions:\n  - .*omp\.js\n/);
+        assert.match(fs.readFileSync(path.join(home, ".omp/agent/config.yml"), "utf8"), /firstRunComplete: true\nextensions:\n  - .*omp-native\.js\n/);
         pluginRemove("omp");
 
         const noNlYml = "extensions:";
         fs.writeFileSync(path.join(home, ".omp/agent/config.yml"), noNlYml);
         pluginInstall("omp");
-        assert.match(fs.readFileSync(path.join(home, ".omp/agent/config.yml"), "utf8"), /extensions:\n  - .*omp\.js\n/);
+        assert.match(fs.readFileSync(path.join(home, ".omp/agent/config.yml"), "utf8"), /extensions:\n  - .*omp-native\.js\n/);
         pluginRemove("omp");
 
         const colZeroYml = "extensions:\n- /a.js\n- /b.js\nother: 1\n";
         fs.writeFileSync(path.join(home, ".omp/agent/config.yml"), colZeroYml);
         pluginInstall("omp");
-        assert.match(fs.readFileSync(path.join(home, ".omp/agent/config.yml"), "utf8"), /^extensions:\n- \/a\.js\n- \/b\.js\n- .*omp\.js\nother: 1\n$/);
+        assert.match(fs.readFileSync(path.join(home, ".omp/agent/config.yml"), "utf8"), /^extensions:\n- \/a\.js\n- \/b\.js\n- .*omp-native\.js\nother: 1\n$/);
         pluginRemove("omp");
         assert.equal(fs.readFileSync(path.join(home, ".omp/agent/config.yml"), "utf8"), colZeroYml);
 
@@ -857,7 +869,7 @@ test("plugin install/remove roundtrips for pi/omp/codex/opencode under a fake HO
         assert.throws(() => pluginInstall("omp"), /flow style|inline value/);
         const quotedYml = `extensions:\n  - "${path.join(root, "dist/agent/omp.js")}" # my ext\n`;
         fs.writeFileSync(path.join(home, ".omp/agent/config.yml"), quotedYml);
-        assert.match(pluginInstall("omp"), /already installed/);
+        assert.match(pluginInstall("omp"), /installed.*replaced/);
         assert.match(pluginRemove("omp"), /removed/);
         assert.equal(fs.readFileSync(path.join(home, ".omp/agent/config.yml"), "utf8"), "extensions:\n");
         });
@@ -1058,7 +1070,7 @@ test("plugin install/remove/status survive a non-object mcp in opencode.json (#8
 test("omp plugin: scoped matching, existence check, overlay redirect (issue #392)", async () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-plugin-omp-"));
     const root = selfPackageRoot();
-    const ompDistFile = path.join(root, "dist", "agent", "omp.js");
+    const ompDistFile = path.join(root, "dist", "agent", "omp-native.js");
     const createdOmpDist = !fs.existsSync(ompDistFile);
     if (createdOmpDist) {
         fs.mkdirSync(path.dirname(ompDistFile), { recursive: true });
@@ -1067,18 +1079,19 @@ test("omp plugin: scoped matching, existence check, overlay redirect (issue #392
     try {
         const stale = "/does/not/exist/dist/agent/omp.js";
 
-        // (a) a same-valued line OUTSIDE the extensions block must not block install
+        // (a) a stale in-block entry migrates to the native form on install
+        // (#957); a same-valued line OUTSIDE the extensions block is never touched
         {
             const agentDir = path.join(home, "a", ".omp", "agent");
             fs.mkdirSync(agentDir, { recursive: true });
             fs.writeFileSync(path.join(agentDir, "config.yml"),
                 `extensions:\n  - ${stale}\nother:\n  - ${stale}\nfirstRunComplete: true\n`);
             await withEnv({ PI_CODING_AGENT_DIR: agentDir }, async () => {
-                assert.match(pluginInstall("omp"), /installed/);
+                assert.match(pluginInstall("omp"), /installed.*replaced/);
                 assert.equal(pluginStatusAll().find((r) => r.agent === "omp")?.status, "installed");
             });
             assert.match(fs.readFileSync(path.join(agentDir, "config.yml"), "utf8"),
-                /extensions:\n  - \/does\/not\/exist\/dist\/agent\/omp\.js\n  - .*dist[\\/]agent[\\/]omp\.js\nother:\n  - \/does\/not\/exist\/dist\/agent\/omp\.js\n/);
+                /extensions:\n  - .*dist[\\/]agent[\\/]omp-native\.js\nother:\n  - \/does\/not\/exist\/dist\/agent\/omp\.js\nfirstRunComplete: true\n/);
         }
 
         // (b) remove only deletes in-block entries; the out-of-block line stays
@@ -1106,7 +1119,7 @@ test("omp plugin: scoped matching, existence check, overlay redirect (issue #392
                 assert.match(pluginInstall("omp"), /installed/);
             });
             assert.match(fs.readFileSync(path.join(realHome, "config.yml"), "utf8"),
-                /extensions:\n  - .*dist[\\/]agent[\\/]omp\.js\n/);
+                /extensions:\n  - .*dist[\\/]agent[\\/]omp-native\.js\n/);
             assert.equal(fs.readFileSync(path.join(overlay, "config.yml"), "utf8"),
                 "extensions:\n  - /stale/overlay/dist/agent/omp.js\n");
         }
@@ -1426,4 +1439,57 @@ test("pi agent never stamps prompt_cache_key (it stamps headers instead)", async
     createBiliPlugin("pi")(pi as never);
     const out = pi.events.get("before_provider_request")!({ type: "before_provider_request", payload: { messages: [{ role: "user", content: "hi" }] } }, fakeCtx(undefined, "pi-uuid"));
     assert.equal(out, undefined, "pi agent never stamps the body");
+});
+
+async function waitForRuntimeInfoCount(proxy: FakeProxy, count: number, timeoutMs = 15000): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    while (proxy.runtimeInfos.length < count) {
+        if (Date.now() > deadline) throw new Error(`timed out waiting for ${count} runtime-info reports; got ${proxy.runtimeInfos.length}`);
+        await new Promise((r) => setTimeout(r, 25));
+    }
+}
+
+test("#957: omp reports runtime-info via before_provider_request (omp has no header event)", async () => {
+    const proxy = await startFakeProxy();
+    try {
+        const pi = makeFakePi();
+        ompPlugin(pi as never);
+        const baseModel = { baseUrl: `${proxy.origin}/bili/https://api.example.com/v1` };
+        const ctxA = { ...fakeCtx(proxy, "omp-rt-1"), model: { id: "omp-rt-model-a", contextWindow: 200000, maxTokens: 32768, ...baseModel } };
+        const ctxB = { ...fakeCtx(proxy, "omp-rt-1"), model: { id: "omp-rt-model-b", contextWindow: 128000, maxTokens: 16384, ...baseModel } };
+        await pi.events.get("session_start")!({}, ctxA);
+        // tools not ready yet → round 1 rides wire mode, no report. The
+        // manifest fetch cannot complete inside this synchronous block, so
+        // toolsReady is provably false here.
+        await pi.events.get("before_provider_request")!({}, ctxA);
+        assert.equal(proxy.runtimeInfos.length, 0, "no report before toolsReady");
+        await waitForTools(pi, 2);
+        await pi.events.get("before_provider_request")!({}, ctxA);
+        await waitForRuntimeInfoCount(proxy, 1);
+        assert.deepEqual(proxy.runtimeInfos[0], {
+            agent: "omp",
+            model: "omp-rt-model-a",
+            contextWindow: 200000,
+            maxOutput: 32768,
+            baseURL: `${proxy.origin}/bili/https://api.example.com/v1`,
+            source: "client-config",
+        });
+        // same model again → deduped, no second POST
+        await pi.events.get("before_provider_request")!({}, ctxA);
+        await flush();
+        assert.equal(proxy.runtimeInfos.length, 1, "deduped per model switch");
+        // model switch → exactly one more report with the new config
+        await pi.events.get("before_provider_request")!({}, ctxB);
+        await waitForRuntimeInfoCount(proxy, 2);
+        assert.deepEqual(proxy.runtimeInfos[1], {
+            agent: "omp",
+            model: "omp-rt-model-b",
+            contextWindow: 128000,
+            maxOutput: 16384,
+            baseURL: `${proxy.origin}/bili/https://api.example.com/v1`,
+            source: "client-config",
+        });
+    } finally {
+        await proxy.close();
+    }
 });

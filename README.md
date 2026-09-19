@@ -152,7 +152,7 @@ Pick by your client:
 | **pi** | [`billion-context-pi`](https://github.com/ranxianglei/billion-context-pi) (in-process extension) |
 | **opencode 1.x** | `bili plugin install opencode` (self-spawning native plugin — pre-migration [`opencode-acp`](https://github.com/ranxianglei/opencode-acp) sessions keep working, see "OpenCode 1.x") or `bili opencode` (launcher) or standalone `opencode-acp` (in-process extension) |
 | **opencode 2.0+** | `bili opencode` (built-in V2 plugin — native tools, no separate package) or `bili plugin install opencode` (self-spawning native plugin, no launcher) |
-| **omp** | [`billion-context`](https://github.com/ranxianglei/billion-context) via `bili omp` (built-in plugin) |
+| **omp** | [`billion-context`](https://github.com/ranxianglei/billion-context) via `bili omp` (built-in plugin) or `bili plugin install omp` (self-spawning native plugin, no launcher) |
 | **dsh** | `bili dsh` (launcher — full native plugin via `--patch`: tools, session-bound `/acp`, fetch intercept) or `bili plugin install dsh` ≡ `dsh plugin --profile <name> add billion-context` (one unified lane — pnpm-installs the package into each profile so dsh mounts the bundled patch layer; the bili form just drives dsh's own channel per profile and migrates legacy managed blocks) |
 | **claude** | `bili claude` (launcher) or `bili plugin install claude` (native posture, #964 — managed settings block + session-owned proxy; see the notes below) |
 | **everything else** (no context hook) | [`billion-context`](https://github.com/ranxianglei/billion-context) — `bili <client>` (launcher, preferred) or `/bili/` prefix |
@@ -185,15 +185,16 @@ Three ways to use it — pick one:
 - **URL change (persistent):** prefix your client's baseURL with the proxy
   origin + `/bili/`.
 
-### Option 1 — Native plugin (`bili plugin install pi` / `opencode` / `dsh`)
+### Option 1 — Native plugin (`bili plugin install pi` / `omp` / `opencode` / `dsh`)
 
 The proxy lives inside the client: install once, then start the client
 exactly as you always do — no launcher command, no env vars, no fixed port,
-no URL edits. Supported today for **pi**, **opencode** (1.x and 2.x) and
-**dsh**:
+no URL edits. Supported today for **pi**, **omp**, **opencode** (1.x and
+2.x) and **dsh**:
 
 ```bash
 bili plugin install pi          # registers a "billion-context" entry in pi's settings (npm form when bili itself was npm-installed)
+bili plugin install omp         # registers an extensions entry in omp's config.yml (~/.omp/agent/config.yml)
 bili plugin install opencode    # registers the plugin in opencode's real config + disables native auto-compaction
 bili plugin install dsh         # runs 'dsh plugin --profile <name> add billion-context' for every existing profile
 bili plugin remove <client>     # undo (dsh removes through the same channel; config snapshots go to .bili-bak)
@@ -211,8 +212,8 @@ rewrites model traffic to `<proxy>/bili/<upstream-url>`, registers
 mode), and binds the `/acp` panel to the current session. It also reports
 the client's **own model config** to the proxy (runtime-info protocol,
 #955) so compression budgets use the real window instead of a registry
-guess. Opt-out envs: `BILI_NATIVE_PI=0`, `BILI_NATIVE_OPENCODE=0`,
-`BILI_NATIVE_DSH=0`.
+guess. Opt-out envs: `BILI_NATIVE_PI=0`, `BILI_NATIVE_OMP=0`,
+`BILI_NATIVE_OPENCODE=0`, `BILI_NATIVE_DSH=0`.
 
 #### Runtime-info protocol (#955)
 
@@ -230,9 +231,10 @@ Resolution order for the window: `anthropic-beta` negotiation > per-request
 plugin header > runtime-info table (agent+model must match) > launcher
 env > route config > models.dev registry > built-in table. A reported
 `maxOutput` only stands in when the request body carries no output budget
-of its own. Implementations: `src/agent/pi.ts`, `src/agent/opencode-native.ts`
-(v1), `src/agent/opencode-v2.ts`, `src/agent/dsh-native.ts` — other client
-integrations should follow the same protocol.
+of its own. Implementations: `src/agent/pi.ts` (covers pi and omp),
+`src/agent/opencode-native.ts` (v1), `src/agent/opencode-v2.ts`,
+`src/agent/dsh-native.ts` — other client integrations should follow the same
+protocol.
 
 The launcher env tier covers pure-proxy clients (no in-process plugin):
 `bili <client>` reads the client's own model config at launch
@@ -257,8 +259,8 @@ Notes:
   to stand down cleanly).
 - On OpenCode 1.x, pre-migration `opencode-acp` sessions keep working
   (v1 lane routing, #920) — see "OpenCode 1.x" below.
-- `codex` / `omp` have companion installs too (an MCP shell / a thin
-  extension), but those need a running proxy — they are not native mode.
+- `codex` has a companion install too (an MCP shell), but it needs a running
+  proxy — it is not native mode.
 - `claude` also has a **native posture** (#964, hybrid): Claude Code has no
   in-process extension point, so `bili plugin install claude` writes a
   managed block into `~/.claude/settings.json` (env
