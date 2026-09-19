@@ -7,7 +7,7 @@ import http from "node:http";
 import { pathToFileURL } from "node:url";
 import { apply, planNativeDsh, shouldBootstrapNativeDsh, _resetRegisterForTest, _stateHeadersForTest } from "../src/agent/dsh-native.ts";
 import { dshNativeInstalled, isNpmInstallForm, pluginInstall, pluginRemove, pluginStatusAll, selfPackageRoot } from "../src/plugin-install.ts";
-import { DSH_PATCH_BEGIN, DSH_PATCH_END, dshBundleInstalled, dshProfileDirs, stripDshManagedPatch, stripLegacyManagedBlock, _setDshRunnersForTest, type DshPlan } from "../src/dsh-channel.ts";
+import { DSH_PATCH_BEGIN, DSH_PATCH_END, dshBundleInstalled, dshProfileDirs, planDshSpawn, stripDshManagedPatch, stripLegacyManagedBlock, _setDshRunnersForTest, type DshPlan } from "../src/dsh-channel.ts";
 
 test("planNativeDsh: kill-switches > attach > spawn precedence (#941)", () => {
     assert.deepEqual(planNativeDsh({}), { mode: "spawn" });
@@ -35,6 +35,13 @@ const HEADER = "# Your patch layer for this dsh profile, applied after every bun
 // Block as written by pre-#966 installs: the markers are stable constants,
 // the body is what the retired managed lane used to append.
 const legacyBlockOf = (root: string): string => `${DSH_PATCH_BEGIN}\n- insert:\n    - id: bili-native\n      name: ${pathToFileURL(path.join(root, "dist", "agent", "dsh-native.js")).href}\n- id: compaction-basic\n  config:\n    auto: false\n${DSH_PATCH_END}\n`;
+
+test("planTokens: unpacks the win32 cmd.exe wrap back to argv", () => {
+    const plan = planDshSpawn("dsh", ["plugin", "--profile", "x", "add", "billion-context"], {}, "win32");
+    assert.deepEqual(planTokens(plan), ["plugin", "--profile", "x", "add", "billion-context"]);
+    // posix plans pass through untouched
+    assert.deepEqual(planTokens({ command: "dsh", args: ["plugin", "--profile", "x", "add", "billion-context"] }), ["plugin", "--profile", "x", "add", "billion-context"]);
+});
 
 test("stripDshManagedPatch: removes only the marked span; no-op without markers", () => {
     const merged = `${HEADER}[]\n${legacyBlockOf("/opt/bili")}`;
@@ -90,13 +97,24 @@ test("stripLegacyManagedBlock: preserves user comments when nothing meaningful r
 
 /** Recording stand-in for the real spawn: applies the manifest effect the
  *  dsh pnpm forwarder would leave behind (dep + bundle entry) so status /
- *  remove / dshNativeInstalled assertions see realistic state. */
+ *  remove / dshNativeInstalled assertions see realistic state. On Windows the
+ *  plan rides cmd.exe /d /s /c "<line>" — unpack it back to argv tokens so
+ *  the same assertions hold on every platform (test tokens carry no spaces). */
+function planTokens(plan: DshPlan): string[] {
+    const base = path.basename(plan.command).toLowerCase();
+    if (base !== "cmd.exe" && base !== "cmd") return [...plan.args];
+    const line = plan.args[3] ?? "";
+    const tokens = line.replace(/^"|"$/g, "").split(" ").map((t) => t.replace(/^"|"$/g, "")).filter((t) => t.length > 0);
+    return tokens.slice(1);
+}
+
 function channelRunner(home: string, calls: string[][]): { sync: (p: DshPlan) => { stdout: string; stderr: string }; async: (p: DshPlan) => Promise<{ stdout: string; stderr: string }> } {
     const apply = (plan: DshPlan): { stdout: string; stderr: string } => {
-        calls.push([...plan.args]);
-        const pi = plan.args.indexOf("--profile");
-        const name = plan.args[pi + 1];
-        const action = plan.args[pi + 2];
+        const tokens = planTokens(plan);
+        calls.push(tokens);
+        const pi = tokens.indexOf("--profile");
+        const name = tokens[pi + 1];
+        const action = tokens[pi + 2];
         const dir = path.join(home, "profiles", name);
         if (action === "add") {
             fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: `dsh-profile-${name}`, dependencies: { "billion-context": "^0.1.120" }, dsh: { profile: { bundles: ["@deepseek-ai/dsh-base", "billion-context"] } } }));

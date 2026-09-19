@@ -16,7 +16,7 @@ import {
 // — planDshSpawn (#679 spawn rules) ---------------------------------
 
 test("planDshSpawn: posix passthrough", () => {
-    assert.deepEqual(planDshSpawn("dsh", ["plugin", "--profile", "x", "add", "billion-context"]), { command: "dsh", args: ["plugin", "--profile", "x", "add", "billion-context"] });
+    assert.deepEqual(planDshSpawn("dsh", ["plugin", "--profile", "x", "add", "billion-context"], {}, "linux"), { command: "dsh", args: ["plugin", "--profile", "x", "add", "billion-context"] });
 });
 
 test("planDshSpawn: win32 bare names and .cmd shims ride comspec /d /s /c", () => {
@@ -69,12 +69,18 @@ function makeHome(entries: Record<string, Manifest | undefined>): string {
     return home;
 }
 
-/** Records successful calls; profiles in `failNames` throw before recording. */
+/** Records successful calls; profiles in `failNames` throw before recording.
+ *  On Windows the plan rides cmd.exe /d /s /c "<line>" — unpack to argv
+ *  tokens first so recording is platform-neutral (no spaced test tokens). */
 function recordingAsyncRunner(calls: string[], failNames?: Set<string>): (plan: DshPlan) => Promise<{ stdout: string; stderr: string }> {
     return async (plan) => {
-        const name = plan.args[plan.args.indexOf("--profile") + 1];
+        const base = path.basename(plan.command).toLowerCase();
+        const tokens = base === "cmd.exe" || base === "cmd"
+            ? (plan.args[3] ?? "").replace(/^"|"$/g, "").split(" ").map((t) => t.replace(/^"|"$/g, "")).filter((t) => t.length > 0).slice(1)
+            : [...plan.args];
+        const name = tokens[tokens.indexOf("--profile") + 1];
         if (failNames?.has(name)) throw Object.assign(new Error("spawn failed"), { status: 1, stderr: "boom" });
-        calls.push(plan.args.join(" "));
+        calls.push(tokens.join(" "));
         return { stdout: "", stderr: "" };
     };
 }
