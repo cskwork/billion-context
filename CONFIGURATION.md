@@ -120,7 +120,7 @@ Top-level keys that control how the proxy listens and behaves globally.
 - **Type:** `string`
 - **Default:** *(none — no upstream proxy)*
 - **Status:** ACTIVE
-- **Description:** Upstream HTTP proxy (`http://host:port`) used for the proxy's **own** outbound connections to model providers. SOCKS5 is not supported. A per-URL `proxy` set inside a `providers` entry overrides this for that provider. An empty string means "explicitly direct" — it disables any environment/system proxy fallback for all providers.
+- **Description:** Upstream HTTP proxy (`http://host:port`) used for the proxy's **own** outbound connections to model providers. SOCKS5 is not supported: an explicit `proxy` value with a `socks5`/`socks5h` scheme fails startup with an actionable error, while env/system proxies (`HTTPS_PROXY`, …) using such a scheme are ignored with a one-time log warning (traffic falls through to direct). For Clash/mihomo, use the same mixed port over `http://` (e.g. `http://127.0.0.1:7890`). A per-URL `proxy` set inside a `providers` entry overrides this for that provider. An empty string means "explicitly direct" — it disables any environment/system proxy fallback for all providers.
 
 ### `imageBilling`
 

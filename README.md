@@ -728,7 +728,12 @@ Rules:
 - Auto mode honors `NO_PROXY` and the Windows proxy bypass list for
   environment/system fallbacks. A proxy pointing back to bili's own local port
   is ignored or rejected to prevent a loop.
-- HTTP and HTTPS proxy origins are supported. SOCKS5 is not supported yet.
+- HTTP and HTTPS proxy origins are supported. SOCKS5 (`socks5`/`socks5h`) is
+  not supported: an explicit `BILI_UPSTREAM_PROXY` / config `proxy` with such
+  a scheme fails startup with an actionable error, while env/system proxies
+  (`HTTPS_PROXY`, …) with such a scheme are ignored with a one-time warning
+  (traffic then falls through to direct). For Clash/mihomo, point bili at the
+  same mixed port over `http://` (e.g. `http://127.0.0.1:7890`).
 - Both outbound paths are covered: `/bili/` path-mode (fetch) AND MITM CONNECT
   tunnels (the proxy's connection to the real upstream goes through the HTTP
   CONNECT proxy).

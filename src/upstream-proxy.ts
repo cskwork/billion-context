@@ -3,6 +3,7 @@ import net from "node:net";
 import tls from "node:tls";
 import { Pool, ProxyAgent } from "undici";
 import type { ProviderRoutes } from "./config.js";
+import { log as loggerLog } from "./logger.js";
 import { maskHostInText, maskUrlForLog } from "./log-mask.js";
 import { upstreamTimeoutMs } from "./fetch-util.js";
 
@@ -116,8 +117,37 @@ export function parseHttpProxy(proxy?: string, biliPort?: number): ParsedHttpPro
     };
 }
 
+/** Non-http(s) scheme of a proxy value (e.g. "socks5h"), or undefined when the
+ *  value is empty/unparseable/http(s). MUST stay in sync with parseHttpProxy's
+ *  schemeless `http://` normalization — otherwise a bare `host:port` would be
+ *  flagged unsupported while parseHttpProxy accepts it. */
+export function unsupportedProxyScheme(proxy?: string): string | undefined {
+    if (!proxy || typeof proxy !== "string" || !proxy.trim()) return undefined;
+    const candidate = /^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(proxy.trim()) ? proxy.trim() : `http://${proxy.trim()}`;
+    let url: URL;
+    try {
+        url = new URL(candidate);
+    } catch {
+        return undefined;
+    }
+    return url.protocol === "http:" || url.protocol === "https:" ? undefined : url.protocol.replace(/:$/, "");
+}
+
+const warnedUnsupportedSchemes = new Set<string>();
+
+function warnUnsupportedScheme(source: string, value: string, scheme: string): void {
+    const key = `${source}\u0000${scheme}`;
+    if (warnedUnsupportedSchemes.has(key)) return;
+    warnedUnsupportedSchemes.add(key);
+    loggerLog("warn", `[upstream-proxy] ignoring ${source}=${redactProxyUrl(value)}: scheme "${scheme}" is not supported — only http:// and https:// proxy origins work. For Clash/mihomo, point bili at the same mixed port over http:// (e.g. http://127.0.0.1:7890).`);
+}
+
 export function validateHttpProxy(proxy: string | undefined, biliPort?: number): void {
     if (!proxy?.trim()) return;
+    const scheme = unsupportedProxyScheme(proxy);
+    if (scheme) {
+        throw new Error(`upstream proxy uses unsupported scheme "${scheme}" (${redactProxyUrl(proxy)}) — only http:// and https:// proxies are supported; for Clash/mihomo use the same mixed port over http:// (e.g. http://127.0.0.1:7890)`);
+    }
     if (!parseHttpProxy(proxy, biliPort)) {
         throw new Error(`upstream proxy must be an HTTP/HTTPS proxy origin: ${redactProxyUrl(proxy)}`);
     }
@@ -253,12 +283,17 @@ export function resolveProxyDecision(
     for (const [source, value] of environmentCandidates) {
         const parsed = parseFallbackProxy(value, fallback.biliPort);
         if (parsed) return { proxy: parsed.url, source };
+        if (!value) continue;
+        const scheme = unsupportedProxyScheme(value);
+        if (scheme) warnUnsupportedScheme(source, value, scheme);
     }
     const system = fallback.systemProxy ?? readWindowsSystemProxy();
     if (target && matchesNoProxy(target, system.bypass)) {
         return { source: "windows-bypass", ...(system.autoConfigUrl ? { autoConfigUrl: system.autoConfigUrl } : {}) };
     }
     const systemValue = target?.protocol === "http:" ? system.http : system.https ?? system.http;
+    const systemScheme = unsupportedProxyScheme(systemValue);
+    if (systemValue && systemScheme) warnUnsupportedScheme("windows-system", systemValue, systemScheme);
     const systemProxy = parseFallbackProxy(systemValue, fallback.biliPort)?.url;
     if (systemProxy) {
         return {
@@ -487,4 +522,5 @@ export function _resetUpstreamProxyForTest(): void {
     resetProxyCache();
     lastConnection = {};
     windowsProxyCache = undefined;
+    warnedUnsupportedSchemes.clear();
 }
