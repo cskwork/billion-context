@@ -20,6 +20,7 @@ export interface ProxyInstanceFile {
     passthrough: boolean;
     mitmDomains: string[];
     modelWindows: Record<string, number>;
+    modelMaxOutputs?: Record<string, number>;
     launchToken?: string;
 }
 
@@ -45,6 +46,13 @@ export function readProxyInstanceFile(file?: string): ProxyInstanceFile | { orig
                         if (Number.isFinite(n) && n > 0) windows[k] = n;
                     }
                 }
+                const maxOutputs: Record<string, number> = {};
+                if (parsed.modelMaxOutputs && typeof parsed.modelMaxOutputs === "object") {
+                    for (const [k, v] of Object.entries(parsed.modelMaxOutputs)) {
+                        const n = Number(v);
+                        if (Number.isFinite(n) && n > 0) maxOutputs[k] = n;
+                    }
+                }
                 return {
                     origin: parsed.origin,
                     instanceId: typeof parsed.instanceId === "string" ? parsed.instanceId : "",
@@ -55,6 +63,7 @@ export function readProxyInstanceFile(file?: string): ProxyInstanceFile | { orig
                     passthrough: Boolean(parsed.passthrough),
                     mitmDomains: Array.isArray(parsed.mitmDomains) ? parsed.mitmDomains.map(String) : [],
                     modelWindows: windows,
+                    modelMaxOutputs: Object.keys(maxOutputs).length > 0 ? maxOutputs : undefined,
                     launchToken: typeof parsed.launchToken === "string" ? parsed.launchToken : undefined,
                 };
             }

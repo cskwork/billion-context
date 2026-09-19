@@ -31,6 +31,31 @@ export function parseLauncherModelWindows(raw: string | undefined): Record<strin
 
 export const LAUNCHER_MODEL_WINDOWS: Readonly<Record<string, number>> = parseLauncherModelWindows(process.env.BILI_LAUNCHER_MODEL_WINDOWS);
 
+// Same channel for configured max output (#971): BILI_LAUNCHER_MODEL_MAX_OUTPUTS
+// (JSON model-id → maxOutput) read from the client's own config at launch
+// time. Consumed by the #924 output-headroom fallback at the rank below the
+// runtime-info protocol (#955) and above configured/registry.
+export function parseLauncherModelMaxOutputs(raw: string | undefined): Record<string, number> {
+    if (!raw) return {};
+    try {
+        const parsed: unknown = JSON.parse(raw);
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+        const out: Record<string, number> = {};
+        for (const [id, v] of Object.entries(parsed as Record<string, unknown>)) {
+            if (typeof v === "number" && Number.isFinite(v) && v > 0) out[id] = Math.floor(v);
+        }
+        return out;
+    } catch {
+        return {};
+    }
+}
+
+export const LAUNCHER_MODEL_MAX_OUTPUTS: Readonly<Record<string, number>> = parseLauncherModelMaxOutputs(process.env.BILI_LAUNCHER_MODEL_MAX_OUTPUTS);
+
+export function launcherMaxOutput(model: string): number | undefined {
+    return LAUNCHER_MODEL_MAX_OUTPUTS[model];
+}
+
 export function launcherContextWindow(model: string): number | undefined {
     return LAUNCHER_MODEL_WINDOWS[model];
 }

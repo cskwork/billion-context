@@ -88,7 +88,7 @@ import { dumpRejectedBody } from "./error-dump.js";
 import { decodeRequestBody, DecompressedTooLargeError } from "./content-encoding.js";
 import { applyCompatRoles, applyCompatRolesJson, detectRoleRejection, detectSystemPlacementError, resolveCompatRoles, type CompatRoles } from "./compat-roles.js";
 import { bodyDumpEnabled, isModelDiscoveryPath, logDumpFailure, logUnrecognizedPath } from "./server/observability.js";
-import { BILI_HOP_HEADER, anthropicBetaContextWindow, LAUNCHER_MODEL_WINDOWS, launcherContextWindow, parseLauncherModelWindows, windowSourceLogged } from "./server/context-window.js";
+import { BILI_HOP_HEADER, anthropicBetaContextWindow, LAUNCHER_MODEL_WINDOWS, LAUNCHER_MODEL_MAX_OUTPUTS, launcherContextWindow, launcherMaxOutput, parseLauncherModelWindows, windowSourceLogged } from "./server/context-window.js";
 import { buildForwardHeaders, connectionNamedHeaders, NO_IDENTITY_MESSAGE, RESPONSE_ONLY_STRIP_HEADERS, safeSessionId, UPSTREAM_HOP_HEADERS } from "./server/headers.js";
 import { isSideRequest, outputBudgetField, restoreOutputBudget, SIDE_REQUEST_MAX_TOKENS, sideRequestGuard } from "./server/side-request.js";
 import { clampOutgoingOutput, countSystemAndToolsTokens, emergencyNudge, estimateInputTokens, estimateWireOverhead } from "./server/budget.js";
@@ -346,6 +346,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
                 passthrough: opts.passthrough,
                 mitmDomains: opts.mitm.enabled ? opts.mitm.domains : [],
                 modelWindows: { ...LAUNCHER_MODEL_WINDOWS },
+                modelMaxOutputs: Object.keys(LAUNCHER_MODEL_MAX_OUTPUTS).length > 0 ? { ...LAUNCHER_MODEL_MAX_OUTPUTS } : undefined,
                 launchToken: launchToken || undefined,
             });
         } catch {
@@ -1489,6 +1490,24 @@ async function handle(
                     if (!headroomFallbackLogged.has(`${fbModel0 ?? "?"}|runtime-info`)) {
                         headroomFallbackLogged.add(`${fbModel0 ?? "?"}|runtime-info`);
                         log("info", `[headroom] model=${fbModel0 ?? "?"}: request carries no output budget; reserving against runtime-info max output ${runtimeMax} (#955)`);
+                    }
+                }
+            }
+            if (!(maxOutput > 0)) {
+                // Launcher env channel (#971): the client's OWN config declares
+                // this model's output ceiling (codex model_max_output_tokens,
+                // pi/omp maxTokens, opencode limit.output, codebuddy
+                // maxOutputTokens) — handed over at launch time. Below
+                // runtime-info (per-request plugin truth) but above the
+                // generic configured/registry sources, same rank order as the
+                // window chain's launcher tier (1b).
+                const fbLauncher = (parsed as { model?: string }).model;
+                const launcherMax = fbLauncher !== undefined ? launcherMaxOutput(fbLauncher) : undefined;
+                if (typeof launcherMax === "number" && launcherMax > 0) {
+                    maxOutput = launcherMax;
+                    if (!headroomFallbackLogged.has(`${fbLauncher}|launcher`)) {
+                        headroomFallbackLogged.add(`${fbLauncher}|launcher`);
+                        log("info", `[headroom] model=${fbLauncher}: request carries no output budget; reserving against launcher max output ${launcherMax} (#971)`);
                     }
                 }
             }

@@ -233,6 +233,14 @@ of its own. Implementations: `src/agent/pi.ts`, `src/agent/opencode-native.ts`
 (v1), `src/agent/opencode-v2.ts`, `src/agent/dsh-native.ts` — other client
 integrations should follow the same protocol.
 
+The launcher env tier covers pure-proxy clients (no in-process plugin):
+`bili <client>` reads the client's own model config at launch
+(`model_context_window` / `model_max_output_tokens` for codex,
+`contextWindow` / `maxTokens` for pi / omp, `limit.context` / `limit.output`
+for opencode, `maxInputTokens` / `maxOutputTokens` for codebuddy) and hands
+it to the proxy via `BILI_LAUNCHER_MODEL_WINDOWS` / `BILI_LAUNCHER_MODEL_MAX_OUTPUTS`
+(#971). A plugin report — when present — always outranks it.
+
 Before the first model request there is no session yet, so the `/acp` panel
 probes `GET /__bili/plugin/status?conversationId=<agent>&fallback=latest`,
 which answers from the runtime table (`phase: "pre-first-request"`) instead

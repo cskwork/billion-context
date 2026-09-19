@@ -2,13 +2,22 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import { once } from "node:events";
 import test from "node:test";
+import type { ProxyOptions } from "../src/server.ts";
 
 process.env.NODE_ENV = "test";
 
-import { defaultConfig } from "acp-kernel";
-import { startServer, type ProxyOptions } from "../src/server.ts";
-import { SessionStore, _setStoreForTest } from "../src/persist.ts";
-import { _setForTest as setRegistryForTest } from "../src/registry.ts";
+// #971: launcher env channel for max output — set before the dynamic imports
+// below (the server module freezes it at load, mirroring
+// LAUNCHER_MODEL_WINDOWS).
+process.env.BILI_LAUNCHER_MODEL_MAX_OUTPUTS = JSON.stringify({
+    "headroom-launch-model": 80_000,
+    "headroom-rank-model": 10_000,
+});
+
+const { defaultConfig } = await import("acp-kernel");
+const { startServer } = await import("../src/server.ts");
+const { SessionStore, _setStoreForTest } = await import("../src/persist.ts");
+const { _setForTest: setRegistryForTest } = await import("../src/registry.ts");
 
 // #924: harnesses that omit every output-budget field (Codex native Responses
 // sends no max_output_tokens) previously got NO headroom reservation at all —
@@ -56,6 +65,7 @@ type Scenario = {
     models?: Record<string, { context?: number; output?: number }>;
     registry?: Record<string, { limit?: { context?: number; output?: number } }>;
     maxTokens?: number;
+    headers?: Record<string, string>;
 };
 
 async function turn2MessageCount(s: Scenario): Promise<number> {
@@ -97,7 +107,7 @@ async function turn2MessageCount(s: Scenario): Promise<number> {
 
     try {
         const url = `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/chat/completions`;
-        const headers = { "content-type": "application/json", "x-acp-session": s.session };
+        const headers = { "content-type": "application/json", "x-acp-session": s.session, ...(s.headers ?? {}) };
         const budget = s.maxTokens !== undefined ? { max_tokens: s.maxTokens } : {};
         const r1 = await fetch(url, {
             method: "POST",
@@ -163,4 +173,31 @@ test("e2e #924: an explicit request budget outranks the configured output", asyn
         models: { "headroom-model-a": { context: 200_000, output: 80_000 } },
         maxTokens: 10_000,
     }), 30);
+});
+
+test("e2e #971: launcher-env max output stands in with nothing configured", async () => {
+    // BILI_LAUNCHER_MODEL_MAX_OUTPUTS carries 80k for this model (set before
+    // the server import above): reserved min(80k, 50k)=50k → effective 150k →
+    // 80% → nudge. Without the channel it stays 60% of the full window → 30.
+    assert.equal(await turn2MessageCount({
+        session: "hf-launcher",
+        model: "headroom-launch-model",
+    }), 31);
+});
+
+test("e2e #971: runtime-info headers outrank the launcher env", async () => {
+    // Plugin headers report 180k while the launcher env carries 10k for the
+    // SAME model. The plugin is the per-request truth (its number is what the
+    // client actually asks the upstream for): reserved min(180k, 50k)=50k →
+    // 150k effective → 80% → nudge (31). If the launcher env wrongly won,
+    // reserved 10k → 190k → 63% → 30.
+    assert.equal(await turn2MessageCount({
+        session: "hf-rank",
+        model: "headroom-rank-model",
+        headers: {
+            "x-bili-plugin": "pi",
+            "x-bili-plugin-model": "headroom-rank-model",
+            "x-bili-plugin-max-output": "180000",
+        },
+    }), 31);
 });

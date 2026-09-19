@@ -31,7 +31,8 @@ test("parseOmpYaml: captures per-model contextWindow (models after baseUrl)", ()
     ].join("\n");
     const cfg = parseOmpYaml(yml);
     assert.equal(cfg.providers["sglang-responses"]?.baseUrl, "http://127.0.0.1:8199/v1");
-    assert.deepEqual(cfg.providers["sglang-responses"]?.models, [{ id: "qwen3.8-27b", contextWindow: 262144 }]);
+    // #971: maxTokens at model-entry depth now completes the entry as maxOutput.
+    assert.deepEqual(cfg.providers["sglang-responses"]?.models, [{ id: "qwen3.8-27b", contextWindow: 262144, maxOutput: 32768 }]);
 });
 
 test("parseOmpYaml: baseUrl AFTER models: is still captured", () => {
@@ -87,7 +88,8 @@ test("readPiConfig: captures models[].contextWindow from models.json", () => {
         }),
     );
     const cfg = readPiConfig(home);
-    assert.deepEqual(cfg.providers.lb?.models, [{ id: "glm-5.2", contextWindow: 1000000 }]);
+    // #971: models[].maxTokens now completes the entry as maxOutput.
+    assert.deepEqual(cfg.providers.lb?.models, [{ id: "glm-5.2", contextWindow: 1000000, maxOutput: 131072 }]);
 });
 
 test("readOpencodeConfig: captures models.<id>.limit", () => {

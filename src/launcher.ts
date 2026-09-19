@@ -54,7 +54,7 @@ import { selfPackageRoot, isBiliPiEntry, ompPluginLoadedFrom, dshNativeInstalled
 function selfDistFile(name: string): string {
     return path.join(selfPackageRoot(), "dist", name);
 }
-import { nonEmpty, resolvePiHome, resolveOmpHome, resolveDshHome, resolveCodexHome, loadClientConfig, collectModelWindows, type ClientConfig, type CodexConfig, resolveOpencodeConfigFile, readOpencodeConfigRoot, opencodePluginBaseDir, type OpencodeConfig, type OpencodeProvider, type HermesConfig, type HermesProvider, qoderIsCnSite, QODER_DEFAULT_MODEL_HOSTS, resolveTraeHome, readTraeConfig, TRAE_DEFAULT_MODEL_HOSTS, JCODE_DEFAULT_MODEL_HOSTS, type TraeConfig, resolveKimiHome, readKimiConfig, parseKimiToml, KIMI_DEFAULT_MODEL_HOSTS, type KimiConfig, type KimiProvider, readOpencodeProjectLayer, type OpencodeProjectLayer } from "./client-config.js";
+import { nonEmpty, resolvePiHome, resolveOmpHome, resolveDshHome, resolveCodexHome, loadClientConfig, collectModelWindows, collectModelMaxOutputs, type ClientConfig, type CodexConfig, resolveOpencodeConfigFile, readOpencodeConfigRoot, opencodePluginBaseDir, type OpencodeConfig, type OpencodeProvider, type HermesConfig, type HermesProvider, qoderIsCnSite, QODER_DEFAULT_MODEL_HOSTS, resolveTraeHome, readTraeConfig, TRAE_DEFAULT_MODEL_HOSTS, JCODE_DEFAULT_MODEL_HOSTS, type TraeConfig, resolveKimiHome, readKimiConfig, parseKimiToml, KIMI_DEFAULT_MODEL_HOSTS, type KimiConfig, type KimiProvider, readOpencodeProjectLayer, type OpencodeProjectLayer } from "./client-config.js";
 import { loadRoutes, resolveConfiguredContextLimit, lookupContextLimit, type ProviderRoutes } from "./config.js";
 import { contextFromRegistry } from "./registry.js";
 
@@ -156,6 +156,10 @@ export interface LaunchOptions {
      *  BILI_LAUNCHER_MODEL_WINDOWS so the nudge denominator matches the
      *  client's real window instead of the built-in table guess. */
     modelWindows?: Record<string, number>;
+    /** Per-model configured max output (#971), same sources as
+     *  modelWindows. Handed to the spawned proxy via
+     *  BILI_LAUNCHER_MODEL_MAX_OUTPUTS for the output-headroom reservation. */
+    modelMaxOutputs?: Record<string, number>;
 }
 
 export interface ProxyHandle {
@@ -1901,7 +1905,11 @@ function instanceCompatible(inst: ProxyInstanceFile, opts: LaunchOptions): boole
     const wantWindows = opts.modelWindows ?? {};
     const keys = Object.keys(wantWindows);
     if (Object.keys(inst.modelWindows).length !== keys.length) return false;
-    return keys.every((k) => inst.modelWindows[k] === wantWindows[k]);
+    if (!keys.every((k) => inst.modelWindows[k] === wantWindows[k])) return false;
+    const wantMax = opts.modelMaxOutputs ?? {};
+    const maxKeys = Object.keys(wantMax);
+    if (Object.keys(inst.modelMaxOutputs ?? {}).length !== maxKeys.length) return false;
+    return maxKeys.every((k) => (inst.modelMaxOutputs ?? {})[k] === wantMax[k]);
 }
 
 async function probeExistingInstance(
@@ -2140,6 +2148,9 @@ export async function ensureProxyRunning(
                             : {}),
                         ...(opts.modelWindows && Object.keys(opts.modelWindows).length > 0
                             ? { BILI_LAUNCHER_MODEL_WINDOWS: JSON.stringify(opts.modelWindows) }
+                            : {}),
+                        ...(opts.modelMaxOutputs && Object.keys(opts.modelMaxOutputs).length > 0
+                            ? { BILI_LAUNCHER_MODEL_MAX_OUTPUTS: JSON.stringify(opts.modelMaxOutputs) }
                             : {}),
                     },
                 },
@@ -2433,7 +2444,7 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
     // used to resolve the budget-alignment window, #321).
     const biliRoutes = loadRoutes(process.env);
     const domains = dedupeInOrder([...routes.httpsDomains, ...(params.mitmDomains ?? [])]);
-    const handle = await ensureProxyRunning({ host, port, passthrough, debug, mitmDomains: domains, modelWindows: collectModelWindows(config, base) }, deps);
+    const handle = await ensureProxyRunning({ host, port, passthrough, debug, mitmDomains: domains, modelWindows: collectModelWindows(config, base), modelMaxOutputs: collectModelMaxOutputs(config, base) }, deps);
     console.error(
         `bili: started proxy at ${handle.origin} (MITM domains: ${domains.length ? domains.join(", ") : "defaults"})` +
             ((base !== "kimi" && routes.httpRewrites.length > 0) ? ` (HTTP /bili/ rewrites: ${routes.httpRewrites.length})` : "") +
@@ -2791,7 +2802,7 @@ export async function runTestPi(params: RunTestPiParams, deps: LauncherDeps = {}
         ...discoverDomains("pi", config),
         ...(params.mitmDomains ?? []),
     ]);
-    const handle = await ensureProxyRunning({ host, port, passthrough, debug, mitmDomains: domains, modelWindows: collectModelWindows(config, "pi") }, deps);
+    const handle = await ensureProxyRunning({ host, port, passthrough, debug, mitmDomains: domains, modelWindows: collectModelWindows(config, "pi"), modelMaxOutputs: collectModelMaxOutputs(config, "pi") }, deps);
     console.error(
         `bili: started proxy at ${handle.origin} (MITM domains: ${domains.length ? domains.join(", ") : "defaults"})`,
     );
