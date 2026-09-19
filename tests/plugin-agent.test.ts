@@ -9,6 +9,7 @@ import test from "node:test";
 process.env.NODE_ENV = "test";
 
 import { proxyBaseFromUrl, proxyBaseFromEnv, detectProxyBase, fetchManifest, forwardTool, fetchStatus } from "../src/agent/shared.ts";
+import { wrapCacheReport } from "../src/acp-panel.ts";
 import biliPlugin, { createBiliPlugin } from "../src/agent/pi.ts";
 import ompPlugin from "../src/agent/omp.ts";
 import { pluginInstall, pluginRemove, pluginStatusAll, PLUGIN_AGENTS, selfPackageRoot, pickPluginKey, detectOpencodeMajor, piEntryFor, PI_NPM_ENTRY, isPiEntry } from "../src/plugin-install.ts";
@@ -694,6 +695,125 @@ test("/acp falls back to notify when pi.sendMessage throws", async () => {
         assert.equal(notes[0], "PANEL-BODY");
     } finally {
         await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+});
+
+function startCacheReportProxy(result: string | undefined, error?: string): Promise<{ origin: string; calls: Array<{ conversationId: string; tool: string }>; close(): Promise<void> }> {
+    const calls: Array<{ conversationId: string; tool: string }> = [];
+    const server = http.createServer((req, res) => {
+        if (req.url === "/__bili/plugin/tool" && req.method === "POST") {
+            let body = "";
+            req.on("data", (c) => (body += c));
+            req.on("end", () => {
+                const data = JSON.parse(body) as { conversationId: string; tool: string };
+                calls.push({ conversationId: data.conversationId, tool: data.tool });
+                res.writeHead(200, { "content-type": "application/json" });
+                if (error !== undefined) res.end(JSON.stringify({ ok: false, error }));
+                else res.end(JSON.stringify({ ok: true, result }));
+            });
+            return;
+        }
+        res.writeHead(404);
+        res.end("{}");
+    });
+    return new Promise((resolve) => {
+        server.listen(0, "127.0.0.1", () => {
+            resolve({
+                origin: `http://127.0.0.1:${(server.address() as { port: number }).port}`,
+                calls,
+                close: () => new Promise<void>((r) => server.close(() => r())),
+            });
+        });
+    });
+}
+
+test("/acp-cache forwards acp_cache and persists the wrapped report via sendMessage (#800)", async () => {
+    const proxy = await startCacheReportProxy("CACHE-REPORT-BODY");
+    try {
+        const sent: Array<{ customType: string; content: string; display: boolean }> = [];
+        const notes: string[] = [];
+        const pi = { ...makeFakePi(), sendMessage: (m: { customType: string; content: string; display: boolean }) => sent.push(m) };
+        createBiliPlugin()(pi as never);
+        const cmd = pi.commands.get("acp-cache");
+        assert.ok(cmd, "acp-cache command should be registered");
+        const ctx = {
+            sessionManager: { getSessionId: () => "sess-cache" },
+            model: { baseUrl: `${proxy.origin}/bili/https://api.example.com/v1` },
+            ui: { notify: (msg: string) => notes.push(msg) },
+        };
+        await cmd!.handler("", ctx);
+        // the model-facing tool is forwarded with the session's conversation id
+        assert.deepEqual(proxy.calls, [{ conversationId: "sess-cache", tool: "acp_cache" }]);
+        assert.equal(sent.length, 1, "one custom message sent");
+        assert.equal(notes.length, 0, "notify must not fire when sendMessage is available");
+        assert.equal(sent[0]!.customType, "bili-acp-cache");
+        assert.equal(sent[0]!.display, true);
+        assert.equal(sent[0]!.content, wrapCacheReport("CACHE-REPORT-BODY"));
+    } finally {
+        await proxy.close();
+    }
+});
+
+test("/acp-cache falls back to raw-text notify when the host has no sendMessage (#800)", async () => {
+    const proxy = await startCacheReportProxy("CACHE-REPORT-BODY");
+    try {
+        const notes: Array<{ msg: string; type?: string }> = [];
+        const pi = makeFakePi();
+        createBiliPlugin()(pi as never);
+        const cmd = pi.commands.get("acp-cache")!;
+        const ctx = {
+            sessionManager: { getSessionId: () => "sess-cache" },
+            model: { baseUrl: `${proxy.origin}/bili/https://api.example.com/v1` },
+            ui: { notify: (msg: string, type?: string) => notes.push({ msg, type }) },
+        };
+        await cmd.handler("", ctx);
+        assert.equal(notes.length, 1, "notify fallback fires");
+        assert.equal(notes[0]!.type, "info");
+        // transient notice carries the RAW report (no wrapper) — the wrapper is
+        // only meaningful for the persistent-message strip path.
+        assert.equal(notes[0]!.msg, "CACHE-REPORT-BODY");
+    } finally {
+        await proxy.close();
+    }
+});
+
+test("/acp-cache warns when no proxy is detected (#800)", async () => {
+    await withEnv({ BILLION_CONTEXT_PROXY: undefined }, async () => {
+        const pi = makeFakePi();
+        createBiliPlugin()(pi as never);
+        const cmd = pi.commands.get("acp-cache")!;
+        const notes: Array<{ msg: string; type?: string }> = [];
+        const ctx = {
+            sessionManager: { getSessionId: () => "sess" },
+            model: { baseUrl: "https://api.example.com/v1" },
+            ui: { notify: (msg: string, type?: string) => notes.push({ msg, type }) },
+        };
+        await cmd.handler("", ctx);
+        assert.equal(notes.length, 1);
+        assert.equal(notes[0]!.type, "warning");
+        assert.match(notes[0]!.msg, /no proxy detected/);
+    });
+});
+
+test("/acp-cache reports a proxy-side failure via notify error (#800)", async () => {
+    const proxy = await startCacheReportProxy(undefined, "boom");
+    try {
+        const notes: Array<{ msg: string; type?: string }> = [];
+        const pi = makeFakePi();
+        createBiliPlugin()(pi as never);
+        const cmd = pi.commands.get("acp-cache")!;
+        const ctx = {
+            sessionManager: { getSessionId: () => "sess-cache" },
+            model: { baseUrl: `${proxy.origin}/bili/https://api.example.com/v1` },
+            ui: { notify: (msg: string, type?: string) => notes.push({ msg, type }) },
+        };
+        await cmd.handler("", ctx);
+        assert.equal(notes.length, 1);
+        assert.equal(notes[0]!.type, "error");
+        assert.match(notes[0]!.msg, /cache report failed/);
+        assert.match(notes[0]!.msg, /boom/);
+    } finally {
+        await proxy.close();
     }
 });
 

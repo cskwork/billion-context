@@ -5,6 +5,7 @@
 // minimal structural declarations — the bundled artifact imports NOTHING
 // from the host at runtime (the host duck-types us in).
 
+import { wrapCacheReport } from "../acp-panel.js";
 import { detectProxyBase, fetchManifest, forwardTool, fetchStatus, fetchProxyVersion, reportRuntimeInfoOnChange, type ManifestTool } from "./shared.js";
 
 type Ctx = {
@@ -169,6 +170,18 @@ function parseProviderRewrites(env: NodeJS.ProcessEnv): Record<string, string> |
         out[key] = value;
     }
     return Object.keys(out).length > 0 ? out : undefined;
+}
+
+// #788: neutral wording — the plugin also loads under plain pi/omp launches
+// where the user never intended proxy mode (e.g. they use billion-context-pi
+// in-process instead), so offer both exits instead of assuming proxy intent.
+function noProxyWarning(agent: string): string {
+    const removeHint = agent === "pi"
+        ? ", or remove this plugin (`bili plugin remove pi`) if you use billion-context-pi or don't want a proxy"
+        : agent === "omp"
+            ? ", or remove this plugin (`bili plugin remove omp`) if you don't want a proxy"
+            : "";
+    return `bili: no proxy detected — run via \`bili ${agent}\` (or set a /bili/ baseURL) to use proxy mode${removeHint}`;
 }
 
 const RETRY_INTERVAL_MS = 10000;
@@ -362,16 +375,7 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
                     };
                     const proxyBase = detectProxyBase(ctx.model?.baseUrl);
                     if (proxyBase === undefined) {
-                        // #788: neutral wording — the plugin also loads under plain
-                        // pi/omp launches where the user never intended proxy mode
-                        // (e.g. they use billion-context-pi in-process instead), so
-                        // offer both exits instead of assuming proxy intent.
-                        const removeHint = agent === "pi"
-                            ? ", or remove this plugin (`bili plugin remove pi`) if you use billion-context-pi or don't want a proxy"
-                            : agent === "omp"
-                                ? ", or remove this plugin (`bili plugin remove omp`) if you don't want a proxy"
-                                : "";
-                        notify(`bili: no proxy detected — run via \`bili ${agent}\` (or set a /bili/ baseURL) to use proxy mode${removeHint}`, "warning");
+                        notify(noProxyWarning(agent), "warning");
                         return;
                     }
                     const conversationId = sessionIdOf(ctx) ?? "unknown";
@@ -413,6 +417,48 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
                     if (typeof pi.sendMessage === "function") {
                         try {
                             pi.sendMessage({ customType: "bili-acp-status", content: text, display: true });
+                            return;
+                        } catch (err) {
+                            console.error(`bili-plugin(${agent}): sendMessage failed (${err instanceof Error ? err.message : String(err)}) — falling back to notify`);
+                        }
+                    }
+                    notify(text, "info");
+                },
+            });
+            // #800: human entry point for the cache-reconciliation feature — the model side
+            // already has the acp_cache tool; this command shows humans the identical report
+            // (both paths hit handleAcpCache on the proxy). Launcher mode and native mode both
+            // load this factory (see pi-native.ts), so one registration covers both.
+            pi.registerCommand("acp-cache", {
+                description: "Prompt-cache reconciliation for this session (same report as the acp_cache tool)",
+                handler: async (_args, ctx) => {
+                    const notify = (message: string, type?: string): void => {
+                        try {
+                            ctx.ui?.notify?.(message, type);
+                        } catch {
+                            // host UI unavailable — the command is best-effort
+                        }
+                    };
+                    const proxyBase = detectProxyBase(ctx.model?.baseUrl);
+                    if (proxyBase === undefined) {
+                        notify(noProxyWarning(agent), "warning");
+                        return;
+                    }
+                    const conversationId = sessionIdOf(ctx) ?? "unknown";
+                    let text: string;
+                    try {
+                        text = await forwardTool(proxyBase, conversationId, "acp_cache", {});
+                    } catch (err) {
+                        notify(`bili: cache report failed: ${err instanceof Error ? err.message : String(err)}`, "error");
+                        return;
+                    }
+                    // Persistent transcript output (TUI + web hosts like pi-web). The proxy strips
+                    // the wrapped message from the model context by content signature
+                    // (src/acp-panel.ts), so it never reaches the LLM; notify() is the fallback
+                    // for hosts without sendMessage (older pi).
+                    if (typeof pi.sendMessage === "function") {
+                        try {
+                            pi.sendMessage({ customType: "bili-acp-cache", content: wrapCacheReport(text), display: true });
                             return;
                         } catch (err) {
                             console.error(`bili-plugin(${agent}): sendMessage failed (${err instanceof Error ? err.message : String(err)}) — falling back to notify`);

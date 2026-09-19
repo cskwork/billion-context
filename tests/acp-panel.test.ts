@@ -2,7 +2,7 @@ import assert from "node:assert";
 import test from "node:test";
 import { createInitialState } from "acp-kernel";
 import { buildStatusPanel } from "acp-kernel/panel";
-import { isAcpPanelText, stripAcpPanelMessages, stripAcpPanelResponsesInput } from "../src/acp-panel.ts";
+import { CACHE_REPORT_CLOSE, CACHE_REPORT_OPEN, isAcpPanelText, stripAcpPanelMessages, stripAcpPanelResponsesInput, wrapCacheReport } from "../src/acp-panel.ts";
 
 // Generate the REAL panel the proxy produces (handlePluginStatus →
 // buildStatusPanel), so the signature test tracks acp-kernel's actual output
@@ -107,4 +107,64 @@ test("stripAcpPanelResponsesInput removes panel user items, keeps others", () =>
 test("stripAcpPanelResponsesInput is a no-op on string input and non-arrays", () => {
     assert.equal(stripAcpPanelResponsesInput(realPanel()), 0);
     assert.equal(stripAcpPanelResponsesInput(undefined), 0);
+});
+
+// #800: /acp-cache persists the kernel cache report via wrapCacheReport. The
+// report shape is kernel-owned (variable-length LINE ITEMS table), so only the
+// plugin's own wrapper marks it as strippable — an unwrapped report (e.g. one
+// the model produced via the acp_cache tool, or user-typed) must survive.
+const REPORT = [
+    "ACP CACHE REPORT (sess-x) \u2014 3 requests",
+    "",
+    "GRAND LEDGER   input=90K  cached=60K  hit rate 66.7%  (of non-system input 30K)",
+    "  new content         25K   27.8%",
+    "  compression re-pay   5K   5.6%",
+    "  TTL expiry           0K   0.0%",
+    "  identity check   OK \u2014 30K = 25K + 5K + 0K (residual 0)",
+].join("\n");
+
+test("isAcpPanelText detects the wrapped cache report (#800)", () => {
+    assert.equal(isAcpPanelText(wrapCacheReport(REPORT)), true);
+});
+
+test("isAcpPanelText rejects an unwrapped cache report (only the plugin's wrapper is stripped)", () => {
+    assert.equal(isAcpPanelText(REPORT), false);
+});
+
+test("isAcpPanelText rejects a wrapped report with a follow-up appended (suffix case)", () => {
+    assert.equal(isAcpPanelText(`${wrapCacheReport(REPORT)}\nmy follow-up question`), false, "report + follow-up is a real user message");
+    assert.equal(isAcpPanelText(`${wrapCacheReport(REPORT)} and what about X?`), false, "report + inline follow-up preserved");
+});
+
+test("isAcpPanelText tolerates surrounding whitespace on the wrapped report", () => {
+    assert.equal(isAcpPanelText(`\n  ${wrapCacheReport(REPORT)}  \n`), true);
+});
+
+test("isAcpPanelText rejects a message that merely quotes the wrapper markers", () => {
+    assert.equal(isAcpPanelText(`here is my custom block:\n${CACHE_REPORT_OPEN}\nsome text\n${CACHE_REPORT_CLOSE}\nafter`), false, "markers inside a longer message are not a report");
+});
+
+test("stripAcpPanelMessages removes wrapped-report user messages (string + block content)", () => {
+    const messages = [
+        { role: "user", content: "hi" },
+        { role: "user", content: wrapCacheReport(REPORT) },
+        { role: "user", content: [{ type: "text", text: wrapCacheReport(REPORT) }] },
+        { role: "assistant", content: wrapCacheReport(REPORT) },
+        { role: "user", content: "next question" },
+    ];
+    const stripped = stripAcpPanelMessages(messages);
+    assert.equal(stripped, 2, "two wrapped-report user messages removed");
+    assert.deepEqual(messages.map((m) => m.role), ["user", "assistant", "user"]);
+});
+
+test("stripAcpPanelResponsesInput removes wrapped-report user items, keeps others", () => {
+    const input = [
+        { type: "message", role: "user", content: "hi" },
+        { type: "message", role: "user", content: wrapCacheReport(REPORT) },
+        { role: "user", content: [{ type: "input_text", text: wrapCacheReport(REPORT) }] },
+        { type: "function_call", name: "compress", arguments: "{}", id: "fc1" },
+    ];
+    const stripped = stripAcpPanelResponsesInput(input);
+    assert.equal(stripped, 2, "two wrapped-report user items removed (typed + type-less)");
+    assert.deepEqual(input.map((i) => i.type ?? "message"), ["message", "function_call"]);
 });
