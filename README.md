@@ -154,6 +154,7 @@ Pick by your client:
 | **opencode 2.0+** | `bili opencode` (built-in V2 plugin — native tools, no separate package) or `bili plugin install opencode` (self-spawning native plugin, no launcher) |
 | **omp** | [`billion-context`](https://github.com/ranxianglei/billion-context) via `bili omp` (built-in plugin) or `bili plugin install omp` (self-spawning native plugin, no launcher) |
 | **dsh** | `bili dsh` (launcher — full native plugin via `--patch`: tools, session-bound `/acp`, fetch intercept) or `bili plugin install dsh` ≡ `dsh plugin --profile <name> add billion-context` (one unified lane — pnpm-installs the package into each profile so dsh mounts the bundled patch layer; the bili form just drives dsh's own channel per profile and migrates legacy managed blocks) |
+| **kimi** | `bili plugin install kimi` (self-spawning native plugin, no launcher — Kimi Code ≥ 2.0.0; per-session routing block in `~/.kimi-code/config.toml`) or `bili kimi` (launcher, cert-MITM) or `/bili/` prefix |
 | **claude** | `bili claude` (launcher) or `bili plugin install claude` (native posture, #964 — managed settings block + session-owned proxy; see the notes below) |
 | **everything else** (no context hook) | [`billion-context`](https://github.com/ranxianglei/billion-context) — `bili <client>` (launcher, preferred) or `/bili/` prefix |
 
@@ -185,18 +186,19 @@ Three ways to use it — pick one:
 - **URL change (persistent):** prefix your client's baseURL with the proxy
   origin + `/bili/`.
 
-### Option 1 — Native plugin (`bili plugin install pi` / `omp` / `opencode` / `dsh`)
+### Option 1 — Native plugin (`bili plugin install pi` / `omp` / `opencode` / `dsh` / `kimi`)
 
 The proxy lives inside the client: install once, then start the client
 exactly as you always do — no launcher command, no env vars, no fixed port,
 no URL edits. Supported today for **pi**, **omp**, **opencode** (1.x and
-2.x) and **dsh**:
+2.x), **dsh** and **kimi**:
 
 ```bash
 bili plugin install pi          # registers a "billion-context" entry in pi's settings (npm form when bili itself was npm-installed)
 bili plugin install omp         # registers an extensions entry in omp's config.yml (~/.omp/agent/config.yml)
 bili plugin install opencode    # registers the plugin in opencode's real config + disables native auto-compaction
 bili plugin install dsh         # runs 'dsh plugin --profile <name> add billion-context' for every existing profile
+bili plugin install kimi        # writes $KIMI_CODE_HOME/plugins/managed/billion-context/kimi.plugin.json (+ installed.json record); per-session routing block lands in config.toml on first start (Kimi Code >= 2.0.0)
 bili plugin remove <client>     # undo (dsh removes through the same channel; config snapshots go to .bili-bak)
 ```
 
@@ -213,7 +215,7 @@ mode), and binds the `/acp` panel to the current session. It also reports
 the client's **own model config** to the proxy (runtime-info protocol,
 #955) so compression budgets use the real window instead of a registry
 guess. Opt-out envs: `BILI_NATIVE_PI=0`, `BILI_NATIVE_OMP=0`,
-`BILI_NATIVE_OPENCODE=0`, `BILI_NATIVE_DSH=0`.
+`BILI_NATIVE_OPENCODE=0`, `BILI_NATIVE_DSH=0`, `BILI_NATIVE_KIMI=0`.
 
 #### Runtime-info protocol (#955)
 
@@ -233,8 +235,10 @@ env > route config > models.dev registry > built-in table. A reported
 `maxOutput` only stands in when the request body carries no output budget
 of its own. Implementations: `src/agent/pi.ts` (covers pi and omp),
 `src/agent/opencode-native.ts` (v1), `src/agent/opencode-v2.ts`,
-`src/agent/dsh-native.ts` — other client integrations should follow the same
-protocol.
+`src/agent/dsh-native.ts`, `src/kimi/native-mcp.ts` (bootstrap-time report
+only — kimi's provider `custom_headers` are static, so per-request headers
+would go stale on model switch) — other client integrations should follow
+the same protocol.
 
 The launcher env tier covers pure-proxy clients (no in-process plugin):
 `bili <client>` reads the client's own model config at launch
@@ -259,6 +263,10 @@ Notes:
   to stand down cleanly).
 - On OpenCode 1.x, pre-migration `opencode-acp` sessions keep working
   (v1 lane routing, #920) — see "OpenCode 1.x" below.
+- `kimi` reports runtime-info at bootstrap only (static `custom_headers` can't
+  carry per-request window/model headers without going stale on model switch)
+  and binds subagent conversations by per-call `conversation_id` — full
+  mechanics in the "Kimi Code" section below.
 - `codex` has a companion install too (an MCP shell), but it needs a running
   proxy — it is not native mode.
 - `claude` also has a **native posture** (#964, hybrid): Claude Code has no
@@ -516,6 +524,60 @@ simply bypassed); already-routed `/bili/`-prefixed requests pass through
 untouched except for header stamping. Known limitation: manual
 `/compact` has no dsh-side event hook, so its boundary is left to the
 kernel's natural ingest diff (auto-compaction is off, so this is rare).
+
+#### Kimi Code (Moonshot)
+
+Three aligned modes: `bili kimi` (launcher, cert-MITM — Option 2), `/bili/`
+URL prefix, and native plugin mode (`bili plugin install kimi`, #963). Kimi
+Code v2's plugin system is declarative only (`kimi.plugin.json`: MCP servers,
+hooks, skills — no in-process JS execution), so bili cannot patch the client's
+fetch stack like it does for pi/opencode/dsh. Instead the plugin ships two
+small node scripts that do the work around the client:
+
+- **Install:** `bili plugin install kimi` writes
+  `$KIMI_CODE_HOME/plugins/managed/billion-context/kimi.plugin.json`
+  declaring a stdio MCP server (`node <root>/dist/kimi/native-mcp.js`) plus a
+  `SessionStart` hook (`node <root>/dist/kimi/bootstrap-hook.js`, 30 s
+  timeout), and registers the plugin in
+  `$KIMI_CODE_HOME/plugins/installed.json`. The installer requires
+  `kimi --version` ≥ 2.0.0 and refuses below that (the launcher still works
+  either way). Remove with `bili plugin remove kimi` (managed dir + registry
+  record + config restore).
+- **Per-session bootstrap:** kimi spawns the MCP server as a direct child for
+  each session; at startup it attaches to a healthy proxy
+  (`BILLION_CONTEXT_PROXY`) or spawns its own on an ephemeral port, then
+  rewrites the client's routing with an idempotent, line-surgical managed
+  block in `~/.kimi-code/config.toml`: an own provider `[providers.bili]`
+  (`base_url = http://127.0.0.1:<port>/bili/<upstream>`, cloning the active
+  provider's `oauth` / `api_key` reference verbatim), a `[models.bili-kimi]`
+  alias, and a top-level `default_model` redirect with the previous value
+  recorded inside the block. The original file is snapshotted to
+  `config.toml.bili-bak` once; every write happens under a mkdir lockfile and
+  user content outside the block is never touched. Kimi's config hot-reload
+  applies the change to live sessions. The `SessionStart` hook runs the same
+  bootstrap opportunistically (attach-only — it never spawns); its
+  non-blocking race is tolerated by design: round 1 may ride direct/wire mode,
+  and the invariant is never pointing `base_url` at a dead port.
+- **Plugin-mode stamping:** the block gains
+  `custom_headers = { x-bili-plugin = "kimi" }` ONLY after the ACP tool list
+  has been verified against the live proxy manifest — until then traffic rides
+  wire mode. Because `custom_headers` are static per provider they cannot
+  carry per-request window/model headers without going stale on model switch;
+  the runtime-info report therefore happens at bootstrap only (model + context
+  window + max output from the client's own config whenever present).
+- **Watchdog & lifecycle:** the MCP child probes the proxy every 30 s. In
+  attach mode it waits forever (it never touches a user-owned proxy); in spawn
+  mode a dead proxy is respawned and the routing rewritten to the new origin.
+  If recovery fails, the managed block is removed so traffic degrades back to
+  direct upstream rather than hitting a dead port. When a session ends, kimi
+  kills the MCP child and the parent-pid watchdog tears down the spawned
+  proxy. Multiple concurrent TUIs share the first-spawned proxy; when it goes
+  away the remaining sessions respawn and re-route automatically.
+- **Known limitations:** subagent conversations get their own derived proxy
+  sessions (kimi exposes no stable session id; tool calls bind via the
+  per-call `conversation_id` argument), and kimi's native auto-compaction is
+  NOT pushed out — ACP compression simply fires first, as in launcher mode.
+  Opt-out: `BILI_NATIVE_KIMI=0`.
 
 ### Verify
 

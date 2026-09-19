@@ -1079,8 +1079,8 @@ test("plugin install/remove roundtrips for pi/omp/codex/opencode under a fake HO
         assert.match(pluginRemove("claude"), /not installed/);
 
         const rows = pluginStatusAll();
-        assert.equal(rows.length, 6);
-        assert.deepEqual(PLUGIN_AGENTS, ["pi", "omp", "claude", "codex", "opencode", "dsh"]);
+        assert.equal(rows.length, 7);
+        assert.deepEqual(PLUGIN_AGENTS, ["pi", "omp", "claude", "codex", "opencode", "dsh", "kimi"]);
     });
     fs.rmSync(home, { recursive: true, force: true });
 });
@@ -1359,7 +1359,7 @@ test("plugin list survives a broken host config (per-row error, no crash)", asyn
     await withEnv(hintEnv(home, piAgentDir), async () => {
         fs.writeFileSync(path.join(home, ".claude.json"), "{ broken json");
         const rows = pluginStatusAll();
-        assert.equal(rows.length, 6);
+        assert.equal(rows.length, 7);
         // #964: claude status never throws — a broken .claude.json just means
         // "MCP face unreadable" (false); the managed block reads settings.json
         // separately, so the row degrades to not-installed instead of error.

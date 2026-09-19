@@ -15,6 +15,9 @@
 //   dsh      no file of its own — drives dsh's own plugin channel per profile
 //            (`dsh plugin --profile <name> add|remove`, #966); profile copies
 //            follow global self-updates via dsh-channel.refreshDshProfileBundles
+//   kimi     $KIMI_CODE_HOME/plugins/managed/billion-context/kimi.plugin.json
+//            + installed.json record (stdio MCP + SessionStart hook; config.toml
+//            routing happens per-session, see src/kimi/)
 // Installers throw on failure (bad/locked config, missing host CLI); the CLI
 // layer catches, prints `bili plugin: <msg>` and exits 1.
 
@@ -24,10 +27,11 @@ import os from "node:os";
 import { execFileSync, spawnSync } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { applyEdits, modify as jsoncModify, parse as jsoncParse, type ParseError } from "jsonc-parser";
-import { resolveDshHome, resolvePiHome } from "./client-config.js";
+import { resolveDshHome, resolveKimiHome, resolvePiHome } from "./client-config.js";
 import { clearClaudeNativePort, resolveClaudeNativePort, saveClaudeNativePort } from "./config.js";
 import { isPidAlive, isProxyInstanceFile, readProxyInstanceFile } from "./instance.js";
 import { DSH_PACKAGE, dshBundleInstalled, dshHasLegacyManagedBlock, dshProfileDependsOnBili, dshProfileDirs, runDshPlugin, stripLegacyManagedBlock } from "./dsh-channel.js";
+import { restoreKimiBackup, unrouteKimi } from "./kimi/native.js";
 
 /** #403: never freeze a dead or unverifiable origin into a client's
  *  persistent config — the MCP shell would dial it forever. An explicit
@@ -46,7 +50,7 @@ function proxyOriginForInstall(): string {
     return inst.origin;
 }
 
-export const PLUGIN_AGENTS = ["pi", "omp", "claude", "codex", "opencode", "dsh"] as const;
+export const PLUGIN_AGENTS = ["pi", "omp", "claude", "codex", "opencode", "dsh", "kimi"] as const;
 export type PluginAgent = (typeof PLUGIN_AGENTS)[number];
 
 export function selfPackageRoot(): string {
@@ -1171,6 +1175,154 @@ export function dshNativeInstalled(env: NodeJS.ProcessEnv = process.env): boolea
     return dirs.some((dir) => dshBundleInstalled(dir) || dshHasLegacyManagedBlock(dir));
 }
 
+// — kimi ————————————————————————————————————————————————————————————————
+// #963: Kimi Code (v2 engine) loads plugins from $KIMI_CODE_HOME/plugins with
+// a machine-managed registry (installed.json) and runs the MANAGED COPY at
+// plugins/managed/<id>/, so the installer writes there directly with absolute
+// paths into THIS package's dist — plugin and proxy share one version and
+// `npm i -g billion-context@latest` upgrades both. The plugin declares one
+// stdio MCP server (the per-session bootstrap + ACP tool shell) and one
+// SessionStart hook (attach-only fast path); config.toml itself is only
+// touched at session start by those entries, never here.
+
+const KIMI_PLUGIN_ID = "billion-context";
+
+function kimiHome(): string {
+    return resolveKimiHome(process.env);
+}
+
+function kimiManagedDir(): string {
+    return path.join(kimiHome(), "plugins", "managed", KIMI_PLUGIN_ID);
+}
+
+function kimiRegistryFile(): string {
+    return path.join(kimiHome(), "plugins", "installed.json");
+}
+
+interface KimiInstalledRecord {
+    id: string;
+    root: string;
+    source: "local-path";
+    enabled: boolean;
+    installedAt: string;
+    updatedAt?: string;
+}
+
+/** installed.json is machine-managed (kimi's own store writes it too) but is
+ *  not user-authored prose — a corrupt registry is surfaced loudly instead of
+ *  being silently re-created (§7.3). */
+export function readKimiInstalledRegistry(file: string): { version: number; plugins: KimiInstalledRecord[] } {
+    let text: string;
+    try {
+        text = fs.readFileSync(file, "utf8");
+    } catch (err) {
+        if ((err as { code?: string }).code === "ENOENT") return { version: 1, plugins: [] };
+        throw err;
+    }
+    const parsed = JSON.parse(text) as { version?: unknown; plugins?: unknown };
+    if (!Array.isArray(parsed.plugins)) throw new Error(`${file} is corrupt (no plugins array) — fix or remove it, then retry`);
+    return { version: typeof parsed.version === "number" ? parsed.version : 1, plugins: parsed.plugins as KimiInstalledRecord[] };
+}
+
+function writeJsonAtomic(file: string, data: unknown): void {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const tmp = `${file}.tmp-${process.pid}`;
+    fs.writeFileSync(tmp, `${JSON.stringify(data, null, 2)}\n`);
+    fs.renameSync(tmp, file);
+}
+
+/** Kimi Code v2 floor: the plugin system (managed plugins + hooks + stdio MCP
+ *  with the bundled-node fallback) requires the v2 engine. A missing binary or
+ *  an old one throws with launcher-mode guidance rather than writing a dead
+ *  manifest. */
+export function detectKimiVersion(env: NodeJS.ProcessEnv = process.env): string {
+    const candidates: Array<{ cmd: string; viaShell: boolean }> = process.platform === "win32"
+        ? [{ cmd: "kimi --version", viaShell: true }]
+        : [{ cmd: "kimi", viaShell: false }, { cmd: path.join(resolveKimiHome(env), "bin", "kimi"), viaShell: false }];
+    let out: string | undefined;
+    for (const c of candidates) {
+        try {
+            out = c.viaShell
+                ? execFileSync(c.cmd, { shell: true, timeout: 5000, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] })
+                : execFileSync(c.cmd, ["--version"], { timeout: 5000, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+            break;
+        } catch {}
+    }
+    if (out === undefined) throw new Error("kimi CLI not found on PATH or in $KIMI_CODE_HOME/bin — install Kimi Code first (`npm i -g @moonshot-ai/kimi-code`)");
+    const m = /(\d+)\.(\d+)(?:\.(\d+))?/.exec(out);
+    if (m && parseInt(m[1], 10) < 2) {
+        throw new Error(`Kimi Code ${m[0]} is too old for native mode (needs >= 2.0.0) — upgrade with \`npm i -g @moonshot-ai/kimi-code@latest\` and retry; \`bili kimi\` launcher mode still works`);
+    }
+    return m ? m[0] : out.trim();
+}
+
+function selfVersion(): string {
+    try {
+        return (JSON.parse(fs.readFileSync(path.join(selfPackageRoot(), "package.json"), "utf8")) as { version?: string }).version ?? "0.0.0";
+    } catch {
+        return "0.0.0";
+    }
+}
+
+function kimiPluginManifest(root: string): Record<string, unknown> {
+    return {
+        name: KIMI_PLUGIN_ID,
+        version: selfVersion(),
+        description: "billion-context: ACP context-compression proxy (native mode)",
+        mcpServers: { bili: { command: "node", args: [path.join(root, "dist", "kimi", "native-mcp.js")], cwd: "./" } },
+        hooks: [{ event: "SessionStart", command: `node ${path.join(root, "dist", "kimi", "bootstrap-hook.js")}`, timeout: 30 }],
+    };
+}
+
+function kimiInstall(): string {
+    const root = selfPackageRoot();
+    requireDistFile(path.join(root, "dist", "kimi", "native-mcp.js"));
+    requireDistFile(path.join(root, "dist", "kimi", "bootstrap-hook.js"));
+    const version = detectKimiVersion();
+    const dir = kimiManagedDir();
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, "kimi.plugin.json"), `${JSON.stringify(kimiPluginManifest(root), null, 2)}\n`);
+    const file = kimiRegistryFile();
+    backupOnce(file);
+    const reg = readKimiInstalledRegistry(file);
+    const now = new Date().toISOString();
+    const existing = reg.plugins.find((p) => p.id === KIMI_PLUGIN_ID);
+    const record: KimiInstalledRecord = { id: KIMI_PLUGIN_ID, root: dir, source: "local-path", enabled: true, installedAt: existing?.installedAt ?? now, updatedAt: now };
+    reg.plugins = existing ? reg.plugins.map((p) => (p.id === KIMI_PLUGIN_ID ? record : p)) : [...reg.plugins, record];
+    writeJsonAtomic(file, reg);
+    return `wrote the billion-context plugin into ${dir} (kimi ${version}) — start a new Kimi Code session to activate`;
+}
+
+function kimiRemove(): string {
+    const notes: string[] = [];
+    let removed = false;
+    const dir = kimiManagedDir();
+    if (fs.existsSync(dir)) {
+        fs.rmSync(dir, { recursive: true, force: true });
+        removed = true;
+    }
+    try {
+        const reg = readKimiInstalledRegistry(kimiRegistryFile());
+        const rest = reg.plugins.filter((p) => p.id !== KIMI_PLUGIN_ID);
+        if (rest.length !== reg.plugins.length) writeJsonAtomic(kimiRegistryFile(), { version: reg.version, plugins: rest });
+    } catch {}
+    const restored = restoreKimiBackup({ log: (msg) => notes.push(msg) });
+    if (restored.restored) notes.push("restored config.toml from the pre-install snapshot");
+    else unrouteKimi({ log: (msg) => notes.push(msg) });
+    return removed ? `removed the billion-context plugin${notes.length > 0 ? ` (${notes.join("; ")})` : ""} — start a new Kimi Code session to finish` : "not installed";
+}
+
+function kimiStatus(): string {
+    const manifestOk = fs.existsSync(path.join(kimiManagedDir(), "kimi.plugin.json"));
+    let registered = false;
+    try {
+        registered = readKimiInstalledRegistry(kimiRegistryFile()).plugins.some((p) => p.id === KIMI_PLUGIN_ID);
+    } catch {}
+    if (manifestOk && registered) return "installed";
+    if (manifestOk || registered) return "partially installed — rerun 'bili plugin install kimi' to fix";
+    return "not installed";
+}
+
 // — dispatch ————————————————————————————————————————————————————————————
 
 export function isPluginAgent(value: string): value is PluginAgent {
@@ -1178,11 +1330,11 @@ export function isPluginAgent(value: string): value is PluginAgent {
 }
 
 export function pluginInstall(agent: PluginAgent, opts: { withMcp?: boolean } = {}): string {
-    return agent === "pi" ? piInstall() : agent === "omp" ? ompInstall() : agent === "claude" ? claudeInstall() : agent === "codex" ? codexInstall() : agent === "dsh" ? dshInstall() : opencodeInstall(opts.withMcp === true);
+    return agent === "pi" ? piInstall() : agent === "omp" ? ompInstall() : agent === "claude" ? claudeInstall() : agent === "codex" ? codexInstall() : agent === "dsh" ? dshInstall() : agent === "kimi" ? kimiInstall() : opencodeInstall(opts.withMcp === true);
 }
 
 export function pluginRemove(agent: PluginAgent): string {
-    return agent === "pi" ? piRemove() : agent === "omp" ? ompRemove() : agent === "claude" ? claudeRemove() : agent === "codex" ? codexRemove() : agent === "dsh" ? dshRemove() : opencodeRemove();
+    return agent === "pi" ? piRemove() : agent === "omp" ? ompRemove() : agent === "claude" ? claudeRemove() : agent === "codex" ? codexRemove() : agent === "dsh" ? dshRemove() : agent === "kimi" ? kimiRemove() : opencodeRemove();
 }
 
 export function pluginStatusAll(): Array<{ agent: string; status: string }> {
@@ -1193,6 +1345,7 @@ export function pluginStatusAll(): Array<{ agent: string; status: string }> {
         ["codex", codexStatus],
         ["opencode", opencodeStatus],
         ["dsh", dshStatus],
+        ["kimi", kimiStatus],
     ];
     return checks.map(([agent, check]) => {
         try {
