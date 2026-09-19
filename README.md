@@ -334,6 +334,23 @@ automatically.
 For per-client configuration examples (OpenCode, Codex, Pi, login-client
 MITM, …) see the web UI guide at [http://localhost:8787](http://localhost:8787).
 
+**Verify.** With the proxy running and your config saved, check it answers
+and that your first real request shows compression activity in the log:
+
+```bash
+# Health check (proxy up + where it forwards)
+curl -s http://localhost:8787/__bili/health
+# → {"ok":true,"upstream":"https://api.anthropic.com"}
+
+# Live session stats (after a real request)
+curl -s http://localhost:8787/__bili/stats
+```
+
+Then send one message from your client and watch the log
+(`~/.local/state/billion-context/bili.log`, also printed to stderr). You
+should see a `processTurn` line per request, and once the conversation grows,
+`[acp-usage] round N input=X cached=Y (cache hit Z%)` + a `compress` event.
+
 ### dsh (deepseek-harness)
 
 Two lanes, same plugin (#941):
@@ -431,25 +448,6 @@ small node scripts that do the work around the client:
   per-call `conversation_id` argument), and kimi's native auto-compaction is
   NOT pushed out — ACP compression simply fires first, as in launcher mode.
   Opt-out: `BILI_NATIVE_KIMI=0`.
-
-### Verify
-
-With the proxy running and your config saved, check it answers and that your
-first real request shows compression activity in the log:
-
-```bash
-# Health check (proxy up + where it forwards)
-curl -s http://localhost:8787/__bili/health
-# → {"ok":true,"upstream":"https://api.anthropic.com"}
-
-# Live session stats (after a real request)
-curl -s http://localhost:8787/__bili/stats
-```
-
-Then send one message from your client and watch the log
-(`~/.local/state/billion-context/bili.log`, also printed to stderr). You
-should see a `processTurn` line per request, and once the conversation grows,
-`[acp-usage] round N input=X cached=Y (cache hit Z%)` + a `compress` event.
 
 ### Client uses `http.proxy` (CONNECT) but nothing compresses
 

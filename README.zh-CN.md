@@ -178,6 +178,19 @@ bili
 
 更多客户端配置参考网页引导: [http://localhost:8787](http://localhost:8787) .
 
+**验证。** 代理跑着、配置保存了之后,确认它能应答,并且第一个真实请求在日志里显示压缩活动:
+
+```bash
+# 健康检查(代理是否在跑 + 转发到哪)
+curl -s http://localhost:8787/__bili/health
+# → {"ok":true,"upstream":"https://api.anthropic.com"}
+
+# 实时会话统计(发过真实请求后)
+curl -s http://localhost:8787/__bili/stats
+```
+
+然后从助手发一条消息,观察日志(`~/.local/state/billion-context/bili.log`,同时也打到 stderr)。每个请求应该看到一行 `processTurn`,等对话变长后会出现 `[acp-usage] round N input=X cached=Y (cache hit Z%)` + `compress` 事件。
+
 ### dsh(deepseek-harness)
 
 两条通道，同一个插件(#941):
@@ -197,23 +210,6 @@ bili
 - **Plugin 模式盖章:** 只有当 ACP 工具清单已在存活代理上验证通过后,块里才会写入 `custom_headers = { x-bili-plugin = "kimi" }` —— 此前流量走 wire 模式。由于 `custom_headers` 按 provider 静态生效,无法承载逐请求的窗口/模型头(会在模型切换后过期),所以 runtime-info 上报只在自举时发生(客户端配置里有模型 + 上下文窗口 + 最大输出就一并上报)。
 - **看门狗与生命周期:** MCP 子进程每 30 s 探测一次代理。attach 模式下永远等待(绝不碰用户自己的代理);spawn 模式下代理死亡则重新拉起并把路由改写到新 origin。恢复失败时移除受管块,让流量退回直连上游而不是打到死端口。会话结束时 kimi 杀掉 MCP 子进程,父进程 pid 看门狗随之收掉拉起的代理。多个并发 TUI 共享第一个拉起的代理;它消失后其余会话自动重新拉起并改路。
 - **已知局限:** 子代理会话各自得到独立的派生代理会话(kimi 不暴露稳定的会话 id;工具调用经每次调用的 `conversation_id` 参数绑定);kimi 的原生自动压缩**没有**被推后 —— ACP 压缩只是先触发,与启动器模式一致。退出开关:`BILI_NATIVE_KIMI=0`。
-
-### 验证
-
-代理跑着、配置保存了之后,确认它能应答,并且第一个真实请求在日志里显示压缩活动:
-
-```bash
-# 健康检查(代理是否在跑 + 转发到哪)
-curl -s http://localhost:8787/__bili/health
-# → {"ok":true,"upstream":"https://api.anthropic.com"}
-
-# 实时会话统计(发过真实请求后)
-curl -s http://localhost:8787/__bili/stats
-```
-
-然后从助手发一条消息,观察日志(`~/.local/state/billion-context/bili.log`,
-同时也打到 stderr)。每个请求应该看到一行 `processTurn`,等对话变长后
-会出现 `[acp-usage] round N input=X cached=Y (cache hit Z%)` + `compress` 事件。
 
 ### 客户端用 `http.proxy`(CONNECT)接入但从不压缩
 
