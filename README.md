@@ -150,8 +150,7 @@ Pick by your client:
 | Client | Use |
 |---|---|
 | **pi** | [`billion-context-pi`](https://github.com/ranxianglei/billion-context-pi) (in-process extension) |
-| **opencode 1.x** | `bili plugin install opencode` (self-spawning native plugin — pre-migration [`opencode-acp`](https://github.com/ranxianglei/opencode-acp) sessions keep working, see "OpenCode 1.x") or `bili opencode` (launcher) or standalone `opencode-acp` (in-process extension) |
-| **opencode 2.0+** | `bili opencode` (built-in V2 plugin — native tools, no separate package) or `bili plugin install opencode` (self-spawning native plugin, no launcher) |
+| **opencode** (1.x / 2.x) | [`billion-context`](https://github.com/ranxianglei/billion-context) — `bili opencode` (launcher) or `bili plugin install opencode` (native, no launcher); standalone [`opencode-acp`](https://github.com/ranxianglei/opencode-acp) remains usable on 1.x. Full guide: [OpenCode](#opencode) |
 | **omp** | [`billion-context`](https://github.com/ranxianglei/billion-context) via `bili omp` (built-in plugin) or `bili plugin install omp` (self-spawning native plugin, no launcher) |
 | **dsh** | `bili dsh` (launcher — full native plugin via `--patch`: tools, session-bound `/acp`, fetch intercept) or `bili plugin install dsh` ≡ `dsh plugin --profile <name> add billion-context` (one unified lane — pnpm-installs the package into each profile so dsh mounts the bundled patch layer; the bili form just drives dsh's own channel per profile and migrates legacy managed blocks) |
 | **kimi** | `bili plugin install kimi` (self-spawning native plugin, no launcher — Kimi Code ≥ 2.0.0; per-session routing block in `~/.kimi-code/config.toml`) or `bili kimi` (launcher, cert-MITM) or `/bili/` prefix |
@@ -160,12 +159,6 @@ Pick by your client:
 
 **Native mode vs standalone extensions.** The host-native plugins (`bili plugin install pi` / `opencode` — they spawn the proxy inside the host process) and the standalone in-process extensions (`billion-context-pi`, `opencode-acp`) are **mutually exclusive**: both active means double compression. The installer makes the switch: `bili plugin install pi` replaces the legacy `npm:billion-context-pi` entry (with a reminder that a project-scope entry in `<project>/.pi/settings.json` from `pi install -l` lives outside the global settings), and `bili plugin install opencode` strips legacy `opencode-acp` entries from the global opencode.json — bare name, `npm:` alias, versioned (`opencode-acp@stable`), or path form, array or object shape; the original config is snapshotted to `.bili-bak` once. A **project-local** install (`opencode plugin opencode-acp` writes `<project>/.opencode/opencode.json`, not the global config) is not touched — remove it by hand; the installer note reminds you. As a runtime safety net for manual installs, the native entries set `BILLION_CONTEXT_NATIVE=<host>` synchronously at load so a standalone extension can stand down at action time — its own load-time `BILLION_CONTEXT_PROXY` check cannot see a proxy that native mode spawns asynchronously, and its `/bili/` baseUrl check never sees the fetch-layer rewrite. On the pi side the marker needs `billion-context-pi` **0.1.72+** (the per-event re-check landed after 0.1.71); the pi-native entry additionally scans both pi settings files once its proxy is up and warns loudly when it spots a co-resident legacy entry the installer never saw — that warning is the only visible signal while an old `billion-context-pi` silently double-compresses.
 
-**Legacy sessions from opencode-acp (v1 lane routing).** On OpenCode 1.x, `bili plugin install opencode` keeps pre-migration sessions WORKING: the native entry absorbs the installed `opencode-acp` package (imported directly from `node_modules` — `.opencode/node_modules`, project `node_modules`, global npm root, or opencode's config-scope modules, first hit wins) and routes per session. A session is legacy iff opencode-acp's persisted state file exists (`<XDG_DATA_HOME>/opencode/storage/plugin/acp/<sessionID>.json`):
-
-- **Legacy session** — compression runs through the absorbed opencode-acp (its own `<dcp-message-id>` refs and block store keep working: `compress` / `decompress` / `search_context` / `acp_status` / `acp_context_recap` all execute in it). Its model requests carry `x-bili-plugin-bypass: 1`, and the proxy forwards them VERBATIM — no wire injection, no nudge, no session binding.
-- **New session** — bili owns it: tool calls forward to the proxy's plugin endpoints (plugin mode). The tool slots the model sees carry the DCP schemas (one def per name process-wide on v1), but the executor routes by session lane, so a new session's `compress` reaches the proxy while a legacy session's reaches opencode-acp. `acp_context_recap` has no proxy counterpart — on new sessions the proxy answers it with its unknown-tool message.
-
-`/acp` and `/dcp` route the same way. Adoption of new sessions into opencode-acp's registry is prevented by gating its transforms (system / messages / text.complete) on the legacy predicate. Degradation: when the opencode-acp package is absent or fails to import, bili runs alone and legacy sessions behave as read-only archives (old `<acp>` tags render, `decompress` returns `[Block … not found]`, new refs restart from m00001).
 
 ## Install
 
@@ -202,10 +195,26 @@ bili plugin install kimi        # writes $KIMI_CODE_HOME/plugins/managed/billion
 bili plugin remove <client>     # undo (dsh removes through the same channel; config snapshots go to .bili-bak)
 ```
 
-dsh users can skip bili entirely: `dsh plugin --profile <name> add
-billion-context` is the very command `bili plugin install dsh` drives per
-profile — same end state either way (pnpm into the profile, bundled patch
-layer mounted by dsh itself). See the dsh section below.
+Where a client has its own plugin channel you can also install natively,
+skipping bili commands entirely:
+
+- **dsh:** `dsh plugin --profile <name> add billion-context` is the very
+  command `bili plugin install dsh` drives per profile — same end state
+  either way (pnpm into the profile, bundled patch layer mounted by dsh
+  itself); remove through the same channel. See the dsh section below.
+- **opencode:** add the bare npm name to your real config's plugin list —
+  `"plugin": ["billion-context"]` (npm form only; a git checkout has no
+  published entry). The package publishes `exports["./server"]` →
+  `dist/agent/opencode-native.js`, so opencode loads it through its own
+  Npm.add machinery and the plugin self-spawns exactly like the
+  bili-installed form. Do the two things the bili installer would have done
+  for you too: set `"compaction": { "auto": false }` in the same config
+  (otherwise OpenCode's native auto-compaction double-compresses) and keep a
+  manual backup of the file first.
+
+For pi / omp / kimi / claude there is no client-side channel — `bili plugin
+install <client>` writes their config entries for you (kimi's declarative
+`kimi.plugin.json` + registry record, claude's managed settings block, …).
 
 At load the plugin **spawns its own proxy** (or attaches to a healthy
 running one — a parent-pid watchdog tears it down when the client exits),
@@ -261,8 +270,7 @@ Notes:
   the entries and snapshots the original config (`.bili-bak`); migration
   details in the client table above (pi needs `billion-context-pi` 0.1.72+
   to stand down cleanly).
-- On OpenCode 1.x, pre-migration `opencode-acp` sessions keep working
-  (v1 lane routing, #920) — see "OpenCode 1.x" below.
+- OpenCode: legacy `opencode-acp` sessions, the V1/V2 plugin shapes, and all caveats are consolidated in the [OpenCode](#opencode) section.
 - `kimi` reports runtime-info at bootstrap only (static `custom_headers` can't
   carry per-request window/model headers without going stale on model switch)
   and binds subagent conversations by per-call `conversation_id` — full
@@ -319,7 +327,7 @@ bili pi                               # launch pi through the proxy — file-fre
 bili codex                            # launch codex through the proxy
 bili claude                           # launch claude through the proxy
 bili omp                              # pi-style, file-free (#535): env + extension registerProvider + compaction cancel, real ~/.omp untouched
-bili opencode                         # MITM for HTTPS + temp opencode.json (/bili/ for HTTP) + thin /acp plugin; OpenCode 1.x: existing opencode-acp sessions keep working (entries stripped from the clone, package imported as a library, #920); OpenCode 2.0+: built-in V2 plugin with native bili tools, native compaction auto-disabled. Reads the user's opencode.jsonc / opencode.json / config.json (JSONC comments accepted, merged the same way opencode itself merges them); relative local plugin specs (`./x`, `../x`) are re-anchored to absolute paths in the clone — opencode resolves them against the declaring config file's dir (#826)
+bili opencode                         # OpenCode (1.x & 2.x): full guide in the [OpenCode](#opencode) section below
 bili hermes                           # file-free (#535): hermes proxy env (HTTPS_PROXY + HERMES_CA_BUNDLE) — https via CONNECT MITM, http via absolute-form forward proxy; real ~/.hermes untouched
 bili dsh                              # deepseek-harness: full native plugin injected via --patch (#941) — compress/decompress/acp_status registered as real dsh tools, requests stamped with the dsh session id (plugin mode), /acp session-bound; non-loopback upstreams ride proxy envs (https MITM, http absolute-form), loopback keeps the overlay DSH_HOME (~/.dsh-bili) rewrite (#535), built-in deepseek route via DEEPSEEK_BASE_URL; dsh native auto-compaction disabled (compaction-basic auto:false)
 bili codebuddy                        # Tencent CodeBuddy Code CLI: CODEBUDDY_BASE_URL /bili/ rewrite (OpenAI chat completions wire), budget aligned via CODEBUDDY_AUTO_COMPACT_WINDOW; real ~/.codebuddy untouched
@@ -355,133 +363,7 @@ automatically.
 For per-client configuration examples (OpenCode, Codex, Pi, login-client
 MITM, …) see the web UI guide at [http://localhost:8787](http://localhost:8787).
 
-### OpenCode 1.x
-
-On a 1.x host, `bili opencode` runs **new sessions through the bili proxy** and
-keeps **existing `opencode-acp` ("legacy") sessions working with their own
-machinery** (#920). The launcher strips the `opencode-acp` entry from its temp
-config clone (the host never loads it armed), and the thin bili plugin imports
-the installed package as a library instead:
-
-- every acp hook is gated on "an acp store file exists for this session"
-  (`~/.local/share/opencode/storage/plugin/acp/<sessionID>.json`, or the dir
-  from `storagePath` in `acp.jsonc`) — legacy sessions keep their DCP compress /
-  decompress / search_context / acp_status tools and the `/dcp` command; new
-  sessions are never adopted and run plain proxy mode.
-- legacy LLM requests are stamped `x-bili-plugin-bypass: 1`, which the proxy
-  honors as raw passthrough (no injection, no compression, no session state).
-- in proxy mode the proxy owns the compression tool names: same-named client
-  tools in the body are dropped before injection, so upstream sees one
-  definition per name.
-
-Graceful degradation: if the package can't be found/imported or isn't v1, the
-plugin behaves exactly as before this change — legacy sessions degrade the way
-they did when `opencode-acp` self-disabled on `/bili/` baseURLs.
-
-### OpenCode 2.0
-
-OpenCode 2.0 ships a new plugin API (`@opencode/plugin`); the standalone
-`opencode-acp` extension is V1-only and does not load under 2.0. Both bili
-modes work on 2.0. The 2.x plugin API surface is still moving between builds
-(adjacent npm `dev`-channel builds expose different `ctx` shapes), so the
-hook/tool details below are version-specific observations, not a stable
-contract:
-
-- **Launcher:** `bili opencode` works unchanged. On a 2.x host it injects the
-  built-in V2 plugin (`dist/agent/opencode.js`) into the temp config as a temp
-  wrapper directory whose `index.js` re-exports the plugin file — 2.x rejects
-  bare file paths in the config `plugin` array (directory entries use
-  `index.js` as entrypoint); 1.x hosts get the bare file path. Host generation
-  is detected with a `--version` probe (a failed probe defaults to the 1.x
-  shape). The V2 plugin registers the bili tools natively in-host — compress /
-  decompress / search_context / acp_status (+ absorb), JSON-Schema inputs — and
-  stamps the proxy headers on every outgoing provider request, so compression
-  runs in plugin mode with no wire-level tool injection. Native auto-compaction
-  is disabled automatically (`compaction.auto: false`). Every registration is
-  defensive (optional chaining): on any 2.x build where a seam is missing or
-  never fires, the plugin stays inert and the session transparently runs in
-  plain proxy mode (wire-level tool injection) instead of breaking — observed
-  on two adjacent `dev` builds (2026-09-13 / 2026-09-14) whose API surfaces
-   differ from each other (#754 review probes); conversely verified end-to-end
-   on `@opencode/cli` 2.0.3 (native `acp_status` executed through the plugin
-   endpoint, zero wire-level injection).
-- **Native (no launcher):** with the package installed from npm, run
-  `bili plugin install opencode` — it registers a self-spawning plugin in your
-  real opencode config and sets `compaction.auto: false`, after which plain
-  `opencode` works as-is. No `mcp.bili` MCP face is added by default (the
-  native plugin already provides the bili tools, session-bound); pass
-  `--with-mcp` to add one — the entry then carries no origin pin, so it
-  survives the plugin's ephemeral-port proxy restarts (#926). The entry form
-  depends on how THIS bili was installed: an **npm install** writes the bare
-  package name (`"plugin":
-  ["billion-context"]`) — the package publishes `exports["./server"]` →
-  `dist/agent/opencode-native.js`, so opencode loads it through its own
-  Npm.add machinery and manages install/upgrade itself; zero absolute paths,
-  portable across machines. A **git checkout / dev build** has no published
-  entry and falls back to a local shim dir
-  (`<configDir>/plugins/billion-context/index.js` → this checkout's
-  `dist/agent/opencode-native.js`) — machine-local by construction, not
-  portable; re-running install from an npm install migrates the entry back to
-  the bare name. At load the plugin bootstraps its own
-  proxy (attaches to a healthy instance instead of doubling; parent-pid
-  watchdog kills it when opencode exits), routes model-API traffic to
-  `<proxy>/bili/<upstream-url>`, and exposes the same native bili tools as
-  launcher mode — no fixed port, no env var, no launcher.
-  Opt-out: `BILI_NATIVE_OPENCODE=0`. If no proxy can be made healthy, requests
-  go direct (uncompressed) with a one-time warning and recover automatically.
-  Under a `bili opencode` launch this entry is skipped entirely (the launcher
-  owns the proxy).
-
-  The same wrapper serves **OpenCode 1.x** through the V1 `.server()` hooks
-  (verified on 1.14.46 and 1.18.31): the `config` hook mutates the shared
-  config object in-process to rewrite every provider `options.baseURL` to
-  `<proxy>/bili/…` and sets `compaction.auto: false`; `chat.headers` stamps
-  the plugin headers per request; `tool` registers the bili tools with real
-  zod shapes (zod is a runtime dependency — when it cannot be resolved the
-  plugin degrades to plain proxy mode: rewrite only, wire-injected tools);
-  the `/acp` command renders the same status panel. Providers **without**
-  an explicit `baseURL` (SDK defaults, e.g. bare `@ai-sdk/openai` →
-  api.openai.com) are caught by a global `fetch` patch (the pi-native
-  mechanism) that reroutes model-API calls to the proxy — verified end-to-end
-  on 1.14.46 and 1.18.31 (log: `v1: fetch patch installed`), including the
-  OpenAI Responses endpoint. The patch is idempotent and passes
-  `/bili/`-wrapped URLs through untouched.
-- **Pure proxy:** point the provider baseURL at the proxy like any other
-  client:
-
-  ```json
-  {
-    "provider": {
-      "myprovider": {
-        "npm": "@ai-sdk/openai-compatible",
-        "options": {
-          "baseURL": "http://localhost:8787/bili/http://upstream.example/v1",
-          "apiKey": "sk-any"
-        }
-      }
-    }
-  }
-  ```
-
-  Note: 2.0 AI-SDK providers require an `apiKey` field even for local
-  endpoints that never check it — set any non-empty value.
-
-Caveats: the 2.x line publishes as npm package `@opencode/cli`. Command
-support is build-dependent: one pre-release exposed only
-list/get/update/remove, while 2.0.x stable lets plugins ADD commands via
-`ctx.command.transform((editor) => editor.add(...))` — invocable in the TUI by
-accepting the slash-menu completion (Tab + Enter); note `opencode run` mode
-dispatches no slash commands at all (they pass through to the model). The
-bundled plugin deliberately registers no commands on either shape — call the
-`acp_status` tool instead of an `/acp` command. The bundled agent file keeps
-the V1 `server()` export alongside the V2 `setup()`, so the same artifact also
-loads on hosts ≥ 1.18.29 that support dual-shape plugins. Design note: the V2 plugin is a thin protocol client (no
-acp-kernel inside) because the proxy stays the single compression authority,
-which eliminates kernel-version drift between agent and proxy — it does not
-rely on the plugin API being unable to mutate context (that capability varies
-by 2.x build).
-
-#### dsh (deepseek-harness)
+### dsh (deepseek-harness)
 
 Two lanes, same plugin (#941):
 
@@ -525,7 +407,7 @@ untouched except for header stamping. Known limitation: manual
 `/compact` has no dsh-side event hook, so its boundary is left to the
 kernel's natural ingest diff (auto-compaction is off, so this is rare).
 
-#### Kimi Code (Moonshot)
+### Kimi Code (Moonshot)
 
 Three aligned modes: `bili kimi` (launcher, cert-MITM — Option 2), `/bili/`
 URL prefix, and native plugin mode (`bili plugin install kimi`, #963). Kimi
@@ -609,6 +491,155 @@ This failure mode is now loud instead of silent:
 - an `UNDECRYPTED TRAFFIC (instance-level)` section in `acp_status` output while such tunnels exist.
 
 To actually compress such a client: add its model domain to `"mitm".domains` in `billion-context.json` (e.g. `"mitm": { "domains": ["copilot.tencent.com"] }`) or via `BILI_MITM_DOMAINS`, restart bili, and make the client trust bili's root CA (`NODE_EXTRA_CA_CERTS=~/.local/share/billion-context/ca/root-ca.pem` for Node-based clients, or the client's own CA-path setting). The `/bili/` prefix trick does not apply here — there is no URL to change. Details: [CONFIGURATION.md → MITM](CONFIGURATION.md#mitm-transparent-proxy-login-clients).
+
+## OpenCode
+
+One bundled plugin serves **both** OpenCode generations: the agent file keeps
+the V1 `server()` export alongside the V2 `setup()`, so hosts ≥ 1.18.29 load
+the V1 shape and 2.x hosts load the V2 `setup()`. The standalone
+[`opencode-acp`](https://github.com/ranxianglei/opencode-acp) extension is
+V1-only and does **not** load under 2.x — for OpenCode 2.x, billion-context
+is the recommended context manager. Everything below is verified end-to-end
+on `@opencode/cli` 2.0.3 (V1 lane: 1.14.46 and 1.18.31).
+
+| Path | Command | When |
+|---|---|---|
+| Launcher (easiest) | `bili opencode` | one command brings up proxy + client; real config untouched |
+| Native (no launcher) | `bili plugin install opencode` | self-spawning plugin in your real config; start `opencode` as usual |
+| Pure proxy (fallback) | baseURL `/bili/` prefix | no plugin — wire-level tool injection |
+
+### Launcher — `bili opencode`
+
+HTTPS rides cert-MITM, HTTP a temp `opencode.json` clone with `/bili/`
+(JSONC comments accepted, merged the way opencode itself merges them;
+relative local plugin specs re-anchored to absolute paths in the clone —
+opencode resolves them against the declaring config file's dir, #826). Host
+generation is detected with a `--version` probe (failed probe defaults to
+1.x): on a **2.x** host the built-in V2 plugin (`dist/agent/opencode.js`) is
+injected as a temp wrapper directory whose `index.js` re-exports the plugin
+file (2.x rejects bare file paths in the config `plugin` array); **1.x**
+hosts get the bare file path.
+
+What the plugin does (both generations): registers the bili tools natively
+in-host — compress / decompress / search_context / acp_status (+ absorb) —
+and stamps the proxy headers on every outgoing provider request, including
+context-window / max-output read from the host's own model catalog
+(`ctx.catalog.model.list()`, refreshed every 60s) and reported to the proxy
+as runtime-info (#955) — compression runs in plugin mode with **no**
+wire-level tool injection. Native auto-compaction is disabled automatically
+(`compaction.auto: false`). Every registration is defensive (optional
+chaining): on any 2.x build where a seam is missing or never fires, the
+plugin stays inert and the session transparently runs in plain proxy mode
+instead of breaking — observed across adjacent `dev` builds whose API
+surfaces differ from each other (#754 review probes).
+
+1.x specifics (verified 1.14.46 + 1.18.31): the V1 `.server()` hooks rewrite
+every provider `options.baseURL` to `<proxy>/bili/…` in-process and set
+`compaction.auto: false`; `chat.headers` stamps the plugin headers per
+request; `tool` registers the bili tools with real zod shapes (zod is a
+runtime dependency — when it cannot be resolved the plugin degrades to
+rewrite-only). Providers **without** an explicit `baseURL` (SDK defaults,
+e.g. bare `@ai-sdk/openai` → api.openai.com) are caught by a global `fetch`
+patch (log: `v1: fetch patch installed`) — idempotent, passes
+`/bili/`-wrapped URLs through untouched; verified including the OpenAI
+Responses endpoint.
+
+### Native (no launcher) — `bili plugin install opencode`
+
+Registers a self-spawning plugin in your real opencode config and sets
+`compaction.auto: false`; afterwards plain `opencode` works as-is. No MCP
+face is added by default (the native plugin already provides the bili tools,
+session-bound); pass `--with-mcp` to add one — the entry then carries no
+origin pin, so it survives the plugin's ephemeral-port proxy restarts (#926).
+Entry form depends on how THIS bili was installed: an **npm install** writes
+the bare package name (`"plugin": ["billion-context"]`) — the package
+publishes `exports["./server"]` → `dist/agent/opencode-native.js`, so
+opencode loads it through its own Npm.add machinery; zero absolute paths, portable. (That exact bare-name entry doubles as a hand-install without bili — see Option 1.) A **git checkout / dev build** falls back to a local shim dir
+(`<configDir>/plugins/billion-context/index.js` → this checkout's
+`dist/agent/opencode-native.js`) — machine-local by construction; re-running
+install from an npm install migrates the entry back to the bare name.
+
+At load the plugin bootstraps its own proxy (attaches to a healthy instance
+instead of doubling; parent-pid watchdog kills it when opencode exits),
+routes model-API traffic to `<proxy>/bili/<upstream-url>`, and exposes the
+same native bili tools as launcher mode — no fixed port, no env var, no
+launcher. Opt-out: `BILI_NATIVE_OPENCODE=0`. If no proxy can be made
+healthy, requests go direct (uncompressed) with a one-time warning and
+recover automatically. Under a `bili opencode` launch this entry is skipped
+entirely (the launcher owns the proxy).
+
+### Pure proxy (no plugin)
+
+Point the provider baseURL at the proxy like any other client:
+
+```json
+{
+  "provider": {
+    "myprovider": {
+      "npm": "@ai-sdk/openai-compatible",
+      "options": {
+        "baseURL": "http://localhost:8787/bili/http://upstream.example/v1",
+        "apiKey": "sk-any"
+      }
+    }
+  }
+}
+```
+
+Note: 2.0 AI-SDK providers require an `apiKey` field even for local
+endpoints that never check it — set any non-empty value.
+
+### Status: `/acp` and `acp_status`
+
+The `/acp` panel is session-bound in all modes, and the `acp_status` tool is
+its in-host equivalent everywhere. On 2.0.x stable, where the command editor
+supports adding entries (`editor.add`), the V2 plugin additionally registers
+an `/acp` slash command — rendered as a synthetic non-model message,
+panel-first like the `acp_status` tool; on older shapes the registration
+stays inert. Note `opencode run` mode dispatches no slash commands at all
+(they pass through to the model) — use the TUI.
+
+### Legacy opencode-acp sessions (#920)
+
+On 1.x hosts, pre-migration [`opencode-acp`](https://github.com/ranxianglei/opencode-acp)
+sessions keep working under both lanes: the launcher strips the
+`opencode-acp` entry from its temp config clone (the host never loads it
+armed), and each lane absorbs the installed package (imported directly from
+`node_modules` — `.opencode/node_modules`, project `node_modules`, global npm
+root, or opencode's config-scope modules, first hit wins). A session is
+legacy iff opencode-acp's persisted state file exists
+(`<XDG_DATA_HOME>/opencode/storage/plugin/acp/<sessionID>.json`, or the dir
+from `storagePath` in `acp.jsonc`):
+
+- **Legacy session** — compression runs through the absorbed opencode-acp
+  (its own refs and block store keep working: `compress` / `decompress` /
+  `search_context` / `acp_status` / `acp_context_recap` all execute in it).
+  Its model requests carry `x-bili-plugin-bypass: 1`; the proxy forwards
+  them VERBATIM — no wire injection, no nudge, no session binding.
+- **New session** — bili owns it: tool calls forward to the proxy's plugin
+  endpoints (plugin mode). The executor routes by session lane, so a new
+  session's `compress` reaches the proxy while a legacy session's reaches
+  opencode-acp. `acp_context_recap` has no proxy counterpart — on new
+  sessions the proxy answers with its unknown-tool message.
+
+`/acp` and `/dcp` route the same way. Adoption of new sessions into
+opencode-acp's registry is prevented by gating its transforms (system /
+messages / text.complete) on the legacy predicate. Degradation: when the
+package is absent or fails to import (or isn't v1), bili runs alone and
+legacy sessions behave as read-only archives (old tags render, `decompress`
+returns `[Block … not found]`, new refs restart from m00001).
+
+### Caveats
+
+- The 2.x line publishes as npm package `@opencode/cli`, and its plugin API
+  surface is still moving between builds (adjacent `dev`-channel builds
+  expose different `ctx` shapes) — the hook/tool details above are
+  version-specific observations, not a stable contract.
+- Design note: the V2 plugin is a thin protocol client (no acp-kernel
+  inside) because the proxy stays the single compression authority — that
+  eliminates kernel-version drift between agent and proxy; it does not rely
+  on the plugin API being unable to mutate context (that capability varies
+  by 2.x build).
 
 ## Running the proxy
 

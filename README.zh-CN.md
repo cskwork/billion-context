@@ -78,9 +78,7 @@ AI 编程助手的<strong>通用上下文压缩代理</strong>
 | 客户端 | 用这个 |
 |---|---|
 | **pi** | [`billion-context-pi`](https://github.com/ranxianglei/billion-context-pi)(进程内扩展) |
-| **opencode 1.x** | [`billion-context`](https://github.com/ranxianglei/billion-context) —— `bili plugin install opencode`(V1 `.server()` 钩子,与 2.x 同一个包装器)或 `bili opencode`(启动器);[`opencode-acp`](https://github.com/ranxianglei/opencode-acp)(进程内扩展)仍可用 |
-| **opencode 2.0+** | `bili opencode`(内置 V2 插件 —— 原生工具,无需另装包)或 `bili plugin install opencode`(自拉起原生插件,免启动器) |
-| **opencode** | [`billion-context`](https://github.com/ranxianglei/billion-context),`bili opencode`(新会话走 bili 代理;现有 [`opencode-acp`](https://github.com/ranxianglei/opencode-acp) 会话继续可用,见下文「OpenCode 1.x」) |
+| **opencode**(1.x / 2.x) | [`billion-context`](https://github.com/ranxianglei/billion-context) —— `bili opencode`(启动器)或 `bili plugin install opencode`(原生,免启动器);独立 [`opencode-acp`](https://github.com/ranxianglei/opencode-acp) 在 1.x 上仍可用。完整指南:[OpenCode](#opencode) |
 | **omp** | [`billion-context`](https://github.com/ranxianglei/billion-context)，`bili omp`（内置插件）或 `bili plugin install omp`（自拉起原生插件，免启动器） |
 | **dsh** | [`billion-context`](https://github.com/ranxianglei/billion-context) —— `bili dsh`（启动器，经 `--patch` 注入完整原生插件：工具、会话绑定 `/acp`、fetch 拦截）或 `bili plugin install dsh` ≡ `dsh plugin --profile <name> add billion-context`（统一泳道 —— pnpm 把包装进各 profile、由 dsh 挂载包内 patch 层；bili 形式只是替你按 profile 驱动 dsh 自己的通道，并顺带迁移旧版受管块） |
 | **kimi** | `bili plugin install kimi`（自拉起原生插件，免启动器 —— 需 Kimi Code ≥ 2.0.0；每会话在 `~/.kimi-code/config.toml` 写入路由块）或 `bili kimi`（启动器，证书 MITM）或 `/bili/` 前缀 |
@@ -89,12 +87,6 @@ AI 编程助手的<strong>通用上下文压缩代理</strong>
 
 **原生模式 vs 独立扩展。** 宿主原生插件(`bili plugin install pi` / `opencode` —— 代理在宿主进程内拉起)与独立进程内扩展(`billion-context-pi`、`opencode-acp`)**互斥**:两者同时生效意味着双重压缩。安装器负责切换:`bili plugin install pi` 会替换旧的 `npm:billion-context-pi` 条目;`bili plugin install opencode` 会从全局 opencode.json 里剔除旧的 `opencode-acp` 条目 —— 裸名、`npm:` 别名、带版本号(`opencode-acp@stable`)、路径形式都认,数组/对象两种形态都处理;原配置会快照到 `opencode.json.bili-bak`。**项目级**安装(`opencode plugin opencode-acp` 写的是 `<project>/.opencode/opencode.json`,不是全局配置)不会被碰 —— 需手动移除,安装器输出里会提醒。作为手动安装的运行期安全网,原生入口在加载时同步设置 `BILLION_CONTEXT_NATIVE=<host>`,让独立扩展在动作时自动退出 —— 它自己的加载期 `BILLION_CONTEXT_PROXY` 检查看不见原生模式异步拉起的代理,`/bili/` baseURL 检查也看不见 fetch 层改写。
 
-**从 opencode-acp 迁移旧会话（v1 泳道路由）。** 在 OpenCode 1.x 上，`bili plugin install opencode` 让迁移前的旧会话继续可用：原生入口会吸收已安装的 `opencode-acp` 包（直接从 `node_modules` 导入 —— `.opencode/node_modules`、项目 `node_modules`、全局 npm root、opencode 配置级 modules，先到先得），并按会话路由。会话属于 legacy ⟺ opencode-acp 的持久化状态文件存在（`<XDG_DATA_HOME>/opencode/storage/plugin/acp/<sessionID>.json`）：
-
-- **旧会话** —— 压缩由被吸收的 opencode-acp 执行（它自己的 `<dcp-message-id>` 引用号与块存储照常工作：`compress` / `decompress` / `search_context` / `acp_status` / `acp_context_recap` 全部在它里面执行）。其模型请求带 `x-bili-plugin-bypass: 1`，代理原样转发 —— 不注入 wire 工具、不注 nudge、不绑定会话。
-- **新会话** —— bili 接管：工具调用转发到代理的 plugin 端点（plugin 模式）。模型看到的工具槽位带 DCP schema（v1 进程级每个名字仅一份定义），但执行器按会话分泳道：新会话的 `compress` 发到代理，旧会话的发给 opencode-acp。`acp_context_recap` 没有代理端对应 —— 新会话调用会收到代理的 unknown-tool 消息。
-
-`/acp` 与 `/dcp` 同样路由。新会话被 opencode-acp 注册表收编的可能被其 transform 门控（system / messages / text.complete 都过 legacy 谓词）阻断。退化路径：opencode-acp 包缺失或导入失败时 bili 单独运行，旧会话退化为只读存档（旧 `<acp>` 标签照常渲染、`decompress` 返回 `[Block … not found]`、新引用号从 m00001 重新开始）。
 
 ## 安装
 
@@ -127,7 +119,12 @@ bili plugin install kimi        # 写 $KIMI_CODE_HOME/plugins/managed/billion-co
 bili plugin remove <client>     # 卸载(dsh 经同一通道移除;配置快照存 .bili-bak)
 ```
 
-dsh 用户可以完全不用 bili：`dsh plugin --profile <name> add billion-context` 正是 `bili plugin install dsh` 按 profile 驱动的那条命令 —— 两种走法终态一致（pnpm 装进 profile、patch 层由 dsh 自己挂载）—— 见下文 dsh 段。
+客户端有自己的插件通道时,也可以原生安装、完全不用 bili 命令:
+
+- **dsh:** `dsh plugin --profile <name> add billion-context` 正是 `bili plugin install dsh` 按 profile 驱动的那条命令 —— 两种走法终态一致(pnpm 装进 profile、patch 层由 dsh 自己挂载);经同一通道卸载。见下文 dsh 段。
+- **opencode:** 把裸 npm 包名直接写进你真实配置的插件列表 —— `"plugin": ["billion-context"]`(仅 npm 形态;git checkout 没有已发布入口)。包通过 `exports["./server"]` → `dist/agent/opencode-native.js` 暴露插件入口,opencode 用自己的 Npm.add 机制加载,插件自拉起的行为与 bili 安装的形态完全一致。另外要做两件 bili 安装器会替你做的事:在同一份配置里设 `"compaction": { "auto": false }`(否则 OpenCode 的原生自动压缩会双重压缩),并先手工备份该配置文件。
+
+pi / omp / kimi / claude 没有客户端侧通道 —— 它们的配置条目由 `bili plugin install <client>` 代写(kimi 的声明式 `kimi.plugin.json` + 注册记录、claude 的受管 settings 块等)。
 
 插件加载时**自拉起自己的代理**(已有健康实例则直接复用 —— 父进程 pid 看门狗在客户端退出时收掉它),把模型流量改写到 `<proxy>/bili/<上游URL>`,并把 `compress` / `decompress` / `acp_status` 注册为客户端原生工具(plugin 模式),`/acp` 面板绑定当前会话。插件还会把客户端**自己的模型配置**上报给代理(runtime-info 协议,#955),压缩预算用真实窗口而不是注册表猜测。退出开关:`BILI_NATIVE_PI=0`、`BILI_NATIVE_OMP=0`、`BILI_NATIVE_OPENCODE=0`、`BILI_NATIVE_DSH=0`、`BILI_NATIVE_KIMI=0`。
 
@@ -149,7 +146,7 @@ launcher 环境变量这档覆盖纯代理客户端(无进程内插件):`bili <c
 注意:
 
 - 原生模式与独立进程内扩展(`billion-context-pi`、`opencode-acp`)**互斥** —— 安装器负责换条目并把原配置快照(`.bili-bak`);迁移细节见上方客户端表(pi 需 `billion-context-pi` 0.1.72+ 才能干净退让)。
-- OpenCode 1.x 上,迁移前的 `opencode-acp` 旧会话继续可用(v1 泳道路由,#920)—— 见下文 "OpenCode 1.x"。
+- OpenCode:legacy `opencode-acp` 会话、V1/V2 插件形态与全部注意事项已并入 [OpenCode](#opencode) 一节。
 - `kimi` 仅在自举时上报 runtime-info(静态 `custom_headers` 无法承载逐请求的窗口/模型头,否则会在模型切换后过期),子代理会话按每次调用的 `conversation_id` 绑定 —— 完整机制见下文「Kimi Code」小节。
 - `claude` 有**原生姿态**(hybrid,#964):Claude Code 没有进程内扩展点,所以 `bili plugin install claude` 往 `~/.claude/settings.json` 写一个受管块(env `ANTHROPIC_BASE_URL=http://127.0.0.1:48787/bili/<upstream>`、`DISABLE_AUTO_COMPACT=1`、`SessionStart` hook),外加同样指向该稳定端口的用户级 MCP shell。hook 在首个模型请求前触发:附着到端口上健康的代理,或拉起一个 pid 看门狗追踪 claude 本身的代理 —— 代理随会话生灭。端口覆盖:`BILI_CLAUDE_NATIVE_PORT` > config `claude.nativePort` > 48787;上游覆盖:`BILI_CLAUDE_UPSTREAM`(或既有 `claude.anthropicBaseUrl`)。`BILI_NATIVE_CLAUDE=0` 退出 —— hook 改为拉起同端口的 **passthrough** 代理(原样转发、关闭压缩)。块是纯 JSON merge/strip:外部键从不触碰,`bili plugin remove claude` 精确还原。装有原生块的机器上 `bili claude` 仍可用 —— 它用自身临时代理覆盖静态 URL,hook 保持休眠。
 - `codex` / `omp` 也有配套安装(MCP shell 与轻量扩展),但它们需要一个在跑的代理 —— 不属于原生模式。
@@ -167,7 +164,7 @@ bili pi                               # 拉起 pi,走代理 —— file-free(#53
 bili codex                            # 拉起 codex
 bili claude                           # 拉起 claude
 bili omp                              # pi 同款,file-free(#535):环境变量 + 扩展 registerProvider + 压缩取消,真实 ~/.omp 不动
-bili opencode                         # HTTPS 走 MITM + 临时 opencode.json(HTTP 走 /bili/)+ 轻量 /acp 插件;OpenCode 2.0+:内置 V2 插件带原生 bili 工具,自动关掉原生 auto-compaction;OpenCode 1.x:旧 opencode-acp 会话继续可用(条目从副本中移除、包以库形式导入,#920)。详见下方「OpenCode 专属说明」
+bili opencode                         # OpenCode(1.x 与 2.x):完整指南见下文 [OpenCode](#opencode) 一节
 bili hermes                           # file-free(#535):hermes 代理环境变量(HTTPS_PROXY + HERMES_CA_BUNDLE)—— https 走 CONNECT MITM,http 走绝对形式转发;真实 ~/.hermes 不动
 bili dsh                              # deepseek-harness:经 --patch 注入完整原生插件(#941) —— compress/decompress/acp_status 注册为真实 dsh 工具，请求盖 dsh 会话 id(plugin 模式)，/acp 会话绑定；非回环上游走代理 env(https MITM、http absolute-form)，回环上游保留 overlay DSH_HOME(~/.dsh-bili)改写(#535)，内置 deepseek 路由走 DEEPSEEK_BASE_URL；dsh 原生自动压缩被禁用(compaction-basic auto:false)
 bili codebuddy                        # Tencent CodeBuddy Code CLI:CODEBUDDY_BASE_URL /bili/ 重写(OpenAI chat completions wire),预算对齐走 CODEBUDDY_AUTO_COMPACT_WINDOW;真实 ~/.codebuddy 不动
@@ -178,16 +175,6 @@ bili kimi                             # Kimi Code CLI(Moonshot):除无条件回�
 bili pi --mitm-domain api.foo.com     # 向 MITM 白名单追加域名
 ```
 
-
-### OpenCode 1.x —— 旧 opencode-acp 会话继续可用(#920)
-
-在 1.x 主机上，`bili opencode` 会**通过 bili 代理运行新会话**，同时**让现有 `opencode-acp`（"legacy"）会话继续使用其自身机制正常工作**（#920）。启动器会从临时配置副本中移除 `opencode-acp` 条目（主机永远不会以激活状态加载它），而轻量的 bili 插件则改为以库的形式导入已安装的包：
-
-- 每个 ACP 钩子都以"该会话存在 ACP 存储文件"为门控条件（`~/.local/share/opencode/storage/plugin/acp/<sessionID>.json`，或 `acp.jsonc` 中 `storagePath` 指定的目录）——旧版会话保留其 DCP compress / decompress / search_context / acp_status 工具和 `/dcp` 命令；新会话不会被接管，而是运行纯代理模式。
-- 旧版 LLM 请求会被打上 `x-bili-plugin-bypass: 1` 标记，代理将其视为原始透传（无注入、无压缩、无会话状态）。
-- 在代理模式下，压缩工具的名称由代理独占：请求体中同名的客户端工具会在注入前被丢弃，因此上游对每个名称只看到一个定义。
-
-优雅降级：如果包无法找到/导入或不是 v1 版本，插件的行为与此更改之前完全一致——旧版会话的降级方式与 `opencode-acp` 在 `/bili/` baseURL 上自我禁用时的表现相同。
 
 ### 方式 3 —— 改url(`/bili/` 前缀)
 
@@ -206,7 +193,7 @@ bili
 
 更多客户端配置参考网页引导: [http://localhost:8787](http://localhost:8787) .
 
-#### dsh(deepseek-harness)
+### dsh(deepseek-harness)
 
 两条通道，同一个插件(#941):
 
@@ -216,7 +203,7 @@ bili
 
 `bili dsh` 启动下插件**附看**(attach)启动器的代理(不二次拉起)。裸上游 URL 与 spawn 模式一样重写为 `<proxy>/bili/<url>`(回环代理目标永不被代理 env 拦截，等于直接绕开 MITM)；已经路由的 `/bili/` 前缀请求原样放行、只盖章。已知局限:手动 `/compact` 没有 dsh 侧事件钩子，其边界交给内核的自然 ingest diff(自动压缩已关，影响罕见)。
 
-#### Kimi Code(Moonshot)
+### Kimi Code(Moonshot)
 
 三种对齐模式:`bili kimi`(启动器,证书 MITM —— 方式 2)、`/bili/` URL 前缀,以及原生插件模式(`bili plugin install kimi`,#963)。Kimi Code v2 的插件体系是纯声明式的(`kimi.plugin.json`:MCP server、hooks、skills —— 没有进程内 JS 执行),所以 bili 无法像 pi/opencode/dsh 那样补丁客户端的 fetch 栈。取而代之,插件带两个小型 node 脚本,在客户端外围完成工作:
 
@@ -243,33 +230,6 @@ curl -s http://localhost:8787/__bili/stats
 同时也打到 stderr)。每个请求应该看到一行 `processTurn`,等对话变长后
 会出现 `[acp-usage] round N input=X cached=Y (cache hit Z%)` + `compress` 事件。
 
-### OpenCode 专属说明
-
-OpenCode 2.0 换了新插件 API(`@opencode/plugin`);独立扩展 `opencode-acp` 仅支持 V1,在 2.0 下不加载。bili 的两种模式在 2.0 都能用。2.x 插件 API 面在不同 build 间仍在变动(相邻的 npm `dev` 构建 `ctx` 形状不同),下面列的钩子/工具细节是针对具体版本的观察,不是稳定契约:
-
-- **启动器:** `bili opencode` 用法不变。在 2.x 宿主上,它把内置 V2 插件(`dist/agent/opencode.js`)以临时包装目录的形式注入临时配置(目录入口 `index.js` 再 re-export 插件文件 —— 2.x 拒绝配置 `plugin` 数组里的裸文件路径;1.x 宿主用裸文件路径)。宿主代次用 `--version` 探测(探测失败默认 1.x 形状)。V2 插件在宿主内原生注册 bili 工具 —— compress / decompress / search_context / acp_status(另加 absorb),JSON-Schema 入参 —— 并在每个 provider 请求上盖章代理头,压缩走插件模式,不做 wire 级工具注入;原生 auto-compaction 自动关闭(`compaction.auto: false`)。所有注册都是防御式的(可选链):任一 2.x build 上接缝缺失或未触发时,插件保持情性,会话透明回退纯代理模式(wire 级注入)而不是报错 —— 在两个相邻 `dev` build(2026-09-13 / 2026-09-14)上观察到过 API 面不同(#754 评审探针);反之在 `@opencode/cli` 2.0.3 上端到端验证过(原生 `acp_status` 经插件端点执行,零 wire 注入)。
-- **原生(免启动器):** npm 装好包后跑 `bili plugin install opencode` —— 它在真实 opencode 配置里注册一个自拉起插件并设 `compaction.auto: false`,之后直接跑 `opencode` 即可。入口形态取决于**本 bili 自身的安装来源**:**npm 安装**写裸包名(`"plugin": ["billion-context"]`)—— 包通过 `exports["./server"]` → `dist/agent/opencode-native.js` 暴露插件入口,opencode 用自己的 Npm.add 机制加载、自行管理安装与升级;零绝对路径、可跨机同步。**git checkout / 开发构建**没有已发布入口,回退到本机 shim 目录(`<configDir>/plugins/billion-context/index.js` → 该 checkout 的 `dist/agent/opencode-native.js`)—— 按构造即机器本地、不可跨机;之后改用 npm 安装再跑一次 install 会把条目迁回裸包名。加载时插件自拉起自己的代理(健康的已有实例直接复用不重复起;父进程 pid 看门狗在 opencode 退出时收掉它),把模型流量路由到 `<proxy>/bili/<upstream-url>`,并暴露与启动器模式相同的原生 bili 工具 —— 无固定端口、无环境变量、免启动器。退出:`BILI_NATIVE_OPENCODE=0`。若没有任何代理能拉到健康状态,请求直连(不压缩)并给一次性告警,之后自动恢复。在 `bili opencode` 启动下该入口整体跳过(代理归启动器管)。
-
-  同一个包装器也服务 **OpenCode 1.x**(V1 `.server()` 钩子;在 1.14.46 和 1.18.31 上验证):`config` 钩子在进程内直接改共享配置对象,把每个 provider 的 `options.baseURL` 改写为 `<proxy>/bili/…` 并设 `compaction.auto: false`;`chat.headers` 每次请求盖章插件头;`tool` 用真实 zod 形状注册 bili 工具(zod 是运行时依赖 —— 解析不到时插件降级纯代理模式:只改写、wire 注入工具);`/acp` 命令渲染同一张状态面板。**没有显式 `baseURL`** 的 provider(SDK 默认值,如裸 `@ai-sdk/openai` → api.openai.com)由全局 `fetch` 补丁(pi-native 同机制)兑住 —— 模型 API 调用重路由到代理(日志:`v1: fetch patch installed`),在 1.14.46 / 1.18.31 上含 OpenAI Responses 端点端到端验证;补丁幂等,`/bili/` 包装过的 URL 原样直通。
-- **纯代理:** 与其它客户端一样,把 provider baseURL 指向代理:
-
-  ```json
-  {
-    "provider": {
-      "myprovider": {
-        "npm": "@ai-sdk/openai-compatible",
-        "options": {
-          "baseURL": "http://localhost:8787/bili/http://upstream.example/v1",
-          "apiKey": "sk-any"
-        }
-      }
-    }
-  }
-  ```
-
-  注意:2.0 AI-SDK provider 即使本地端点从不校验也要求 `apiKey` 字段 —— 随便填个非空值。
-
-注意事项:2.x 系列以 npm 包 `@opencode/cli` 发布。命令支持随 build 而定:某个预发布版只暴露 list/get/update/remove,而 2.0.x 稳定版允许插件经 `ctx.command.transform((editor) => editor.add(...))` 新增命令 —— TUI 里接受斜杠菜单补全(Tab + Enter)即可调用;注意 `opencode run` 模式完全不派发斜杠命令(它们会透传给模型)。内置插件在两种形状上都刻意不注册命令。
 ### 客户端用 `http.proxy`(CONNECT)接入但从不压缩
 
 部分客户端(VS Code 系 IDE:CodeBuddy、Cursor、Windsurf……)只提供一个 HTTP **代理**设置(`http.proxy`、`codingcopilot.httpProxyURL` 等),没有可改写的模型 base-URL。这类客户端不走普通的 `/bili/…` 请求,而是把 `CONNECT <模型域名>:443` 发给代理。只有当模型域名在 bili 的 **MITM 白名单**里时这条路径才会被解密;否则 bili 只做盲隧道(不透明转发),永远看不到——也就无法压缩——模型请求(#897)。
@@ -281,6 +241,68 @@ OpenCode 2.0 换了新插件 API(`@opencode/plugin`);独立扩展 `opencode-acp`
 - 存在此类隧道时,`acp_status` 输出会多一节 `UNDECRYPTED TRAFFIC (instance-level)`。
 
 要真正压缩这类客户端:把它的模型域名加进 `billion-context.json` 的 `"mitm".domains`(如 `"mitm": { "domains": ["copilot.tencent.com"] }`)或环境变量 `BILI_MITM_DOMAINS`,重启 bili,并让客户端信任 bili 的根 CA(Node 系客户端用 `NODE_EXTRA_CA_CERTS=~/.local/share/billion-context/ca/root-ca.pem`,有 CA 路径设置的用其设置)。`/bili/` 前缀方案在这里不适用——没有 URL 可改。详见 [CONFIGURATION.zh-CN.md → MITM](CONFIGURATION.zh-CN.md#mitm-透明代理登录客户端)。
+
+## OpenCode
+
+同一个内置插件同时服务两代 OpenCode:agent 文件同时保留 V1 `server()` 与 V2 `setup()` 导出 —— ≥ 1.18.29 的 1.x 宿主加载 V1 形状,2.x 宿主加载 V2 `setup()`。独立扩展 [`opencode-acp`](https://github.com/ranxianglei/opencode-acp) 仅支持 V1,在 2.x 下**不加载** —— 对 OpenCode 2.x,**billion-context 是推荐的上下文管理方案**。以下均在 `@opencode/cli` 2.0.3 上端到端验证过(V1 泳道:1.14.46 与 1.18.31)。
+
+| 路径 | 命令 | 适用 |
+|---|---|---|
+| 启动器(最省事) | `bili opencode` | 一条命令拉起代理 + 客户端;不碰真实配置 |
+| 原生(免启动器) | `bili plugin install opencode` | 自拉起插件写进真实配置;照常启动 `opencode` |
+| 纯代理(兜底) | baseURL 加 `/bili/` 前缀 | 无插件 —— wire 级工具注入 |
+
+### 启动器 —— `bili opencode`
+
+HTTPS 走证书 MITM,HTTP 走临时 `opencode.json` 副本(`/bili/` 改写;JSONC 注释照单接受,合并方式与 opencode 自身一致;相对本地插件路径在副本里重新锚定为绝对路径 —— opencode 按声明所在配置文件目录解析,#826)。宿主代次用 `--version` 探测(探测失败默认按 1.x):**2.x** 宿主注入内置 V2 插件(`dist/agent/opencode.js`),以临时包装目录形式给出(目录入口 `index.js` 再 re-export 插件文件 —— 2.x 拒绝配置 `plugin` 数组里的裸文件路径);**1.x** 宿主直接给裸文件路径。
+
+插件在两代宿主上做的事相同:在宿主内原生注册 bili 工具 —— compress / decompress / search_context / acp_status(另加 absorb)—— 并在每个 provider 请求上盖章代理头,含从宿主自身模型目录(`ctx.catalog.model.list()`,每 60s 刷新)读取的 context-window / max-output,并以 runtime-info 上报给代理(#955)—— 压缩走插件模式,**不做** wire 级工具注入;原生 auto-compaction 自动关闭(`compaction.auto: false`)。所有注册都是防御式的(可选链):任一 2.x build 上接缝缺失或未触发时,插件保持惰性,会话透明回退纯代理模式而不是报错 —— 在相邻的 `dev` build 上观察到过 API 面互不相同(#754 评审探针)。
+
+1.x 细节(1.14.46 + 1.18.31 验证):V1 `.server()` 钩子在进程内把每个 provider 的 `options.baseURL` 改写为 `<proxy>/bili/…` 并设 `compaction.auto: false`;`chat.headers` 每次请求盖章插件头;`tool` 用真实 zod 形状注册 bili 工具(zod 是运行时依赖 —— 解析不到时降级为只改写)。没有显式 `baseURL` 的 provider(SDK 默认值,如裸 `@ai-sdk/openai` → api.openai.com)由全局 `fetch` 补丁兜住(日志:`v1: fetch patch installed`)—— 幂等,`/bili/` 包装过的 URL 原样直通;含 OpenAI Responses 端点端到端验证。
+
+### 原生(免启动器)—— `bili plugin install opencode`
+
+在真实 opencode 配置里注册一个自拉起插件并设 `compaction.auto: false`,之后直接跑 `opencode` 即可。默认不加 MCP 面(原生插件已提供会话绑定的 bili 工具);需要就传 `--with-mcp` —— 该条目不带 origin 钉扎,能扛过插件临时端口的代理重启(#926)。条目形态取决于**本 bili 自身的安装来源**:**npm 安装**写裸包名(`"plugin": ["billion-context"]`)—— 包经 `exports["./server"]` → `dist/agent/opencode-native.js` 暴露插件入口,opencode 用自己的 Npm.add 机制加载、自行管理安装与升级;零绝对路径、可跨机。(这个裸包名条目也可以不经 bili 直接手写进配置 —— 见方式 1。)**git checkout / 开发构建**回退到本机 shim 目录(`<configDir>/plugins/billion-context/index.js` → 该 checkout 的 `dist/agent/opencode-native.js`)—— 按构造即机器本地;之后改用 npm 安装再跑一次 install 会把条目迁回裸包名。
+
+加载时插件自拉起自己的代理(健康的已有实例直接复用不重复起;父进程 pid 看门狗在 opencode 退出时收掉它),把模型流量路由到 `<proxy>/bili/<upstream-url>`,暴露与启动器模式相同的原生 bili 工具 —— 无固定端口、无环境变量、免启动器。退出:`BILI_NATIVE_OPENCODE=0`。若没有任何代理能拉到健康状态,请求直连(不压缩)并给一次性告警,之后自动恢复。在 `bili opencode` 启动下该条目整体跳过(代理归启动器管)。
+
+### 纯代理(无插件)
+
+与其它客户端一样,把 provider baseURL 指向代理:
+
+```json
+{
+  "provider": {
+    "myprovider": {
+      "npm": "@ai-sdk/openai-compatible",
+      "options": {
+        "baseURL": "http://localhost:8787/bili/http://upstream.example/v1",
+        "apiKey": "sk-any"
+      }
+    }
+  }
+}
+```
+
+注意:2.0 AI-SDK provider 即使本地端点从不校验也要求 `apiKey` 字段 —— 随便填个非空值。
+
+### 状态:`/acp` 与 `acp_status`
+
+`/acp` 面板在所有模式下都绑定当前会话,`acp_status` 工具是其宿主内等价手段。在命令编辑器支持新增条目的宿主(2.0.x 稳定版,`editor.add`)上,V2 插件额外注册 `/acp` 斜杠命令 —— 以合成非模型消息渲染,面板优先(与 `acp_status` 工具一致);旧形状上该注册保持惰性。注意 `opencode run` 模式完全不派发斜杠命令(它们会透传给模型)—— 请用 TUI。
+
+### 旧 opencode-acp 会话(#920)
+
+在 1.x 宿主上,迁移前的 [`opencode-acp`](https://github.com/ranxianglei/opencode-acp) 旧会话在两条泳道下都继续可用:启动器从临时配置副本中移除 `opencode-acp` 条目(宿主永远不会以激活状态加载它),各泳道把已安装的包作为库吸收(直接从 `node_modules` 导入 —— `.opencode/node_modules`、项目 `node_modules`、全局 npm root、opencode 配置级 modules,先到先得)。会话属于 legacy ⟺ opencode-acp 的持久化状态文件存在(`<XDG_DATA_HOME>/opencode/storage/plugin/acp/<sessionID>.json`,或 `acp.jsonc` 中 `storagePath` 指定的目录):
+
+- **旧会话** —— 压缩由被吸收的 opencode-acp 执行(它自己的引用号与块存储照常工作:`compress` / `decompress` / `search_context` / `acp_status` / `acp_context_recap` 全部在它里面执行)。其模型请求带 `x-bili-plugin-bypass: 1`,代理原样转发 —— 不注入 wire 工具、不注 nudge、不绑定会话。
+- **新会话** —— bili 接管:工具调用转发到代理的 plugin 端点(plugin 模式)。执行器按会话分泳道:新会话的 `compress` 发到代理,旧会话的发给 opencode-acp。`acp_context_recap` 没有代理端对应 —— 新会话调用会收到代理的 unknown-tool 消息。
+
+`/acp` 与 `/dcp` 同样路由。新会话被 opencode-acp 注册表收编的可能被其 transform 门控(system / messages / text.complete 都过 legacy 谓词)阻断。退化路径:包缺失、导入失败或不是 v1 时,bili 单独运行,旧会话退化为只读存档(旧标签照常渲染、`decompress` 返回 `[Block … not found]`、新引用号从 m00001 重新开始)。
+
+### 注意事项
+
+- 2.x 系列以 npm 包 `@opencode/cli` 发布,且插件 API 面在不同 build 间仍在变动(相邻 `dev` 通道构建暴露不同 `ctx` 形状)—— 上文钩子/工具细节是针对具体版本的观察,不是稳定契约。
+- 设计说明:V2 插件是薄协议客户端(不含 acp-kernel)—— 代理始终是唯一的压缩权威,消除 agent 与代理间的内核版本漂移;它不依赖插件 API 无法改上下文这一事实(该能力随 2.x build 变化)。
 
 ## 运行代理
 
