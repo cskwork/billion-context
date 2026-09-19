@@ -182,7 +182,7 @@ test("default config (unset mode) keeps the inherited aux tier reachable — exp
     });
 });
 
- test("resolveProxyDecision: inherited tier routes blind-tunnel aux traffic, model path stays direct (#1012)", () => {
+test("resolveProxyDecision: inherited tier routes blind-tunnel aux traffic, model path stays direct (#1012)", () => {
     const target = "https://chatgpt.com/backend-api/ps/mcp";
     const proxyFallback = { biliPort: 42422, systemProxy: { enabled: false } };
     const auxProxyFallback = {
