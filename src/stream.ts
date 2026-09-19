@@ -69,7 +69,6 @@ export function compressibleSpanHint(state: CompressionState): string {
     return ` Live compressible refs: ${fmt(boundary + 1)}–${fmt(highest)} (everything up to ${fmt(boundary)} is already inside active blocks). Retry NOW in this same turn with startId/endId inside that span.`;
 }
 
-
 const M_REF_NUM_RE = /^m0*(\d{1,7})$/i;
 
 // #1001: after a client history rewrite, ref numbers are no longer monotonic
@@ -149,7 +148,7 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         if (r.blocksCreated === 0) {
             const errs = r.errors.join("; ") || "no blocks created";
             ctx.log(`[acp-proxy: compress FAILED ${detail} → 0 blocks. ${errs}]`);
-        return `[Compression FAILED: ${errs}${compressibleSpanHint(ctx.session.state)}]`;
+            return `[Compression FAILED: ${errs}${compressibleSpanHint(ctx.session.state)}]`;
         }
 
         // #189 observability: record the rewrite magnitude + fold point so a
