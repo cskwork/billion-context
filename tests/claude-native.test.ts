@@ -363,9 +363,13 @@ function runHook(distScript: string, port: number, xdg: Record<string, string>):
                 BILI_CLAUDE_NATIVE_PORT: String(port),
                 NO_COLOR: "1",
                 // Hermetic tmp: the hook's spawned proxy logs to
-                // <tmpdir>/bili-proxy-<port>.log — pin it to the test
-                // process's tmpdir (same as the XDG sandbox above).
-                TMPDIR: os.tmpdir(),
+                // <tmpdir>/bili-proxy-<port>.log. The minimal child env has
+                // no platform tmp vars, so pin every one of them to the
+                // sandbox (Node reads TMPDIR on POSIX, TMP/TEMP on Windows —
+                // with none set it falls back to an unwritable root, e.g. C:\).
+                TMPDIR: xdg.tmp,
+                TEMP: xdg.tmp,
+                TMP: xdg.tmp,
             },
             stdio: ["ignore", "ignore", "pipe"],
         });
@@ -473,7 +477,9 @@ test("hook e2e: dist script spawns a proxy on the stable port, second run attach
         state: path.join(home, "state"),
         cache: path.join(home, "cache"),
         data: path.join(home, "data"),
+        tmp: path.join(home, "tmp"),
     };
+    fs.mkdirSync(xdg.tmp);
     const port = await freePort();
     const instanceFile = path.join(xdg.state, "billion-context", "proxy-origin");
     let proxyPid = 0;
