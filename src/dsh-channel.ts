@@ -61,7 +61,9 @@ export function stripDshManagedPatch(text: string): string {
 function restoreDshPatchPlaceholder(text: string): string {
     const meaningful = text.split("\n").some((line) => line.trim().length > 0 && !line.trimStart().startsWith("#"));
     if (meaningful) return text.endsWith("\n") ? text : text + "\n";
-    return DSH_PATCH_HEADER + "[]\n";
+    const comments = text.split("\n").filter((l) => l.trimStart().startsWith("#")).join("\n");
+    const header = comments.length > 0 ? `${comments}\n` : DSH_PATCH_HEADER;
+    return `${header}[]\n`;
 }
 
 /** True when this profile's cordis.patch.yml still carries a pre-unification

@@ -71,6 +71,21 @@ test("stripLegacyManagedBlock: preserves user entries; leaves non-managed files 
     }
 });
 
+test("stripLegacyManagedBlock: preserves user comments when nothing meaningful remains", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-legacy3-"));
+    try {
+        const notes = "# my note one\n# my note two\n";
+        fs.writeFileSync(path.join(dir, "cordis.patch.yml"), `${notes}${legacyBlockOf("/opt/bili")}`);
+        assert.equal(stripLegacyManagedBlock(dir), true);
+        const out = fs.readFileSync(path.join(dir, "cordis.patch.yml"), "utf8");
+        assert.ok(out.startsWith(notes));
+        assert.ok(out.includes("[]"));
+        assert.ok(!out.includes(DSH_PATCH_BEGIN));
+    } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
 // — channel-driven installer roundtrip under a fake DSH_HOME ——————————
 
 /** Recording stand-in for the real spawn: applies the manifest effect the
