@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import http from "node:http";
 import { pathToFileURL } from "node:url";
-import { apply, planNativeDsh, shouldBootstrapNativeDsh, _resetRegisterForTest, _stateHeadersForTest } from "../src/agent/dsh-native.ts";
+import { apply, planNativeDsh, shouldBootstrapNativeDsh, _resetRegisterForTest, _setSpawnForTest, _stateHeadersForTest } from "../src/agent/dsh-native.ts";
 import { dshNativeInstalled, isNpmInstallForm, pluginInstall, pluginRemove, pluginStatusAll, selfPackageRoot } from "../src/plugin-install.ts";
 import { DSH_PATCH_BEGIN, DSH_PATCH_END, dshBundleInstalled, dshProfileDirs, planDshSpawn, stripDshManagedPatch, stripLegacyManagedBlock, _setDshRunnersForTest, type DshPlan } from "../src/dsh-channel.ts";
 
@@ -654,6 +654,110 @@ test("apply() /acp pre-first-request (#955): renders the runtime-table entry bef
         });
     } finally {
         proxy.close();
+        fs.rmSync(home, { recursive: true, force: true });
+        _resetRegisterForTest(undefined);
+    }
+});
+
+// — #983: stale attach verification + spawn fallback + self-heal ——————————
+
+test("#983 apply() attach mode: a dead preset falls back to a spawned proxy and unfreezes the env", async () => {
+    const live = await startMockProxy([]);
+    const calls: Array<{ conversationId: string; tool: string; args: unknown }> = [];
+    const forward = await startMockProxy(calls);
+    let spawnCalls = 0;
+    _setSpawnForTest(async () => {
+        spawnCalls += 1;
+        return forward.origin;
+    });
+    const errors: string[] = [];
+    const origErr = console.error;
+    console.error = (...args: unknown[]) => {
+        errors.push(args.map(String).join(" "));
+    };
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-983a-"));
+    try {
+        // port 1 on loopback: connection refused immediately — a stale preset
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: "http://127.0.0.1:1" }, async () => {
+            _resetRegisterForTest("http://127.0.0.1:1");
+            const ctx = mockCtx();
+            apply(ctx);
+            await waitFor(() => ctx.registeredTools.length === 1, "fallback tool registration");
+            // the dead preset was replaced by the fallback-spawned origin…
+            assert.equal(spawnCalls, 1);
+            assert.match(errors.join("\n"), /not healthy — falling back/);
+            // …and the env is unfrozen so a later re-apply plans spawn, not attach
+            assert.equal(process.env.BILLION_CONTEXT_PROXY, undefined);
+            // tools are live against the fallback origin
+            const out = await ctx.registeredTools[0].execute({ summary: "s" }, { agent: { session: { id: "s983" } } });
+            assert.equal(out, "compressed 42 tokens");
+            assert.deepEqual(calls, [{ conversationId: "s983", tool: "compress", args: { summary: "s" } }]);
+        });
+    } finally {
+        console.error = origErr;
+        _setSpawnForTest(undefined);
+        live.close();
+        forward.close();
+        fs.rmSync(home, { recursive: true, force: true });
+        _resetRegisterForTest(undefined);
+    }
+});
+
+test("#983 apply() attach mode: a healthy preset attaches without any spawn", async () => {
+    const proxy = await startMockProxy([]);
+    let spawnCalls = 0;
+    _setSpawnForTest(async () => {
+        spawnCalls += 1;
+        return "http://127.0.0.1:1";
+    });
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-983b-"));
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin }, async () => {
+            _resetRegisterForTest(proxy.origin);
+            const ctx = mockCtx();
+            apply(ctx);
+            await waitFor(() => ctx.registeredTools.length === 1, "attach tool registration");
+            assert.equal(spawnCalls, 0);
+            assert.equal(process.env.BILLION_CONTEXT_PROXY, proxy.origin);
+        });
+    } finally {
+        _setSpawnForTest(undefined);
+        proxy.close();
+        fs.rmSync(home, { recursive: true, force: true });
+        _resetRegisterForTest(undefined);
+    }
+});
+
+test("#983 maybeRetry self-heals a base-less register after a failed respawn", async () => {
+    const calls: Array<{ conversationId: string; tool: string; args: unknown }> = [];
+    const forward = await startMockProxy(calls);
+    const answers: Array<string | undefined> = [undefined, forward.origin];
+    _setSpawnForTest(async () => answers.shift());
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-983c-"));
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: "http://127.0.0.1:1" }, async () => {
+            _resetRegisterForTest("http://127.0.0.1:1");
+            const ctx = mockCtx();
+            apply(ctx);
+            // first spawn attempt fails → fallback leaves the register base-less
+            await new Promise((r) => setTimeout(r, 50));
+            const headersFor = _stateHeadersForTest();
+            assert.ok(headersFor !== undefined, "headersFor installed");
+            // a later model request drives maybeRetry → respawn (2nd answer) → tools recover
+            headersFor("https://api.anthropic.com/v1/messages");
+            await waitFor(() => ctx.registeredTools.length === 1, "self-healed tool registration");
+            const out = await ctx.registeredTools[0].execute({ summary: "s" }, { agent: { session: { id: "s983c" } } });
+            assert.equal(out, "compressed 42 tokens");
+            // once tools are ready the stamping path works again
+            ctx.setInitiator({ session: { id: "s983c" } });
+            headersFor("https://api.anthropic.com/v1/messages");
+            // toolsReady is set asynchronously after registration; poll for the stamp
+            await waitFor(() => headersFor("https://api.anthropic.com/v1/messages") !== undefined, "plugin headers stamped");
+            assert.equal(headersFor("https://api.anthropic.com/v1/messages")?.["x-bili-plugin"], "dsh");
+        });
+    } finally {
+        _setSpawnForTest(undefined);
+        forward.close();
         fs.rmSync(home, { recursive: true, force: true });
         _resetRegisterForTest(undefined);
     }

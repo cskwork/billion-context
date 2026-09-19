@@ -132,7 +132,10 @@ async function withTimeout(p: Promise<string | undefined>, ms: number): Promise<
     });
     try {
         return await Promise.race([p, timeout]);
-    } catch {
+    } catch (err) {
+        // #983: a rejected bootstrap used to vanish silently here — surface
+        // the real error so a dead-spawn looks different from a slow one.
+        console.error(`bili-native: proxy bootstrap failed (${err instanceof Error ? err.message : String(err)}) — falling back after timeout`);
         return undefined;
     } finally {
         if (timer !== undefined) clearTimeout(timer);

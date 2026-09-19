@@ -4,7 +4,8 @@
 // injected by the `bili dsh` launcher through the same --patch overlay that
 // used to carry dsh-acp.ts. Architecture mirrors pi-native.ts:
 //   1. plan: attach (BILLION_CONTEXT_ATTACH ?? BILLION_CONTEXT_PROXY — the
-//      launcher preset, or a user-supplied external proxy) or spawn the
+//      launcher preset, or a user-supplied external proxy; #983: the preset
+//      is probed and a dead one falls back to spawn) or spawn the
 //      package's own proxy (ensureProxyRunning, ephemeral port, parent-pid
 //      watchdog = this dsh process);
 //   2. patch globalThis.fetch (native-intercept.ts) — model-API URLs are
@@ -177,7 +178,11 @@ async function bootstrap(): Promise<string | undefined> {
         );
         state.origin = handle.origin;
         register.base = handle.origin;
-        process.env.BILLION_CONTEXT_PROXY = handle.origin;
+        // #983: do NOT write BILLION_CONTEXT_PROXY — dsh has no reader for it
+        // here (tools use register.base, /acp uses it too), and a frozen env
+        // turns a later same-process re-apply (cordis deactivate/reactivate)
+        // into an unverified attach to a possibly-dead origin. Reuse across
+        // lifecycles goes through ensureProxyRunning's instance discovery.
         return handle.origin;
     } catch (err) {
         console.error(`bili-native-dsh: proxy bootstrap failed — model traffic goes direct (uncompressed): ${errMessage(err)}`);
@@ -185,7 +190,56 @@ async function bootstrap(): Promise<string | undefined> {
     }
 }
 
-function toolDefinition(base: string, tool: ManifestTool): ToolDefinition {
+// #983: test injection for the stale-attach fallback's spawn — production
+// always uses the real bootstrap; tests substitute a recorder that returns
+// an origin (side effects on register/state live in the fallback itself).
+let _spawnForTest: (() => Promise<string | undefined>) | undefined;
+
+/** Test hook: replace the fallback spawn (and the respawn self-heal's
+ *  spawn) with a stub. Pass undefined to restore. */
+export function _setSpawnForTest(fn?: () => Promise<string | undefined>): void {
+    _spawnForTest = fn;
+}
+
+/** #983: a planned attach origin can be stale — the `bili dsh` launcher's
+ *  proxy died, or a pre-#983 build froze its spawned origin into
+ *  process.env and cordis re-activated this plugin in the same process.
+ *  Probe before trusting it: healthy → attach as planned; dead → unfreeze
+ *  the preset env and fall back to spawning our own proxy (instance
+ *  discovery may find another healthy one first). Resolves to the origin
+ *  the plugin should use — attachOrigin, the fallback origin, or undefined
+ *  when even the fallback failed (register left base-less). */
+async function verifyAttachAndRecover(attachOrigin: string): Promise<string | undefined> {
+    const version = await fetchProxyVersion(attachOrigin).catch(() => undefined);
+    if (version !== undefined) return attachOrigin;
+    console.error(`bili-native-dsh: attach target ${attachOrigin} is not healthy — falling back to a spawned proxy`);
+    // Unfreeze: only the preset (BILLION_CONTEXT_PROXY) freezes future
+    // plans; an explicit BILLION_CONTEXT_ATTACH never touches the preset.
+    delete process.env.BILLION_CONTEXT_PROXY;
+    state.attach = false;
+    state.origin = undefined;
+    markNativeHost(process.env, "dsh");
+    const start = singleFlight(_spawnForTest ?? bootstrap);
+    state.respawn = start;
+    state.onGiveUp = () => {
+        register.base = undefined;
+        register.toolsReady = false;
+    };
+    const landed = start().then((origin) => {
+        if (origin === undefined) {
+            register.base = undefined;
+            register.toolsReady = false;
+            return undefined;
+        }
+        register.base = origin;
+        state.origin = origin;
+        return origin;
+    });
+    state.ready = landed;
+    return landed;
+}
+
+function toolDefinition(tool: ManifestTool): ToolDefinition {
     return {
         name: tool.name,
         description: tool.description,
@@ -195,6 +249,12 @@ function toolDefinition(base: string, tool: ManifestTool): ToolDefinition {
             render: (_args, value) => [{ type: "text", text: typeof value === "string" ? value : String(value ?? "") }],
         },
         execute: async (args, exec) => {
+            // #983: read the LIVE base — a respawn after a proxy death moves
+            // the origin, and a captured base would keep firing at a dead port.
+            const base = register.base;
+            if (base === undefined) {
+                throw new Error("bili: proxy is down — recovery in progress, retry shortly");
+            }
             const sid = exec.agent?.session?.id;
             if (typeof sid !== "string" || sid.length === 0) {
                 throw new Error(`bili tool ${tool.name} requires an owning agent session`);
@@ -210,7 +270,7 @@ async function registerTools(ctx: PluginContext): Promise<void> {
     if (register.toolsReady || base === undefined) return;
     register.pending = (async () => {
         const tools = await fetchManifest(base, "anthropic");
-        for (const tool of tools) ctx.tools.register(toolDefinition(base, tool));
+        for (const tool of tools) ctx.tools.register(toolDefinition(tool));
         register.toolsReady = true;
     })()
         .catch((err: unknown) => {
@@ -232,9 +292,27 @@ async function registerTools(ctx: PluginContext): Promise<void> {
 }
 
 function maybeRetry(ctx: PluginContext): void {
-    if (register.dead || register.toolsReady || register.base === undefined) return;
+    if (register.dead || register.toolsReady) return;
     if (register.pending !== undefined) return;
     if (Date.now() < register.retryAt) return;
+    if (register.base === undefined) {
+        // #983: a failed respawn (onGiveUp) left the register base-less —
+        // without this branch the plugin never recovers and tools die for
+        // good. Self-heal: re-arm the spawn bootstrap every retry interval
+        // until a proxy comes back (attach mode has no respawn — nothing to do).
+        const respawn = state.respawn;
+        if (respawn === undefined) return;
+        register.retryAt = Date.now() + RETRY_INTERVAL_MS;
+        void respawn()
+            .then((origin) => {
+                if (origin === undefined) return;
+                register.base = origin;
+                state.origin = origin;
+                void registerTools(ctx).catch(() => {});
+            })
+            .catch(() => {});
+        return;
+    }
     void registerTools(ctx).catch(() => {});
 }
 
@@ -297,15 +375,16 @@ export function apply(ctx: PluginContext): void {
     if (plan.mode === "attach") {
         state.attach = true;
         state.origin = plan.attachOrigin;
-        state.ready = Promise.resolve(plan.attachOrigin);
         register.base = plan.attachOrigin;
-        process.env.BILLION_CONTEXT_PROXY = plan.attachOrigin;
+        // #983: no env write (it freezes future plans); the origin is probed
+        // first — a dead preset falls back to a spawned proxy, and tools only
+        // register once the landed origin is known.
+        state.ready = plan.attachOrigin !== undefined ? verifyAttachAndRecover(plan.attachOrigin) : Promise.resolve(undefined);
     } else if (process.env.NODE_TEST_CONTEXT === undefined) {
         markNativeHost(process.env, "dsh");
         const start = singleFlight(bootstrap);
         state.respawn = start;
         state.onGiveUp = () => {
-            delete process.env.BILLION_CONTEXT_PROXY;
             register.base = undefined;
             register.toolsReady = false;
         };
