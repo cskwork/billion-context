@@ -18,6 +18,7 @@ import {
     isBiliClaudeBaseUrl,
     pluginInstall,
     pluginRemove,
+    resolveClaudeCli,
     stripClaudeManagedBlock,
 } from "../src/plugin-install.ts";
 import { CLAUDE_NATIVE_DEFAULT_PORT, clearClaudeNativePort, resolveClaudeNativePort, saveClaudeNativePort } from "../src/config.ts";
@@ -175,6 +176,20 @@ function unsandbox(prev: string | undefined, prevCfg: string | undefined = proce
 
 test("claudeSettingsFile: CLAUDE_CONFIG_DIR replaces the whole .claude dir", () => {
     assert.equal(claudeSettingsFile({ CLAUDE_CONFIG_DIR: "/tmp/cc" }), path.join("/tmp/cc", "settings.json"));
+});
+
+test("resolveClaudeCli: bare names resolve via where.exe on Windows, untouched elsewhere", () => {
+    if (process.platform === "win32") {
+        // 'where' always exists on Windows PATH; the resolution must return
+        // an absolute path to a real executable file.
+        const resolved = resolveClaudeCli("where");
+        assert.match(resolved, /where\.exe$/i);
+    } else {
+        // Paths, names with extensions, and everything on posix pass through.
+        assert.equal(resolveClaudeCli("claude"), "claude");
+        assert.equal(resolveClaudeCli("C:\\x\\claude.cmd"), "C:\\x\\claude.cmd");
+        assert.equal(resolveClaudeCli("/usr/local/bin/claude"), "/usr/local/bin/claude");
+    }
 });
 
 test("installer round-trip: managed block + MCP face, then removal restores", () => {

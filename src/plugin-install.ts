@@ -18,7 +18,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { applyEdits, modify as jsoncModify, parse as jsoncParse, type ParseError } from "jsonc-parser";
 import { resolveDshHome, resolvePiHome } from "./client-config.js";
@@ -493,6 +493,22 @@ function runClaudeCli(claude: string, args: string[]): void {
 // CLAUDE overrides the claude binary path (absolute path for sandboxed
 // setups; a guaranteed-missing file in tests so the failure path stays
 // deterministic even on machines that have the real CLI).
+/** Resolve a bare CLI name to its real path on Windows — Node's spawn
+ *  never consults PATHEXT, so a bare `claude` (→ claude.cmd / claude.exe)
+ *  would ENOENT before runClaudeCli ever sees the .cmd. Uses where.exe; on
+ *  failure or non-Windows the input is returned untouched (the original
+ *  ENOENT error stays truthful). */
+export function resolveClaudeCli(claude: string): string {
+    if (process.platform !== "win32" || /[\\/]/.test(claude) || /\.[a-z]+$/i.test(claude)) return claude;
+    try {
+        const r = spawnSync("where.exe", [claude], { stdio: ["ignore", "pipe", "ignore"], timeout: 5000, encoding: "utf8" });
+        const first = (r.stdout ?? "").split(/\r?\n/).find((l) => l.trim().length > 0)?.trim();
+        return first && first.length > 0 ? first : claude;
+    } catch {
+        return claude;
+    }
+}
+
 function claudeInstall(): string {
     if (process.env.BILI_NATIVE_CLAUDE === "0") {
         throw new Error("claude: install refused — BILI_NATIVE_CLAUDE=0 is set (clear it to install the native posture)");
@@ -523,7 +539,7 @@ function claudeInstall(): string {
     // port the hook brings up — never proxyOriginForInstall() (an ephemeral
     // launcher proxy would go stale in this static config).
     const stableOrigin = `http://127.0.0.1:${nativePort}`;
-    const claude = process.env.CLAUDE?.trim() || "claude";
+    const claude = resolveClaudeCli(process.env.CLAUDE?.trim() || "claude");
     try {
         runClaudeCli(claude, ["mcp", "add", "bili", "--scope", "user", "-e", `BILI_MCP_PROXY=${stableOrigin}`, "--", process.execPath, mcpJs]);
     } catch (err) {
@@ -560,7 +576,7 @@ function claudeRemove(): string {
         parts.push(`managed block removed from ${file} (${removed.join(", ")})`);
     }
     if (claudeMcpInstalled()) {
-        const claude = process.env.CLAUDE?.trim() || "claude";
+        const claude = resolveClaudeCli(process.env.CLAUDE?.trim() || "claude");
         try {
             runClaudeCli(claude, ["mcp", "remove", "bili", "--scope", "user"]);
             parts.push("MCP face removed");
