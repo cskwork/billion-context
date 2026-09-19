@@ -81,11 +81,32 @@ test("applyOpencodePluginEntry: dev form replaces an existing bare-name entry wi
     assert.match(notes[1], /not portable across machines/);
 });
 
-test("applyOpencodePluginEntry: non-string plugin entries are ignored (pre-existing filter behavior)", () => {
+test("applyOpencodePluginEntry: non-string plugin entries are preserved verbatim (#1002)", () => {
     const args = entryArgs(NPM_ROOT, tempDir("bili-oc-nonstr-"));
-    args.data.plugin = [42, null, "other-pkg"];
-    applyOpencodePluginEntry(args);
-    assert.deepEqual(args.data.plugin, ["other-pkg", OPENCODE_NPM_ENTRY]);
+    const objs = [{ package: "@org/x" }, { package: "y", options: { z: 1 } }];
+    args.data.plugin = [42, null, ...objs, "other-pkg"];
+    const notes = applyOpencodePluginEntry(args);
+    assert.deepEqual(args.data.plugin, [42, null, ...objs, "other-pkg", OPENCODE_NPM_ENTRY]);
+    assert.deepEqual(notes, [`plugin -> ${OPENCODE_NPM_ENTRY}`]);
+});
+
+test("applyOpencodePluginEntry: idempotent run with foreign objects leaves the key untouched (#1002)", () => {
+    const args = entryArgs(NPM_ROOT, tempDir("bili-oc-idem-obj-"));
+    const objs = [{ package: "@org/x" }];
+    args.data.plugin = [...objs, OPENCODE_NPM_ENTRY];
+    const touched = new Set<string>();
+    const before = args.data.plugin;
+    assert.deepEqual(applyOpencodePluginEntry({ ...args, touched }), ["plugin present"]);
+    assert.equal(touched.size, 0, "no key touched — no rewrite");
+    assert.equal(args.data.plugin, before, "same array reference, untouched");
+});
+
+test("applyOpencodePluginEntry: map-form plugins keep foreign options and stay a map (#1002)", () => {
+    const args = entryArgs(NPM_ROOT, tempDir("bili-oc-map-"));
+    args.data.plugins = { "@org/x": { options: { z: 1 } }, "plain-y": true };
+    applyOpencodePluginEntry({ ...args, key: "plugins" });
+    assert.deepEqual(args.data.plugins, { "@org/x": { options: { z: 1 } }, "plain-y": true, [OPENCODE_NPM_ENTRY]: true });
+    assert.ok(!Array.isArray(args.data.plugins), "map form preserved");
 });
 
 type OcCfg = { plugin?: unknown; compaction?: { auto?: boolean } & Record<string, unknown>; mcp?: unknown };
