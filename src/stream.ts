@@ -49,10 +49,11 @@ function executeAnthropicProxyTool(toolName: string, args: Record<string, unknow
 }
 
 /** Numeric part of a ref ("m00042" → 42, "b3" → 3); 0 for non-numeric. Used to
- *  order ranges by position when picking the fold point (#189 observability). */
+ * order ranges by position when picking the fold point (#189 observability). */
 function refNum(ref: string): number {
     return Number(ref.replace(/\D/g, "")) || 0;
 }
+
 
 const M_REF_NUM_RE = /^m0*(\d{1,7})$/i;
 
@@ -85,7 +86,7 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         ctx.log("[acp-proxy: compress call had no valid ranges; nothing compressed.]");
         const reasons = diagnostics.invalidReasons?.slice(0, 8).map((r) => (r.length > 200 ? r.slice(0, 200) + "..." : r)) ?? [];
         const why = reasons.length > 0 ? ` Rejected entries:\n${reasons.map((r) => `- ${r}`).join("\n")}` : "";
-        return `[Compression FAILED: no valid ranges parsed (kind=${diagnostics.kind}, dropped=${diagnostics.invalidItems}).${why}\n compress requires a non-empty 'content' array where each element is EITHER an object {startId, endId, summary} OR one line-form string whose first line is 'mNNNNN–mNNNNN optional topic' with the summary markdown on the following lines (a separate summary-only element right after a bare header line is also accepted). startId/endId are mNNNNN message refs from the conversation. Re-issue the compress call with a valid content array.]`;
+        return `[Compression FAILED: no valid ranges parsed (kind=${diagnostics.kind}, dropped=${diagnostics.invalidItems}). NOTHING was compressed — the nudge is still pending.${why}\ncompress requires a non-empty 'content' array: compress({ content: [{ startId: "m00123", endId: "m00180", summary: "one short line per range" }] }). startId/endId are mNNNNN message refs from the conversation; get the current ranges from the nudge or acp_status. Retry NOW in this same turn — write your own summary text for each range, do not skip the compression.]`;
     }
     const swappedRanges = normalizeRangeOrder(ranges);
     if (swappedRanges > 0) {
@@ -133,7 +134,7 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         if (r.blocksCreated === 0) {
             const errs = r.errors.join("; ") || "no blocks created";
             ctx.log(`[acp-proxy: compress FAILED ${detail} → 0 blocks. ${errs}]`);
-            return `[Compression FAILED: ${errs}]`;
+        return `[Compression FAILED: ${errs}]`;
         }
 
         // #189 observability: record the rewrite magnitude + fold point so a
