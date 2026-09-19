@@ -77,7 +77,7 @@ import { emitPreflightError, emitStreamError } from "./stream-error.js";
 import { affinityToken, clientConversationHeader, codexTurnIdentity, preferPromptCacheKeyIdentity, type ConversationIdentity } from "./session-id.js";
 import { prefixAffinity, type AnonymousAffinity } from "./prefix-affinity.js";
 import { flushPrefixAffinity, hydratePrefixAffinity, scheduleAffinityPersist } from "./affinity-persist.js";
-import { consumePluginRegisterFor, flushConversations, handlePluginCompact, handlePluginManifest, handlePluginRegister, handlePluginRuntimeInfo, handlePluginStatus, handlePluginTool, loadConversations, pipePluginChatWithStrip, pipePluginJson, pipePluginResponsesWithStrip, pluginAgentHeader, pluginConversationHeader, pluginReportedContextWindow, pluginReportedMaxOutput, pluginRuntimeInfoFor, recordPluginSession, rememberPluginMessages, takePendingPluginRegister } from "./plugin.js";
+import { consumePluginRegisterFor, flushConversations, handlePluginCompact, handlePluginManifest, handlePluginRegister, handlePluginRuntimeInfo, handlePluginStatus, handlePluginTool, loadConversations, pipePluginChatWithStrip, pipePluginJson, pipePluginResponsesWithStrip, pluginAgentHeader, pluginConversationHeader, pluginHeadersMatchModel, pluginReportedContextWindow, pluginReportedMaxOutput, pluginRuntimeInfoFor, recordPluginSession, rememberPluginMessages, takePendingPluginRegister } from "./plugin.js";
 import { setupMitm, readMitmUpstream, getBlindTunnelStats } from "./mitm.js";
 import type { BiliMessage } from "acp-kernel/wire";
 import { BILI_PLUGIN_BYPASS_HEADER, hardenOpenaiAssistantContent, isLoopbackAddress, inspectContextOverflow, reserveOutputHeadroom, resolveOutputHeadroomCap, shouldReserveOutputHeadroom, systemToUser, usageTotals, type WireProtocol } from "./util.js";
@@ -1012,7 +1012,7 @@ async function handle(
             // outranks everything inside resolveRequestConfig.
             const host = (() => { try { return embeddedUrl ? new URL(embeddedUrl).host : undefined; } catch { return undefined; } })();
             const betaWindow = anthropicBetaContextWindow(req.headers);
-            const pluginWindow = pluginReportedContextWindow(req.headers);
+            const pluginWindow = pluginHeadersMatchModel(req.headers, model) ? pluginReportedContextWindow(req.headers) : undefined;
             // Runtime-table fallback for the window (#955): only when this
             // request's plugin sent no window header AND the agent's latest
             // runtime-info entry matches THIS request's model — a stale
@@ -1483,7 +1483,7 @@ async function handle(
                 // actually ask the upstream for. Still only a fallback: a
                 // max_tokens on the wire beat it above.
                 const fbModel0 = (parsed as { model?: string }).model;
-                const runtimeMax = pluginReportedMaxOutput(req.headers) ?? pluginRuntimeInfoFor(pluginAgentHeader(req.headers), fbModel0)?.maxOutput;
+                const runtimeMax = (pluginHeadersMatchModel(req.headers, fbModel0) ? pluginReportedMaxOutput(req.headers) : undefined) ?? pluginRuntimeInfoFor(pluginAgentHeader(req.headers), fbModel0)?.maxOutput;
                 if (typeof runtimeMax === "number" && runtimeMax > 0) {
                     maxOutput = runtimeMax;
                     if (!headroomFallbackLogged.has(`${fbModel0 ?? "?"}|runtime-info`)) {

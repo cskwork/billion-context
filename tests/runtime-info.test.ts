@@ -18,6 +18,7 @@ import { _resetSessionsForTest } from "../src/session.ts";
 import {
     _resetPluginStateForTest,
     handlePluginRuntimeInfo,
+    pluginHeadersMatchModel,
     pluginReportedMaxOutput,
     pluginReportedModel,
     pluginRuntimeInfoFor,
@@ -50,6 +51,18 @@ describe("runtime-info header parsing (#955)", () => {
         assert.equal(pluginReportedModel({ "x-bili-plugin": "pi", "x-bili-plugin-model": "qwen3.5-33b" }), "qwen3.5-33b");
         assert.equal(pluginReportedModel({ "x-bili-plugin-model": "qwen" }), undefined);
         assert.equal(pluginReportedModel({ "x-bili-plugin": "pi", "x-bili-plugin-model": "a b" }), undefined);
+    });
+
+    it("header/model cross-check: a different body model rejects the plugin headers (#956 hardening)", () => {
+        const h = { "x-bili-plugin": "pi", "x-bili-plugin-model": "qwen-a" };
+        assert.equal(pluginHeadersMatchModel(h, "qwen-a"), true);
+        assert.equal(pluginHeadersMatchModel(h, "qwen-b"), false);
+        // provider/model composite bodies match the bare stamped id
+        assert.equal(pluginHeadersMatchModel(h, "sglang/qwen-a"), true);
+        assert.equal(pluginHeadersMatchModel(h, "sglang/qwen-b"), false);
+        // no model header = pre-#956 trust preserved
+        assert.equal(pluginHeadersMatchModel({ "x-bili-plugin": "pi" }, "qwen-b"), true);
+        assert.equal(pluginHeadersMatchModel(h, undefined), true);
     });
 });
 

@@ -101,6 +101,15 @@ const register: RegisterState = { base: undefined, toolsReady: false, dead: fals
 type ModelInfoCache = { provider: string; model: string; contextWindow?: number; maxOutput?: number };
 const modelInfo: { cached?: ModelInfoCache; services?: { llm?: PluginContext["llm"]; agentDefaultModel?: PluginContext["agentDefaultModel"] }; refreshing: boolean } = { refreshing: false };
 
+function selectionStillCurrent(svc: { agentDefaultModel?: PluginContext["agentDefaultModel"] }, provider: string, model: string): boolean {
+    try {
+        const live = svc.agentDefaultModel?.currentSelection?.();
+        return live?.provider === provider && live?.model === model;
+    } catch {
+        return false;
+    }
+}
+
 function refreshModelInfo(origin: string | undefined): void {
     const svc = modelInfo.services;
     if (svc === undefined || modelInfo.refreshing) return;
@@ -123,6 +132,11 @@ function refreshModelInfo(origin: string | undefined): void {
     void Promise.resolve()
         .then(() => resolve(provider, model))
         .then((info) => {
+            // Commit only if the LIVE selection still matches what we
+            // resolved: a model switch mid-resolve must not overwrite the
+            // cache (and report) the OLD model's numbers — the next
+            // headersFor refresh re-resolves the new one (review on #956).
+            if (!selectionStillCurrent(svc, provider, model)) return;
             modelInfo.cached = {
                 provider,
                 model,
@@ -131,18 +145,20 @@ function refreshModelInfo(origin: string | undefined): void {
             };
         })
         .catch(() => {
+            if (!selectionStillCurrent(svc, provider, model)) return;
             // Resolution failed (transient catalog read, model offline): keep
             // the model id (usable for registry lookup) without window claims.
             modelInfo.cached = { provider, model };
         })
         .finally(() => {
             modelInfo.refreshing = false;
-            if (origin !== undefined && modelInfo.cached !== undefined) {
+            const cached = modelInfo.cached;
+            if (cached !== undefined && cached.provider === provider && cached.model === model && origin !== undefined) {
                 void reportRuntimeInfo(origin, {
                     agent: "dsh",
-                    model: modelInfo.cached.model,
-                    contextWindow: modelInfo.cached.contextWindow,
-                    maxOutput: modelInfo.cached.maxOutput,
+                    model: cached.model,
+                    contextWindow: cached.contextWindow,
+                    maxOutput: cached.maxOutput,
                     source: "client-config",
                 }).catch(() => {});
             }

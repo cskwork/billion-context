@@ -130,6 +130,20 @@ export function pluginReportedModel(headers: Record<string, string | string[] | 
     return raw !== undefined && /^\S{1,256}$/.test(raw) ? raw : undefined;
 }
 
+/** #956 hardening: per-request plugin window/max-output headers describe the
+ *  model the plugin CONFIGURED — when the request body carries a different
+ *  model (mid-switch race, or a provider-model composite like
+ *  "provider/model"), those headers must not size this request. Match is
+ *  exact or on the last path segment (openai-compatible bodies use
+ *  "provider/model" while plugins stamp the bare model id). A missing model
+ *  header keeps the pre-#956 trust (window-only reporters still work). */
+export function pluginHeadersMatchModel(headers: Record<string, string | string[] | undefined>, bodyModel: string | undefined): boolean {
+    const reported = pluginReportedModel(headers);
+    if (reported === undefined || bodyModel === undefined) return true;
+    if (reported === bodyModel) return true;
+    return bodyModel.split("/").pop() === reported;
+}
+
 type ConversationEntry = { sessionId: string; lastSeen: number };
 type RememberedMessages = { processed: CoreMessage[]; original: CoreMessage[]; nudge?: NudgeDecision };
 
