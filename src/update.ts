@@ -22,13 +22,16 @@
  */
 import { readFile, writeFile, mkdir, access, constants, rm, cp, unlink } from "node:fs/promises";
 import { execFile } from "node:child_process";
+import { realpathSync } from "node:fs";
 import crypto from "node:crypto";
 import * as tar from "tar";
 import path from "node:path";
+import os from "node:os";
 import { fileURLToPath } from "node:url";
 import { cacheDir } from "./paths.js";
 import { log as loggerLog, type Logger } from "./logger.js";
 import { refreshDshProfileBundles } from "./dsh-channel.js";
+import { resolveDshHome, resolveKimiHome, resolveOmpHome, resolvePiHome } from "./client-config.js";
 import { proxyDispatcher } from "./upstream-proxy.js";
 import type { FetchOptions } from "./fetch-util.js";
 
@@ -199,6 +202,56 @@ export async function isGitWorkingTree(dir: string): Promise<boolean> {
     } catch {
         return false;
     }
+}
+
+export interface HostManagedInstall {
+    /** Who owns and updates this copy: "pnpm", "pi", "opencode", "dsh". */
+    owner: string;
+    /** User-facing instruction for updating this copy through its owner. */
+    channel: string;
+}
+
+/** #991 single-writer rule: detect install directories that are OWNED by a
+ *  host's package manager — a pnpm virtual store (dsh profile bundles, pnpm
+ *  global) or a host agent's data tree (pi's package dir, opencode's plugin
+ *  dir, dsh/kimi homes). An in-place tarball copy over such a directory
+ *  corrupts the owner's bookkeeping (npm/pnpm metadata drift, #953) or, for
+ *  pnpm, the hardlinked content files shared across every install in the
+ *  store. Returns the owner + its update channel, or undefined when the copy
+ *  is bili-owned (npm global, manual install) and may be updated in place.
+ *  Exported for tests. */
+export function hostManagedInstall(installDir: string, env: NodeJS.ProcessEnv = process.env): HostManagedInstall | undefined {
+    let real = installDir;
+    try {
+        real = realpathSync(installDir);
+    } catch {
+        // nonexistent or unreadable — evaluate the literal path
+    }
+    for (const dir of [installDir, real]) {
+        if (dir.split(path.sep).some((seg) => seg === ".pnpm")) {
+            return {
+                owner: "pnpm",
+                channel: "dsh profiles refresh automatically on the next global bili self-update; a pnpm-global install upgrades via `pnpm add -g billion-context@latest`",
+            };
+        }
+    }
+    const xdgData = env.XDG_DATA_HOME && env.XDG_DATA_HOME.trim().length > 0 ? env.XDG_DATA_HOME : path.join(os.homedir(), ".local", "share");
+    const homes: Array<[string, string, string]> = [
+        ["pi", resolvePiHome(env), "`pi update` (pi installs and upgrades the npm:billion-context entry itself)"],
+        ["opencode", path.join(xdgData, "opencode"), "opencode's own plugin manager (reload/reinstall the billion-context plugin)"],
+        ["dsh", resolveDshHome(env), "the dsh plugin channel (global bili self-update refreshes profiles; or `dsh plugin add billion-context@latest`)"],
+        ["kimi", resolveKimiHome(env), "`bili plugin install kimi` after updating the global bili install"],
+        ["omp", resolveOmpHome(env), "the global bili install (the extensions entry points at it)"],
+    ];
+    for (const [owner, home, channel] of homes) {
+        if (!home) continue;
+        for (const dir of [installDir, real]) {
+            if (dir === home || dir.startsWith(home + path.sep)) {
+                return { owner, channel };
+            }
+        }
+    }
+    return undefined;
 }
 
 /** Read the version from the on-disk package.json (not the startup constant). */
@@ -429,6 +482,24 @@ function fetchWithEgress(url: string, init: FetchOptions): Promise<Response> {
     return fetch(url, init as RequestInit);
 }
 
+/** Resolve the current version of `packageName` on the configured dist-tag
+ *  channel. Shared by the self-updater and `bili plugin update` (dsh profile
+ *  refresh). Returns undefined on any failure — callers treat "unknown" as
+ *  "do nothing". (#991) */
+export async function fetchRegistryVersion(opts: Pick<UpdateOptions, "resolveProxy" | "updateTag">, packageName: string): Promise<string | undefined> {
+    const tag = normalizeUpdateTag(opts.updateTag);
+    const url = registryUrlFor(packageName, tag);
+    const dispatcher = egressDispatcher(opts, url);
+    const res = await fetchWithEgress(url, {
+        signal: AbortSignal.timeout(5000),
+        headers: { Accept: "application/json" },
+        ...(dispatcher ? { dispatcher } : {}),
+    });
+    if (!res.ok) return undefined;
+    const data = (await res.json()) as { version?: string };
+    return data.version;
+}
+
 /** Run a single check (throttled unless `force`). Safe to call frequently. */
 export async function checkForUpdate(opts: UpdateOptions, force = false): Promise<void> {
     if (!opts.autoUpdate && !force) return;
@@ -454,6 +525,16 @@ export async function checkForUpdate(opts: UpdateOptions, force = false): Promis
         const installDir = await findInstallDir(opts.packageName);
         if (installDir && await isGitWorkingTree(installDir)) {
             loggerLog("info", `[update] running from a source checkout (${installDir}) \u2014 skipping auto-update (use npm install -g ${opts.packageName})`);
+            return;
+        }
+
+        // #991 single-writer: when this install dir belongs to a host (pnpm
+        // store, pi/opencode/dsh/kimi/omp trees), the copy must only be
+        // updated through its owner — never overwritten in place by the
+        // global self-updater.
+        const managed = installDir ? hostManagedInstall(installDir) : undefined;
+        if (managed) {
+            loggerLog("info", `[update] install dir is managed by ${managed.owner} (${installDir}) \u2014 skipping in-place self-update; update it via ${managed.channel} (#991)`);
             return;
         }
 
@@ -587,6 +668,13 @@ export async function installViaTarball(
     // callers.
     if (await isGitWorkingTree(installDir)) {
         return { ok: false, error: `install dir is a git working tree (${installDir}) \u2014 refusing to overwrite a source checkout (use npm install -g)` };
+    }
+
+    // #991 single-writer: refuse to overwrite a host-managed copy (pnpm
+    // store, host agent data trees) — only its owner may update it.
+    const managed = hostManagedInstall(installDir);
+    if (managed) {
+        return { ok: false, error: `install dir is managed by ${managed.owner} (${installDir}) \u2014 refusing in-place overwrite (single-writer); update via ${managed.channel}` };
     }
 
     // Download tarball. Stream into memory with a hard size cap so a corrupt
