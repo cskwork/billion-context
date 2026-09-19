@@ -11,7 +11,7 @@ process.env.NODE_ENV = "test";
 import { proxyBaseFromUrl, proxyBaseFromEnv, detectProxyBase, fetchManifest, forwardTool, fetchStatus } from "../src/agent/shared.ts";
 import biliPlugin, { createBiliPlugin } from "../src/agent/pi.ts";
 import ompPlugin from "../src/agent/omp.ts";
-import { pluginInstall, pluginRemove, pluginStatusAll, PLUGIN_AGENTS, selfPackageRoot, pickPluginKey, detectOpencodeMajor, piEntryFor, PI_NPM_ENTRY, isPiEntry } from "../src/plugin-install.ts";
+import { pluginInstall, pluginRemove, pluginStatusAll, PLUGIN_AGENTS, selfPackageRoot, pickPluginKey, detectOpencodeMajor, piEntryFor, PI_NPM_ENTRY, isPiEntry, claudeNativeInstalled } from "../src/plugin-install.ts";
 import { resolveProxyOrigin, forwardTool as mcpForwardTool } from "../src/mcp.ts";
 
 function withEnv(vars: Record<string, string | undefined>, fn: () => void | Promise<void>): Promise<void> {
@@ -936,10 +936,14 @@ test("plugin install/remove roundtrips for pi/omp/codex/opencode under a fake HO
         assert.equal(oc.$schema, "https://opencode.ai/config.json");
         assert.equal(fs.existsSync(ocPluginDir), false);
 
-        assert.throws(() => pluginInstall("claude"), /claude: install failed/);
-        // The CLAUDE stub above keeps that assertion deterministic even on
-        // machines WITH the real claude CLI; remove is a no-op when the
-        // config has no bili entry (and must not exec the CLI at all).
+        // #964 native posture: the managed settings block is written FIRST
+        // (pure JSON, no CLI needed); the MCP face execs the claude CLI. With
+        // the stub CLAUDE above the exec fails — install throws, but the
+        // block IS in place, so remove has real work (and must not exec the
+        // CLI when the MCP face never registered).
+        assert.throws(() => pluginInstall("claude"), /claude: MCP registration failed .*managed settings block.*was written/);
+        assert.equal(claudeNativeInstalled(), true);
+        assert.match(pluginRemove("claude"), /managed block removed/);
         assert.match(pluginRemove("claude"), /not installed/);
 
         const rows = pluginStatusAll();
@@ -1223,8 +1227,11 @@ test("plugin list survives a broken host config (per-row error, no crash)", asyn
         fs.writeFileSync(path.join(home, ".claude.json"), "{ broken json");
         const rows = pluginStatusAll();
         assert.equal(rows.length, 6);
+        // #964: claude status never throws — a broken .claude.json just means
+        // "MCP face unreadable" (false); the managed block reads settings.json
+        // separately, so the row degrades to not-installed instead of error.
         const claude = rows.find((r) => r.agent === "claude")!;
-        assert.match(claude.status, /error: .*not valid JSON/);
+        assert.equal(claude.status, "not installed");
         const pi = rows.find((r) => r.agent === "pi")!;
         assert.equal(pi.status, "not installed");
     });

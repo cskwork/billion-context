@@ -256,9 +256,26 @@ Notes:
   to stand down cleanly).
 - On OpenCode 1.x, pre-migration `opencode-acp` sessions keep working
   (v1 lane routing, #920) — see "OpenCode 1.x" below.
-- `claude` / `codex` / `omp` have companion installs too (an MCP shell and a
-  thin extension), but those need a running proxy — they are not native
-  mode.
+- `codex` / `omp` have companion installs too (an MCP shell / a thin
+  extension), but those need a running proxy — they are not native mode.
+- `claude` also has a **native posture** (#964, hybrid): Claude Code has no
+  in-process extension point, so `bili plugin install claude` writes a
+  managed block into `~/.claude/settings.json` (env
+  `ANTHROPIC_BASE_URL=http://127.0.0.1:48787/bili/<upstream>`,
+  `DISABLE_AUTO_COMPACT=1`, and a `SessionStart` hook) plus the same
+  user-scope MCP shell as before, now pinned to that stable port. The hook
+  (fired before claude's first model request) attaches to a healthy proxy
+  on the port or spawns one whose pid watchdog tracks claude itself, so the
+  proxy lives and dies with the session. Port override:
+  `BILI_CLAUDE_NATIVE_PORT` > config `claude.nativePort` > 48787; upstream
+  override: `BILI_CLAUDE_UPSTREAM` (or the existing `claude.anthropicBaseUrl`
+  config). Opt out with `BILI_NATIVE_CLAUDE=0` — the hook then brings up a
+  **passthrough** proxy on the same port (verbatim forward, compression
+  off) so claude keeps working. The block is pure JSON merge/strip: foreign
+  keys are never touched, `bili plugin remove claude` restores exactly.
+  `bili claude` still works on a machine with the native block installed —
+  it overrides the static URL with its own ephemeral proxy and the hook
+  stays dormant.
 
 ### Injection priority — no files unless unavoidable (#535)
 

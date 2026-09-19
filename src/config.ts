@@ -600,6 +600,11 @@ type FileConfig = {
      *  Per-provider `imageBilling` overrides it; env BILI_IMAGE_BILLING wins
      *  over both. See ProviderRoute.imageBilling. */
     imageBilling?: string;
+    /** Claude-native install tuning (#964): the loopback port the managed
+     *  settings block pins ANTHROPIC_BASE_URL at and the SessionStart hook
+     *  brings a proxy up on. Default CLAUDE_NATIVE_DEFAULT_PORT; env
+     *  BILI_CLAUDE_NATIVE_PORT wins over both. */
+    claude?: { nativePort?: number };
 };
 
 function nonEmpty(value: string | undefined): string | undefined {
@@ -633,6 +638,22 @@ function loadConfigFile(): FileConfig {
         return parsed as FileConfig;
     }
     return {};
+}
+
+/** Default loopback port for the claude native install (#964): the value the
+ *  installer bakes into ~/.claude/settings.json's env.ANTHROPIC_BASE_URL and
+ *  the SessionStart hook brings a proxy up on. Documented as reserved. */
+export const CLAUDE_NATIVE_DEFAULT_PORT = 48787;
+
+/** The claude-native loopback port, one resolution for installer, hook, and
+ *  launcher: env BILI_CLAUDE_NATIVE_PORT > config `claude.nativePort` >
+ *  CLAUDE_NATIVE_DEFAULT_PORT. */
+export function resolveClaudeNativePort(env: NodeJS.ProcessEnv = process.env): number {
+    const fromEnv = Number.parseInt(env.BILI_CLAUDE_NATIVE_PORT ?? "", 10);
+    if (Number.isInteger(fromEnv) && fromEnv > 0 && fromEnv < 65536) return fromEnv;
+    const fromFile = loadConfigFile().claude?.nativePort;
+    if (typeof fromFile === "number" && Number.isInteger(fromFile) && fromFile > 0 && fromFile < 65536) return fromFile;
+    return CLAUDE_NATIVE_DEFAULT_PORT;
 }
 
 /** Template written on first run so the user has a file to edit instead

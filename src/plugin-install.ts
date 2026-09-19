@@ -22,6 +22,7 @@ import { execFileSync } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { applyEdits, modify as jsoncModify, parse as jsoncParse, type ParseError } from "jsonc-parser";
 import { resolveDshHome, resolvePiHome } from "./client-config.js";
+import { resolveClaudeNativePort } from "./config.js";
 import { isPidAlive, isProxyInstanceFile, readProxyInstanceFile } from "./instance.js";
 
 /** #403: never freeze a dead or unverifiable origin into a client's
@@ -356,38 +357,223 @@ function claudeMcpJson(): string {
     return homeFile(".claude.json", "CLAUDE_CONFIG_DIR");
 }
 
+/** ~/.claude/settings.json honoring CLAUDE_CONFIG_DIR (claude replaces the
+ *  whole ~/.claude directory when it is set). The #964 managed block lives
+ *  here — env.ANTHROPIC_BASE_URL / env.DISABLE_AUTO_COMPACT /
+ *  hooks.SessionStart. */
+export function claudeSettingsFile(env: NodeJS.ProcessEnv = process.env): string {
+    const raw = env.CLAUDE_CONFIG_DIR?.trim();
+    const base = raw && raw.length > 0 ? raw : path.join(os.homedir(), ".claude");
+    return path.join(base, "settings.json");
+}
+
+/** True for an ANTHROPIC_BASE_URL value written by a bili managed block:
+ *  loopback /bili/-wrapped upstream. Any port matches — an older install's
+ *  port differs from the current one, and both are ours to rewrite. */
+export function isBiliClaudeBaseUrl(value: unknown): boolean {
+    if (typeof value !== "string") return false;
+    return /^http:\/\/127\.0\.0\.1:\d{1,5}\/bili\/https?:\/\//.test(value);
+}
+
+export function claudeNativeBaseUrl(env: NodeJS.ProcessEnv = process.env): string {
+    const origin = `http://127.0.0.1:${resolveClaudeNativePort(env)}`;
+    const relay = env.BILI_CLAUDE_UPSTREAM?.trim();
+    const upstream = (relay && relay.length > 0 ? relay : "https://api.anthropic.com").replace(/\/+$/, "");
+    const prefix = origin + "/bili/";
+    return upstream.startsWith(prefix) ? upstream : prefix + upstream;
+}
+
+/** Pure merge of the #964 managed block into parsed settings (install path).
+ *  Never clobbers user keys: a foreign ANTHROPIC_BASE_URL or a non-"1"
+ *  DISABLE_AUTO_COMPACT is reported and skipped, not overwritten. Returns the
+ *  mutated copy plus human notes. Exported for tests. */
+export function applyClaudeManagedBlock(settings: Record<string, unknown>, opts: { baseUrl: string; hookCommand: string }): { data: Record<string, unknown>; notes: string[] } {
+    const data = structuredClone(settings);
+    const notes: string[] = [];
+    const env = (data.env !== null && typeof data.env === "object" && !Array.isArray(data.env) ? data.env : {}) as Record<string, unknown>;
+    const cur = env.ANTHROPIC_BASE_URL;
+    if (cur === undefined || cur === null || isBiliClaudeBaseUrl(cur)) {
+        if (cur !== opts.baseUrl) {
+            env.ANTHROPIC_BASE_URL = opts.baseUrl;
+            notes.push("env.ANTHROPIC_BASE_URL pinned to the bili proxy");
+        }
+    } else {
+        notes.push(`env.ANTHROPIC_BASE_URL left untouched (foreign value ${JSON.stringify(cur)} — unset it or set BILI_CLAUDE_UPSTREAM, then reinstall)`);
+    }
+    const dac = env.DISABLE_AUTO_COMPACT;
+    if (dac === undefined || dac === null || dac === "1") {
+        if (dac !== "1") {
+            env.DISABLE_AUTO_COMPACT = "1";
+            notes.push("env.DISABLE_AUTO_COMPACT=1 (bili owns compression; manual /compact survives)");
+        }
+    } else {
+        notes.push(`env.DISABLE_AUTO_COMPACT left untouched (foreign value ${JSON.stringify(dac)})`);
+    }
+    if (Object.keys(env).length > 0) data.env = env;
+
+    const hooks = (data.hooks !== null && typeof data.hooks === "object" && !Array.isArray(data.hooks) ? data.hooks : {}) as Record<string, unknown>;
+    const sessionStart = Array.isArray(hooks.SessionStart) ? hooks.SessionStart : [];
+    const carriesOurs = sessionStart.some(isOursSessionStartEntry);
+    if (!carriesOurs) {
+        sessionStart.push({ hooks: [{ type: "command", command: opts.hookCommand }] });
+        hooks.SessionStart = sessionStart;
+        data.hooks = hooks;
+        notes.push("hooks.SessionStart += bili proxy bootstrap");
+    }
+    return { data, notes };
+}
+
+/** A SessionStart entry we wrote: any hook command naming our bootstrap
+ *  script (path may differ across installs/upgrades). */
+export function isOursSessionStartEntry(entry: unknown): boolean {
+    const hooks = (entry !== null && typeof entry === "object" && !Array.isArray(entry) ? (entry as { hooks?: unknown }).hooks : undefined);
+    if (!Array.isArray(hooks)) return false;
+    return hooks.some(
+        (h) => h !== null && typeof h === "object" && typeof (h as { command?: unknown }).command === "string" && /claude-native-bootstrap\.(?:js|mjs|ts)["']?$/.test((h as { command: string }).command),
+    );
+}
+
+/** Pure strip of the managed block (remove path) — returns the cleaned copy
+ *  and what was removed. DISABLE_AUTO_COMPACT is dropped only when it is the
+ *  value we wrote ("1"); a .bili-bak with a pre-install value restores it in
+ *  the caller. Exported for tests. */
+export function stripClaudeManagedBlock(settings: Record<string, unknown>): { data: Record<string, unknown>; removed: string[] } {
+    const data = structuredClone(settings);
+    const removed: string[] = [];
+    const env = (data.env !== null && typeof data.env === "object" && !Array.isArray(data.env) ? data.env : undefined) as Record<string, unknown> | undefined;
+    if (env !== undefined) {
+        if (isBiliClaudeBaseUrl(env.ANTHROPIC_BASE_URL)) {
+            delete env.ANTHROPIC_BASE_URL;
+            removed.push("env.ANTHROPIC_BASE_URL");
+        }
+        if (env.DISABLE_AUTO_COMPACT === "1") {
+            delete env.DISABLE_AUTO_COMPACT;
+            removed.push("env.DISABLE_AUTO_COMPACT");
+        }
+        if (Object.keys(env).length === 0) delete data.env;
+    }
+    const hooks = (data.hooks !== null && typeof data.hooks === "object" && !Array.isArray(data.hooks) ? data.hooks : undefined) as Record<string, unknown> | undefined;
+    if (hooks !== undefined && Array.isArray(hooks.SessionStart)) {
+        const kept = (hooks.SessionStart as unknown[]).filter((e) => !isOursSessionStartEntry(e));
+        if (kept.length !== (hooks.SessionStart as unknown[]).length) {
+            removed.push("hooks.SessionStart entry");
+            if (kept.length > 0) hooks.SessionStart = kept;
+            else delete hooks.SessionStart;
+            if (Object.keys(hooks).length === 0) delete data.hooks;
+        }
+    }
+    return { data, removed };
+}
+
+/** True when the managed settings block (the static ANTHROPIC_BASE_URL) is
+ *  present — the `bili claude` launcher consults this to override the static
+ *  URL with its own ephemeral proxy (coexistence, #964 item 5). */
+export function claudeNativeInstalled(env: NodeJS.ProcessEnv = process.env): boolean {
+    try {
+        const data = readJson(claudeSettingsFile(env));
+        return isBiliClaudeBaseUrl((data.env as Record<string, unknown> | undefined)?.ANTHROPIC_BASE_URL);
+    } catch {
+        return false;
+    }
+}
+
 // CLAUDE overrides the claude binary path (absolute path for sandboxed
 // setups; a guaranteed-missing file in tests so the failure path stays
 // deterministic even on machines that have the real CLI).
 function claudeInstall(): string {
+    if (process.env.BILI_NATIVE_CLAUDE === "0") {
+        throw new Error("claude: install refused — BILI_NATIVE_CLAUDE=0 is set (clear it to install the native posture)");
+    }
     const root = selfPackageRoot();
     const mcpJs = path.join(root, "dist", "mcp.js");
+    const bootstrapJs = path.join(root, "dist", "claude-native-bootstrap.js");
     requireDistFile(mcpJs);
+    requireDistFile(bootstrapJs);
+
+    // Managed block first: the static URL + bootstrap hook + compaction off.
+    const file = claudeSettingsFile();
+    const settings = readJson(file);
+    const { data, notes } = applyClaudeManagedBlock(settings, {
+        baseUrl: claudeNativeBaseUrl(),
+        hookCommand: `${process.execPath} ${JSON.stringify(bootstrapJs)}`,
+    });
+    writeJson(file, data);
+
+    // MCP face: same registration path as before, but pinned to the STABLE
+    // port the hook brings up — never proxyOriginForInstall() (an ephemeral
+    // launcher proxy would go stale in this static config).
+    const stableOrigin = `http://127.0.0.1:${resolveClaudeNativePort()}`;
     const claude = process.env.CLAUDE?.trim() || "claude";
     try {
-        execFileSync(claude, ["mcp", "add", "bili", "--scope", "user", "-e", `BILI_MCP_PROXY=${proxyOriginForInstall()}`, "--", process.execPath, mcpJs], { stdio: ["ignore", "pipe", "pipe"], timeout: CLAUDE_EXEC_TIMEOUT_MS });
-        return `claude: installed via \`claude mcp add\` (user scope) -> ${claudeMcpJson()}`;
+        execFileSync(claude, ["mcp", "add", "bili", "--scope", "user", "-e", `BILI_MCP_PROXY=${stableOrigin}`, "--", process.execPath, mcpJs], { stdio: ["ignore", "pipe", "pipe"], timeout: CLAUDE_EXEC_TIMEOUT_MS });
     } catch (err) {
         const stderr = err instanceof Error && "stderr" in err ? String((err as { stderr?: Buffer | string }).stderr ?? "") : "";
-        throw new Error(`claude: install failed (${stderr.trim() || (err instanceof Error ? err.message : String(err))}) — is the claude CLI on PATH?`);
+        throw new Error(`claude: MCP registration failed (${stderr.trim() || (err instanceof Error ? err.message : String(err))}) — is the claude CLI on PATH? (the managed settings block at ${file} was written; rerun after fixing the CLI to complete the MCP face)`);
     }
+    return `claude: managed block -> ${file} (${notes.join("; ")}); MCP face -> ${claudeMcpJson()} (pinned ${stableOrigin}) — restart claude to activate`;
 }
 
 function claudeRemove(): string {
-    if (claudeStatus() === "not installed") return `claude: not installed (${claudeMcpJson()})`;
-    const claude = process.env.CLAUDE?.trim() || "claude";
-    try {
-        execFileSync(claude, ["mcp", "remove", "bili", "--scope", "user"], { stdio: ["ignore", "pipe", "pipe"], timeout: CLAUDE_EXEC_TIMEOUT_MS });
-        return "claude: removed";
-    } catch (err) {
-        throw new Error(`claude: remove failed (${err instanceof Error ? err.message : String(err)})`);
+    const parts: string[] = [];
+    const file = claudeSettingsFile();
+    const settings = readJson(file);
+    const { data, removed } = stripClaudeManagedBlock(settings);
+    if (removed.length > 0) {
+        // Restore a pre-install DISABLE_AUTO_COMPACT when the backup holds
+        // one (writeJson snapshotted the pristine file on first install).
+        const bak = `${file}.bili-bak`;
+        try {
+            if (fs.existsSync(bak)) {
+                const bakData = readJson(bak) as { env?: Record<string, unknown> };
+                const bakDac = bakData.env?.DISABLE_AUTO_COMPACT;
+                if (removed.includes("env.DISABLE_AUTO_COMPACT") && bakDac !== undefined) {
+                    const env = ((data.env !== null && typeof data.env === "object" && !Array.isArray(data.env) ? data.env : {}) as Record<string, unknown>);
+                    env.DISABLE_AUTO_COMPACT = bakDac;
+                    data.env = env;
+                }
+            }
+        } catch {
+            // unreadable backup — the value is simply dropped
+        }
+        writeJson(file, data);
+        parts.push(`managed block removed from ${file} (${removed.join(", ")})`);
     }
+    if (claudeMcpInstalled()) {
+        const claude = process.env.CLAUDE?.trim() || "claude";
+        try {
+            execFileSync(claude, ["mcp", "remove", "bili", "--scope", "user"], { stdio: ["ignore", "pipe", "pipe"], timeout: CLAUDE_EXEC_TIMEOUT_MS });
+            parts.push("MCP face removed");
+        } catch (err) {
+            throw new Error(`claude: MCP removal failed (${err instanceof Error ? err.message : String(err)})${parts.length > 0 ? ` — ${parts.join("; ")} succeeded first` : ""}`);
+        }
+    }
+    return parts.length > 0 ? `claude: ${parts.join("; ")}` : `claude: not installed (${file} / ${claudeMcpJson()})`;
+}
+
+function claudeMcpInstalled(): boolean {
+    const data = readJson(claudeMcpJson()) as { mcpServers?: Record<string, unknown> };
+    return isPlainMcpObject(data.mcpServers) && "bili" in data.mcpServers;
 }
 
 function claudeStatus(): string {
-    const data = readJson(claudeMcpJson()) as { mcpServers?: Record<string, unknown> };
-    const mcpServers = data.mcpServers;
-    return isPlainMcpObject(mcpServers) && "bili" in mcpServers ? "installed" : "not installed";
+    let block = false;
+    try {
+        const data = readJson(claudeSettingsFile());
+        block = isBiliClaudeBaseUrl((data.env as Record<string, unknown> | undefined)?.ANTHROPIC_BASE_URL);
+    } catch {
+        block = false;
+    }
+    const mcp = (() => {
+        try {
+            return claudeMcpInstalled();
+        } catch {
+            return false;
+        }
+    })();
+    if (block && mcp) return "installed (managed settings block + MCP)";
+    if (block) return "installed (managed settings block; MCP face missing — rerun install)";
+    if (mcp) return "installed (MCP only — legacy companion posture; rerun install for the native block)";
+    return "not installed";
 }
 
 // — codex ——————————————————————————————————————————————————————————————
