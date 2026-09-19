@@ -133,8 +133,9 @@ export function promptInputTotal(
 export interface ContextOverflowInfo {
     /** True if the response looks like an upstream context-overflow error. */
     isOverflow: boolean;
-    /** The real context window (tokens) learned from the error body, if any
-     *  confident number is present. */
+    /** The context-window number stated in the error body, if a confident
+     *  number is present. #987: this arms the one-shot emergency shrink — it
+     *  is never persisted as a learned window. */
     window?: number;
     /** Truncated error-body text, for logging. */
     message: string;
@@ -160,7 +161,7 @@ const CONTEXT_OVERFLOW_PATTERNS: RegExp[] = [
     /request_too_large/i,
     /token limit exceeded/i,
     // #554: llama.cpp-family "exceed_context_size_error (A / B > W)" — carried by
-    // side requests that bypass preflight; without it the learned channel learns nothing.
+    // side requests that bypass preflight; its number arms the emergency shrink.
     // #570: its body also carries the real window, see parseOverflowWindow.
     /exceed[_\s]?context[_\s]?size/i,
 ];
@@ -216,7 +217,7 @@ export function inspectContextOverflow(status: number, bodyText: string): Contex
  *  guarantee where it matters — any single-turn reply up to the reserved amount
  *  still fits at the 95% emergency threshold — while bounding the budget loss.
  *  A reply longer than the reservation overflows once; the overflow self-heal
- *  (learned window + armed emergency) recovers it on the next turn. */
+ *  (armed emergency) recovers it on the next turn. */
 export const DEFAULT_OUTPUT_HEADROOM_MAX_PCT = 0.25;
 
 /** Resolve the user's `outputHeadroomMaxPct` (ratio or "N%" string) to a

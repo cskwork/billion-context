@@ -68,11 +68,10 @@ export function restoreOutputBudget(
 const SIDE_REQUEST_GUARD_TOLERANCE = 1.15;
 
 /** #554: side requests are forwarded VERBATIM (no pipeline, #388), so a payload
- *  over the upstream window is a guaranteed 400 that the learned self-heal can
- *  never fix from this path — the gate fires before the self-heal read and
- *  never consults reqConfig.modelContextLimit. Block here instead of forwarding:
- *  estimate the RAW body (CJK-aware text + image tokens) against the effective
- *  window = resolved ∩ learned (learned only ever shrinks) minus the output
+ *  over the upstream window is a guaranteed 400 that preflight can never fix
+ *  from this path. Block here instead of forwarding: estimate the RAW body
+ *  (CJK-aware text + image tokens) against the effective window — the declared
+ *  modelContextLimit (#987: no learned window exists anymore) minus the output
  *  reservation on wires where output counts against the window. blocked=false
  *  with limit<=0 means "window unknown — forward as before". blocked requires
  *  estimate >= limit x SIDE_REQUEST_GUARD_TOLERANCE (estimator bias). */
@@ -80,12 +79,17 @@ export function sideRequestGuard(
     parsed: unknown,
     protocol: WireProtocol,
     modelContextLimit: number,
-    learnedLimit: number | undefined,
     imageBilling: ResolvedImageBilling = "bytes",
     headroomCap: number = 1,
+    armedLimit: number = 0,
 ): { blocked: boolean; estimate: number; limit: number } {
     let limit = modelContextLimit;
-    if (typeof learnedLimit === "number" && learnedLimit > 0 && learnedLimit < limit) limit = learnedLimit;
+    // #987: no learned window exists, but a usage-grounded arm left by an
+    // overflow 400 (the upstream STATED that size) is live evidence this
+    // session cannot exceed it — a side request above it is the same
+    // guaranteed 400 (#554 loop). The arm is one-shot memory (a successful
+    // turn's usage overwrites it); it never re-centers the declared window.
+    if (armedLimit > 0 && (limit <= 0 || armedLimit < limit)) limit = armedLimit;
     const field = outputBudgetField(parsed);
     const maxOut = field ? ((parsed as Record<string, unknown>)[field] as number) : 0;
     if (limit > 0 && shouldReserveOutputHeadroom(protocol)) limit = reserveOutputHeadroom(limit, maxOut, headroomCap);
