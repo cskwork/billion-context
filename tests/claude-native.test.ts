@@ -148,8 +148,10 @@ test("planClaudeNativeBootstrap: launcher-owned / opt-out / start", () => {
 // — installer round-trip (fake claude CLI + sandboxed config dir) ———————
 
 function fakeClaude(dir: string): string {
-    const script = path.join(dir, "claude-fake");
-    fs.writeFileSync(script, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    const isWin = process.platform === "win32";
+    const script = path.join(dir, isWin ? "claude-fake.cmd" : "claude-fake");
+    fs.writeFileSync(script, isWin ? "@exit /b 0\r\n" : "#!/bin/sh\nexit 0\n");
+    if (!isWin) fs.chmodSync(script, 0o755);
     return script;
 }
 
