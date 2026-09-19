@@ -165,6 +165,11 @@ export interface LaunchOptions {
      *  modelWindows. Handed to the spawned proxy via
      *  BILI_LAUNCHER_MODEL_MAX_OUTPUTS for the output-headroom reservation. */
     modelMaxOutputs?: Record<string, number>;
+    /** Pin opts.port: an EADDRINUSE at bind fails loud (child exits 1)
+     * instead of the launcher default of port-hopping +1 (#964 — the claude
+     * native posture dials a STATIC url baked into settings.json; a proxy
+     * that silently landed on port+1 would strand every model request). */
+    strictPort?: boolean;
 }
 
 export interface ProxyHandle {
@@ -2065,7 +2070,10 @@ export async function ensureProxyRunning(
     // doubled — two concurrent launches of the same client would otherwise
     // spawn two writers over one sessions dir.
     const existing = await probeExistingInstance(readInstance, fetchHealthInfo);
-    if (existing && instanceCompatible(existing, opts)) {
+    if (existing && instanceCompatible(existing, opts) && (!opts.strictPort || existing.port === opts.port)) {
+        // strictPort (#964): the client dials a STATIC url — attaching to a
+        // healthy proxy on a DIFFERENT port would strand every request. Only
+        // an instance already bound to the exact port may be shared.
         console.error(`bili: attaching to running proxy at ${existing.origin} (pid ${existing.pid})`);
         return { origin: existing.origin, port: existing.port, attached: true };
     }
@@ -2157,6 +2165,7 @@ export async function ensureProxyRunning(
                         ...(opts.modelMaxOutputs && Object.keys(opts.modelMaxOutputs).length > 0
                             ? { BILI_LAUNCHER_MODEL_MAX_OUTPUTS: JSON.stringify(opts.modelMaxOutputs) }
                             : {}),
+                        ...(opts.strictPort ? { BILI_STRICT_PORT: "1" } : {}),
                     },
                 },
             );

@@ -8,6 +8,7 @@ import fs from "node:fs";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
+import { once } from "node:events";
 import { execFileSync, spawn } from "node:child_process";
 import {
     applyClaudeManagedBlock,
@@ -155,15 +156,21 @@ function fakeClaude(dir: string): string {
     return script;
 }
 
-function sandbox(): { dir: string; settings: string; mcpJson: string } {
+function sandbox(): { dir: string; settings: string; mcpJson: string; biliConfig: string } {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-claude-"));
     process.env.CLAUDE_CONFIG_DIR = dir;
-    return { dir, settings: path.join(dir, "settings.json"), mcpJson: path.join(dir, ".claude.json") };
+    // #964: pluginInstall persists claude.nativePort into the bili config —
+    // sandbox that too so tests never touch the real user config.
+    const biliConfig = path.join(dir, "billion-context.json");
+    process.env.BILI_CONFIG_FILE = biliConfig;
+    return { dir, settings: path.join(dir, "settings.json"), mcpJson: path.join(dir, ".claude.json"), biliConfig };
 }
 
-function unsandbox(prev: string | undefined): void {
+function unsandbox(prev: string | undefined, prevCfg: string | undefined = process.env.BILI_CONFIG_FILE): void {
     if (prev === undefined) delete process.env.CLAUDE_CONFIG_DIR;
     else process.env.CLAUDE_CONFIG_DIR = prev;
+    if (prevCfg === undefined) delete process.env.BILI_CONFIG_FILE;
+    else process.env.BILI_CONFIG_FILE = prevCfg;
 }
 
 test("claudeSettingsFile: CLAUDE_CONFIG_DIR replaces the whole .claude dir", () => {
@@ -172,6 +179,7 @@ test("claudeSettingsFile: CLAUDE_CONFIG_DIR replaces the whole .claude dir", () 
 
 test("installer round-trip: managed block + MCP face, then removal restores", () => {
     const prevDir = process.env.CLAUDE_CONFIG_DIR;
+    const prevCfg = process.env.BILI_CONFIG_FILE;
     const prevClaude = process.env.CLAUDE;
     const prevOpt = process.env.BILI_NATIVE_CLAUDE;
     const box = sandbox();
@@ -187,6 +195,9 @@ test("installer round-trip: managed block + MCP face, then removal restores", ()
         assert.equal(after.env?.ANTHROPIC_BASE_URL, baseUrlForPort(CLAUDE_NATIVE_DEFAULT_PORT));
         assert.equal(after.env?.DISABLE_AUTO_COMPACT, "1");
         assert.equal(claudeNativeInstalled(), true);
+        // #964: the resolved port is persisted so the SessionStart hook (which
+        // does NOT inherit claude's settings.env) resolves the SAME port.
+        assert.deepEqual(JSON.parse(fs.readFileSync(box.biliConfig, "utf8")), { claude: { nativePort: CLAUDE_NATIVE_DEFAULT_PORT } });
 
         const removeNote = pluginRemove("claude");
         assert.ok(removeNote.includes("managed block removed"), removeNote);
@@ -194,8 +205,9 @@ test("installer round-trip: managed block + MCP face, then removal restores", ()
         assert.equal(restored.env, undefined);
         assert.equal(restored.hooks, undefined);
         assert.equal(claudeNativeInstalled(), false);
+        assert.deepEqual(JSON.parse(fs.readFileSync(box.biliConfig, "utf8")), {}, "nativePort cleared on remove");
     } finally {
-        unsandbox(prevDir);
+        unsandbox(prevDir, prevCfg);
         if (prevClaude === undefined) delete process.env.CLAUDE;
         else process.env.CLAUDE = prevClaude;
         if (prevOpt === undefined) delete process.env.BILI_NATIVE_CLAUDE;
@@ -205,6 +217,7 @@ test("installer round-trip: managed block + MCP face, then removal restores", ()
 
 test("installer preserves foreign settings.json keys end-to-end", () => {
     const prevDir = process.env.CLAUDE_CONFIG_DIR;
+    const prevCfg = process.env.BILI_CONFIG_FILE;
     const prevClaude = process.env.CLAUDE;
     const prevOpt = process.env.BILI_NATIVE_CLAUDE;
     const box = sandbox();
@@ -222,7 +235,7 @@ test("installer preserves foreign settings.json keys end-to-end", () => {
         assert.deepEqual(restored.permissions, { allow: ["Bash"] });
         assert.deepEqual(restored.env, { THEME: "dark" });
     } finally {
-        unsandbox(prevDir);
+        unsandbox(prevDir, prevCfg);
         if (prevClaude === undefined) delete process.env.CLAUDE;
         else process.env.CLAUDE = prevClaude;
         if (prevOpt === undefined) delete process.env.BILI_NATIVE_CLAUDE;
@@ -230,8 +243,44 @@ test("installer preserves foreign settings.json keys end-to-end", () => {
     }
 });
 
+test("installer persists an env-driven port so the hook resolves the SAME port", () => {
+    const prevDir = process.env.CLAUDE_CONFIG_DIR;
+    const prevCfg = process.env.BILI_CONFIG_FILE;
+    const prevClaude = process.env.CLAUDE;
+    const prevOpt = process.env.BILI_NATIVE_CLAUDE;
+    const prevPortEnv = process.env.BILI_CLAUDE_NATIVE_PORT;
+    const box = sandbox();
+    try {
+        delete process.env.BILI_NATIVE_CLAUDE;
+        process.env.CLAUDE = fakeClaude(box.dir);
+        // Live failure shape: install with an explicit port, then claude
+        // later runs the hook WITHOUT that env (claude does not inject its
+        // settings.env into hook children) — the persisted config keeps
+        // hook and settings.json on the same port.
+        process.env.BILI_CLAUDE_NATIVE_PORT = "49999";
+        pluginInstall("claude");
+        const settings = JSON.parse(fs.readFileSync(box.settings, "utf8")) as { env?: Record<string, string> };
+        assert.equal(settings.env?.ANTHROPIC_BASE_URL, baseUrlForPort(49999));
+        assert.deepEqual(JSON.parse(fs.readFileSync(box.biliConfig, "utf8")), { claude: { nativePort: 49999 } });
+        delete process.env.BILI_CLAUDE_NATIVE_PORT;
+        assert.equal(resolveClaudeNativePort(), 49999, "hook (no env) resolves the persisted port");
+        assert.equal(planClaudeNativeBootstrap(process.env).port, 49999);
+        pluginRemove("claude");
+        assert.equal(resolveClaudeNativePort(), CLAUDE_NATIVE_DEFAULT_PORT, "remove restores the default");
+    } finally {
+        unsandbox(prevDir, prevCfg);
+        if (prevClaude === undefined) delete process.env.CLAUDE;
+        else process.env.CLAUDE = prevClaude;
+        if (prevOpt === undefined) delete process.env.BILI_NATIVE_CLAUDE;
+        else process.env.BILI_NATIVE_CLAUDE = prevOpt;
+        if (prevPortEnv === undefined) delete process.env.BILI_CLAUDE_NATIVE_PORT;
+        else process.env.BILI_CLAUDE_NATIVE_PORT = prevPortEnv;
+    }
+});
+
 test("installer refuses under BILI_NATIVE_CLAUDE=0", () => {
     const prevDir = process.env.CLAUDE_CONFIG_DIR;
+    const prevCfg = process.env.BILI_CONFIG_FILE;
     const prevOpt = process.env.BILI_NATIVE_CLAUDE;
     const box = sandbox();
     try {
@@ -239,7 +288,7 @@ test("installer refuses under BILI_NATIVE_CLAUDE=0", () => {
         assert.throws(() => pluginInstall("claude"), /refused/);
         assert.equal(fs.existsSync(box.settings), false);
     } finally {
-        unsandbox(prevDir);
+        unsandbox(prevDir, prevCfg);
         if (prevOpt === undefined) delete process.env.BILI_NATIVE_CLAUDE;
         else process.env.BILI_NATIVE_CLAUDE = prevOpt;
     }
@@ -247,6 +296,7 @@ test("installer refuses under BILI_NATIVE_CLAUDE=0", () => {
 
 test("installer refuses malformed settings.json instead of overwriting", () => {
     const prevDir = process.env.CLAUDE_CONFIG_DIR;
+    const prevCfg = process.env.BILI_CONFIG_FILE;
     const prevClaude = process.env.CLAUDE;
     const prevOpt = process.env.BILI_NATIVE_CLAUDE;
     const box = sandbox();
@@ -257,7 +307,7 @@ test("installer refuses malformed settings.json instead of overwriting", () => {
         assert.throws(() => pluginInstall("claude"), /not valid JSON/);
         assert.equal(fs.readFileSync(box.settings, "utf8"), "{ not json", "file untouched");
     } finally {
-        unsandbox(prevDir);
+        unsandbox(prevDir, prevCfg);
         if (prevClaude === undefined) delete process.env.CLAUDE;
         else process.env.CLAUDE = prevClaude;
         if (prevOpt === undefined) delete process.env.BILI_NATIVE_CLAUDE;
@@ -327,6 +377,73 @@ function runHook(distScript: string, port: number, xdg: Record<string, string>):
         child.once("close", (code) => resolve({ code, stderr }));
     });
 }
+
+test("hook e2e: an occupied stable port fails loud — never port-hops", { timeout: 120_000 }, async () => {
+    const distScript = path.resolve(import.meta.dirname, "..", "dist", "claude-native-bootstrap.js");
+    assert.ok(fs.existsSync(distScript), `dist script missing — run npm run build (${distScript})`);
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-claude-hook-"));
+    const xdg = {
+        home,
+        config: path.join(home, "cfg"),
+        state: path.join(home, "state"),
+        cache: path.join(home, "cache"),
+        data: path.join(home, "data"),
+    };
+    // A foreign listener squats the stable port (a relay, another test
+    // stub, anything non-bili). Without strict-port the spawned proxy
+    // would EADDRINUSE-hop to port+1 and "succeed" — stranding every
+    // claude model call on the dead original port (found live on the
+    // host of issue #964: two test listeners on 48787/48788).
+    const squatter = net.createServer();
+    squatter.listen(0, "127.0.0.1");
+    await once(squatter, "listening");
+    const port = (squatter.address() as net.AddressInfo).port;
+    try {
+        const r = await runHook(distScript, port, xdg);
+        assert.equal(r.code, 0, "the hook never fails claude");
+        assert.match(r.stderr, /bring-up failed/);
+        assert.doesNotMatch(r.stderr, /started at/);
+        await new Promise((r2) => setTimeout(r2, 500));
+        assert.equal(await canConnect(port + 1), false, "no port-hop proxy on port+1");
+    } finally {
+        squatter.close();
+        fs.rmSync(home, { recursive: true, force: true });
+    }
+});
+
+test("hook e2e: a healthy proxy on ANOTHER port is never attached (static URL)", { timeout: 120_000 }, async () => {
+    const distScript = path.resolve(import.meta.dirname, "..", "dist", "claude-native-bootstrap.js");
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-claude-hook-"));
+    const xdg = { home, config: path.join(home, "cfg"), state: path.join(home, "state"), cache: path.join(home, "cache"), data: path.join(home, "data") };
+    const portA = await freePort();
+    const portB = await freePort();
+    const instFile = path.join(xdg.state, "billion-context", "proxy-origin");
+    let pidA = 0;
+    let pidB = 0;
+    try {
+        // Bring up a healthy proxy on portA first — its instance file is
+        // exactly what a probe would attach to (this mirrors the live host:
+        // another bili proxy already running when claude's hook fires).
+        const rA = await runHook(distScript, portA, xdg);
+        assert.equal(rA.code, 0);
+        assert.ok(await waitForPort(portA, 60_000), "proxy A up");
+        pidA = (JSON.parse(fs.readFileSync(instFile, "utf8")) as { pid: number }).pid;
+
+        // SAME state dir, DIFFERENT port: claude dials a STATIC url pinned to
+        // portB — attaching to A's origin would strand every request. The
+        // hook must spawn its own instance on portB instead.
+        const rB = await runHook(distScript, portB, xdg);
+        assert.equal(rB.code, 0);
+        assert.match(rB.stderr, /started at/, "spawned — not attached to A");
+        assert.ok(await waitForPort(portB, 60_000), "proxy B up on its own port");
+        pidB = (JSON.parse(fs.readFileSync(instFile, "utf8")) as { pid: number }).pid;
+        assert.notEqual(pidB, pidA, "separate instance, not an attach");
+    } finally {
+        if (pidA > 0) killPid(pidA);
+        if (pidB > 0) killPid(pidB);
+        fs.rmSync(home, { recursive: true, force: true });
+    }
+});
 
 function killPid(pid: number): void {
     try {

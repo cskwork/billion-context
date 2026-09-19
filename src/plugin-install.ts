@@ -22,7 +22,7 @@ import { execFileSync } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { applyEdits, modify as jsoncModify, parse as jsoncParse, type ParseError } from "jsonc-parser";
 import { resolveDshHome, resolvePiHome } from "./client-config.js";
-import { resolveClaudeNativePort } from "./config.js";
+import { clearClaudeNativePort, resolveClaudeNativePort, saveClaudeNativePort } from "./config.js";
 import { isPidAlive, isProxyInstanceFile, readProxyInstanceFile } from "./instance.js";
 
 /** #403: never freeze a dead or unverifiable origin into a client's
@@ -491,6 +491,13 @@ function claudeInstall(): string {
     requireDistFile(bootstrapJs);
 
     // Managed block first: the static URL + bootstrap hook + compaction off.
+    // #964: persist the resolved port into the bili config too — the
+    // SessionStart hook does NOT inherit claude's settings.env, so without a
+    // persisted copy an env-driven port (BILI_CLAUDE_NATIVE_PORT=48790)
+    // would live only in settings.json while the hook resolves the default
+    // and brings the proxy up on the WRONG port.
+    const nativePort = resolveClaudeNativePort();
+    saveClaudeNativePort(nativePort);
     const file = claudeSettingsFile();
     const settings = readJson(file);
     const { data, notes } = applyClaudeManagedBlock(settings, {
@@ -502,7 +509,7 @@ function claudeInstall(): string {
     // MCP face: same registration path as before, but pinned to the STABLE
     // port the hook brings up — never proxyOriginForInstall() (an ephemeral
     // launcher proxy would go stale in this static config).
-    const stableOrigin = `http://127.0.0.1:${resolveClaudeNativePort()}`;
+    const stableOrigin = `http://127.0.0.1:${nativePort}`;
     const claude = process.env.CLAUDE?.trim() || "claude";
     try {
         execFileSync(claude, ["mcp", "add", "bili", "--scope", "user", "-e", `BILI_MCP_PROXY=${stableOrigin}`, "--", process.execPath, mcpJs], { stdio: ["ignore", "pipe", "pipe"], timeout: CLAUDE_EXEC_TIMEOUT_MS });
@@ -515,6 +522,7 @@ function claudeInstall(): string {
 
 function claudeRemove(): string {
     const parts: string[] = [];
+    clearClaudeNativePort();
     const file = claudeSettingsFile();
     const settings = readJson(file);
     const { data, removed } = stripClaudeManagedBlock(settings);

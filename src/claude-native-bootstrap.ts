@@ -74,12 +74,16 @@ async function run(): Promise<void> {
                 passthrough: plan.action === "passthrough",
                 debug: false,
                 parentPid: process.ppid,
+                strictPort: true,
             },
             { scriptPath: proxyScriptPath() },
         );
         log(`proxy ${handle.attached ? "attached" : "started"} at ${handle.origin}${plan.action === "passthrough" ? " (passthrough — compression off)" : ""}`);
     } catch (err) {
-        log(`proxy bring-up failed on port ${plan.port} — ${err instanceof Error ? err.message : String(err)}`);
+        log(
+            `proxy bring-up failed on port ${plan.port} — ${err instanceof Error ? err.message : String(err)}` +
+                (plan.action === "start" ? ` — claude will fail its model calls until this is fixed (free the port or set BILI_CLAUDE_NATIVE_PORT, then reinstall: bili plugin install claude)` : ""),
+        );
     }
 }
 

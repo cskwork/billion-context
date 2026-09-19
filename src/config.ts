@@ -656,6 +656,47 @@ export function resolveClaudeNativePort(env: NodeJS.ProcessEnv = process.env): n
     return CLAUDE_NATIVE_DEFAULT_PORT;
 }
 
+/** Persist the claude-native port the installer baked into settings.json
+ *  (#964). Without this, an install driven by BILI_CLAUDE_NATIVE_PORT writes
+ *  that port into ~/.claude/settings.json but the SessionStart hook (which
+ *  does NOT inherit claude's settings.env) later resolves the default —
+ *  hooking the wrong port while claude dials the baked one. `claude plugin
+ *  install` calls this; `claude plugin remove` calls clearClaudeNativePort. */
+export function saveClaudeNativePort(port: number): void {
+    const p = configFile();
+    const cur = loadConfigFile() as { claude?: { nativePort?: number } } & Record<string, unknown>;
+    const next: { claude?: { nativePort?: number } } & Record<string, unknown> = { ...cur };
+    next.claude = { ...(cur.claude ?? {}), nativePort: port };
+    try {
+        mkdirSync(dirname(p), { recursive: true });
+        writeFileSync(p, JSON.stringify(next, null, 2) + "\n", "utf8");
+    } catch (err) {
+        loggerLog("warn", `[acp-config] could not persist claude.nativePort=${port} at ${p} — ${err instanceof Error ? err.message : String(err)}`);
+    }
+}
+
+/** Drop the persisted claude-native port (plugin remove) so a fresh default
+ *  install resolves the default port again. Never throws. */
+export function clearClaudeNativePort(): void {
+    const p = configFile();
+    const cur = loadConfigFile() as { claude?: { nativePort?: number } } & Record<string, unknown>;
+    if (cur.claude?.nativePort === undefined) return;
+    const next: Record<string, unknown> = { ...cur };
+    if (Object.keys(cur.claude).length > 1) {
+        const claude = { ...cur.claude } as Record<string, unknown>;
+        delete claude.nativePort;
+        next.claude = claude;
+    } else {
+        delete next.claude;
+    }
+    try {
+        mkdirSync(dirname(p), { recursive: true });
+        writeFileSync(p, JSON.stringify(next, null, 2) + "\n", "utf8");
+    } catch (err) {
+        loggerLog("warn", `[acp-config] could not clear claude.nativePort at ${p} — ${err instanceof Error ? err.message : String(err)}`);
+    }
+}
+
 /** Template written on first run so the user has a file to edit instead
  *  of having to invent the path/schema. Left empty on purpose: the proxy
  *  can't guess your provider, so we don't put a fake one. Fill it in per
