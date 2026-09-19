@@ -85,7 +85,7 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         ctx.log("[acp-proxy: compress call had no valid ranges; nothing compressed.]");
         const reasons = diagnostics.invalidReasons?.slice(0, 8).map((r) => (r.length > 200 ? r.slice(0, 200) + "..." : r)) ?? [];
         const why = reasons.length > 0 ? ` Rejected entries:\n${reasons.map((r) => `- ${r}`).join("\n")}` : "";
-        return `[Compression FAILED: no valid ranges parsed (kind=${diagnostics.kind}, dropped=${diagnostics.invalidItems}).${why}\n compress requires a non-empty 'content' array of {startId, endId, summary} ranges, where startId/endId are mNNNNN message refs from the conversation. Re-issue the compress call with a valid content array.]`;
+        return `[Compression FAILED: no valid ranges parsed (kind=${diagnostics.kind}, dropped=${diagnostics.invalidItems}).${why}\n compress requires a non-empty 'content' array where each element is EITHER an object {startId, endId, summary} OR one line-form string whose first line is 'mNNNNN–mNNNNN optional topic' with the summary markdown on the following lines (a separate summary-only element right after a bare header line is also accepted). startId/endId are mNNNNN message refs from the conversation. Re-issue the compress call with a valid content array.]`;
     }
     const swappedRanges = normalizeRangeOrder(ranges);
     if (swappedRanges > 0) {

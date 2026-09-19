@@ -8,7 +8,8 @@ process.env.NODE_ENV = "test";
 import { createCore, createInitialState, defaultConfig, type CoreMessage } from "acp-kernel";
 import type { Session } from "../src/session.ts";
 import { applyCompactionArchive, detectUnannouncedHistoryRewrite, listSessions, markCompactionBoundary, preCompactionArchiveOf } from "../src/session.ts";
-import { normalizeRangeOrder } from "../src/stream.ts";
+import { normalizeRangeOrder, applyRanges } from "../src/stream.ts";
+import { parseCompressInput } from "../src/compress-tool.ts";
 import { startServer } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
@@ -229,4 +230,28 @@ test("#1001 e2e openai-wire: silent client history rewrite → boundary marked, 
         upstream.close();
         await once(upstream, "close");
     }
+});
+
+// #1001 问题3: the documented line form split across sibling array elements
+// (refs header + summary as separate strings) previously died with
+// kind=no-valid-ranges, dropped=2. Kernel 0.0.79 coalesces them; this guards
+// the pinned kernel actually carries the fix through the bili funnel.
+test("#1001 问题3: split-element line form compresses instead of failing (kernel coalesce)", () => {
+    const session = makeSession();
+    const core = createCore();
+    const config = defaultConfig(200000);
+    const msgs: CoreMessage[] = [];
+    for (let i = 0; i < 24; i++) {
+        msgs.push({ id: `h_split${i}`, role: i % 2 === 0 ? "user" : "assistant", contentType: "text", text: `message ${i} ${"x".repeat(2000)}` });
+    }
+    const turn = core.processTurn({ messages: msgs, state: session.state, config, tokenCount: 9999, renderTags: "text-only" });
+    session.state = turn.state;
+    const logs: string[] = [];
+    const out = applyRanges(
+        parseCompressInput({ content: ["m00001\u2013m00012 前期调试与决策", "## TASK AS OF THIS BLOCK\n- goal\n- decisions with reasons"] }),
+        { core, config, messages: turn.messages, session, log: (m: string) => logs.push(m) },
+    );
+    assert.ok(!out.startsWith("[Compression FAILED"), `split line form must parse: ${out}`);
+    assert.ok(session.state.blocks.length > 0, "one block created from the coalesced range");
+    assert.match(logs.join("\n"), /compress requested 1 range\(s\): m00001\u2013m00012/, "range reached the compress funnel");
 });
