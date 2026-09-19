@@ -520,6 +520,13 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
     const inheritedNoProxy = nonEmpty(env.BILI_INHERITED_NO_PROXY);
     const auxProxyFallback: ProxyFallbackOptions = {
         ...proxyFallback,
+        // #1012 review catch: the DEFAULT (unset) mode resolves to "direct"
+        // too (explicitDirect=true + empty global) which short-circuits
+        // resolveProxyDecision BEFORE the env tier — killing the inherited
+        // aux tier for every default-config user. Only an EXPLICIT "direct"
+        // mode (upstreamProxyMode / BILI_UPSTREAM_PROXY_MODE) opts aux egress
+        // out of the inherited tier; unset means "no preference".
+        explicitDirect: rawProxyMode === "direct" && !biliProxy,
         ...(httpProxy ? {} : inheritedHttpProxy ? { httpProxy: inheritedHttpProxy } : {}),
         ...(httpsProxy ? {} : inheritedHttpsProxy ? { httpsProxy: inheritedHttpsProxy } : {}),
         ...(allProxy ? {} : inheritedAllProxy ? { allProxy: inheritedAllProxy } : {}),

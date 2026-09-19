@@ -154,7 +154,37 @@ test("loadOptions: BILI_INHERITED_* fills auxProxyFallback only, own env tier st
     });
 });
 
-test("resolveProxyDecision: inherited tier routes blind-tunnel aux traffic, model path stays direct (#1012)", () => {
+test("default config (unset mode) keeps the inherited aux tier reachable — explicitDirect trap (#1012 review)", () => {
+    // default config: no proxy mode set anywhere → resolves to "direct" with
+    // explicitDirect=true — the inherited aux tier must NOT be short-circuited
+    withSandboxEnv(() => {}, () => {
+        const opts = loadOptions({
+            ACP_PORT: "42422",
+            BILI_INHERITED_HTTPS_PROXY: "http://127.0.0.1:7897",
+        });
+        assert.equal(opts.proxy, "");
+        assert.equal(opts.proxyFallback?.explicitDirect, true); // model path: default-direct unchanged
+        assert.equal(opts.auxProxyFallback?.explicitDirect, false); // ← the trap
+        const aux = resolveProxyDecision({}, opts.proxy, "https://chatgpt.com/backend-api/ps/mcp", opts.auxProxyFallback);
+        assert.equal(aux.source, "HTTPS_PROXY");
+        assert.equal(aux.proxy, "http://127.0.0.1:7897/");
+        const model = resolveProxyDecision({}, opts.proxy, "https://chatgpt.com/backend-api/ps/mcp", opts.proxyFallback);
+        assert.equal(model.source, "direct");
+    });
+
+    // EXPLICIT "direct" mode disables the inherited aux tier too
+    withSandboxEnv(() => {}, () => {
+        const opts = loadOptions({
+            ACP_PORT: "42422",
+            BILI_UPSTREAM_PROXY_MODE: "direct",
+            BILI_INHERITED_HTTPS_PROXY: "http://127.0.0.1:7897",
+        });
+        const aux = resolveProxyDecision({}, opts.proxy, "https://chatgpt.com/backend-api/ps/mcp", opts.auxProxyFallback);
+        assert.equal(aux.source, "direct");
+    });
+});
+
+ test("resolveProxyDecision: inherited tier routes blind-tunnel aux traffic, model path stays direct (#1012)", () => {
     const target = "https://chatgpt.com/backend-api/ps/mcp";
     const proxyFallback = { biliPort: 42422, systemProxy: { enabled: false } };
     const auxProxyFallback = {
