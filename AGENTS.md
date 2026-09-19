@@ -383,13 +383,16 @@ latest; type a full semver for minor/major/prerelease bumps. The workflow:
    `release v{VERSION}` — the same one-version-one-commit discipline as the
    Version Bumps section above.
 3. Runs the full pre-flight gate (`npm ci` + typecheck + test + build).
- 4. Pushes the release commit directly to `master` (GITHUB_TOKEN, fast-forward
-    only). If branch protection blocks direct pushes, the release lands on a
-    release branch instead and the run tries to open the release PR itself
-    (best-effort — if the account forbids Actions-created PRs the run still
-    finishes green with a one-click "open the release PR" link in the job
-    summary). Merging that PR publishes via the standard flow; red is reserved
-    for real failures (guard trips, gate failures, or a failed branch push).
+  4. Pushes the release commit directly to `master` (GITHUB_TOKEN, fast-forward
+     only). If branch protection blocks direct pushes, the release lands on a
+     release branch instead and the run tries to open the release PR itself
+     (best-effort — if the account forbids Actions-created PRs the run still
+     finishes green with a one-click "open the release PR" link in the job
+     summary). The fallback PR body carries a generated changelog (`git log`
+     since the last release tag); the same notes appear in the job summary as
+     a paste-ready block for opening the PR manually. Merging that PR publishes
+     via the standard flow; red is reserved for real failures (guard trips,
+     gate failures, or a failed branch push).
 5. Publishes to npm (`latest`, or `dev` for prerelease), tags `v{VERSION}`,
    and creates the GitHub Release with notes generated from `git log` since
    the last tag.

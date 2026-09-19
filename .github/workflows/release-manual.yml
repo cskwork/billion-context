@@ -129,22 +129,56 @@ jobs:
         run: |
           VER="${{ steps.version.outputs.version }}"
           LINK="https://github.com/${{ github.repository }}/pull/new/${PR_BRANCH}"
+          LAST_TAG="$(git describe --match 'v[0-9]*' --tags --abbrev=0 HEAD~1 2>/dev/null || true)"
+          if [ -n "$LAST_TAG" ]; then
+            NOTES="$(git log --no-merges --pretty='- %s' "${LAST_TAG}..HEAD~1")"
+          else
+            NOTES="(no prior release tag found)"
+          fi
+          PAYLOAD_FILE="$(mktemp)"
+          BODY_FILE="$(mktemp)"
+          VER="$VER" PR_BRANCH="$PR_BRANCH" LAST_TAG="$LAST_TAG" NOTES="$NOTES" node -e '
+            const fs = require("fs");
+            const body = [
+              "Auto-fallback from the one-click release workflow: direct push to master was blocked by branch protection. Merging this PR publishes via the standard release.yml flow.",
+              "",
+              "## Changes since " + (process.env.LAST_TAG || "n/a"),
+              "",
+              process.env.NOTES || "(no changes recorded)",
+              "",
+              "<!-- ework-agent-pr -->",
+            ].join("\n");
+            fs.writeFileSync(process.argv[1], JSON.stringify({ title: "release v" + process.env.VER, head: process.env.PR_BRANCH, base: "master", body }));
+            fs.writeFileSync(process.argv[2], body);
+          ' "$PAYLOAD_FILE" "$BODY_FILE"
           RESP_FILE="$(mktemp)"
           HTTP_CODE=$(curl -sS -o "$RESP_FILE" -w '%{http_code}' -X POST \
             -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
             -H "Content-Type: application/json" \
             "https://api.github.com/repos/${{ github.repository }}/pulls" \
-            -d "{\"title\":\"release v${VER}\",\"head\":\"${PR_BRANCH}\",\"base\":\"master\",\"body\":\"Auto-fallback from the one-click release workflow: direct push to master was blocked by branch protection. Merging this PR publishes via the standard release.yml flow.\\n\\n<!-- ework-agent-pr -->\"}")
+            -d @"$PAYLOAD_FILE")
           PR_URL=$(node -e 'try{console.log(JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).html_url||"")}catch(e){console.log("")}' "$RESP_FILE")
           echo "POST /pulls HTTP: $HTTP_CODE"
+          write_notes() {
+            {
+              echo "<details>"
+              echo "<summary>Release notes — paste into the PR description</summary>"
+              echo ""
+              echo '```markdown'
+              cat "$BODY_FILE"
+              echo '```'
+              echo "</details>"
+            } >> "$GITHUB_STEP_SUMMARY"
+          }
           if [ -n "$PR_URL" ]; then
             {
               echo "### :rotating_light: Release v${VER} prepared — NOT PUBLISHED yet"
               echo ""
               echo "Direct push to master was blocked (branch protection); the release commit is on branch \`${PR_BRANCH}\`."
-              echo "Release PR opened automatically: **${PR_URL}** — merge it to publish via CI."
+              echo "Release PR opened automatically **with the generated changelog**: **${PR_URL}** — merge it to publish via CI."
             } >> "$GITHUB_STEP_SUMMARY"
+            write_notes
             echo "::notice::Release PR opened automatically: ${PR_URL} — merge it to publish v${VER}"
             exit 0
           fi
@@ -154,8 +188,9 @@ jobs:
             echo "The release commit passed the full pre-flight gate and is on branch \`${PR_BRANCH}\`."
             echo "Auto-opening the release PR failed (HTTP ${HTTP_CODE}): $(cat "$RESP_FILE")"
             echo ""
-            echo "**Finish with one click:** [open the release PR](${LINK}), then merge it to publish."
+            echo "**Finish with one click:** [open the release PR](${LINK}), copy the release notes below into the description, then merge to publish."
           } >> "$GITHUB_STEP_SUMMARY"
+          write_notes
           echo "::warning::NOTHING WAS PUBLISHED YET — auto-PR failed (HTTP ${HTTP_CODE}): $(cat "$RESP_FILE")"
           echo "::warning::Finish the release with one click: ${LINK} (then merge to publish v${VER})"
           exit 0
