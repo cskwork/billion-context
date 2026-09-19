@@ -506,9 +506,9 @@ export function claudeNativeInstalled(env: NodeJS.ProcessEnv = process.env): boo
 function runClaudeCli(claude: string, args: string[]): void {
     if (process.platform === "win32" && /\.(cmd|bat)$/i.test(claude)) {
         const q = (s: string) => `"${s.replaceAll("%", "%%")}"`;
-        execFileSync([claude, ...args].map(q).join(" "), { shell: true, stdio: ["ignore", "pipe", "pipe"], timeout: CLAUDE_EXEC_TIMEOUT_MS });
+        execFileSync([claude, ...args].map(q).join(" "), { shell: true, stdio: ["ignore", "pipe", "pipe"], timeout: CLAUDE_EXEC_TIMEOUT_MS, windowsHide: true });
     } else {
-        execFileSync(claude, args, { stdio: ["ignore", "pipe", "pipe"], timeout: CLAUDE_EXEC_TIMEOUT_MS });
+        execFileSync(claude, args, { stdio: ["ignore", "pipe", "pipe"], timeout: CLAUDE_EXEC_TIMEOUT_MS, windowsHide: true });
     }
 }
 
@@ -523,7 +523,7 @@ function runClaudeCli(claude: string, args: string[]): void {
 export function resolveClaudeCli(claude: string): string {
     if (process.platform !== "win32" || /[\\/]/.test(claude) || /\.[a-z]+$/i.test(claude)) return claude;
     try {
-        const r = spawnSync("where.exe", [claude], { stdio: ["ignore", "pipe", "ignore"], timeout: 5000, encoding: "utf8" });
+        const r = spawnSync("where.exe", [claude], { stdio: ["ignore", "pipe", "ignore"], timeout: 5000, encoding: "utf8", windowsHide: true });
         const first = (r.stdout ?? "").split(/\r?\n/).find((l) => l.trim().length > 0)?.trim();
         return first && first.length > 0 ? first : claude;
     } catch {
@@ -725,8 +725,8 @@ export function detectOpencodeMajor(): number {
         // quoting. Plain exes and POSIX shebang scripts go straight through.
         const viaShell = process.platform === "win32" && /\.(cmd|bat)$/i.test(command);
         const out = viaShell
-            ? execFileSync(`"${command}" --version`, { shell: true, timeout: 5000, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] })
-            : execFileSync(command, ["--version"], { timeout: 5000, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+            ? execFileSync(`"${command}" --version`, { shell: true, timeout: 5000, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], windowsHide: true })
+            : execFileSync(command, ["--version"], { timeout: 5000, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], windowsHide: true });
         const m = /(\d+)\s*\./.exec(out);
         if (m) major = parseInt(m[1], 10);
     } catch {}
@@ -1243,8 +1243,8 @@ export function detectKimiVersion(env: NodeJS.ProcessEnv = process.env): string 
     for (const c of candidates) {
         try {
             out = c.viaShell
-                ? execFileSync(c.cmd, { shell: true, timeout: 5000, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] })
-                : execFileSync(c.cmd, ["--version"], { timeout: 5000, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+                ? execFileSync(c.cmd, { shell: true, timeout: 5000, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], windowsHide: true })
+                : execFileSync(c.cmd, ["--version"], { timeout: 5000, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], windowsHide: true });
             break;
         } catch {}
     }

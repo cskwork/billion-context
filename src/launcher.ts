@@ -142,7 +142,7 @@ export interface SpawnChild {
 export type SpawnFn = (
     command: string,
     args: readonly string[],
-    options: { detached?: boolean; stdio?: StdioOptions; env?: NodeJS.ProcessEnv; shell?: boolean; windowsVerbatimArguments?: boolean },
+    options: { detached?: boolean; stdio?: StdioOptions; env?: NodeJS.ProcessEnv; shell?: boolean; windowsVerbatimArguments?: boolean; windowsHide?: boolean },
 ) => SpawnChild;
 
 export interface LaunchOptions {
@@ -1672,7 +1672,7 @@ export function opencodeMajorVersion(command: string): number {
     if (hit !== undefined) return hit;
     let major = 1;
     try {
-        const out = execFileSync(command, ["--version"], { timeout: 5000, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+        const out = execFileSync(command, ["--version"], { timeout: 5000, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], windowsHide: true });
         const parsed = parseOpencodeMajor(out);
         if (parsed !== undefined) major = parsed;
     } catch {}
@@ -2151,6 +2151,7 @@ export async function ensureProxyRunning(
                 [script, ...proxyStartArgs({ ...opts, port })],
                 {
                     detached: true,
+                    windowsHide: true,
                     stdio: ["ignore", logFd, logFd],
                     env: {
                         ...stripInheritedProxy(process.env),
@@ -2313,7 +2314,7 @@ export function runClient(
     const spawnImpl = deps?.spawnImpl ?? (spawn as SpawnFn);
     const plan = planClientSpawn(cmd, args, env, deps?.platform);
     return new Promise((resolve, reject) => {
-        const child = spawnImpl(plan.command, plan.args, { stdio: "inherit", env, windowsVerbatimArguments: plan.windowsVerbatimArguments });
+        const child = spawnImpl(plan.command, plan.args, { stdio: "inherit", env, windowsVerbatimArguments: plan.windowsVerbatimArguments, windowsHide: true });
         child.on?.("error", (...rest: unknown[]) => reject(rest[0]));
         child.on?.("exit", (...rest: unknown[]) => {
             const code = rest[0];

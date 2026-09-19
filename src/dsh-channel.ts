@@ -205,6 +205,7 @@ function defaultSyncRun(plan: DshPlan): { stdout: string; stderr: string } {
         encoding: "utf8",
         stdio: ["ignore", "pipe", "pipe"],
         windowsVerbatimArguments: plan.windowsVerbatimArguments,
+        windowsHide: true,
     });
     if (res.error) throw res.error;
     if (res.status !== 0 && res.status !== null) {
@@ -222,6 +223,7 @@ async function defaultAsyncRun(plan: DshPlan): Promise<{ stdout: string; stderr:
         timeout: DSH_EXEC_TIMEOUT_MS,
         encoding: "utf8",
         windowsVerbatimArguments: plan.windowsVerbatimArguments,
+        windowsHide: true,
     });
     return { stdout, stderr };
 }
