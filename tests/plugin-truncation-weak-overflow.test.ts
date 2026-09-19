@@ -8,6 +8,10 @@ import type { Session } from "../src/session.ts";
 const SID = "plug-trunc-test";
 
 function makeSession(): Session {
+    // 95000 = the previous turn's real usage report. A truncated responses
+    // stream carries NO usage of its own (response.completed never arrives),
+    // so the weak-overflow count falls back to this water mark — and the
+    // emergency stays armed at it (#969: armed, never learned).
     return {
         id: SID,
         metadata: { effectiveContextLimit: 100000 },
@@ -64,14 +68,25 @@ function learnedOf(session: Session): number | undefined {
     return (session.metadata as { learnedContextLimit?: number }).learnedContextLimit;
 }
 
-test("chat pipe: 3 truncated streams at high usage learn a conservative window", async () => {
+// #969: nothing is learned anymore — the pattern's only lasting effect is
+// keeping the usage water mark at/above the failing input, which is what the
+// next turn's emergency preflight reads. (When the stream carried a usage
+// report it landed as source=usage; without one the arm itself raises the
+// mark tagged estimate. Either way the mark must be at the failing input.)
+function armedAtLeast(session: Session, floor: number): boolean {
+    const stats = session.stats as { lastInputTokens?: number };
+    return (stats.lastInputTokens ?? 0) >= floor;
+}
+
+test("chat pipe: 3 truncated streams at high usage arm the emergency shrink without learning (#969)", async () => {
     let session = makeSession();
     for (let i = 0; i < 3; i++) {
         const { res } = makeRes();
         session = makeSession();
         await pipePluginChatWithStrip(streamOf([chatChunk({ content: "hi" })]), res, "openai", session);
     }
-    assert.equal(learnedOf(session), 95000, "learned the failing input size after the 3rd truncation");
+    assert.equal(learnedOf(session), undefined, "#969: nothing learned without an upstream-stated window");
+    assert.ok(armedAtLeast(session, 95000), "emergency water mark at the failing input after the 3rd truncation");
 });
 
 test("chat pipe: a [DONE]-terminated stream never arms the signal", async () => {
@@ -96,7 +111,7 @@ test("chat pipe (anthropic): message_stop terminates, no signal", async () => {
     assert.equal(learnedOf(session), undefined);
 });
 
-test("responses pipe: stream without a done-family event arms the signal", async () => {
+test("responses pipe: stream without a done-family event arms the signal (no learning, #969)", async () => {
     const delta = `data: ${JSON.stringify({ type: "response.output_text.delta", delta: "hello" })}\n\n`;
     let session = makeSession();
     for (let i = 0; i < 3; i++) {
@@ -104,7 +119,8 @@ test("responses pipe: stream without a done-family event arms the signal", async
         session = makeSession();
         await pipePluginResponsesWithStrip(streamOf([delta]), res, session);
     }
-    assert.equal(learnedOf(session), 95000);
+    assert.equal(learnedOf(session), undefined, "#969: nothing learned");
+    assert.ok(armedAtLeast(session, 95000), "emergency water mark at the failing input");
 });
 
 test("responses pipe: response.completed terminates, no signal", async () => {
