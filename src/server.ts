@@ -50,7 +50,7 @@ import { applyAbsorbView, absorbEnabled, absorbToolName, storeEffectiveAbsorb } 
 import { rewriteJsonResponse, type RewriteCtx } from "./stream.js";
 import { applyRanges } from "./stream.js";
 import { buildSessionCacheReport } from "./cache-ledger.js";
-import { preflightCompress, estimateCoreMessages, estimateRawBodyTokens, estimateCoreMessagesUpper, type PreflightResult } from "./preflight.js";
+import { preflightCompress, estimateCoreMessages, estimateCoreMessagesUpper, type PreflightResult } from "./preflight.js";
 import { imageTokensInRawBody, imageTokensInParsedBody, resolveImageBilling, type ResolvedImageBilling } from "./image-tokens.js";
 import { renderUI, handleConfigGet, handleConfigPut } from "./web/index.js";
 import { reapOrphanBlocks } from "./orphan-gc.js";
@@ -81,7 +81,7 @@ import { consumePluginRegisterFor, flushConversations, handlePluginCompact, hand
 import { setupMitm, readMitmUpstream, getBlindTunnelStats } from "./mitm.js";
 import type { BiliMessage } from "acp-kernel/wire";
 import { BILI_PLUGIN_BYPASS_HEADER, hardenOpenaiAssistantContent, isLoopbackAddress, inspectContextOverflow, reserveOutputHeadroom, resolveOutputHeadroomCap, shouldReserveOutputHeadroom, systemToUser, usageTotals, type WireProtocol } from "./util.js";
-import { recordProvenInput, resolveConfirmedLimit, resolveLearnedLimit, resolveSpeculativeLimit, retractStaleLearnedLimits, sessionProvenMax } from "./weak-overflow.js";
+import { recordProvenInput, resolveConfirmedLimit, resolveLearnedLimit, retractStaleLearnedLimits, sessionProvenMax } from "./weak-overflow.js";
 import { BILI_TUNNEL_HEADER, checkTunnelDestination, tunnelAllowlistFromEnv } from "./tunnel-guard.js";
 import { dumpRejectedBody } from "./error-dump.js";
 
@@ -984,6 +984,13 @@ async function handle(
     let reqSurfacePack = "default";
     let wsSourceForLog: string | undefined;
     let reqModelId: string | undefined;
+    // #969: the operator explicitly owns the window for this model (per-route
+    // per-model `models.<id>.context` declaration or `compress.modelContextLimit`
+    // tuning). A learned window — even one the upstream stated in a 400 —
+    // never overrides an explicit operator declaration: the operator's number
+    // is a deliberate deployment decision, and the emergency shrink (armed on
+    // the overflow itself) remains the safety net either way.
+    let operatorOwnsWindow = false;
     if (parsed && typeof parsed === "object") {
         const model = (parsed as { model?: string }).model;
         reqModelId = typeof model === "string" ? model : undefined;
@@ -1022,6 +1029,8 @@ async function handle(
             const runtimeWindow = pluginWindow === undefined ? runtimeEntry?.contextWindow : undefined;
             const launcherWindow = launcherContextWindow(model);
             const configuredWindow = resolveConfiguredContextLimit(opts.routes, embeddedUrl, model);
+            const operatorWindowTuned = resolveCompress(opts.routes, embeddedUrl, model, opts.compress).modelContextLimit !== undefined;
+            operatorOwnsWindow = operatorWindowTuned || configuredWindow !== undefined;
             const peekWindow = peekRegistryContext(model, host);
             let native = betaWindow
                 ?? pluginWindow
@@ -1035,7 +1044,6 @@ async function handle(
             // explicit tuning is owned by the operator — never floored). The
             // beta window is authoritative (the client's own runtime
             // negotiation), so it also clears the fallback flag.
-            const operatorWindowTuned = resolveCompress(opts.routes, embeddedUrl, model, opts.compress).modelContextLimit !== undefined;
             nativeFromFallback = !betaWindow && !pluginWindow && !runtimeWindow && !launcherWindow && !peekWindow && !configuredWindow && !operatorWindowTuned;
             if (!native) {
                 native = await contextFromRegistry(model, host);
@@ -1397,15 +1405,22 @@ async function handle(
         // session. Runs before the resolution below so this request already
         // sees the corrected window.
         retractStaleLearnedLimits(session, reqModel);
-        const confirmedLimit = resolveConfirmedLimit(session, reqModel);
-        const learnedLimit = confirmedLimit ?? resolveSpeculativeLimit(session, reqModel);
-        if (learnedLimit && learnedLimit > 0 && learnedLimit < reqConfig.modelContextLimit) {
+        // #969: only a window the upstream itself STATED in an overflow
+        // rejection (confirmedContextLimits) re-centers the limit — speculative
+        // guesses (rejected-payload size, weak-overflow counts) no longer learn
+        // anything. And never below an explicit operator declaration: the
+        // operator owns the window they configured (compress.modelContextLimit /
+        // models.<id>.context); the emergency shrink stays the safety net.
+        const learnedLimit = resolveConfirmedLimit(session, reqModel);
+        if (learnedLimit && learnedLimit > 0 && learnedLimit < reqConfig.modelContextLimit && !operatorOwnsWindow) {
             const resolved = reqConfig.modelContextLimit;
             reqConfig = { ...reqConfig, modelContextLimit: learnedLimit };
             // A learned limit is ground truth from a real overflow — it must
             // not be floored back up (that would undo the self-heal).
             nativeFromFallback = false;
-            log("info", `[${session.id}] self-healed context window: ${resolved} → ${learnedLimit} (${confirmedLimit !== undefined ? "confirmed by an upstream overflow error" : "weak-overflow heuristic"})`);
+            log("info", `[${session.id}] self-healed context window: ${resolved} → ${learnedLimit} (confirmed by an upstream overflow error)`);
+        } else if (learnedLimit && learnedLimit > 0 && learnedLimit < reqConfig.modelContextLimit && operatorOwnsWindow) {
+            log("info", `[${session.id}] confirmed overflow window ${learnedLimit} NOT applied over the operator-declared window ${reqConfig.modelContextLimit} (#969)`);
         } else if (nativeFromFallback && reqModel) {
             // Self-heal UPWARD — complement of the overflow self-heal above. An
             // overflow only proves the window is SMALLER; a too-small fallback
@@ -3608,14 +3623,11 @@ async function forward(
                 // model that produced the overflow (per-model scoping: a stale
                 // limit from another model must not cap this one).
                 let reqModel: string | undefined;
-                let rejectedImageTokens = 0;
                 let parsedBody: Record<string, unknown> | undefined;
                 try {
                     const rawBody = typeof prepared.body === "string" ? prepared.body : prepared.body.toString("utf8");
                     parsedBody = JSON.parse(rawBody) as Record<string, unknown>;
                     reqModel = typeof parsedBody.model === "string" ? parsedBody.model : undefined;
-                    // #488: the rejected payload's size must include its images (they were forwarded verbatim).
-                    rejectedImageTokens = imageTokensInParsedBody(prepared.protocol, parsedBody, imageBillingFor(opts, upstreamUrl));
                 } catch {
                     reqModel = undefined; // non-JSON body — fall back to the legacy scalar
                 }
@@ -3634,26 +3646,17 @@ async function forward(
                     s.metadata.confirmedContextLimits = confirmedMap;
                     log("warn", `[${s.id}] upstream context overflow — learned real window ${info.window} for ${reqModel ?? "(unknown model)"} (was ${prev ?? "unset"}); arming emergency shrink`);
                 } else {
-                    // No window number in the body (e.g. Codex's
-                    // "context_window_exceeded" error). The rejected payload's
-                    // size is a safe upper bound on the real window — learn it
-                    // so the next turn re-centers the limit and the pre-flight
-                    // compresses below it. Only shrink, never grow: a previously
-                    // learned (smaller) value is the tighter bound.
-                    // #554: side passthrough has an EMPTY kernel view (processedMessages=[]),
-                    // so estimate from the raw body — exactly what was forwarded verbatim.
-                    const payloadEstimate = (prepared.processedMessages.length > 0
-                        ? estimateCoreMessages(prepared.processedMessages)
-                        : estimateRawBodyTokens(parsedBody)) + rejectedImageTokens;
-                    const prev = (reqModel ? confirmedMap[reqModel] : undefined) ?? (s.metadata.confirmedContextLimit as number | undefined);
-                    if (payloadEstimate >= 1000 && (prev === undefined || payloadEstimate < prev)) {
-                        if (reqModel) confirmedMap[reqModel] = payloadEstimate;
-                        else s.metadata.confirmedContextLimit = payloadEstimate;
-                        s.metadata.confirmedContextLimits = confirmedMap;
-                        log("warn", `[${s.id}] upstream context overflow (window not parseable) — learned conservative window ${payloadEstimate} for ${reqModel ?? "(unknown model)"} from rejected payload size (was ${prev ?? "unset"}); arming emergency shrink`);
-                    } else {
-                        log("warn", `[${s.id}] upstream context overflow (window not parseable): ${info.message}`);
-                    }
+                    // #969: no window number in the body (e.g. Codex's
+                    // "context_window_exceeded", or a relay 400-ing for
+                    // non-window reasons that merely LOOK like overflow) —
+                    // learn NOTHING. The rejected payload's size is a guess,
+                    // and a persisted guess is exactly how #969's session
+                    // shrank to 16161 forever (each 400 taught a smaller
+                    // "bound", preflight then blocked the recovery that would
+                    // have retracted it). Only a window the upstream itself
+                    // STATES is learned (the info.window branch above); here
+                    // the emergency shrink below still unblocks the next turn.
+                    log("warn", `[${s.id}] upstream context overflow (window not parseable) — not learning a window (#969); emergency shrink only: ${info.message}`);
                 }
                 // Arm the emergency shrink: force the next turn's usage to >=100%
                 // so the kernel's emergency nudge + tool-result truncate fire.

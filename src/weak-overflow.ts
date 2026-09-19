@@ -24,13 +24,18 @@ import { log as loggerLog } from "./logger.js";
  * overflow failure landed below the gate, so the learner starved exactly
  * where the deployment was broken).
  *
- * When the pattern fires we learn the failing input size as a conservative
- * window (shrink-only, mirroring the 400-without-window path: the payload
- * was above the real window, so its size is an upper bound) and arm the
- * emergency shrink so the next turn compresses below it. This unblocks the
- * #351/#499 failure family: oversized requests never succeed, never cache,
- * and never self-heal — without this, the session loops on truncated
- * streams until the client gives up.
+ * When the pattern fires we learn NOTHING about the window (#969): the
+ * failing input's size is a guess, and a persisted guess kept throttling
+ * sessions far below their real window (9router: 18320 → 16161 learned from
+ * non-window failures, unretractable because preflight never forwards the
+ * over-window payload that would have produced a contradicting success).
+ * The upstream states the real window itself when it rejects with one —
+ * that path (server.ts inspectContextOverflow → confirmedContextLimits) is
+ * the ONLY source of a learned window. What the weak pattern still does:
+ * arm the emergency shrink so the next turn compresses below the failing
+ * size (a one-shot action, no persisted limit). This unblocks the
+ * #351/#499 failure family (oversized requests never succeed, never cache)
+ * without letting mid-stream noise shrink the declared window.
  *
  * #570: everything learned here is a HYPOTHESIS. A high-usage truncation
  * cannot be distinguished in-band from other mid-stream deaths (upstream KV
@@ -82,21 +87,12 @@ export function resolveConfirmedLimit(session: Session, model?: string): number 
     return (model ? map?.[model] : undefined) ?? (md.confirmedContextLimit as number | undefined);
 }
 
-/** Weak hypotheses only: values written by noteWeakOverflow (and legacy
- *  stores, where weak and strong values share these fields). */
-export function resolveSpeculativeLimit(session: Session, model?: string): number | undefined {
-    const md = (session.metadata ?? {}) as Record<string, unknown>;
-    const map = md.learnedContextLimits as Record<string, number> | undefined;
-    return (model ? map?.[model] : undefined) ?? (md.learnedContextLimit as number | undefined);
-}
-
-/** Best known limit for this session/model (#570 provenance order):
- *  confirmed per-model > speculative per-model > confirmed scalar > speculative scalar. */
+/** #969: the ONLY learned-window store is confirmedContextLimits — windows
+ * the upstream itself stated in an overflow rejection. Legacy speculative
+ * values (written by pre-#969 builds) are ignored everywhere; retraction
+ * still deletes them so stale state drains. */
 export function resolveLearnedLimit(session: Session, model?: string): number | undefined {
-    const perModel = model
-        ? (resolveConfirmedLimit(session, model) ?? resolveSpeculativeLimit(session, model))
-        : undefined;
-    return perModel ?? resolveConfirmedLimit(session) ?? resolveSpeculativeLimit(session);
+    return resolveConfirmedLimit(session, model) ?? resolveConfirmedLimit(session);
 }
 
 /** #570: a window that a later SUCCESSFUL turn exceeded is stale — the
@@ -247,12 +243,12 @@ export function noteWeakOverflow(
     }
     states.delete(session.id);
 
-    const md = ((session.metadata ?? {}) as Record<string, unknown>);
     const reqModel = opts.model;
-    // #570: ground truth governs. While a CONFIRMED window (learned from an
-    // actual upstream overflow rejection) exists for this model, a speculative
-    // truncation count must not overwrite it with a smaller guess — that is
-    // exactly how KV-pressure false positives poisoned real windows. The
+    // #969: ground truth governs, and NOTHING is learned without it. While a
+    // CONFIRMED window (learned from an actual upstream overflow rejection)
+    // exists for this model it is untouched; without one the pattern still
+    // does not write any window — the failing input's size is a guess, and a
+    // persisted guess is how #969's session shrank to 16161 forever. The
     // transient emergency shrink below still unblocks the loop either way.
     const confirmed = resolveConfirmedLimit(session, reqModel);
     // A mid-stream death ABOVE a governing confirmed window cannot be a window
@@ -261,20 +257,9 @@ export function noteWeakOverflow(
     // retraction never reads this failure's size as "a later success".
     const armInput = confirmed !== undefined && confirmed > 0 ? Math.min(input, confirmed) : input;
     if (confirmed !== undefined && confirmed > 0) {
-        loggerLog("warn", `[${session.id}] weak overflow confirmed (${MIN_EVENTS}× high-usage failures, ${opts.reason}) — confirmed window ${confirmed} governs (failing input ${input}); arming emergency shrink only, learned window untouched`);
+        loggerLog("warn", `[${session.id}] weak overflow pattern (${MIN_EVENTS}× high-usage failures, ${opts.reason}) — confirmed window ${confirmed} governs (failing input ${input}); arming emergency shrink only, learned window untouched`);
     } else {
-        if (md.learnedContextLimits === undefined) md.learnedContextLimits = {};
-        const learnedMap = md.learnedContextLimits as Record<string, number>;
-        const prev = (reqModel ? learnedMap[reqModel] : undefined) ?? (md.learnedContextLimit as number | undefined);
-        // Shrink-only: a previously learned (smaller) value is the tighter bound.
-        if (prev === undefined || input < prev) {
-            if (reqModel) learnedMap[reqModel] = input;
-            else md.learnedContextLimit = input;
-            session.metadata = md;
-            loggerLog("warn", `[${session.id}] weak overflow confirmed (${MIN_EVENTS}× high-usage failures, ${opts.reason}) — learned conservative window ${input} for ${reqModel ?? "(unknown model)"} (was ${prev ?? "unset"}); arming emergency shrink`);
-        } else {
-            loggerLog("warn", `[${session.id}] weak overflow confirmed (${MIN_EVENTS}× high-usage failures, ${opts.reason}) — conservative window ${input} not below learned ${prev}; arming emergency shrink only`);
-        }
+        loggerLog("warn", `[${session.id}] weak overflow pattern (${MIN_EVENTS}× high-usage failures, ${opts.reason}, input ${input}) — no confirmed window; arming emergency shrink only, no window learned (#969)`);
     }
     if (!session.stats) session.stats = { lastInputTokens: armInput, lastInputTokensSource: "estimate" } as Session["stats"];
     else if (armInput > session.stats.lastInputTokens) {

@@ -45,8 +45,13 @@ test("#901 regression: no success sample yet — low-usage failures count (the b
     const session = makeSession(1_000_000);
     // 40% of the trusted 1M window: under the old MIN_USAGE gate this was
     // ignored forever when the trusted window overstated reality (~370k true).
+    // #969: the pattern still fires (counting is capability-based), but it
+    // arms the emergency shrink WITHOUT learning a window — the failing
+    // input's size is a guess, and a persisted guess is how #969's session
+    // shrank to 16161 forever.
     for (const r of ["r1", "r2", "r3"]) noteWeakOverflow(session, { inputTokens: 400_000, reason: r });
-    assert.equal(session.metadata.learnedContextLimit, 400_000, "learned despite 40% usage of the trusted window");
+    assert.equal(session.metadata.learnedContextLimit, undefined, "#969: nothing learned without an upstream-stated window");
+    assert.equal(session.metadata.learnedContextLimits, undefined);
     assert.equal((session.stats as { lastInputTokens: number }).lastInputTokens, 400_000, "emergency shrink armed");
 });
 
@@ -57,7 +62,9 @@ test("#901: filtered noise does not consume the event budget — a real overflow
     noteWeakOverflow(session, { inputTokens: 400_000, model: "glm", reason: "o1" });
     noteWeakOverflow(session, { inputTokens: 402_000, model: "glm", reason: "o2" });
     noteWeakOverflow(session, { inputTokens: 404_000, model: "glm", reason: "o3" });
-    assert.equal((session.metadata.learnedContextLimits as Record<string, number>)["glm"], 404_000);
+    // #969: the real-overflow pattern arms at the failing size but learns nothing.
+    assert.equal(session.metadata.learnedContextLimits, undefined, "#969: no window learned");
+    assert.equal((session.stats as { lastInputTokens: number }).lastInputTokens, 404_000, "armed at the last failing input");
 });
 
 test("#901: the issue deployment end-to-end — inflated 1M trusted, 392k proven, 60–96k cuts are noise, 400k cutoffs learn", () => {
@@ -70,7 +77,10 @@ test("#901: the issue deployment end-to-end — inflated 1M trusted, 392k proven
     for (const r of ["r1", "r2", "r3"]) {
         noteWeakOverflow(session, { inputTokens: 400_000, model: "z-ai/glm-5.3-flash", reason: "cut" });
     }
-    assert.equal((session.metadata.learnedContextLimits as Record<string, number>)["z-ai/glm-5.3-flash"], 400_000, "oversized deaths above capability confirm");
+    // #969: oversized deaths above capability confirm the PATTERN (arming),
+    // but only an upstream-stated window is ever learned.
+    assert.equal(session.metadata.learnedContextLimits, undefined, "#969: no window learned from guessed sizes");
+    assert.equal((session.stats as { lastInputTokens: number }).lastInputTokens, 400_000, "armed at the failing size");
 });
 
 test("#901: recordProvenInput stores per-model and scalar; baseline resolves max with scalar fallback", () => {
@@ -95,31 +105,34 @@ test("#901: the proven ring is bounded so a resized upstream drains out", () => 
     assert.equal(resolveProvenBaseline(session), 100_000, "the stale giant drained out of the ring");
 });
 
-test("three high-usage events learn a conservative window and arm emergency", () => {
+test("three high-usage events arm the emergency shrink without learning a window (#969)", () => {
     const session = makeSession(100000);
     noteWeakOverflow(session, { inputTokens: 95000, reason: "r1" });
     noteWeakOverflow(session, { inputTokens: 96000, reason: "r2" });
     assert.equal(session.metadata.learnedContextLimit, undefined, "not before the 3rd event");
     noteWeakOverflow(session, { inputTokens: 97000, reason: "r3" });
-    assert.equal(session.metadata.learnedContextLimit, 97000, "learns the LAST failing input size");
-    assert.equal((session.stats as { lastInputTokens: number }).lastInputTokens, 97000, "emergency shrink armed");
+    assert.equal(session.metadata.learnedContextLimit, undefined, "#969: the failing input's size is a guess — never learned");
+    assert.equal((session.stats as { lastInputTokens: number }).lastInputTokens, 97000, "emergency shrink armed at the last failing input");
 });
 
-test("model-scoped learning lands in learnedContextLimits", () => {
+test("model-scoped arming writes nothing to the learned maps (#969)", () => {
     const session = makeSession(100000);
     noteWeakOverflow(session, { inputTokens: 95000, model: "qwen", reason: "r1" });
     noteWeakOverflow(session, { inputTokens: 95000, model: "qwen", reason: "r2" });
     noteWeakOverflow(session, { inputTokens: 95000, model: "qwen", reason: "r3" });
-    assert.deepEqual(session.metadata.learnedContextLimits, { qwen: 95000 });
+    assert.equal(session.metadata.learnedContextLimits, undefined, "#969: nothing learned");
     assert.equal(session.metadata.learnedContextLimit, undefined);
+    assert.equal((session.stats as { lastInputTokens: number }).lastInputTokens, 95000, "emergency shrink armed");
 });
 
-test("shrink-only: never grows a previously learned smaller window", () => {
+test("#969: a legacy speculative value is frozen, never overwritten or grown", () => {
+    // Pre-#969 builds wrote speculative values here. New code ignores them
+    // entirely (retraction drains them); it must not grow OR shrink them.
     const session = makeSession(100000, 50000);
     noteWeakOverflow(session, { inputTokens: 95000, reason: "r1" });
     noteWeakOverflow(session, { inputTokens: 95000, reason: "r2" });
     noteWeakOverflow(session, { inputTokens: 95000, reason: "r3" });
-    assert.equal(session.metadata.learnedContextLimit, 50000, "smaller learned value wins");
+    assert.equal(session.metadata.learnedContextLimit, 50000, "legacy value untouched");
     assert.equal((session.stats as { lastInputTokens: number }).lastInputTokens, 95000, "emergency shrink still armed");
 });
 
@@ -143,13 +156,14 @@ test("events older than the window do not accumulate", () => {
 // #901: counting no longer requires a configured window at all — capability
 // evidence (or its absence) decides, so sessions with an unknown window can
 // still learn from repeated oversized deaths.
-test("#901: no configured window — failures still accumulate and learn", () => {
+test("#901: no configured window — failures still accumulate and arm (#969: nothing learned)", () => {
     const session = makeSession(0);
     noteWeakOverflow(session, { inputTokens: 95000, reason: "r1" });
     noteWeakOverflow(session, { inputTokens: 96000, reason: "r2" });
     assert.equal(session.metadata.learnedContextLimit, undefined, "not before the 3rd event");
     noteWeakOverflow(session, { inputTokens: 97000, reason: "r3" });
-    assert.equal(session.metadata.learnedContextLimit, 97000, "learns with zero configured window");
+    assert.equal(session.metadata.learnedContextLimit, undefined, "#969: arms without learning even with zero configured window");
+    assert.equal((session.stats as { lastInputTokens: number }).lastInputTokens, 97000, "armed");
 });
 
 test("falls back to lastInputTokens when inputTokens is absent", () => {
@@ -158,7 +172,8 @@ test("falls back to lastInputTokens when inputTokens is absent", () => {
     noteWeakOverflow(session, { reason: "r1" });
     noteWeakOverflow(session, { reason: "r2" });
     noteWeakOverflow(session, { reason: "r3" });
-    assert.equal(session.metadata.learnedContextLimit, 92000);
+    assert.equal(session.metadata.learnedContextLimit, undefined, "#969: nothing learned");
+    assert.equal((session.stats as { lastInputTokens: number }).lastInputTokens, 92000, "armed from the stats fallback");
 });
 
 function makeSessionWithMaps(opts: {
@@ -196,12 +211,16 @@ test("#570: a confirmed window governs — weak confirmations never clobber it",
     assert.equal((session.stats as { lastInputTokens: number }).lastInputTokens, 134000, "emergency shrink still armed");
 });
 
-test("#570: weak confirmations still refine their own speculative values", () => {
+test("#969: weak confirmations refine nothing — a legacy speculative value is frozen", () => {
+    // Pre-#969 behavior refined (shrank) its own speculative guesses. That
+    // feedback loop is what shrank #969's session 18320 → 16161: each failure
+    // taught a smaller "bound". Now nothing is written, ever.
     const session = makeSessionWithMaps({ learnedMap: { qwen: 130000 } });
     for (const r of ["r1", "r2", "r3"]) {
         noteWeakOverflow(session, { inputTokens: 125000, model: "qwen", reason: r });
     }
-    assert.equal((session.metadata.learnedContextLimits as Record<string, number>).qwen, 125000);
+    assert.equal((session.metadata.learnedContextLimits as Record<string, number>).qwen, 130000, "legacy value untouched");
+    assert.equal((session.stats as { lastInputTokens: number }).lastInputTokens, 125000, "armed at the failing size");
 });
 
 test("#570 retraction: a successful turn above the learned window removes it", () => {
@@ -260,7 +279,7 @@ test("#857 arming: noteWeakOverflow tags its baseline raise as estimate", () => 
     assert.equal(stats.lastInputTokensSource, "estimate", "estimate provenance tagged");
 });
 
-test("#570 resolvers: confirmed > speculative, per-model > scalar", () => {
+test("#570/#969 resolvers: confirmed only, per-model > scalar", () => {
     const s = makeSessionWithMaps({
         learnedMap: { qwen: 100000 },
         confirmedMap: { qwen: 150000 },
@@ -270,8 +289,8 @@ test("#570 resolvers: confirmed > speculative, per-model > scalar", () => {
     assert.equal(resolveLearnedLimit(s, "qwen"), 150000, "confirmed per-model wins");
     assert.equal(resolveLearnedLimit(s, "other"), 80000, "unknown model → confirmed scalar");
     const s2 = makeSessionWithMaps({ learnedMap: { qwen: 100000 }, learnedScalar: 90000 });
-    assert.equal(resolveLearnedLimit(s2, "qwen"), 100000, "speculative per-model next");
-    assert.equal(resolveLearnedLimit(s2, "other"), 90000, "falls back to the speculative scalar");
+    assert.equal(resolveLearnedLimit(s2, "qwen"), undefined, "#969: speculative values no longer resolve");
+    assert.equal(resolveLearnedLimit(s2, "other"), undefined, "#969: speculative scalar ignored too");
     assert.equal(resolveConfirmedLimit(s2, "other"), undefined);
 });
 

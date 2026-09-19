@@ -109,13 +109,14 @@ test("e2e #496 (byte-counting relay): one rejected forward, then fail-fast — t
         assert.ok(r1text.includes("context_window_exceeded"), "relay error body passes through");
         assert.deepEqual(streamForwards, [true], "request 1 was forwarded exactly once");
 
-        // The self-heal recognized the overflow and learned a conservative window from
-        // the REJECTED payload size (which counts the images, #488), arming the shrink.
-        const s = listSessions().find((x) => (x.metadata.confirmedContextLimits as Record<string, number> | undefined)?.["claude-img"] !== undefined);
-        assert.ok(s, "session learned a conservative window from the rejected multimodal payload");
-        const learned = (s!.metadata.confirmedContextLimits as Record<string, number>)["claude-img"];
-        assert.ok(learned >= 1000 && learned > 10_000, `learned window reflects the image-heavy payload (got ${learned})`);
-        assert.ok(s!.stats.lastInputTokens >= learned, "emergency shrink armed (lastInputTokens >= learned window)");
+        // #969: the relay's 400 carries NO window number, so nothing is
+        // learned — but the emergency shrink still arms at the effective
+        // window (10k, trusted provenance), which is the overflow EVIDENCE
+        // that breaks the forward-once loop below.
+        const s = listSessions().find((x) => x.id === "img-relay-sess");
+        assert.ok(s, "session exists");
+        assert.equal(s!.metadata.confirmedContextLimits, undefined, "#969: no window learned from a numberless rejection");
+        assert.equal((s!.stats as { lastInputTokens?: number }).lastInputTokens, 10_000, "emergency shrink armed at the effective window");
 
         // --- Request 2: overflow EVIDENCE now exists → NO forward-once → fail-fast ---
         const r2 = await fetch(url, { method: "POST", headers, body: screenshotPayload() });
