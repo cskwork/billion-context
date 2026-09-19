@@ -104,6 +104,8 @@ npm install -g billion-context
 - **启动器(最省事):** `bili <client>` 一条命令拉起代理 + 客户端,不碰任何真实配置文件.
 - **改url(持久化):** 在客户端 baseURL 前面加上代理地址 + `/bili/`。
 
+三种方式背后的机制细节(插件生命周期、runtime-info 协议、注入优先级)见 [TECHNICAL-NOTES.zh-CN.md](TECHNICAL-NOTES.zh-CN.md)。
+
 
 
 ### 方式 1 —— 原生插件(native,`bili plugin install pi` / `omp` / `opencode` / `dsh` / `kimi`)
@@ -126,34 +128,17 @@ bili plugin remove <client>     # 卸载(dsh 经同一通道移除;配置快照�
 
 pi / omp / kimi / claude 没有客户端侧通道 —— 它们的配置条目由 `bili plugin install <client>` 代写(kimi 的声明式 `kimi.plugin.json` + 注册记录、claude 的受管 settings 块等)。
 
-插件加载时**自拉起自己的代理**(已有健康实例则直接复用 —— 父进程 pid 看门狗在客户端退出时收掉它),把模型流量改写到 `<proxy>/bili/<上游URL>`,并把 `compress` / `decompress` / `acp_status` 注册为客户端原生工具(plugin 模式),`/acp` 面板绑定当前会话。插件还会把客户端**自己的模型配置**上报给代理(runtime-info 协议,#955),压缩预算用真实窗口而不是注册表猜测。退出开关:`BILI_NATIVE_PI=0`、`BILI_NATIVE_OMP=0`、`BILI_NATIVE_OPENCODE=0`、`BILI_NATIVE_DSH=0`、`BILI_NATIVE_KIMI=0`。
+插件加载时**自拉起自己的代理**(已有健康实例则直接复用;父进程 pid 看门狗在客户端退出时收掉它),把模型流量改写到 `<proxy>/bili/<上游URL>`,注册 `compress` / `decompress` / `acp_status` 为客户端原生工具(plugin 模式),并把客户端**自己的模型配置**上报给代理让压缩预算用真实窗口而不是注册表猜测。退出开关:`BILI_NATIVE_PI=0`、`BILI_NATIVE_OMP=0`、`BILI_NATIVE_OPENCODE=0`、`BILI_NATIVE_DSH=0`、`BILI_NATIVE_KIMI=0`。完整机制:[TECHNICAL-NOTES.zh-CN.md](TECHNICAL-NOTES.zh-CN.md)。
 
-#### Runtime-info 协议(#955)
-
-原生插件就在客户端进程里,因此能读到客户端自己将要使用的模型配置。它通过两个通道把真相推给代理,代理在上下文窗口解析链里优先采用它而不是 models.dev 注册表/内置表:
-
-| 通道 | 时机 | 字段 |
-|---|---|---|
-| 逐请求头(门控在 `x-bili-plugin`) | 每次模型请求 | `x-bili-plugin-context-window`、`x-bili-plugin-max-output`、`x-bili-plugin-model` |
-| `POST /__bili/plugin/runtime-info`(回环地址) | 插件自举 + 模型切换 | `{agent, model, contextWindow?, maxOutput?, baseURL?, source}` |
-
-窗口解析顺序:`anthropic-beta` 协商 > 逐请求 plugin 头 > runtime-info 表(agent+model 必须匹配) > launcher 环境变量 > 路由配置 > models.dev 注册表 > 内置表。上报的 `maxOutput` 仅在请求体自带输出预算缺席时兜底。现有实现:`src/agent/pi.ts`(覆盖 pi 与 omp)、`src/agent/opencode-native.ts`(v1)、`src/agent/opencode-v2.ts`、`src/agent/dsh-native.ts`、`src/kimi/native-mcp.ts`(仅自举时上报 —— kimi 的 provider `custom_headers` 是静态的,逐请求头会在模型切换后过期)—— 其他客户端接入请遵循同一协议。
-
-launcher 环境变量这档覆盖纯代理客户端(无进程内插件):`bili <client>` 启动时读客户端自己的模型配置(codex 的 `model_context_window` / `model_max_output_tokens`,pi / omp 的 `contextWindow` / `maxTokens`,opencode 的 `limit.context` / `limit.output`,codebuddy 的 `maxInputTokens` / `maxOutputTokens`),经 `BILI_LAUNCHER_MODEL_WINDOWS` / `BILI_LAUNCHER_MODEL_MAX_OUTPUTS` 交给代理(#971)。插件上报 —— 若存在 —— 永远优先于它。
-
-首次模型请求之前会话尚不存在,`/acp` 面板会探测 `GET /__bili/plugin/status?conversationId=<agent>&fallback=latest`,代理从 runtime-info 表应答(`phase: "pre-first-request"`)而不是返回 404 —— 上报的配置立即可见,流量落地后由真实会话接管。
+**Runtime-info 协议(#955)。** 原生插件读取客户端自己将要使用的模型配置并推给代理(逐请求头 + 自举上报);代理解析上下文窗口时优先采用这份真相,而不是 models.dev 注册表/内置表。协议细节、解析顺序与现有实现:[TECHNICAL-NOTES.zh-CN.md](TECHNICAL-NOTES.zh-CN.md)。
 
 注意:
 
 - 原生模式与独立进程内扩展(`billion-context-pi`、`opencode-acp`)**互斥** —— 安装器负责换条目并把原配置快照(`.bili-bak`);迁移细节见上方客户端表(pi 需 `billion-context-pi` 0.1.72+ 才能干净退让)。
 - OpenCode:legacy `opencode-acp` 会话、V1/V2 插件形态与全部注意事项已并入 [OpenCode](#opencode) 一节。
 - `kimi` 仅在自举时上报 runtime-info(静态 `custom_headers` 无法承载逐请求的窗口/模型头,否则会在模型切换后过期),子代理会话按每次调用的 `conversation_id` 绑定 —— 完整机制见下文「Kimi Code」小节。
-- `claude` 有**原生姿态**(hybrid,#964):Claude Code 没有进程内扩展点,所以 `bili plugin install claude` 往 `~/.claude/settings.json` 写一个受管块(env `ANTHROPIC_BASE_URL=http://127.0.0.1:48787/bili/<upstream>`、`DISABLE_AUTO_COMPACT=1`、`SessionStart` hook),外加同样指向该稳定端口的用户级 MCP shell。hook 在首个模型请求前触发:附着到端口上健康的代理,或拉起一个 pid 看门狗追踪 claude 本身的代理 —— 代理随会话生灭。端口覆盖:`BILI_CLAUDE_NATIVE_PORT` > config `claude.nativePort` > 48787;上游覆盖:`BILI_CLAUDE_UPSTREAM`(或既有 `claude.anthropicBaseUrl`)。`BILI_NATIVE_CLAUDE=0` 退出 —— hook 改为拉起同端口的 **passthrough** 代理(原样转发、关闭压缩)。块是纯 JSON merge/strip:外部键从不触碰,`bili plugin remove claude` 精确还原。装有原生块的机器上 `bili claude` 仍可用 —— 它用自身临时代理覆盖静态 URL,hook 保持休眠。
+- `claude` 有**原生姿态**(#964):`bili plugin install claude` 写入受管 settings 块(静态 `/bili/` URL + `SessionStart` hook)+ 指向稳定端口的 MCP shell —— 代理随会话生灭。`BILI_NATIVE_CLAUDE=0` 退出(passthrough)。机制细节:[TECHNICAL-NOTES.zh-CN.md](TECHNICAL-NOTES.zh-CN.md)。
 - `codex` / `omp` 也有配套安装(MCP shell 与轻量扩展),但它们需要一个在跑的代理 —— 不属于原生模式。
-
-### 注入优先级 —— 能不写文件就不写(#535)
-
-bili 永不拥有用户数据:每个被启动的客户端都跑在**真实 home** 上,运行期写入落在用户预期的位置。把客户端指向代理时,启动器按优先级选择——**优先 env 变量**(hermes/dsh/codex 的代理/CA env;pi/omp 的 `BILI_PROVIDER_REWRITES` URL 清单,由扩展加载时经 `registerProvider` 消费),其次 **CLI 参数或扩展 API**(codex `-c key=value`、opencode 插件),最后才是**生成文件**——目前仅剩 opencode 的临时 `opencode.json`(退出即删)和 dsh 的回环例外:dsh 的 fetch 栈对回环目标无条件绕过代理 env,所以本地上游保留持久 `~/.dsh-bili` overlay 改写,直到 dsh 提供 settings-path env 或上游支持回环 opt-out。旧版本创建的 overlay 目录原地保留,绝不合并回真实 home。
 
 ### 方式 2 —— 启动器(`bili pi` / `bili codex` / `bili claude` / `bili omp` / `bili opencode` / `bili hermes` / `bili dsh` / `bili codebuddy` / `bili qoder` / `bili trae` / `bili jcode` / `bili kimi`)
 
@@ -193,6 +178,19 @@ bili
 
 更多客户端配置参考网页引导: [http://localhost:8787](http://localhost:8787) .
 
+**验证。** 代理跑着、配置保存了之后,确认它能应答,并且第一个真实请求在日志里显示压缩活动:
+
+```bash
+# 健康检查(代理是否在跑 + 转发到哪)
+curl -s http://localhost:8787/__bili/health
+# → {"ok":true,"upstream":"https://api.anthropic.com"}
+
+# 实时会话统计(发过真实请求后)
+curl -s http://localhost:8787/__bili/stats
+```
+
+然后从助手发一条消息,观察日志(`~/.local/state/billion-context/bili.log`,同时也打到 stderr)。每个请求应该看到一行 `processTurn`,等对话变长后会出现 `[acp-usage] round N input=X cached=Y (cache hit Z%)` + `compress` 事件。
+
 ### dsh(deepseek-harness)
 
 两条通道，同一个插件(#941):
@@ -212,23 +210,6 @@ bili
 - **Plugin 模式盖章:** 只有当 ACP 工具清单已在存活代理上验证通过后,块里才会写入 `custom_headers = { x-bili-plugin = "kimi" }` —— 此前流量走 wire 模式。由于 `custom_headers` 按 provider 静态生效,无法承载逐请求的窗口/模型头(会在模型切换后过期),所以 runtime-info 上报只在自举时发生(客户端配置里有模型 + 上下文窗口 + 最大输出就一并上报)。
 - **看门狗与生命周期:** MCP 子进程每 30 s 探测一次代理。attach 模式下永远等待(绝不碰用户自己的代理);spawn 模式下代理死亡则重新拉起并把路由改写到新 origin。恢复失败时移除受管块,让流量退回直连上游而不是打到死端口。会话结束时 kimi 杀掉 MCP 子进程,父进程 pid 看门狗随之收掉拉起的代理。多个并发 TUI 共享第一个拉起的代理;它消失后其余会话自动重新拉起并改路。
 - **已知局限:** 子代理会话各自得到独立的派生代理会话(kimi 不暴露稳定的会话 id;工具调用经每次调用的 `conversation_id` 参数绑定);kimi 的原生自动压缩**没有**被推后 —— ACP 压缩只是先触发,与启动器模式一致。退出开关:`BILI_NATIVE_KIMI=0`。
-
-### 验证
-
-代理跑着、配置保存了之后,确认它能应答,并且第一个真实请求在日志里显示压缩活动:
-
-```bash
-# 健康检查(代理是否在跑 + 转发到哪)
-curl -s http://localhost:8787/__bili/health
-# → {"ok":true,"upstream":"https://api.anthropic.com"}
-
-# 实时会话统计(发过真实请求后)
-curl -s http://localhost:8787/__bili/stats
-```
-
-然后从助手发一条消息,观察日志(`~/.local/state/billion-context/bili.log`,
-同时也打到 stderr)。每个请求应该看到一行 `processTurn`,等对话变长后
-会出现 `[acp-usage] round N input=X cached=Y (cache hit Z%)` + `compress` 事件。
 
 ### 客户端用 `http.proxy`(CONNECT)接入但从不压缩
 
