@@ -418,7 +418,7 @@ function runHook(distScript: string, port: number, xdg: Record<string, string>):
 
 test("hook e2e: an occupied stable port fails loud — never port-hops", { timeout: 120_000 }, async () => {
     const distScript = path.resolve(import.meta.dirname, "..", "dist", "claude-native-bootstrap.js");
-    assert.ok(fs.existsSync(distScript), `dist script missing — run npm run build (${distScript})`);
+    ensureDistBuilt(distScript);
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-claude-hook-"));
     const xdg = {
         home,
@@ -451,6 +451,7 @@ test("hook e2e: an occupied stable port fails loud — never port-hops", { timeo
 
 test("hook e2e: a healthy proxy on ANOTHER port is never attached (static URL)", { timeout: 120_000 }, async () => {
     const distScript = path.resolve(import.meta.dirname, "..", "dist", "claude-native-bootstrap.js");
+    ensureDistBuilt(distScript);
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-claude-hook-"));
     const xdg = { home, config: path.join(home, "cfg"), state: path.join(home, "state"), cache: path.join(home, "cache"), data: path.join(home, "data") };
     const portA = await freePort();
