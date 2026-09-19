@@ -193,6 +193,7 @@ bili plugin install opencode    # registers the plugin in opencode's real config
 bili plugin install dsh         # runs 'dsh plugin --profile <name> add billion-context' for every existing profile
 bili plugin install kimi        # writes $KIMI_CODE_HOME/plugins/managed/billion-context/kimi.plugin.json (+ installed.json record); per-session routing block lands in config.toml on first start (Kimi Code >= 2.0.0)
 bili plugin remove <client>     # undo (dsh removes through the same channel; config snapshots go to .bili-bak)
+bili plugin update [client]     # bring every lane's bili presence up to date, each through its own owner (see below)
 ```
 
 Where a client has its own plugin channel you can also install natively,
@@ -215,6 +216,30 @@ skipping bili commands entirely:
 For pi / omp / kimi / claude there is no client-side channel — `bili plugin
 install <client>` writes their config entries for you (kimi's declarative
 `kimi.plugin.json` + registry record, claude's managed settings block, …).
+
+#### Single-writer: who owns which copy (#991)
+
+Every bili presence on a machine has exactly **one writer** — the thing
+that installed it is the thing that updates it, and nothing else ever
+overwrites that copy in place:
+
+| Lane | Copy lives in | Updated by |
+|------|---------------|------------|
+| global `bili` | npm global (`npm i -g billion-context`) | `bili update` / background auto-update |
+| **pi** | pi's package manager (npm form) | **`pi update`** — bili never overwrites it |
+| **opencode** | opencode's plugin dir | **opencode's plugin manager** — bili never overwrites it |
+| **dsh** | each profile's pnpm store | global bili self-update re-runs dsh's plugin channel per profile (or `dsh plugin add billion-context@latest`); pnpm's hardlinked store must never be copied over in place |
+| omp / claude / codex / kimi | no copy — entries point at the global bili install | they update together with the global copy |
+
+This is enforced in code, not just convention: the self-updater
+(`src/update.ts` → `hostManagedInstall`) detects install dirs under a pnpm
+virtual store (`.pnpm`) or a host agent tree (pi / opencode / dsh / kimi /
+omp homes) and **skips** them; `installViaTarball` refuses them structurally
+so direct callers cannot corrupt a store either. Mixing *commands* is fine
+(`dsh plugin add` ≡ `bili plugin install dsh` — same channel, same records);
+mixing *writers* is what the guard forbids. `bili plugin update [client]`
+is the one command that drives every lane through its own owner and prints
+the per-lane update path (`bili plugin list` shows the same per-lane channel).
 
 At load the plugin **spawns its own proxy** (or attaches to a healthy
 running one — a parent-pid watchdog tears it down when the client exits),

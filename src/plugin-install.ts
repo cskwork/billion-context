@@ -30,7 +30,8 @@ import { applyEdits, modify as jsoncModify, parse as jsoncParse, type ParseError
 import { resolveDshHome, resolveKimiHome, resolvePiHome } from "./client-config.js";
 import { clearClaudeNativePort, resolveClaudeNativePort, saveClaudeNativePort } from "./config.js";
 import { isPidAlive, isProxyInstanceFile, readProxyInstanceFile } from "./instance.js";
-import { DSH_PACKAGE, dshBundleInstalled, dshHasLegacyManagedBlock, dshProfileDependsOnBili, dshProfileDirs, runDshPlugin, stripLegacyManagedBlock } from "./dsh-channel.js";
+import { DSH_PACKAGE, dshBundleInstalled, dshHasLegacyManagedBlock, dshProfileDependsOnBili, dshProfileDirs, refreshDshProfileBundles, runDshPlugin, stripLegacyManagedBlock } from "./dsh-channel.js";
+import { fetchRegistryVersion } from "./update.js";
 import { restoreKimiBackup, unrouteKimi } from "./kimi/native.js";
 
 /** #403: never freeze a dead or unverifiable origin into a client's
@@ -1337,8 +1338,8 @@ export function pluginRemove(agent: PluginAgent): string {
     return agent === "pi" ? piRemove() : agent === "omp" ? ompRemove() : agent === "claude" ? claudeRemove() : agent === "codex" ? codexRemove() : agent === "dsh" ? dshRemove() : agent === "kimi" ? kimiRemove() : opencodeRemove();
 }
 
-export function pluginStatusAll(): Array<{ agent: string; status: string }> {
-    const checks: Array<[string, () => string]> = [
+export function pluginStatusAll(): Array<{ agent: string; status: string; channel: string }> {
+    const checks: Array<[PluginAgent, () => string]> = [
         ["pi", piStatus],
         ["omp", ompStatus],
         ["claude", claudeStatus],
@@ -1349,9 +1350,105 @@ export function pluginStatusAll(): Array<{ agent: string; status: string }> {
     ];
     return checks.map(([agent, check]) => {
         try {
-            return { agent, status: check() };
+            return { agent, status: check(), channel: UPDATE_CHANNEL[agent] };
         } catch (err) {
-            return { agent, status: `error: ${err instanceof Error ? err.message : String(err)}` };
+            return { agent, status: `error: ${err instanceof Error ? err.message : String(err)}`, channel: UPDATE_CHANNEL[agent] };
         }
     });
+}
+
+// #991 single-writer: every lane's update path, user-facing. Host-managed
+// copies (pi's npm entry, opencode's plugin dir) are only ever updated by
+// their host; dsh profile bundles track the global version; reference lanes
+// (omp/claude/codex/kimi) follow the global bili install itself.
+const UPDATE_CHANNEL: Record<PluginAgent, string> = {
+    pi: "pi update (pi owns the npm:billion-context copy)",
+    omp: "the global bili install (entry points at it)",
+    claude: "the global bili install (hook/MCP point at it)",
+    codex: "the global bili install (the mcp launcher shells out to it)",
+    opencode: "opencode's own plugin manager (opencode owns the copy)",
+    dsh: "the global bili self-update (profile bundles track it)",
+    kimi: "the global bili install (plugin points at its dist)",
+};
+
+export interface PluginUpdateOpts {
+    packageName: string;
+    resolveProxy?: (url: string) => string | undefined;
+    updateTag?: string;
+    /** Runs the global self-update check before per-lane reports. The CLI
+     *  wires this to checkForUpdate(force); tests omit it to stay offline. */
+    globalCheck?: () => Promise<void>;
+    log?: (level: "info" | "warn", msg: string) => void;
+}
+
+/** `bili plugin update [agent]` — bring every lane's bili presence up to
+ *  date, each through its OWN owner (#991 single-writer):
+ *  - reference lanes (omp/claude/codex/kimi) need nothing per-lane: they
+ *    point at the global install, so only the global copy updates;
+ *  - host-managed copies (pi npm entry, opencode plugin entry) are never
+ *    overwritten by bili — the report says which host command upgrades
+ *    them;
+ *  - dsh profile bundles are re-resolved to the latest registry version
+ *    through dsh's own plugin channel.
+ *  Returns user-facing lines. Network is only touched when a dsh profile
+ *  actually depends on bili (version lookup) or globalCheck is provided. */
+export async function pluginUpdate(agents: readonly PluginAgent[] | undefined, opts: PluginUpdateOpts): Promise<string[]> {
+    const log = opts.log ?? (() => {});
+    const lines: string[] = [];
+    if (opts.globalCheck) {
+        await opts.globalCheck();
+        lines.push("global bili copy: update check ran (see log above; it skips copies owned by a host)");
+    }
+    for (const agent of agents ?? PLUGIN_AGENTS) {
+        try {
+            lines.push(...await updateLane(agent as PluginAgent, opts, log));
+        } catch (err) {
+            lines.push(`${agent}: update failed — ${err instanceof Error ? err.message : String(err)}`);
+        }
+    }
+    return lines;
+}
+
+async function updateLane(agent: PluginAgent, opts: PluginUpdateOpts, log: (level: "info" | "warn", msg: string) => void): Promise<string[]> {
+    if (agent === "pi") {
+        const packages = readJson(piSettingsFile()).packages;
+        const list = Array.isArray(packages) ? (packages as unknown[]).map(String) : [];
+        const root = selfPackageRoot();
+        if (list.some((p) => p === PI_NPM_ENTRY)) {
+            return ["pi: the plugin copy is pi-managed (npm:billion-context) — `pi update` upgrades it; bili never overwrites it (#991)"];
+        }
+        if (list.some((p) => isPiEntry(p, root))) {
+            return ["pi: entry points at this checkout — rebuild the checkout (`npm run build`) to pick up changes"]; 
+        }
+        return ["pi: not installed"];
+    }
+    if (agent === "opencode") {
+        const file = opencodeTargetFile();
+        const { data } = loadOpencodeConfig(file);
+        const dir = opencodePluginDir(file);
+        if (PLUGIN_KEYS.some((k) => pluginEntries(data, k).some((p) => p === OPENCODE_NPM_ENTRY))) {
+            return ["opencode: the plugin copy is opencode-managed — upgrade/reload it via opencode's plugin manager; bili never overwrites it (#991)"]; 
+        }
+        if (PLUGIN_KEYS.some((k) => pluginEntries(data, k).some((p) => p === dir))) {
+            return ["opencode: plugin points at this checkout — rebuild the checkout (`npm run build`) to pick up changes"]; 
+        }
+        return ["opencode: not installed"];
+    }
+    if (agent === "dsh") {
+        let dirs: string[];
+        try {
+            dirs = dshProfileDirs();
+        } catch {
+            return ["dsh: never initialized on this machine — nothing to update"];
+        }
+        const targets = dirs.filter((dir) => dshProfileDependsOnBili(dir));
+        if (targets.length === 0) return ["dsh: no profile depends on billion-context — nothing to update"];
+        const latest = await fetchRegistryVersion(opts, opts.packageName);
+        if (!latest) return ["dsh: could not resolve the latest version from npm — leaving profile bundles alone"];
+        const before = targets.length;
+        await refreshDshProfileBundles(latest, log);
+        return [`dsh: refreshing ${before} profile bundle(s) to ${latest} through dsh's plugin channel (see log for per-profile results)`];
+    }
+    const via = UPDATE_CHANNEL[agent];
+    return [`${agent}: the plugin entry follows the global bili install — it updates together with it (${via})`];
 }

@@ -26,7 +26,7 @@ import { configFile as defaultConfigFile } from "./paths.js";
 import { checkForUpdate, startAutoUpdate } from "./update.js";
 import { resolveProxy } from "./upstream-proxy.js";
 import { runMcpStdio } from "./mcp.js";
-import { PLUGIN_AGENTS, isPluginAgent, pluginInstall, pluginRemove, pluginStatusAll, type PluginAgent } from "./plugin-install.js";
+import { PLUGIN_AGENTS, isPluginAgent, pluginInstall, pluginRemove, pluginStatusAll, pluginUpdate, type PluginAgent } from "./plugin-install.js";
 import { runLaunch, runTestPi, isLaunchClient, type ClientName } from "./launcher.js";
 import { exportSession } from "./export.js";
 import { VERSION, PACKAGE_NAME } from "./version.js";
@@ -57,6 +57,11 @@ Usage:
                                     --with-mcp (opencode only) also adds the mcp.bili
                                     MCP face; default is the native plugin tools only
   bili plugin remove <agent>       remove it again
+  bili plugin update [agent]      update each lane's bili presence through its
+                                    own owner (#991): reference lanes follow the
+                                    global install, dsh bundles refresh through
+                                    dsh's channel, host-owned copies are pointed
+                                    at their host's updater — never overwritten
   bili plugin list                 show install status for every host
   bili mcp                         run the bili MCP server standalone (stdio)
   bili plugin-register <id>        pre-bind a conversation to the plugin mode
@@ -118,7 +123,7 @@ type Parsed = {
     exportOutput?: string;
     exportFull?: boolean;
     registerConversationId?: string;
-    pluginAction?: "install" | "remove" | "list";
+    pluginAction?: "install" | "remove" | "update" | "list";
     pluginAgent?: PluginAgent;
     pluginWithMcp?: boolean;
 };
@@ -252,10 +257,10 @@ export function parseArgs(argv: string[]): Parsed {
         } else if (cmd === "plugin") {
             command = "plugin";
             const action = positional[1];
-            if (action === "install" || action === "remove" || action === "list") {
+            if (action === "install" || action === "remove" || action === "update" || action === "list") {
                 pluginAction = action;
             } else {
-                console.error(`bili plugin: unknown action "${action ?? ""}" (try "bili plugin install|remove|list <agent>")`);
+                console.error(`bili plugin: unknown action "${action ?? ""}" (try "bili plugin install|remove|update|list <agent>")`);
                 process.exit(2);
             }
             const agent = positional[2];
@@ -266,7 +271,7 @@ export function parseArgs(argv: string[]): Parsed {
                 }
                 pluginAgent = agent;
             }
-            if (pluginAction !== "list" && pluginAgent === undefined) {
+            if (pluginAction !== "list" && pluginAction !== "update" && pluginAgent === undefined) {
                 console.error(`bili plugin ${pluginAction}: agent is required (try one of: ${PLUGIN_AGENTS.join(", ")})`);
                 process.exit(2);
             }
@@ -334,7 +339,40 @@ export async function main(): Promise<void> {
         if (overrides.BILI_MCP_PROXY !== undefined) process.env.BILI_MCP_PROXY = overrides.BILI_MCP_PROXY;
         if (pluginAction === "list") {
             for (const row of pluginStatusAll()) {
-                console.log(`${row.agent.padEnd(10)} ${row.status}`);
+                const channel = row.status === "not installed" || row.status.startsWith("error") ? "" : ` | updates via ${row.channel}`;
+                console.log(`${row.agent.padEnd(10)} ${row.status}${channel}`);
+            }
+            return;
+        }
+        if (pluginAction === "update") {
+            // Same updater egress/channel wiring as `bili update` (#609): the
+            // dsh lane resolves the latest registry version and the global
+            // check downloads through the same proxy decision as model
+            // traffic.
+            for (const [k, v] of Object.entries(overrides)) {
+                if (v !== undefined) process.env[k] = v;
+            }
+            let updaterResolveProxy: ((url: string) => string | undefined) | undefined;
+            let updateTag: string | undefined;
+            try {
+                const o = loadOptions();
+                updaterResolveProxy = (url) => resolveProxy(o.routes, o.proxy, url, o.proxyFallback);
+                updateTag = o.updateTag;
+            } catch {
+                // config unloadable — updater egress goes direct
+            }
+            try {
+                const lines = await pluginUpdate(pluginAgent ? [pluginAgent] : undefined, {
+                    packageName: PACKAGE_NAME,
+                    resolveProxy: updaterResolveProxy,
+                    updateTag,
+                    globalCheck: () => checkForUpdate({ packageName: PACKAGE_NAME, currentVersion: VERSION, autoUpdate: true, resolveProxy: updaterResolveProxy, updateTag }, true),
+                    log: (_level, msg) => console.log(msg),
+                });
+                for (const line of lines) console.log(line);
+            } catch (error) {
+                console.error(`bili plugin: ${error instanceof Error ? error.message : String(error)}`);
+                process.exit(1);
             }
             return;
         }
