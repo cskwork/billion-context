@@ -406,7 +406,8 @@ export type ProxyOptions = {
     maskHosts?: boolean;
     /** Split Claude Code subagent requests (parent+agent header pair) into
      *  their own session id so they don't queue on the main session's lock
-     *  (#970, default on). Opt out with env BILI_SUBAGENT_SPLIT=0. */
+     *  (#970, default on). Opt out with env BILI_SUBAGENT_SPLIT=0 or
+     *  `subagentSplit: false` in the config file (env wins). */
     subagentSplit?: boolean;
 };
 
@@ -549,7 +550,7 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
             ]),
         },
         maskHosts: (env.BILI_LOG_MASK_HOSTS ?? (fileConfig.maskHosts === false ? "0" : "1")) !== "0",
-        subagentSplit: (env.BILI_SUBAGENT_SPLIT ?? "1") !== "0",
+        subagentSplit: (env.BILI_SUBAGENT_SPLIT ?? (fileConfig.subagentSplit === false ? "0" : "1")) !== "0",
     };
 }
 
@@ -588,6 +589,9 @@ type FileConfig = {
     /** Set `false` to log real (non-public) target hosts instead of the
      *  `<private-host>` placeholder (#897; env BILI_LOG_MASK_HOSTS=0 wins). */
     maskHosts?: boolean;
+    /** Set `false` to keep Claude Code subagents on the main session (#970;
+     *  env BILI_SUBAGENT_SPLIT=0 wins). */
+    subagentSplit?: boolean;
     /** Global wire-compat block. `roles` maps message roles to the role name
      *  upstreams accept (e.g. `{"developer":"system"}`) — applied to the
      *  final forwarded body for openai/responses requests (#552). */
