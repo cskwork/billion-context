@@ -74,7 +74,7 @@ import { rewriteOpenaiJsonResponse } from "./stream-openai.js";
 import { rewriteResponsesJsonResponse } from "./stream-responses.js";
 import { observeResponsesTerminalState } from "./stream-terminal.js";
 import { emitPreflightError, emitStreamError } from "./stream-error.js";
-import { affinityToken, clientConversationHeader, codexTurnIdentity, preferPromptCacheKeyIdentity, type ConversationIdentity } from "./session-id.js";
+import { affinityToken, claudeSubagentAgentId, claudeSubagentSplit, clientConversationHeader, codexTurnIdentity, preferPromptCacheKeyIdentity, type ConversationIdentity } from "./session-id.js";
 import { prefixAffinity, type AnonymousAffinity } from "./prefix-affinity.js";
 import { flushPrefixAffinity, hydratePrefixAffinity, scheduleAffinityPersist } from "./affinity-persist.js";
 import { consumePluginRegisterFor, flushConversations, handlePluginCompact, handlePluginManifest, handlePluginRegister, handlePluginRuntimeInfo, handlePluginStatus, handlePluginTool, loadConversations, pipePluginChatWithStrip, pipePluginJson, pipePluginResponsesWithStrip, pluginAgentHeader, pluginConversationHeader, pluginHeadersMatchModel, pluginReportedContextWindow, pluginReportedMaxOutput, pluginRuntimeInfoFor, recordPluginSession, rememberPluginMessages, takePendingPluginRegister } from "./plugin.js";
@@ -1124,6 +1124,20 @@ async function handle(
         // unparseable / mismatched / unknown thread_source) → undefined, and
         // the legacy chain below is unchanged.
         const codexTurn = protocol === "responses" ? codexTurnIdentity(req.headers) : undefined;
+        // Claude Code subagent discriminator (#970): subagent requests carry
+        // the agent headers AND lack the main agent's system-prefix block
+        // (see claudeSubagentAgentId for the two-signal contract). Hoisted so
+        // the conversation split, the pending-register guard, and the plugin
+        // conversation binding below all test the same signal.
+        const systemTextsForSplit: string[] =
+            typeof (parsed as { system?: unknown }).system === "string"
+                ? [(parsed as { system: string }).system]
+                : Array.isArray((parsed as { system?: unknown }).system)
+                  ? (parsed as { system: { text?: unknown }[] }).system
+                        .map((b) => (typeof b?.text === "string" ? b.text : ""))
+                        .filter((t) => t.length > 0)
+                  : [];
+        const claudeSub = protocol === "anthropic" ? claudeSubagentAgentId(req.headers, systemTextsForSplit) : undefined;
         const responsesIdentity = protocol === "responses"
             ? (codexTurn
                 ? { value: codexTurn.value, source: "header" as const, clientProvided: true }
@@ -1168,7 +1182,16 @@ async function handle(
               )
             : undefined;
         const conversation = protocol === "anthropic"
-            ? anthropicIdentity?.value ?? anthropicSignal
+            ? // #970: a subagent's conversation value gets its own
+              // `<id>|sub:<agent-id>` namespace so it lands on its own session
+              // (own lock chain, own compression state) instead of queueing
+              // behind the main turn. The identity itself is NOT rewritten:
+              // affinityToken/clientLabel below keep consuming the raw value
+              // so upstream prefix caches and the UI label stay continuous
+              // across main and subagent sessions.
+              (claudeSub !== undefined && opts.subagentSplit !== false
+                  ? claudeSubagentSplit(anthropicIdentity?.value ?? anthropicSignal, req.headers, systemTextsForSplit)
+                  : anthropicIdentity?.value ?? anthropicSignal)
             : protocol === "openai"
               ? openaiIdentity?.value ?? openaiSignal
               : codexTurn
@@ -1274,10 +1297,12 @@ async function handle(
                 pluginConversation = clientConv ?? conversation;
             }
         }
-        if (!pluginAgent && session.stats.requests === 0 && codexTurnIdentity(req.headers) === undefined) {
+        if (!pluginAgent && session.stats.requests === 0 && codexTurnIdentity(req.headers) === undefined && claudeSub === undefined) {
             // A codex subagent thread mints a fresh session too, but it must
             // not claim the ROOT conversation's pending register (the plugin
-            // binding belongs to the root session, #317).
+            // binding belongs to the root session, #317). Same for a split
+            // Claude Code subagent session (#970): its first request looks
+            // brand-new, but the root's register is not its to claim.
             const pending = takePendingPluginRegister();
             if (pending) {
                 pluginAgent = pending.agent;
@@ -1288,7 +1313,15 @@ async function handle(
         if (pluginAgent && !pluginConversation) pluginConversation = conversation;
         if (pluginAgent) {
             if (session.metadata.pluginAgent !== pluginAgent) session.metadata.pluginAgent = pluginAgent;
-            recordPluginSession(pluginConversation ?? conversation, session.id);
+            // #970: for a split subagent session, record it under its split
+            // conversation id — recording under the raw conversation value
+            // would flip the single-valued conversations map between the main
+            // and subagent sessions on every interleaved request, breaking
+            // /acp lookups and MCP tool routing (last writer wins). The raw
+            // key keeps pointing at the MAIN session; the subagent session
+            // stays reachable via its verbatim split id and its canonical
+            // pfa-* (printed in wire notes).
+            recordPluginSession(claudeSub !== undefined ? conversation : (pluginConversation ?? conversation), session.id);
         }
         // Responses, OpenAI-chat AND Anthropic-wire clients that send their
         // own session id as `prompt_cache_key` (omp) get that conversation
