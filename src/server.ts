@@ -311,7 +311,11 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         // (whitelisted model hosts only — see setupMitm). Loopback binds
         // keep the strict loopback-only CONNECT gate (#240).
         const allowRemoteConnect = opts.host === "0.0.0.0" || opts.host === "::" || !isLoopbackAddress(opts.host);
-        setupMitm(server, opts.mitm.domains, (msg) => log("info", msg), (host) => resolveProxy(opts.routes, opts.proxy, `https://${host}`, opts.proxyFallback), allowRemoteConnect);
+        // #1012: blind tunnels are client AUX traffic (MCP/web), not model
+        // egress — they resolve with the aux fallback so the launcher-forwarded
+        // user proxy (BILI_INHERITED_*) applies here and ONLY here; the model
+        // paths below keep the clean-env direct semantics (e1c6c92).
+        setupMitm(server, opts.mitm.domains, (msg) => log("info", msg), (host) => resolveProxy(opts.routes, opts.proxy, `https://${host}`, opts.auxProxyFallback ?? opts.proxyFallback), allowRemoteConnect);
     }
     // Launcher mode handshake (#407): the child self-binds and retries on
     // EADDRINUSE instead of dying, reporting the real origin via the instance
@@ -684,6 +688,7 @@ async function handle(
             opts.proxyMode = fresh.proxyMode;
             opts.proxySource = fresh.proxySource;
             opts.proxyFallback = fresh.proxyFallback;
+            opts.auxProxyFallback = fresh.auxProxyFallback;
             opts.compress = fresh.compress;
             opts.compat = fresh.compat;
             resetProxyCache();

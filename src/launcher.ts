@@ -2014,6 +2014,28 @@ export function stripInheritedProxy(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
     return cleaned;
 }
 
+/** #1012: capture the user's proxy vars BEFORE stripping, so the launcher can
+ *  forward them to the proxy child under dedicated BILI_INHERITED_* names.
+ *  The child itself runs with a clean env (e1c6c92: shell proxies must not
+ *  hijack model egress), but its AUXILIARY egress (MITM blind tunnels for
+ *  client-side MCP/web traffic) needs the user's proxy to reach hosts the
+ *  client could reach before #890 stripped its env. Uppercase wins over
+ *  lowercase, matching config.ts's own-env precedence. */
+export function captureInheritedProxyEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+    const captured: NodeJS.ProcessEnv = {};
+    const pairs: Array<[string, string | undefined, string | undefined]> = [
+        ["BILI_INHERITED_HTTP_PROXY", env.HTTP_PROXY, env.http_proxy],
+        ["BILI_INHERITED_HTTPS_PROXY", env.HTTPS_PROXY, env.https_proxy],
+        ["BILI_INHERITED_ALL_PROXY", env.ALL_PROXY, env.all_proxy],
+        ["BILI_INHERITED_NO_PROXY", env.NO_PROXY, env.no_proxy],
+    ];
+    for (const [name, upper, lower] of pairs) {
+        const value = (upper ?? lower ?? "").trim();
+        if (value) captured[name] = value;
+    }
+    return captured;
+}
+
 function proxyStartArgs(opts: LaunchOptions): string[] {
     const args = ["start", "--host", opts.host, "--port", String(opts.port)];
     if (opts.passthrough) args.push("--passthrough");
@@ -2155,6 +2177,7 @@ export async function ensureProxyRunning(
                     stdio: ["ignore", logFd, logFd],
                     env: {
                         ...stripInheritedProxy(process.env),
+                        ...captureInheritedProxyEnv(process.env),
                         BILI_LAUNCH_TOKEN: launchToken,
                         BILI_PARENT_PID: String(opts.parentPid ?? process.pid),
                         ...(opts.mitmDomains && opts.mitmDomains.length
