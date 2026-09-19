@@ -380,7 +380,11 @@ bili --host 0.0.0.0           # 所有网卡(或直接用局域网 IP)
 - 空字符串 `""` 表示**明确直连**(覆盖并禁用)。
 - 自动模式会让环境/系统 fallback 遵守 `NO_PROXY` 与 Windows 绕过列表。
   指回 bili 自己本地端口的代理会被跳过或拒绝,防止自环。
-- 支持 HTTP 和 HTTPS 代理 origin。SOCKS5 暂不支持。
+- 支持 HTTP 和 HTTPS 代理 origin。SOCKS5（`socks5`/`socks5h`）暂不支持：显式
+  的 `BILI_UPSTREAM_PROXY` / 配置 `proxy` 使用此类 scheme 会在启动时报出可操作
+  的错误；环境变量/系统代理（`HTTPS_PROXY` 等）使用此类 scheme 时会被忽略并打
+  一次警告日志（流量随后回退为直连）。Clash/mihomo 用户请改用同一 mixed 端口
+  的 HTTP 形式（如 `http://127.0.0.1:7890`）。
 - 两条出站路径都覆盖:`/bili/` 路径模式(fetch)和 MITM CONNECT 隧道(代理连接真实上游的链路走 HTTP CONNECT 代理)。
 
 环境变量覆盖:`BILI_UPSTREAM_PROXY=http://127.0.0.1:20172`(优先于配置文件)。

@@ -9,7 +9,9 @@ import { resolveUpstream, startServer } from "../src/server.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { fetchWithTimeout } from "../src/fetch-util.ts";
+import { setLogCapture } from "../src/logger.ts";
 import {
+    _resetUpstreamProxyForTest,
     formatUpstreamError,
     matchesNoProxy,
     parseHttpProxy,
@@ -17,6 +19,8 @@ import {
     resetProxyCache,
     resolveProxy,
     resolveProxyDecision,
+    unsupportedProxyScheme,
+    validateHttpProxy,
 } from "../src/upstream-proxy.ts";
 
 function listen(server: http.Server, port: number = 0): Promise<void> {
@@ -304,6 +308,75 @@ test("PR #67 ProxyAgent remains the sole HTTP egress transport", async () => {
         upstream.closeAllConnections();
         await close(upstream);
     }
+});
+
+test("#1014: unsupportedProxyScheme classifies schemes without false positives on bare host:port", () => {
+    assert.equal(unsupportedProxyScheme("socks5h://127.0.0.1:7890"), "socks5h");
+    assert.equal(unsupportedProxyScheme("socks5://127.0.0.1:1080"), "socks5");
+    assert.equal(unsupportedProxyScheme("socks://proxy.example:1080"), "socks");
+    assert.equal(unsupportedProxyScheme("http://proxy.example:8080"), undefined);
+    assert.equal(unsupportedProxyScheme("https://proxy.example:9443"), undefined);
+    assert.equal(unsupportedProxyScheme("127.0.0.1:7890"), undefined, "schemeless host:port normalizes to http like parseHttpProxy");
+    assert.equal(unsupportedProxyScheme(undefined), undefined);
+    assert.equal(unsupportedProxyScheme(""), undefined);
+});
+
+test("#1014: env proxy with unsupported scheme falls through to direct loudly, once per source+scheme", () => {
+    _resetUpstreamProxyForTest();
+    const captured: Array<{ level: string; msg: string }> = [];
+    setLogCapture((level, msg) => captured.push({ level, msg }));
+    try {
+        const fallback = {
+            httpsProxy: "socks5h://user:secret@127.0.0.1:7890",
+            allProxy: "socks5://127.0.0.1:1080",
+            systemProxy: { enabled: false },
+            biliPort: 8787,
+        };
+        const first = resolveProxyDecision({}, undefined, "https://api.example.com/v1", fallback);
+        assert.deepEqual(first, { source: "direct" });
+        const warnings = () => captured.filter((entry) => entry.level === "warn" && entry.msg.startsWith("[upstream-proxy] ignoring"));
+        assert.equal(warnings().length, 2, `expected 2 warnings, got: ${captured.map((e) => e.msg).join(" | ")}`);
+        assert.ok(warnings().some((entry) => entry.msg.includes("HTTPS_PROXY=socks5h://***:***@127.0.0.1:7890")), "redacted HTTPS_PROXY warning");
+        assert.ok(!captured.some((entry) => entry.msg.includes("secret")), "credential must not leak into the log");
+        assert.ok(warnings().some((entry) => entry.msg.includes("ALL_PROXY=socks5://127.0.0.1:1080") && entry.msg.includes('scheme "socks5"')));
+        assert.ok(warnings().every((entry) => entry.msg.includes("mixed port over http://")));
+        const before = captured.length;
+        const second = resolveProxyDecision({}, undefined, "https://api.example.com/v1", fallback);
+        assert.deepEqual(second, { source: "direct" });
+        assert.equal(captured.length, before, "warning must not repeat on later requests");
+    } finally {
+        setLogCapture(null);
+        _resetUpstreamProxyForTest();
+    }
+});
+
+test("#1014: a valid env proxy still wins while an earlier unsupported one warns and drops", () => {
+    _resetUpstreamProxyForTest();
+    const captured: Array<{ level: string; msg: string }> = [];
+    setLogCapture((level, msg) => captured.push({ level, msg }));
+    try {
+        const decision = resolveProxyDecision({}, undefined, "https://api.example.com/v1", {
+            httpsProxy: "socks5h://127.0.0.1:7890",
+            httpProxy: "http://fallback.example:8080",
+            systemProxy: { enabled: false },
+            biliPort: 8787,
+        });
+        assert.deepEqual(decision, { proxy: "http://fallback.example:8080/", source: "HTTP_PROXY" });
+        const warnings = captured.filter((entry) => entry.level === "warn" && entry.msg.startsWith("[upstream-proxy] ignoring"));
+        assert.equal(warnings.length, 1);
+        assert.ok(warnings[0].msg.includes("HTTPS_PROXY=socks5h://127.0.0.1:7890"));
+    } finally {
+        setLogCapture(null);
+        _resetUpstreamProxyForTest();
+    }
+});
+
+test("#1014: explicit socks proxy fails startup with an actionable error, not the generic origin message", () => {
+    assert.throws(() => validateHttpProxy("socks5h://127.0.0.1:7890"), /unsupported scheme "socks5h"/);
+    assert.throws(() => validateHttpProxy("socks5://127.0.0.1:1080"), /mixed port over http/);
+    assert.throws(() => validateHttpProxy("http://proxy.example/bad-path"), /must be an HTTP\/HTTPS proxy origin/);
+    assert.doesNotThrow(() => validateHttpProxy("http://127.0.0.1:7890"));
+    assert.doesNotThrow(() => validateHttpProxy(undefined));
 });
 
 test("upstream failures expand nested causes with redacted proxy context", () => {
