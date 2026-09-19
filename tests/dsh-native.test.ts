@@ -265,8 +265,12 @@ test("dshNativeInstalled: true iff any profile has the bundle or a legacy manage
             fs.writeFileSync(path.join(home, "profiles", "web", "package.json"), JSON.stringify({ dsh: { profile: { bundles: ["billion-context"] } } }));
             assert.equal(dshNativeInstalled(), true);
         });
-        // no profiles root at all — nothing can be installed
-        assert.equal(dshNativeInstalled(), false);
+        // no profiles root at all — nothing can be installed (keep the env
+        // pointed at the sandbox: the developer's real ~/.dsh may carry an
+        // install, and this must not read it)
+        await withEnv({ DSH_HOME: path.join(home, "absent") }, () => {
+            assert.equal(dshNativeInstalled(), false);
+        });
     } finally {
         fs.rmSync(home, { recursive: true, force: true });
     }
