@@ -361,6 +361,12 @@ export type ProxyOptions = {
     proxyMode?: UpstreamProxyMode;
     proxySource?: "bili-env" | "web-manual" | "config" | "auto" | "direct";
     proxyFallback?: ProxyFallbackOptions;
+    /** Auxiliary-egress fallback (#1012): same shape as proxyFallback but its
+     *  env tier is filled from the launcher-forwarded BILI_INHERITED_* vars.
+     *  Consumed ONLY by the MITM blind-tunnel resolver — client-side aux
+     *  traffic (MCP/web) regains the user's shell proxy, while model egress
+     *  keeps the clean-env direct semantics (e1c6c92). */
+    auxProxyFallback?: ProxyFallbackOptions;
     modelContextLimit: number;
     kernelConfig: Config;
     /** Global-level compression settings (level 1) — the tuning fields from the
@@ -503,6 +509,22 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
         globalSource: proxySource,
         explicitDirect,
     };
+    // #1012: the launcher forwards the user's pre-strip proxy vars under
+    // BILI_INHERITED_* (the child's own env tier is intentionally empty —
+    // e1c6c92). They feed ONLY the aux (blind-tunnel) fallback; explicit
+    // routes / global config / explicitDirect keep outranking them, and the
+    // biliPort loop guard inside parseFallbackProxy still drops self-loops.
+    const inheritedHttpProxy = nonEmpty(env.BILI_INHERITED_HTTP_PROXY);
+    const inheritedHttpsProxy = nonEmpty(env.BILI_INHERITED_HTTPS_PROXY);
+    const inheritedAllProxy = nonEmpty(env.BILI_INHERITED_ALL_PROXY);
+    const inheritedNoProxy = nonEmpty(env.BILI_INHERITED_NO_PROXY);
+    const auxProxyFallback: ProxyFallbackOptions = {
+        ...proxyFallback,
+        ...(httpProxy ? {} : inheritedHttpProxy ? { httpProxy: inheritedHttpProxy } : {}),
+        ...(httpsProxy ? {} : inheritedHttpsProxy ? { httpsProxy: inheritedHttpsProxy } : {}),
+        ...(allProxy ? {} : inheritedAllProxy ? { allProxy: inheritedAllProxy } : {}),
+        ...(noProxy ? {} : inheritedNoProxy ? { noProxy: inheritedNoProxy } : {}),
+    };
     validateHttpProxy(proxy, proxyFallback.biliPort);
     for (const [url, route] of Object.entries(routes)) {
         try {
@@ -515,6 +537,7 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
         port,
         host,
         upstream,
+        auxProxyFallback,
         routes,
         proxy,
         proxyMode,
