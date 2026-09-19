@@ -106,6 +106,7 @@ jobs:
           git commit -q -m "release v$VER"
           if git push -q origin HEAD:master; then
             echo "pushed release commit to master"
+            echo "direct=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           echo "::warning::direct push to master was blocked (branch protection). Fallback: release prepared on a branch; a PR is needed to publish."
@@ -161,6 +162,7 @@ jobs:
 
       - name: Check if prerelease
         id: pre
+        if: steps.push.outputs.direct == 'true'
         run: |
           if echo "${{ steps.version.outputs.version }}" | grep -q '-'; then
             echo "tag=dev" >> "$GITHUB_OUTPUT"
@@ -171,16 +173,19 @@ jobs:
           fi
 
       - name: Create tag
+        if: steps.push.outputs.direct == 'true'
         run: |
           git tag "v${{ steps.version.outputs.version }}" || true
           git push origin "v${{ steps.version.outputs.version }}" || true
 
       - name: Publish
+        if: steps.push.outputs.direct == 'true'
         run: npm publish --tag ${{ steps.pre.outputs.tag }} --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       - name: Create GitHub Release
+        if: steps.push.outputs.direct == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
