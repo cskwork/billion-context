@@ -208,3 +208,29 @@ test("empty session reports zero balanced totals", () => {
     assert.equal(r.totals.balanced, true);
     assert.match(handleAcpCache(session), /identity check\s+OK/);
 });
+
+test("handleAcpCache defaults to summary; detail full restores the per-line listing", () => {
+    const session = makeSession();
+    withView20(session);
+    for (let i = 0; i < 12; i++) {
+        recordCacheSample(session, { at: T0 + 1000 * i, input: 100000, cached: 99000 });
+    }
+    recordCacheFoldsFromBlocks(session, [block("b1", T0 + 12500, 5000, 8192, "m00010")], { V: 10000, Vp: 5000 });
+    for (let i = 0; i < 12; i++) {
+        recordCacheSample(session, { at: T0 + 13000 + 1000 * i, input: 100000, cached: 99000 });
+    }
+    const summary = handleAcpCache(session);
+    assert.match(summary, /\[summary — detail:"full" for every fold & line\]/);
+    assert.match(summary, /no anomalies \(24 requests, median hit 99\.0%\)/);
+    const full = handleAcpCache(session, { detail: "full" });
+    assert.ok(!full.includes("[summary"));
+    const rows = full.split("\n").filter((l) => /\s+99\.0%\s/.test(l));
+    assert.equal(rows.length, 24);
+});
+
+test("handleAcpCache rejects non-full detail values back to summary", () => {
+    const session = makeSession();
+    withView20(session);
+    recordCacheSample(session, { at: T0 + 1000, input: 10000, cached: 9000 });
+    assert.match(handleAcpCache(session, { detail: "everything" }), /\[summary/);
+});

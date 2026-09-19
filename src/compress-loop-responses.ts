@@ -4,6 +4,7 @@ import {
     type CoreMessage,
 } from "acp-kernel";
 import { handleAcpStatus } from "./acp-status.js";
+import { handleAcpCache } from "./cache-ledger.js";
 import { lastCompressSuffix, type Session } from "./session.js";
 import { parseCompressInput, PROXY_TOOL_NAMES, MUTATING_PROXY_TOOLS, COMPRESS_TOOL_NAME, ACP_TEXT_OPEN, ACP_TEXT_CLOSE } from "./compress-tool.js";
 import { log as loggerLog } from "./logger.js";
@@ -99,6 +100,9 @@ function executeProxyTool(
     }
     if (toolName === "acp_status") {
         return handleAcpStatus(args, ctx);
+    }
+    if (toolName === "acp_cache") {
+        return handleAcpCache(ctx.session, args);
     }
     return `[Unknown proxy tool: ${toolName}]`;
 }

@@ -430,8 +430,8 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
             // (both paths hit handleAcpCache on the proxy). Launcher mode and native mode both
             // load this factory (see pi-native.ts), so one registration covers both.
             pi.registerCommand("acp-cache", {
-                description: "Prompt-cache reconciliation for this session (same report as the acp_cache tool)",
-                handler: async (_args, ctx) => {
+                description: "Prompt-cache reconciliation for this session (same report as the acp_cache tool). Usage: /acp-cache [full]",
+                handler: async (args, ctx) => {
                     const notify = (message: string, type?: string): void => {
                         try {
                             ctx.ui?.notify?.(message, type);
@@ -445,9 +445,10 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
                         return;
                     }
                     const conversationId = sessionIdOf(ctx) ?? "unknown";
+                    const toolArgs = /(^|\s)(--)?full(\s|$)/.test(args ?? "") ? { detail: "full" as const } : {};
                     let text: string;
                     try {
-                        text = await forwardTool(proxyBase, conversationId, "acp_cache", {});
+                        text = await forwardTool(proxyBase, conversationId, "acp_cache", toolArgs);
                     } catch (err) {
                         notify(`bili: cache report failed: ${err instanceof Error ? err.message : String(err)}`, "error");
                         return;

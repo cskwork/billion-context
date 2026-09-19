@@ -264,9 +264,10 @@ export function buildSessionCacheReport(session: Session): CacheReport {
     };
 }
 
-export function handleAcpCache(session: Session): string {
+export function handleAcpCache(session: Session, args?: Record<string, unknown>): string {
     try {
-        return formatCacheReport(buildSessionCacheReport(session), session.id);
+        const detail = args?.detail === "full" ? "full" : "summary";
+        return formatCacheReport(buildSessionCacheReport(session), session.id, { detail });
     } catch (err) {
         loggerLog("warn", `[${session.id}] [acp_cache] report failed: ${String(err)}`);
         return `[acp_cache FAILED: ${String(err)}]`;
