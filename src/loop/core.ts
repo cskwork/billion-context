@@ -170,7 +170,7 @@ export function executeProxyTool(
         return handleAcpStatus(args, ctx);
     }
     if (toolName === "acp_cache") {
-        return handleAcpCache(ctx.session);
+        return handleAcpCache(ctx.session, args);
     }
     const absorb = effectiveAbsorbConfig(ctx.session, ctx.config);
     if (absorb?.enabled === true && toolName === (absorb.toolName ?? ABSORB_TOOL_NAME)) {
