@@ -477,6 +477,19 @@ export function claudeNativeInstalled(env: NodeJS.ProcessEnv = process.env): boo
     }
 }
 
+// Windows: npm global shims are .cmd/.bat — direct spawn is EINVAL, so
+// route through the shell with per-token quoting (same handling as
+// detectOpencodeMajor below). % is doubled because cmd.exe still expands
+// env vars inside quoted tokens.
+function runClaudeCli(claude: string, args: string[]): void {
+    if (process.platform === "win32" && /\.(cmd|bat)$/i.test(claude)) {
+        const q = (s: string) => `"${s.replaceAll("%", "%%")}"`;
+        execFileSync([claude, ...args].map(q).join(" "), { shell: true, stdio: ["ignore", "pipe", "pipe"], timeout: CLAUDE_EXEC_TIMEOUT_MS });
+    } else {
+        execFileSync(claude, args, { stdio: ["ignore", "pipe", "pipe"], timeout: CLAUDE_EXEC_TIMEOUT_MS });
+    }
+}
+
 // CLAUDE overrides the claude binary path (absolute path for sandboxed
 // setups; a guaranteed-missing file in tests so the failure path stays
 // deterministic even on machines that have the real CLI).
@@ -512,7 +525,7 @@ function claudeInstall(): string {
     const stableOrigin = `http://127.0.0.1:${nativePort}`;
     const claude = process.env.CLAUDE?.trim() || "claude";
     try {
-        execFileSync(claude, ["mcp", "add", "bili", "--scope", "user", "-e", `BILI_MCP_PROXY=${stableOrigin}`, "--", process.execPath, mcpJs], { stdio: ["ignore", "pipe", "pipe"], timeout: CLAUDE_EXEC_TIMEOUT_MS });
+        runClaudeCli(claude, ["mcp", "add", "bili", "--scope", "user", "-e", `BILI_MCP_PROXY=${stableOrigin}`, "--", process.execPath, mcpJs]);
     } catch (err) {
         const stderr = err instanceof Error && "stderr" in err ? String((err as { stderr?: Buffer | string }).stderr ?? "") : "";
         throw new Error(`claude: MCP registration failed (${stderr.trim() || (err instanceof Error ? err.message : String(err))}) — is the claude CLI on PATH? (the managed settings block at ${file} was written; rerun after fixing the CLI to complete the MCP face)`);
@@ -549,7 +562,7 @@ function claudeRemove(): string {
     if (claudeMcpInstalled()) {
         const claude = process.env.CLAUDE?.trim() || "claude";
         try {
-            execFileSync(claude, ["mcp", "remove", "bili", "--scope", "user"], { stdio: ["ignore", "pipe", "pipe"], timeout: CLAUDE_EXEC_TIMEOUT_MS });
+            runClaudeCli(claude, ["mcp", "remove", "bili", "--scope", "user"]);
             parts.push("MCP face removed");
         } catch (err) {
             throw new Error(`claude: MCP removal failed (${err instanceof Error ? err.message : String(err)})${parts.length > 0 ? ` — ${parts.join("; ")} succeeded first` : ""}`);
