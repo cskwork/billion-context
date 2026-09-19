@@ -44,7 +44,7 @@ import {
     subagentNamespace,
 } from "acp-kernel/wire";
 import { responsesToCoreWithToolImages as responsesToCore, patchResponsesInputWithToolImages as patchResponsesInput } from "./responses-tool-output.js";
-import { getSession, listSessions, type Session, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight, withSessionLock, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, snapshotMessages, applyCompactionArchive, ensureCanonicalId, storeEffectiveConfig } from "./session.js";
+import { getSession, listSessions, type Session, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight, withSessionLock, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, snapshotMessages, applyCompactionArchive, detectUnannouncedHistoryRewrite, markCompactionBoundary, ensureCanonicalId, storeEffectiveConfig } from "./session.js";
 import { ABSORB_TOOL, ABSORB_TOOL_OPENAI, ABSORB_TOOL_RESPONSES, COMPRESS_TOOL, BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_OPENAI, BILI_ACP_TOOLS_RESPONSES, BILI_ACP_READONLY_TOOLS_RESPONSES, COMPRESS_TOOL_NAME, buildAbsorbSystemPrompt, buildCompressSystemPrompt, buildCompressHybridSystemPrompt, withConversationIdNote, withMarkerIntegrityNote, withStagedCompressGuidance } from "./compress-tool.js";
 import { applyAbsorbView, absorbEnabled, absorbToolName, storeEffectiveAbsorb } from "./absorb.js";
 import { rewriteJsonResponse, type RewriteCtx } from "./stream.js";
@@ -1975,6 +1975,9 @@ function prepareAnthropic(
     try {
         const { msgs, cacheControls } = anthropicToCore(parsed);
         originalMessages = msgs;
+        // #1001: pre-turn snapshot — processTurn below assigns fresh refs to every
+        // previously-unknown id, which would make rewrite detection read 1.0.
+        const knownRefsBefore = new Set(Object.keys(session.state.messageRefs.byRaw));
         // tokenCount drives the nudge decision ("should we compress?"). It MUST
         // be the real context size, never an estimate — estimates undercount
         // CJK text 3-4x and never trigger compression for Chinese sessions.
@@ -2018,6 +2021,16 @@ function prepareAnthropic(
         const willInjectNudge = opts.compress.injectNudge && !!turn.nudge && (turn.nudge.shouldInject || emergencyNudge(turn.nudge));
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, parsed.model, willInjectNudge));
         processedMessages = stripReasoning(stripKernelSummaries(turn.messages, turn.state));
+        // #1001: a silent client history rewrite takes the same archive+prune path
+        // as an announced /compact boundary — syncBlocks above has already
+        // deactivated the blocks whose sources left the context.
+        {
+            const rewrite = detectUnannouncedHistoryRewrite(session, knownRefsBefore, msgs.map((m) => m.id));
+            if (rewrite.detected) {
+                log("warn", `[${sessionId}] unannounced client history rewrite detected (${rewrite.knownIncoming}/${rewrite.incomingTotal} incoming message(s) carry pre-turn refs of ${rewrite.knownBefore} known) — marking compaction boundary (#1001)`);
+                markCompactionBoundary(session);
+            }
+        }
         applyCompactionArchive(session, activeBefore, new Set(msgs.map((m) => m.id)), log);
         reapOrphanBlocks(session, msgs, deactivateBlock);
         rebuiltMessages = coreToAnthropic(processedMessages as BiliMessage[], cacheControls);
@@ -2124,6 +2137,9 @@ function prepareOpenai(
         const { msgs, systemText } = openaiToCore(parsed);
         openaiSystemText = systemText;
         originalMessages = msgs;
+        // #1001: pre-turn snapshot — processTurn below assigns fresh refs to every
+        // previously-unknown id, which would make rewrite detection read 1.0.
+        const knownRefsBefore = new Set(Object.keys(session.state.messageRefs.byRaw));
         // tokenCount = upstream's real input_tokens from the previous turn
         // tokenCount = upstream's real input_tokens from the previous turn
         // (see anthropic branch comment + its #553-follow-up exception).
@@ -2155,6 +2171,16 @@ function prepareOpenai(
         const willInjectNudge = opts.compress.injectNudge && !!turn.nudge && shouldInject && (turn.nudge.shouldInject || emergencyNudge(turn.nudge));
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, parsed.model, willInjectNudge));
         processedMessages = stripReasoning(stripKernelSummaries(turn.messages, turn.state));
+        // #1001: a silent client history rewrite takes the same archive+prune path
+        // as an announced /compact boundary — syncBlocks above has already
+        // deactivated the blocks whose sources left the context.
+        {
+            const rewrite = detectUnannouncedHistoryRewrite(session, knownRefsBefore, msgs.map((m) => m.id));
+            if (rewrite.detected) {
+                log("warn", `[${sessionId}] unannounced client history rewrite detected (${rewrite.knownIncoming}/${rewrite.incomingTotal} incoming message(s) carry pre-turn refs of ${rewrite.knownBefore} known) — marking compaction boundary (#1001)`);
+                markCompactionBoundary(session);
+            }
+        }
         applyCompactionArchive(session, activeBefore, new Set(msgs.map((m) => m.id)), log);
         reapOrphanBlocks(session, msgs, deactivateBlock);
         rebuiltMessages = systemToUser(hardenOpenaiAssistantContent(coreToOpenai(processedMessages as BiliMessage[])));
