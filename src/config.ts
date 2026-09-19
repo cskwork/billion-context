@@ -662,8 +662,34 @@ export function resolveClaudeNativePort(env: NodeJS.ProcessEnv = process.env): n
  *  does NOT inherit claude's settings.env) later resolves the default —
  *  hooking the wrong port while claude dials the baked one. `claude plugin
  *  install` calls this; `claude plugin remove` calls clearClaudeNativePort. */
+/** #964: read-modify-write safety for user config files — refuse to write
+ *  over a file that exists but is NOT valid JSON: loadConfigFile() degrades
+ *  malformed input to {}, so an unguarded RMW would replace the user's
+ *  corrupt-but-repairable config with a minimal one (silent clobber).
+ *  Absent / empty / valid files are all safe to write. */
+function configFileRmwSafe(): boolean {
+    const p = configFile();
+    let raw: string;
+    try {
+        raw = readFileSync(p, "utf8");
+    } catch {
+        return true;
+    }
+    if (!raw.trim()) return true;
+    try {
+        JSON.parse(raw.replace(/^\uFEFF/, ""));
+        return true;
+    } catch {
+        return false;
+    }
+}
+
 export function saveClaudeNativePort(port: number): void {
     const p = configFile();
+    if (!configFileRmwSafe()) {
+        loggerLog("warn", `[acp-config] refusing to persist claude.nativePort=${port} — ${p} is not valid JSON; repair it first`);
+        return;
+    }
     const cur = loadConfigFile() as { claude?: { nativePort?: number } } & Record<string, unknown>;
     const next: { claude?: { nativePort?: number } } & Record<string, unknown> = { ...cur };
     next.claude = { ...(cur.claude ?? {}), nativePort: port };
@@ -679,6 +705,10 @@ export function saveClaudeNativePort(port: number): void {
  *  install resolves the default port again. Never throws. */
 export function clearClaudeNativePort(): void {
     const p = configFile();
+    if (!configFileRmwSafe()) {
+        loggerLog("warn", `[acp-config] refusing to clear claude.nativePort — ${p} is not valid JSON; repair it first`);
+        return;
+    }
     const cur = loadConfigFile() as { claude?: { nativePort?: number } } & Record<string, unknown>;
     if (cur.claude?.nativePort === undefined) return;
     const next: Record<string, unknown> = { ...cur };

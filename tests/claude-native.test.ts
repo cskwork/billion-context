@@ -20,7 +20,7 @@ import {
     pluginRemove,
     stripClaudeManagedBlock,
 } from "../src/plugin-install.ts";
-import { CLAUDE_NATIVE_DEFAULT_PORT, resolveClaudeNativePort } from "../src/config.ts";
+import { CLAUDE_NATIVE_DEFAULT_PORT, clearClaudeNativePort, resolveClaudeNativePort, saveClaudeNativePort } from "../src/config.ts";
 import { planClaudeNativeBootstrap } from "../src/claude-native-bootstrap.ts";
 
 const HOOK_COMMAND = "/opt/bili/dist/claude-native-bootstrap.js";
@@ -278,6 +278,37 @@ test("installer persists an env-driven port so the hook resolves the SAME port",
     }
 });
 
+test("persist/clear refuse to clobber a malformed bili config", () => {
+    const prevDir = process.env.CLAUDE_CONFIG_DIR;
+    const prevCfg = process.env.BILI_CONFIG_FILE;
+    const box = sandbox();
+    try {
+        const corrupt = "{ this is not json";
+        fs.writeFileSync(box.biliConfig, corrupt, "utf8");
+        assert.doesNotThrow(() => saveClaudeNativePort(49999));
+        assert.equal(fs.readFileSync(box.biliConfig, "utf8"), corrupt, "save leaves the corrupt file byte-identical");
+        assert.doesNotThrow(() => clearClaudeNativePort());
+        assert.equal(fs.readFileSync(box.biliConfig, "utf8"), corrupt, "clear leaves the corrupt file byte-identical");
+    } finally {
+        unsandbox(prevDir, prevCfg);
+    }
+});
+
+test("persist preserves foreign config keys; clear drops only the persisted key", () => {
+    const prevDir = process.env.CLAUDE_CONFIG_DIR;
+    const prevCfg = process.env.BILI_CONFIG_FILE;
+    const box = sandbox();
+    try {
+        fs.writeFileSync(box.biliConfig, JSON.stringify({ port: 9999, claude: { nativePort: 1234 } }), "utf8");
+        saveClaudeNativePort(49999);
+        assert.deepEqual(JSON.parse(fs.readFileSync(box.biliConfig, "utf8")), { port: 9999, claude: { nativePort: 49999 } });
+        clearClaudeNativePort();
+        assert.deepEqual(JSON.parse(fs.readFileSync(box.biliConfig, "utf8")), { port: 9999 }, "clear drops only nativePort");
+    } finally {
+        unsandbox(prevDir, prevCfg);
+    }
+});
+
 test("installer refuses under BILI_NATIVE_CLAUDE=0", () => {
     const prevDir = process.env.CLAUDE_CONFIG_DIR;
     const prevCfg = process.env.BILI_CONFIG_FILE;
@@ -351,6 +382,14 @@ async function waitForPort(port: number, ms: number): Promise<boolean> {
 }
 
 function runHook(distScript: string, port: number, xdg: Record<string, string>): Promise<{ code: number | null; stderr: string }> {
+    // Hermetic tmp: the hook's spawned proxy logs to
+    // <tmpdir>/bili-proxy-<port>.log. The minimal child env has no platform
+    // tmp vars, so pin every one of them to the sandbox (Node reads TMPDIR on
+    // POSIX, TMP/TEMP on Windows — with none set it falls back to an
+    // unwritable root, e.g. C:\). Derived here from home so EVERY caller is
+    // covered without each one remembering to pass a tmp dir.
+    const tmp = path.join(xdg.home, "tmp");
+    fs.mkdirSync(tmp, { recursive: true });
     return new Promise((resolve, reject) => {
         const child = spawn(process.execPath, [distScript], {
             env: {
@@ -362,14 +401,9 @@ function runHook(distScript: string, port: number, xdg: Record<string, string>):
                 XDG_DATA_HOME: xdg.data,
                 BILI_CLAUDE_NATIVE_PORT: String(port),
                 NO_COLOR: "1",
-                // Hermetic tmp: the hook's spawned proxy logs to
-                // <tmpdir>/bili-proxy-<port>.log. The minimal child env has
-                // no platform tmp vars, so pin every one of them to the
-                // sandbox (Node reads TMPDIR on POSIX, TMP/TEMP on Windows —
-                // with none set it falls back to an unwritable root, e.g. C:\).
-                TMPDIR: xdg.tmp,
-                TEMP: xdg.tmp,
-                TMP: xdg.tmp,
+                TMPDIR: tmp,
+                TEMP: tmp,
+                TMP: tmp,
             },
             stdio: ["ignore", "ignore", "pipe"],
         });
@@ -445,7 +479,7 @@ test("hook e2e: a healthy proxy on ANOTHER port is never attached (static URL)",
     } finally {
         if (pidA > 0) killPid(pidA);
         if (pidB > 0) killPid(pidB);
-        fs.rmSync(home, { recursive: true, force: true });
+        await rmHome(home);
     }
 });
 
@@ -453,6 +487,21 @@ function killPid(pid: number): void {
     try {
         process.kill(pid, "SIGTERM");
     } catch {}
+}
+
+// SIGTERM triggers the proxy's graceful session flush into <home>/state — a
+// single rmSync races the dying writer (ENOTEMPTY mid-rimraf). Retry inside
+// a bounded window instead of racing it.
+async function rmHome(home: string): Promise<void> {
+    for (let i = 0; ; i++) {
+        try {
+            fs.rmSync(home, { recursive: true, force: true });
+            return;
+        } catch {
+            if (i >= 50) throw new Error(`cleanup: could not remove ${home} after 5s`);
+            await new Promise((r) => setTimeout(r, 100));
+        }
+    }
 }
 
 // CI runs `npm test` BEFORE `npm run build` (ci.yml step order) — this test
@@ -477,9 +526,7 @@ test("hook e2e: dist script spawns a proxy on the stable port, second run attach
         state: path.join(home, "state"),
         cache: path.join(home, "cache"),
         data: path.join(home, "data"),
-        tmp: path.join(home, "tmp"),
     };
-    fs.mkdirSync(xdg.tmp);
     const port = await freePort();
     const instanceFile = path.join(xdg.state, "billion-context", "proxy-origin");
     let proxyPid = 0;
@@ -509,6 +556,6 @@ test("hook e2e: dist script spawns a proxy on the stable port, second run attach
                 if (typeof inst.pid === "number") killPid(inst.pid);
             } catch {}
         }
-        fs.rmSync(home, { recursive: true, force: true });
+        await rmHome(home);
     }
 });
