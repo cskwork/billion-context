@@ -54,6 +54,31 @@ function refNum(ref: string): number {
     return Number(ref.replace(/\D/g, "")) || 0;
 }
 
+const M_REF_NUM_RE = /^m0*(\d{1,7})$/i;
+
+// #1001: after a client history rewrite, ref numbers are no longer monotonic
+// with message position (surviving old messages keep low refs interleaved with
+// fresh high refs), so position-derived spans can come back numerically
+// reversed (startId > endId). The kernel resolves boundaries BY POSITION and
+// swaps silently — normalize up front so specs and logs stay honest and range
+// validity is validated explicitly instead of implicitly. bN/mixed endpoints
+// have no cross-namespace ordering and are left untouched.
+export function normalizeRangeOrder(ranges: Array<{ startRef: string; endRef: string }>): number {
+    let swapped = 0;
+    for (const r of ranges) {
+        const a = M_REF_NUM_RE.exec(r.startRef.trim());
+        const b = M_REF_NUM_RE.exec(r.endRef.trim());
+        if (!a || !b) continue;
+        if (Number(a[1]) > Number(b[1])) {
+            const s = r.startRef;
+            r.startRef = r.endRef;
+            r.endRef = s;
+            swapped++;
+        }
+    }
+    return swapped;
+}
+
 export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: RewriteCtx): string {
     const { ranges, diagnostics } = parsed;
     if (ranges.length === 0) {
@@ -62,8 +87,12 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         const why = reasons.length > 0 ? ` Rejected entries:\n${reasons.map((r) => `- ${r}`).join("\n")}` : "";
         return `[Compression FAILED: no valid ranges parsed (kind=${diagnostics.kind}, dropped=${diagnostics.invalidItems}).${why}\n compress requires a non-empty 'content' array of {startId, endId, summary} ranges, where startId/endId are mNNNNN message refs from the conversation. Re-issue the compress call with a valid content array.]`;
     }
+    const swappedRanges = normalizeRangeOrder(ranges);
+    if (swappedRanges > 0) {
+        ctx.log(`[acp-proxy: normalized ${swappedRanges} reversed range(s) to ascending ref order (#1001)]`);
+    }
     ctx.log(`[acp-proxy: compress requested ${ranges.length} range(s): ${ranges.map((r) => `${r.startRef}–${r.endRef}`).join(", ")}]`);
-    ctx.log(`[acp-proxy: ctx has ${ctx.messages.length} message(s), state has ${ctx.session.state.messageRefs?.byRef?.size ?? "?"} ref(s) mapped]`);
+    ctx.log(`[acp-proxy: ctx has ${ctx.messages.length} message(s), state has ${Object.keys(ctx.session.state.messageRefs?.byRef ?? {}).length} ref(s) mapped]`);
     if (ctx.messages.length > 0) {
         const ids = ctx.messages.slice(0, 10).map((m) => `${m.id}(${(m.text ?? "").length}c)`).join(", ");
         ctx.log(`[acp-proxy: first msg ids: ${ids}]`);

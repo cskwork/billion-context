@@ -10,7 +10,7 @@ import {
 import { buildCompressSystemPrompt, parseCompressInput } from "./compress-tool.js";
 import { IMAGE_PLACEHOLDER, imagePlaceholders } from "./image-note.js";
 import { applyAbsorbView } from "./absorb.js";
-import { applyRanges, type RewriteCtx } from "./stream.js";
+import { applyRanges, normalizeRangeOrder, type RewriteCtx } from "./stream.js";
 import { fetchWithTimeout, isTransientUpstreamError, replayMaxAttempts, replayBackoffMs, sleep, UpstreamHttpError } from "./fetch-util.js";
 import { proxyDispatcher } from "./upstream-proxy.js";
 import { lastCompressSuffix, type Session } from "./session.js";
@@ -837,9 +837,16 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                 if (!span) break;
                 const [cs, ce] = span;
                 const maps = refMaps(messages, deps.session.state);
-                const startRef = maps.idxToRef.get(cs);
-                const endRef = maps.idxToRef.get(ce);
+                let startRef = maps.idxToRef.get(cs);
+                let endRef = maps.idxToRef.get(ce);
                 if (!startRef || !endRef) continue;
+                // #1001: after a client history rewrite, ref numbers are not monotonic
+                // with position — emit ascending pairs (the kernel resolves by
+                // position anyway; this keeps specs, logs and the summary prompt honest).
+                if (refNum(startRef) > refNum(endRef)) {
+                    deps.log("warn", `[preflight] normalized reversed range ${startRef}–${endRef} → ${endRef}–${startRef} (non-monotonic refs after client history rewrite, #1001)`);
+                    [startRef, endRef] = [endRef, startRef];
+                }
                 const preview = deps.core.applyCompression({
                     messages,
                     state: deps.session.state,

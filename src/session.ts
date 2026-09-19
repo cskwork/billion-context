@@ -496,6 +496,43 @@ export function applyCompactionArchive(
     log("info", `[${session.id}] native compaction boundary: archived ${deactivated.length} pre-compaction block(s)${deactivated.length > 0 ? ` (${deactivated.join(", ")})` : ""}; pruned ref maps to ${prunedByRaw.length} live raw id(s)`);
 }
 
+// #1001: clients rewrite session history SILENTLY mid-session (opencode native
+// compaction on model switch) with no /compact request for the announced-
+// boundary machinery to key off — mixed-generation ref maps then persist.
+// TIMING INVARIANT: callers must capture knownRefsBefore BEFORE processTurn —
+// post-turn every incoming id has a fresh ref and the ratio is always 1.0.
+// Append-only turns keep the ratio near 1.0; a rewrite collapses it. The gate
+// on prior compression history keeps fresh sessions / first replays out.
+const REWRITE_MIN_KNOWN_REFS = 20;
+const REWRITE_MAX_KNOWN_RATIO = 0.5;
+
+export interface RewriteDetection {
+    detected: boolean;
+    knownBefore: number;
+    incomingTotal: number;
+    knownIncoming: number;
+}
+
+export function detectUnannouncedHistoryRewrite(
+    session: Session,
+    knownRefsBefore: ReadonlySet<string>,
+    liveRawIds: Iterable<string>,
+): RewriteDetection {
+    const knownBefore = knownRefsBefore.size;
+    let incomingTotal = 0;
+    let knownIncoming = 0;
+    for (const id of liveRawIds) {
+        incomingTotal++;
+        if (knownRefsBefore.has(id)) knownIncoming++;
+    }
+    const detected =
+        knownBefore >= REWRITE_MIN_KNOWN_REFS &&
+        session.state.blocks.length > 0 &&
+        incomingTotal > 0 &&
+        knownIncoming / incomingTotal < REWRITE_MAX_KNOWN_RATIO;
+    return { detected, knownBefore, incomingTotal, knownIncoming };
+}
+
 /** Flush a session to disk and drop it from memory (LRU eviction). Refuses to
  *  evict sessions that are in-flight or whose flush failed (would lose a
  *  never-persisted session permanently). Returns true if a slot was freed. */
