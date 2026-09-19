@@ -469,6 +469,52 @@ test("apply() runtime-info (#955): model services stamp model/window/max-output 
     }
 });
 
+test("apply() runtime-info (#956): a mid-resolve model switch discards the stale resolve", async () => {
+    const proxy = await startMockProxy([]);
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-race-"));
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin }, async () => {
+            _resetRegisterForTest(proxy.origin);
+            const ctx = mockCtx();
+            // mutable live selection: A at startup, switched to B mid-resolve
+            let selection = { provider: "deepseek", model: "qwen-a" };
+            type ModelInfoLike = { context?: { contextWindow?: number }; defaultMaxTokens?: number };
+            let releaseA: ((v: ModelInfoLike) => void) | undefined;
+            const gateA = new Promise<ModelInfoLike>((r) => {
+                releaseA = r;
+            });
+            ctx.setModelServices(
+                {
+                    resolveModelInfo: async (_provider, model) =>
+                        model === "qwen-a" ? gateA : { context: { contextWindow: 12345 }, defaultMaxTokens: 4096 },
+                },
+                { currentSelection: () => selection },
+            );
+            apply(ctx);
+            await waitFor(() => ctx.registeredTools.length === 1, "manifest tool registration (race)");
+            ctx.setInitiator({ session: { id: "session-race" } });
+            const stamp = () => _stateHeadersForTest()?.("http://example.test/v1/chat/completions");
+            // apply()'s inject already started A's async resolve (gated, in flight)
+            assert.equal(stamp()?.["x-bili-plugin-context-window"], undefined);
+            // switch the LIVE selection to B while A is still resolving
+            selection = { provider: "deepseek", model: "qwen-b" };
+            releaseA?.({ context: { contextWindow: 999999 }, defaultMaxTokens: 8888 });
+            await new Promise((r) => setTimeout(r, 20));
+            // the stale A result must NOT have been committed or stamped
+            assert.equal(stamp()?.["x-bili-plugin-context-window"], undefined);
+            assert.notEqual(stamp()?.["x-bili-plugin-model"], "qwen-a");
+            // self-heal: the next refresh re-resolves the LIVE selection (B)
+            await waitFor(() => stamp()?.["x-bili-plugin-context-window"] === "12345", "post-switch re-resolve stamped B");
+            assert.equal(stamp()?.["x-bili-plugin-model"], "qwen-b");
+            assert.equal(stamp()?.["x-bili-plugin-max-output"], "4096");
+        });
+    } finally {
+        proxy.close();
+        fs.rmSync(home, { recursive: true, force: true });
+        _resetRegisterForTest(undefined);
+    }
+});
+
 test("apply() /acp pre-first-request (#955): renders the runtime-table entry before any model request", async () => {
     const pre = {
         ok: true,
