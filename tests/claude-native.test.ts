@@ -8,7 +8,7 @@ import fs from "node:fs";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import {
     applyClaudeManagedBlock,
     claudeNativeBaseUrl,
@@ -310,6 +310,10 @@ function runHook(distScript: string, port: number, xdg: Record<string, string>):
                 XDG_DATA_HOME: xdg.data,
                 BILI_CLAUDE_NATIVE_PORT: String(port),
                 NO_COLOR: "1",
+                // Hermetic tmp: the hook's spawned proxy logs to
+                // <tmpdir>/bili-proxy-<port>.log — pin it to the test
+                // process's tmpdir (same as the XDG sandbox above).
+                TMPDIR: os.tmpdir(),
             },
             stdio: ["ignore", "ignore", "pipe"],
         });
@@ -328,9 +332,21 @@ function killPid(pid: number): void {
     } catch {}
 }
 
+// CI runs `npm test` BEFORE `npm run build` (ci.yml step order) — this test
+// exercises the BUILT artifact (the hook command claude actually runs), so
+// build on demand when dist/ is absent (tsup ~1s; dev checkouts usually
+// already have dist/ from a prior build).
+function ensureDistBuilt(distScript: string): void {
+    if (!fs.existsSync(distScript)) {
+        const root = path.resolve(import.meta.dirname, "..");
+        execFileSync(process.execPath, [path.join(root, "node_modules", "tsup", "dist", "cli-default.js")], { cwd: root, stdio: "pipe", timeout: 300_000 });
+    }
+    assert.ok(fs.existsSync(distScript), `build did not produce ${distScript}`);
+}
+
 test("hook e2e: dist script spawns a proxy on the stable port, second run attaches", { timeout: 120_000 }, async () => {
     const distScript = path.resolve(import.meta.dirname, "..", "dist", "claude-native-bootstrap.js");
-    assert.ok(fs.existsSync(distScript), `dist script missing — run npm run build (${distScript})`);
+    ensureDistBuilt(distScript);
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-claude-hook-"));
     const xdg = {
         home,
