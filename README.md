@@ -207,8 +207,37 @@ At load the plugin **spawns its own proxy** (or attaches to a healthy
 running one — a parent-pid watchdog tears it down when the client exits),
 rewrites model traffic to `<proxy>/bili/<upstream-url>`, registers
 `compress` / `decompress` / `acp_status` as native client tools (plugin
-mode), and binds the `/acp` panel to the current session. Opt-out envs:
-`BILI_NATIVE_PI=0`, `BILI_NATIVE_OPENCODE=0`, `BILI_NATIVE_DSH=0`.
+mode), and binds the `/acp` panel to the current session. It also reports
+the client's **own model config** to the proxy (runtime-info protocol,
+#955) so compression budgets use the real window instead of a registry
+guess. Opt-out envs: `BILI_NATIVE_PI=0`, `BILI_NATIVE_OPENCODE=0`,
+`BILI_NATIVE_DSH=0`.
+
+#### Runtime-info protocol (#955)
+
+A native plugin lives inside the client process, so it can read the model
+config the client itself will use. It pushes that truth to the proxy on two
+channels, and the proxy prefers it over the models.dev registry / built-in
+table in the context-window chain:
+
+| Channel | When | Fields |
+|---|---|---|
+| Per-request headers (gated on `x-bili-plugin`) | every model request | `x-bili-plugin-context-window`, `x-bili-plugin-max-output`, `x-bili-plugin-model` |
+| `POST /__bili/plugin/runtime-info` (loopback) | plugin bootstrap + model switch | `{agent, model, contextWindow?, maxOutput?, baseURL?, source}` |
+
+Resolution order for the window: `anthropic-beta` negotiation > per-request
+plugin header > runtime-info table (agent+model must match) > launcher
+env > route config > models.dev registry > built-in table. A reported
+`maxOutput` only stands in when the request body carries no output budget
+of its own. Implementations: `src/agent/pi.ts`, `src/agent/opencode-native.ts`
+(v1), `src/agent/opencode-v2.ts`, `src/agent/dsh-native.ts` — other client
+integrations should follow the same protocol.
+
+Before the first model request there is no session yet, so the `/acp` panel
+probes `GET /__bili/plugin/status?conversationId=<agent>&fallback=latest`,
+which answers from the runtime table (`phase: "pre-first-request"`) instead
+of 404ing — the reported config is visible immediately, and the real session
+takes over once traffic lands.
 
 Notes:
 

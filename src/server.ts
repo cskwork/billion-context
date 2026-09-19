@@ -77,7 +77,7 @@ import { emitPreflightError, emitStreamError } from "./stream-error.js";
 import { affinityToken, clientConversationHeader, codexTurnIdentity, preferPromptCacheKeyIdentity, type ConversationIdentity } from "./session-id.js";
 import { prefixAffinity, type AnonymousAffinity } from "./prefix-affinity.js";
 import { flushPrefixAffinity, hydratePrefixAffinity, scheduleAffinityPersist } from "./affinity-persist.js";
-import { consumePluginRegisterFor, flushConversations, handlePluginCompact, handlePluginManifest, handlePluginRegister, handlePluginStatus, handlePluginTool, loadConversations, pipePluginChatWithStrip, pipePluginJson, pipePluginResponsesWithStrip, pluginAgentHeader, pluginConversationHeader, pluginReportedContextWindow, recordPluginSession, rememberPluginMessages, takePendingPluginRegister } from "./plugin.js";
+import { consumePluginRegisterFor, flushConversations, handlePluginCompact, handlePluginManifest, handlePluginRegister, handlePluginRuntimeInfo, handlePluginStatus, handlePluginTool, loadConversations, pipePluginChatWithStrip, pipePluginJson, pipePluginResponsesWithStrip, pluginAgentHeader, pluginConversationHeader, pluginHeadersMatchModel, pluginReportedContextWindow, pluginReportedMaxOutput, pluginRuntimeInfoFor, recordPluginSession, rememberPluginMessages, takePendingPluginRegister } from "./plugin.js";
 import { setupMitm, readMitmUpstream, getBlindTunnelStats } from "./mitm.js";
 import type { BiliMessage } from "acp-kernel/wire";
 import { BILI_PLUGIN_BYPASS_HEADER, hardenOpenaiAssistantContent, isLoopbackAddress, inspectContextOverflow, reserveOutputHeadroom, resolveOutputHeadroomCap, shouldReserveOutputHeadroom, systemToUser, usageTotals, type WireProtocol } from "./util.js";
@@ -768,6 +768,17 @@ async function handle(
             return;
         }
     }
+    if (req.method === "POST" && req.url === "/__bili/plugin/runtime-info") {
+        try {
+            const body = await readBody(req);
+            handlePluginRuntimeInfo(body.toString("utf8"), res);
+            return;
+        } catch (err) {
+            res.writeHead(err instanceof BodyTooLargeError ? 413 : 400, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: false, error: String(err) }));
+            return;
+        }
+    }
     if (req.method === "POST" && req.url === "/__bili/plugin/compact") {
         try {
             const body = await readBody(req);
@@ -970,8 +981,11 @@ async function handle(
     let reqPrompts: Prompts = defaultPrompts;
     let reqSurface: PackSurface = {};
     let reqSurfacePack = "default";
+    let wsSourceForLog: string | undefined;
+    let reqModelId: string | undefined;
     if (parsed && typeof parsed === "object") {
         const model = (parsed as { model?: string }).model;
+        reqModelId = typeof model === "string" ? model : undefined;
         if (model) {
             const embeddedUrl = route?.rewrittenUrl;
             // Native-window resolution order: (0) the client's `anthropic-beta`
@@ -998,12 +1012,19 @@ async function handle(
             // outranks everything inside resolveRequestConfig.
             const host = (() => { try { return embeddedUrl ? new URL(embeddedUrl).host : undefined; } catch { return undefined; } })();
             const betaWindow = anthropicBetaContextWindow(req.headers);
-            const pluginWindow = pluginReportedContextWindow(req.headers);
+            const pluginWindow = pluginHeadersMatchModel(req.headers, model) ? pluginReportedContextWindow(req.headers) : undefined;
+            // Runtime-table fallback for the window (#955): only when this
+            // request's plugin sent no window header AND the agent's latest
+            // runtime-info entry matches THIS request's model — a stale
+            // post-switch entry must never size a different model.
+            const runtimeEntry = pluginRuntimeInfoFor(pluginAgentHeader(req.headers), model);
+            const runtimeWindow = pluginWindow === undefined ? runtimeEntry?.contextWindow : undefined;
             const launcherWindow = launcherContextWindow(model);
             const configuredWindow = resolveConfiguredContextLimit(opts.routes, embeddedUrl, model);
             const peekWindow = peekRegistryContext(model, host);
             let native = betaWindow
                 ?? pluginWindow
+                ?? runtimeWindow
                 ?? launcherWindow
                 ?? configuredWindow
                 ?? peekWindow
@@ -1014,16 +1035,17 @@ async function handle(
             // beta window is authoritative (the client's own runtime
             // negotiation), so it also clears the fallback flag.
             const operatorWindowTuned = resolveCompress(opts.routes, embeddedUrl, model, opts.compress).modelContextLimit !== undefined;
-            nativeFromFallback = !betaWindow && !pluginWindow && !launcherWindow && !peekWindow && !configuredWindow && !operatorWindowTuned;
+            nativeFromFallback = !betaWindow && !pluginWindow && !runtimeWindow && !launcherWindow && !peekWindow && !configuredWindow && !operatorWindowTuned;
             if (!native) {
                 native = await contextFromRegistry(model, host);
                 if (native) nativeFromFallback = false;
             }
             reqConfig = resolveRequestConfig(config, opts.routes, embeddedUrl, model, native, opts.compress);
             {
+                const wsSource = betaWindow ? "anthropic-beta" : pluginWindow ? "plugin" : runtimeWindow ? "runtime-info" : launcherWindow ? "launcher" : configuredWindow ? "configured" : peekWindow ? "registry-peek" : native ? "table-or-registry" : "default";
+                wsSourceForLog = wsSource;
                 if (!windowSourceLogged.has(model)) {
                     windowSourceLogged.add(model);
-                    const wsSource = betaWindow ? "anthropic-beta" : pluginWindow ? "plugin" : launcherWindow ? "launcher" : configuredWindow ? "configured" : peekWindow ? "registry-peek" : native ? "table-or-registry" : "default";
                     log("info", `[window] model=${model} source=${wsSource} native=${native ?? "none"} effective=${reqConfig.modelContextLimit} launcher=${launcherWindow ?? "none"} configured=${configuredWindow ?? "none"} peek=${peekWindow ?? "none"} fallback=${nativeFromFallback}`);
                 }
             }
@@ -1454,6 +1476,23 @@ async function handle(
             // source preflight's summary cap uses, #853) — through the SAME capped
             // reservation below. Unknown model → 0 → today's behavior.
             if (!(maxOutput > 0)) {
+                // Runtime-info protocol (#955): the plugin reported the client's
+                // CONFIGURED max output (or the model's declared default, e.g.
+                // dsh's defaultMaxTokens) for exactly this model — outranks
+                // configured/registry because it is what the client will
+                // actually ask the upstream for. Still only a fallback: a
+                // max_tokens on the wire beat it above.
+                const fbModel0 = (parsed as { model?: string }).model;
+                const runtimeMax = (pluginHeadersMatchModel(req.headers, fbModel0) ? pluginReportedMaxOutput(req.headers) : undefined) ?? pluginRuntimeInfoFor(pluginAgentHeader(req.headers), fbModel0)?.maxOutput;
+                if (typeof runtimeMax === "number" && runtimeMax > 0) {
+                    maxOutput = runtimeMax;
+                    if (!headroomFallbackLogged.has(`${fbModel0 ?? "?"}|runtime-info`)) {
+                        headroomFallbackLogged.add(`${fbModel0 ?? "?"}|runtime-info`);
+                        log("info", `[headroom] model=${fbModel0 ?? "?"}: request carries no output budget; reserving against runtime-info max output ${runtimeMax} (#955)`);
+                    }
+                }
+            }
+            if (!(maxOutput > 0)) {
                 const fbModel = (parsed as { model?: string }).model;
                 if (fbModel) {
                     let host: string | undefined;
@@ -1489,6 +1528,11 @@ async function handle(
         // pre-self-heal and only for plugin sessions, so wire-mode panels fell
         // back to a hardcoded 200K.
         session.metadata.effectiveContextLimit = reqConfig.modelContextLimit;
+        // #955 runtime-info: record the model id + window source for this
+        // session so /__bili/plugin/status can show them pre-first-request and
+        // post-hoc forensics can tell which source sized the window.
+        if (reqModelId !== undefined) session.metadata.lastModel = reqModelId;
+        session.metadata.lastWindowSource = wsSourceForLog ?? null;
         // Window THIS turn runs under — read by the NEXT turn's upward self-heal
         // to tell "context exceeded our window" (evidence) from "context fit
         // inside a larger window" (not evidence). #393.

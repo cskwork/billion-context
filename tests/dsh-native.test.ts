@@ -221,7 +221,7 @@ test("dshProfileDirs: skips node_modules, errors when profiles root is absent", 
 
 type MockTool = { name: string; description?: string; inputSchema: unknown };
 
-function startMockProxy(toolCalls: Array<{ conversationId: string; tool: string; args: unknown }>): Promise<{ origin: string; close: () => void }> {
+function startMockProxy(toolCalls: Array<{ conversationId: string; tool: string; args: unknown }>, statusResponder?: (url: string) => unknown | undefined): Promise<{ origin: string; close: () => void }> {
     const manifestTools: MockTool[] = [
         {
             name: "compress",
@@ -248,8 +248,14 @@ function startMockProxy(toolCalls: Array<{ conversationId: string; tool: string;
             return;
         }
         if (url.startsWith("/__bili/plugin/status")) {
+            const body = statusResponder === undefined ? { panel: "PANEL-OK" } : statusResponder(url);
+            if (body === undefined) {
+                res.writeHead(404);
+                res.end("{}");
+                return;
+            }
             res.writeHead(200, { "content-type": "application/json" });
-            res.end(JSON.stringify({ panel: "PANEL-OK" }));
+            res.end(JSON.stringify(body));
             return;
         }
         res.writeHead(404);
@@ -285,6 +291,10 @@ function mockCtx() {
     const tools: RegisteredTool[] = [];
     const commands: Array<{ name: string; handler: () => Promise<{ kind: string; text: string }> }> = [];
     let initiator: { session?: { id?: unknown } } | undefined = undefined;
+    // #955 runtime-info sources: tests can attach llm/agentDefaultModel and
+    // replay them through the same dynamic ctx.inject path production uses.
+    let llm: { resolveModelInfo?: (provider: string, model: string) => Promise<{ context?: { contextWindow?: number }; defaultMaxTokens?: number } | undefined> } | undefined = undefined;
+    let agentDefaultModel: { currentSelection?: () => { provider?: string; model?: string } | undefined } | undefined = undefined;
     return {
         tools: { register: (t: RegisteredTool) => tools.push(t) },
         commands: { register: (c: { name: string; handler: () => Promise<{ kind: string; text: string }> }) => commands.push(c) },
@@ -292,6 +302,15 @@ function mockCtx() {
         setInitiator: (i: { session?: { id?: unknown } } | undefined) => (initiator = i),
         registeredTools: tools,
         registeredCommands: commands,
+        inject: (deps: readonly string[], callback: (sub: unknown) => void) => {
+            if (deps.includes("llm") && deps.includes("agentDefaultModel") && llm !== undefined && agentDefaultModel !== undefined) {
+                callback({ llm, agentDefaultModel });
+            }
+        },
+        setModelServices: (l: typeof llm, a: typeof agentDefaultModel) => {
+            llm = l;
+            agentDefaultModel = a;
+        },
     };
 }
 
@@ -407,5 +426,126 @@ test("apply() is a no-op under the kill switches", async () => {
         });
     } finally {
         fs.rmSync(home, { recursive: true, force: true });
+    }
+});
+
+test("apply() runtime-info (#955): model services stamp model/window/max-output headers", async () => {
+    const proxy = await startMockProxy([]);
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-ri-"));
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin }, async () => {
+            _resetRegisterForTest(proxy.origin);
+            const ctx = mockCtx();
+            ctx.setModelServices(
+                {
+                    resolveModelInfo: async (provider, model) => {
+                        assert.equal(provider, "deepseek");
+                        assert.equal(model, "qwen-ri");
+                        return { context: { contextWindow: 262144 }, defaultMaxTokens: 32768 };
+                    },
+                },
+                { currentSelection: () => ({ provider: "deepseek", model: "qwen-ri" }) },
+            );
+            apply(ctx);
+            await waitFor(() => ctx.registeredTools.length === 1, "manifest tool registration (ri)");
+            ctx.setInitiator({ session: { id: "session-ri" } });
+            // First stamp may fire before the async resolveModelInfo lands —
+            // poll until the window header shows up.
+            await waitFor(() => {
+                const headers = _stateHeadersForTest()?.("http://example.test/v1/chat/completions");
+                return headers?.["x-bili-plugin-context-window"] === "262144";
+            }, "model-info refresh stamped headers");
+            const headers = _stateHeadersForTest()?.("http://example.test/v1/chat/completions");
+            assert.equal(headers?.["x-bili-plugin"], "dsh");
+            assert.equal(headers?.["x-bili-plugin-conversation"], "session-ri");
+            assert.equal(headers?.["x-bili-plugin-model"], "qwen-ri");
+            assert.equal(headers?.["x-bili-plugin-context-window"], "262144");
+            assert.equal(headers?.["x-bili-plugin-max-output"], "32768");
+        });
+    } finally {
+        proxy.close();
+        fs.rmSync(home, { recursive: true, force: true });
+        _resetRegisterForTest(undefined);
+    }
+});
+
+test("apply() runtime-info (#956): a mid-resolve model switch discards the stale resolve", async () => {
+    const proxy = await startMockProxy([]);
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-race-"));
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin }, async () => {
+            _resetRegisterForTest(proxy.origin);
+            const ctx = mockCtx();
+            // mutable live selection: A at startup, switched to B mid-resolve
+            let selection = { provider: "deepseek", model: "qwen-a" };
+            type ModelInfoLike = { context?: { contextWindow?: number }; defaultMaxTokens?: number };
+            let releaseA: ((v: ModelInfoLike) => void) | undefined;
+            const gateA = new Promise<ModelInfoLike>((r) => {
+                releaseA = r;
+            });
+            ctx.setModelServices(
+                {
+                    resolveModelInfo: async (_provider, model) =>
+                        model === "qwen-a" ? gateA : { context: { contextWindow: 12345 }, defaultMaxTokens: 4096 },
+                },
+                { currentSelection: () => selection },
+            );
+            apply(ctx);
+            await waitFor(() => ctx.registeredTools.length === 1, "manifest tool registration (race)");
+            ctx.setInitiator({ session: { id: "session-race" } });
+            const stamp = () => _stateHeadersForTest()?.("http://example.test/v1/chat/completions");
+            // apply()'s inject already started A's async resolve (gated, in flight)
+            assert.equal(stamp()?.["x-bili-plugin-context-window"], undefined);
+            // switch the LIVE selection to B while A is still resolving
+            selection = { provider: "deepseek", model: "qwen-b" };
+            releaseA?.({ context: { contextWindow: 999999 }, defaultMaxTokens: 8888 });
+            await new Promise((r) => setTimeout(r, 20));
+            // the stale A result must NOT have been committed or stamped
+            assert.equal(stamp()?.["x-bili-plugin-context-window"], undefined);
+            assert.notEqual(stamp()?.["x-bili-plugin-model"], "qwen-a");
+            // self-heal: the next refresh re-resolves the LIVE selection (B)
+            await waitFor(() => stamp()?.["x-bili-plugin-context-window"] === "12345", "post-switch re-resolve stamped B");
+            assert.equal(stamp()?.["x-bili-plugin-model"], "qwen-b");
+            assert.equal(stamp()?.["x-bili-plugin-max-output"], "4096");
+        });
+    } finally {
+        proxy.close();
+        fs.rmSync(home, { recursive: true, force: true });
+        _resetRegisterForTest(undefined);
+    }
+});
+
+test("apply() /acp pre-first-request (#955): renders the runtime-table entry before any model request", async () => {
+    const pre = {
+        ok: true,
+        conversationId: "dsh",
+        phase: "pre-first-request",
+        model: "qwen-ri",
+        contextLimit: 262144,
+        runtimeInfo: { agent: "dsh", model: "qwen-ri", contextWindow: 262144, maxOutput: 32768, source: "client-config" },
+        panel: null,
+    };
+    // no initiator session → statusOutcome takes the fetchStatusLatest path
+    // (conversationId=dsh&fallback=latest), which the proxy answers from the
+    // agent-keyed runtime table pre-first-request
+    const proxy = await startMockProxy([], (url) => (url.includes("conversationId=dsh&fallback=latest") ? pre : undefined));
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-pre-"));
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin }, async () => {
+            _resetRegisterForTest(proxy.origin);
+            const ctx = mockCtx();
+            apply(ctx);
+            assert.equal(ctx.registeredCommands.length, 1);
+            const out = await ctx.registeredCommands[0].handler();
+            assert.equal(out.kind, "success");
+            assert.match(out.text, /model=qwen-ri/);
+            assert.match(out.text, /window=262144/);
+            assert.match(out.text, /maxOut=32768/);
+            assert.match(out.text, /client-config/);
+        });
+    } finally {
+        proxy.close();
+        fs.rmSync(home, { recursive: true, force: true });
+        _resetRegisterForTest(undefined);
     }
 });
