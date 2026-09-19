@@ -81,7 +81,7 @@ import { consumePluginRegisterFor, flushConversations, handlePluginCompact, hand
 import { setupMitm, readMitmUpstream, getBlindTunnelStats } from "./mitm.js";
 import type { BiliMessage } from "acp-kernel/wire";
 import { BILI_PLUGIN_BYPASS_HEADER, hardenOpenaiAssistantContent, isLoopbackAddress, inspectContextOverflow, reserveOutputHeadroom, resolveOutputHeadroomCap, shouldReserveOutputHeadroom, systemToUser, usageTotals, type WireProtocol } from "./util.js";
-import { recordProvenInput, resolveConfirmedLimit, resolveLearnedLimit, retractStaleLearnedLimits, sessionProvenMax } from "./weak-overflow.js";
+
 import { BILI_TUNNEL_HEADER, checkTunnelDestination, tunnelAllowlistFromEnv } from "./tunnel-guard.js";
 import { dumpRejectedBody } from "./error-dump.js";
 
@@ -977,8 +977,8 @@ async function handle(
     // True when the resolved native window came from a low-confidence fallback
     // (built-in table / env default) instead of an authoritative source — such
     // windows get an effective-floor after output-headroom reservation (see
-    // FALLBACK_EFFECTIVE_WINDOW_FLOOR). Cleared if a learned overflow limit or
-    // an async registry hit replaces the value.
+    // FALLBACK_EFFECTIVE_WINDOW_FLOOR). Cleared when an async registry hit
+    // replaces the value.
     let nativeFromFallback = false;
     // Effective compression prompts for this request: resolved from the same
     // three-level cascade (global → provider → model) as the limit above, then
@@ -990,13 +990,6 @@ async function handle(
     let reqSurfacePack = "default";
     let wsSourceForLog: string | undefined;
     let reqModelId: string | undefined;
-    // #969: the operator explicitly owns the window for this model (per-route
-    // per-model `models.<id>.context` declaration or `compress.modelContextLimit`
-    // tuning). A learned window — even one the upstream stated in a 400 —
-    // never overrides an explicit operator declaration: the operator's number
-    // is a deliberate deployment decision, and the emergency shrink (armed on
-    // the overflow itself) remains the safety net either way.
-    let operatorOwnsWindow = false;
     if (parsed && typeof parsed === "object") {
         const model = (parsed as { model?: string }).model;
         reqModelId = typeof model === "string" ? model : undefined;
@@ -1036,7 +1029,6 @@ async function handle(
             const launcherWindow = launcherContextWindow(model);
             const configuredWindow = resolveConfiguredContextLimit(opts.routes, embeddedUrl, model);
             const operatorWindowTuned = resolveCompress(opts.routes, embeddedUrl, model, opts.compress).modelContextLimit !== undefined;
-            operatorOwnsWindow = operatorWindowTuned || configuredWindow !== undefined;
             const peekWindow = peekRegistryContext(model, host);
             let native = betaWindow
                 ?? pluginWindow
@@ -1389,11 +1381,8 @@ async function handle(
             // hammering the upstream). Gate on the raw body estimate and fail
             // fast locally instead of forwarding (#301 precedent).
             const reqModel = (parsed as { model?: string }).model;
-            // #572-merge: read through the resolver (confirmed → speculative, per-model
-            // then scalar) — the learner now writes the confirmed channel, so the
-            // legacy direct map read would miss windows learned from real 400s.
-            const learnedLimit = resolveLearnedLimit(session, reqModel);
-            const guard = sideRequestGuard(parsed, protocol, reqConfig.modelContextLimit, learnedLimit, imageBillingFor(opts, route?.rewrittenUrl ?? upstreamOrigin), headroomCap);
+            const armedForGuard = session.stats.lastInputTokensSource === "usage" ? session.stats.lastInputTokens : 0;
+            const guard = sideRequestGuard(parsed, protocol, reqConfig.modelContextLimit, imageBillingFor(opts, route?.rewrittenUrl ?? upstreamOrigin), headroomCap, armedForGuard);
             if (guard.blocked) {
                 log("warn", `[${session.id}] side request (~${guard.estimate} tokens) ≥ effective window ${guard.limit} (model=${reqModel ?? "?"}) — NOT forwarded: guaranteed upstream 400 (side requests bypass preflight by design, #388)`);
                 if (!res.headersSent && !res.writableEnded && !res.destroyed) {
@@ -1425,76 +1414,9 @@ async function handle(
             await forward(req, res, opts, bodyBuffer, sidePrepared, core, reqConfig, log, route, instanceId, affinity);
             return;
         }
-        // Self-heal the context window: a prior upstream overflow may have
-        // taught us the real window (forward()'s overflow detection persists it
-        // to metadata.confirmedContextLimits, keyed by model, or the legacy
-        // scalar metadata.confirmedContextLimit; the weak-overflow heuristic
-        // keeps its hypotheses in metadata.learnedContextLimits / scalar). If
-        // it is smaller than what we resolved this turn (e.g. the 200k fallback
-        // for an unknown model on a relay), re-center the kernel on it so the
-        // nudge/truncate bands sit below the real limit instead of above it.
-        // A limit learned for a DIFFERENT model does not apply — the user can
-        // switch models mid-conversation (same session), and a stale smaller
-        // window would cap the bigger model prematurely. Spread into a new
-        // object — never mutate the shared global config.
-        const reqModel = (parsed as { model?: string }).model;
-        // #570: a learned window is a hypothesis — if a later turn SUCCEEDED
-        // with reported input above it, it is stale (KV-pressure false
-        // positive, resized server, ...) and must not keep throttling this
-        // session. Runs before the resolution below so this request already
-        // sees the corrected window.
-        retractStaleLearnedLimits(session, reqModel);
-        // #969: only a window the upstream itself STATED in an overflow
-        // rejection (confirmedContextLimits) re-centers the limit — speculative
-        // guesses (rejected-payload size, weak-overflow counts) no longer learn
-        // anything. And never below an explicit operator declaration: the
-        // operator owns the window they configured (compress.modelContextLimit /
-        // models.<id>.context); the emergency shrink stays the safety net.
-        const learnedLimit = resolveConfirmedLimit(session, reqModel);
-        if (learnedLimit && learnedLimit > 0 && learnedLimit < reqConfig.modelContextLimit && !operatorOwnsWindow) {
-            const resolved = reqConfig.modelContextLimit;
-            reqConfig = { ...reqConfig, modelContextLimit: learnedLimit };
-            // A learned limit is ground truth from a real overflow — it must
-            // not be floored back up (that would undo the self-heal).
-            nativeFromFallback = false;
-            log("info", `[${session.id}] self-healed context window: ${resolved} → ${learnedLimit} (confirmed by an upstream overflow error)`);
-        } else if (learnedLimit && learnedLimit > 0 && learnedLimit < reqConfig.modelContextLimit && operatorOwnsWindow) {
-            log("info", `[${session.id}] confirmed overflow window ${learnedLimit} NOT applied over the operator-declared window ${reqConfig.modelContextLimit} (#969)`);
-        } else if (nativeFromFallback && reqModel) {
-            // Self-heal UPWARD — complement of the overflow self-heal above. An
-            // overflow only proves the window is SMALLER; a too-small fallback
-            // guess never overflows (we compress early), so the only signal that
-            // can raise it is a prior SUCCESSFUL turn whose reported input
-            // EXCEEDED the window it was measured under (prevWindow, stored in
-            // metadata at the end of prepare()). A context that merely FIT inside
-            // a larger (e.g. beta) window is not evidence. Fires only on a
-            // low-confidence fallback (nativeFromFallback) — an authoritative
-            // window is never second-guessed from one turn. lastInputTokens is a
-            // lower bound on the real window ONLY when it came from an upstream
-            // usage report (#857: an estimate-derived baseline — preflight
-            // write-back, #604 failure arming — can exceed the window without
-            // the upstream ever accepting it); absent provenance on legacy
-            // files is untrusted. With a usage-grounded value, raising to it is
-            // safe (overshoot self-corrects via the overflow path).
-            const prevInput = session.stats.lastInputTokens ?? 0;
-            const prevWindow = session.metadata.lastTurnWindow as number | undefined;
-            const resolved = reqConfig.modelContextLimit;
-            if (session.stats.lastInputTokensSource === "usage" && prevWindow !== undefined && prevInput > prevWindow && prevInput > resolved && prevInput >= 1000) {
-                // #570: a successful turn's reported input is grounded evidence
-                // (the upstream accepted it), so it lands in the CONFIRMED
-                // fields — a later weak-overflow heuristic must not clobber it.
-                const map = (session.metadata.confirmedContextLimits as Record<string, number> | undefined) ?? {};
-                const prev = map[reqModel];
-                if (prev === undefined || prevInput > prev) {
-                    map[reqModel] = prevInput;
-                    session.metadata.confirmedContextLimits = map;
-                    markDirty(session);
-                }
-                reqConfig = { ...reqConfig, modelContextLimit: prevInput };
-                nativeFromFallback = false;
-                log("info", `[${session.id}] self-healed context window upward: ${resolved} → ${prevInput} (a prior turn used ${prevInput} input tokens, exceeding the fallback window)`);
-            }
-        }
+        // #987: the window is NEVER learned from traffic — no self-heal read
+        // here. Only the one-shot emergency shrink (armed on the overflow
+        // itself) reacts to a wrong declared window.
         // Reserve the model's OUTPUT budget for this turn from the window so the
         // kernel's nudge/truncate bands sit below (window - reserved) and a
         // context+output overflow can't happen on a small window (e.g. 100k with a
@@ -1606,10 +1528,6 @@ async function handle(
         // post-hoc forensics can tell which source sized the window.
         if (reqModelId !== undefined) session.metadata.lastModel = reqModelId;
         session.metadata.lastWindowSource = wsSourceForLog ?? null;
-        // Window THIS turn runs under — read by the NEXT turn's upward self-heal
-        // to tell "context exceeded our window" (evidence) from "context fit
-        // inside a larger window" (not evidence). #393.
-        session.metadata.lastTurnWindow = reqConfig.modelContextLimit;
         // #833: remember the FINAL resolved Config (post self-heal + headroom,
         // same instant as effectiveContextLimit above) so request-context-free
         // display paths (/__bili/plugin/status Nudge line, plugin tool API)
@@ -3105,22 +3023,16 @@ async function preflightCompressIfNeeded(
     // tokens, not ~133K), so an image-dominated payload can clear the window on ESTIMATE
     // alone. When images are the sole over-window component (text fits) and we hold no
     // upstream overflow evidence, forward once and let the upstream arbitrate billing:
-    // tile upstreams accept it; byte relays reject it (400) → forward()'s self-heal
-    // learns the window (it counts rejected image tokens) → later requests fail-fast.
+    // tile upstreams accept it; byte relays reject it (400) → the rejection
+    // arms the emergency shrink (at the stated window, or the declared one
+    // when the body carries no number) → later requests fail-fast.
     // #488's 400 loop stays broken (exactly one rejected forward). Evidence signals:
-    // (1) a usage-grounded baseline ≥ window — an estimate-derived or legacy-unmarked
-    // baseline does NOT count (#857: preflight used to write image estimates back into
-    // lastInputTokens, which permanently closed this hatch on pixel-billing upstreams);
-    // (2) a GOVERNING learned limit (≤ the configured window — an above-window learned
-    // value never applied via the downward self-heal, so it has not observed this
-    // payload overflowing). Compared against the CONFIGURED window (pre output-
-    // headroom reservation): a limit equal to it is still upstream-stated
-    // evidence (#767), while an above-configured value is #857's upward-self-heal
-    // residue and never applied. With either present we trust the estimate and
-    // fall through to fold / fail-fast below.
-    const learnedLimit = resolveLearnedLimit(session, model);
-    const governingLearned = learnedLimit !== undefined && learnedLimit <= configuredWindow ? learnedLimit : undefined;
-    const noOverflowEvidence = (session.stats.lastInputTokens < limit || session.stats.lastInputTokensSource !== "usage") && governingLearned === undefined;
+    // A usage-grounded baseline ≥ window is evidence; an estimate-derived or
+    // legacy-unmarked baseline is NOT (#857: preflight used to write image
+    // estimates back into lastInputTokens, which permanently closed this
+    // hatch on pixel-billing upstreams). With evidence present we trust the
+    // estimate and fall through to fold / fail-fast below.
+    const noOverflowEvidence = session.stats.lastInputTokens < limit || session.stats.lastInputTokensSource !== "usage";
     if (imageTokens > 0 && payloadEstimate >= limit && textEstimate < limit && noOverflowEvidence) {
         log("warn", `[${session.id}] image-dominated payload (~${textEstimate} text + ~${imageTokens} image tokens) exceeds window ${limit} by estimate only, no upstream overflow evidence — forwarding once so the upstream arbitrates billing (#496)`);
         return prepared;
@@ -3658,75 +3570,58 @@ async function forward(
             const s = prepared.session;
             const info = inspectContextOverflow(upstream.status, errBody.toString("utf8"));
             if (info.isOverflow) {
-                // The request's model — the learned window only applies to the
-                // model that produced the overflow (per-model scoping: a stale
-                // limit from another model must not cap this one).
+                // #987: no window learning — the context window is a deployment
+                // property, owned by declarations (config / registry /
+                // runtime-info), never adjusted from session traffic. An overflow
+                // still arms the one-shot emergency shrink so the NEXT turn
+                // compresses below the failing size, but nothing is persisted
+                // and the declared window keeps governing.
                 let reqModel: string | undefined;
-                let parsedBody: Record<string, unknown> | undefined;
+                let rawBody: string | undefined;
                 try {
-                    const rawBody = typeof prepared.body === "string" ? prepared.body : prepared.body.toString("utf8");
-                    parsedBody = JSON.parse(rawBody) as Record<string, unknown>;
+                    rawBody = typeof prepared.body === "string" ? prepared.body : prepared.body.toString("utf8");
+                    const parsedBody = JSON.parse(rawBody) as Record<string, unknown>;
                     reqModel = typeof parsedBody.model === "string" ? parsedBody.model : undefined;
                 } catch {
-                    reqModel = undefined; // non-JSON body — fall back to the legacy scalar
+                    reqModel = undefined;
                 }
-                // #570 provenance: an actual non-2xx overflow rejection is
-                // STRONG evidence — it lands in the CONFIRMED fields, which
-                // take precedence over the weak-overflow heuristic's guesses
-                // and are never clobbered by them.
-                const confirmedMap = (s.metadata.confirmedContextLimits as Record<string, number> | undefined) ?? {};
                 if (info.window) {
-                    const prev = (reqModel ? confirmedMap[reqModel] : undefined) ?? (s.metadata.confirmedContextLimit as number | undefined);
-                    // Persist the real window to a STABLE field (effectiveContextLimit
-                    // is re-resolved every turn in plugin mode and would be overwritten);
-                    // handle() reads it (per model) to re-center the kernel next turn.
-                    if (reqModel) confirmedMap[reqModel] = info.window;
-                    else s.metadata.confirmedContextLimit = info.window;
-                    s.metadata.confirmedContextLimits = confirmedMap;
-                    log("warn", `[${s.id}] upstream context overflow — learned real window ${info.window} for ${reqModel ?? "(unknown model)"} (was ${prev ?? "unset"}); arming emergency shrink`);
-                } else {
-                    // #969: no window number in the body (e.g. Codex's
-                    // "context_window_exceeded", or a relay 400-ing for
-                    // non-window reasons that merely LOOK like overflow) —
-                    // learn NOTHING. The rejected payload's size is a guess,
-                    // and a persisted guess is exactly how #969's session
-                    // shrank to 16161 forever (each 400 taught a smaller
-                    // "bound", preflight then blocked the recovery that would
-                    // have retracted it). Only a window the upstream itself
-                    // STATES is learned (the info.window branch above); here
-                    // the emergency shrink below still unblocks the next turn.
-                    log("warn", `[${s.id}] upstream context overflow (window not parseable) — not learning a window (#969); emergency shrink only: ${info.message}`);
-                }
-                // Arm the emergency shrink: force the next turn's usage to >=100%
-                // so the kernel's emergency nudge + tool-result truncate fire.
-                // With a parsed window, arm at EXACTLY it: a turn cannot succeed
-                // above the real window, so any higher armed value came from an
-                // earlier FAILED turn, and #570's retraction must not mistake
-                // that failure's size for a success and delete the window we
-                // just learned. Without one, keep the max-floor (a real usage
-                // report from the next successful turn overwrites either way).
-                // #857: these values are window numbers stated by the upstream
-                // (or derived from such), not content estimates — trusted
-                // provenance for the self-heal / #496-evidence consumers.
-                if (info.window) {
+                    // Arm the emergency shrink at EXACTLY the stated window: the
+                    // upstream just proved a turn cannot succeed above it, so the
+                    // next turn's kernel emergency nudge + tool-result truncate
+                    // must fire. #857: a number the upstream itself stated is
+                    // usage-grade provenance (not a content estimate); a real
+                    // usage report on the next successful turn overwrites it.
                     s.stats.lastInputTokens = info.window;
                     s.stats.lastInputTokensSource = "usage";
+                    log("warn", `[${s.id}] upstream context overflow (model=${reqModel ?? "unknown"}) — window ${info.window} stated upstream; armed emergency shrink, declared window unchanged (#987)`);
                 } else {
-                    const floor =
-                        (reqModel ? confirmedMap[reqModel] : undefined) ??
-                        (s.metadata.confirmedContextLimit as number | undefined) ??
-                        (s.metadata.effectiveContextLimit as number | undefined) ??
-                        0;
-                    if (floor > 0 && floor > s.stats.lastInputTokens) {
-                        s.stats.lastInputTokens = floor;
+                    // No window number stated — nothing to learn (and #987
+                    // removed the learner anyway), but the rejection itself is
+                    // evidence at the size actually sent: arm at
+                    // min(declared, payload estimate). A payload BELOW the
+                    // declared window being rejected means the declaration is
+                    // wrong (or the upstream is flaky) — arming at the payload's
+                    // own size never over-triggers, while a payload OVER the
+                    // declared window arms at the declaration — which is what
+                    // the #496 image-relay forward-once gate needs to break the
+                    // #488 400 loop after exactly one rejected forward.
+                    const declared = typeof s.metadata.effectiveContextLimit === "number" ? s.metadata.effectiveContextLimit : 0;
+                    let est = 0;
+                    try {
+                        est = estimateTokensFast(rawBody ?? "");
+                    } catch { est = 0; }
+                    const arm = Math.max(0, Math.min(declared, Number.isFinite(est) ? est : declared));
+                    if (arm > 0) {
+                        s.stats.lastInputTokens = arm;
                         s.stats.lastInputTokensSource = "usage";
                     }
+                    log("warn", `[${s.id}] upstream context overflow (window not parseable, model=${reqModel ?? "unknown"}) — armed emergency shrink at ~${arm} tokens (min of declared ${declared} and payload estimate), nothing learned (#987): ${info.message}`);
                 }
-                // The learned window (metadata) and the armed emergency
-                // (lastInputTokens) live in memory only until scheduled —
-                // the error path returns before forward()'s trailing
-                // markDirty, so schedule the save HERE or the self-heal is
-                // lost on restart and the next overflow must be re-learned.
+                // The armed emergency (lastInputTokens) lives in memory only
+                // until scheduled — the error path returns before forward()'s
+                // trailing markDirty, so schedule the save HERE or the arm is
+                // lost on restart.
                 markDirty(s);
             }
             // #762: learn strict-echo on the MAIN request path too. The loop-only
@@ -4190,11 +4085,6 @@ async function forward(
                     }
                     const out = u.completion_tokens ?? u.output_tokens;
                     if (typeof out === "number") prepared.session.stats.outputTokens += out;
-                    // #901: a clean non-streaming completion proves the upstream accepted
-                    // this input size — feed the capability baseline. Model echoed by the
-                    // response when present; scalar bucket otherwise.
-                    const respModel = typeof json.model === "string" ? json.model : undefined;
-                    recordProvenInput(prepared.session, total, respModel);
                 }
                 if (prepared.protocol === "openai") {
                     rewriteOpenaiJsonResponse(json, ctx);
@@ -4360,7 +4250,6 @@ function sendStats(res: http.ServerResponse): void {
         // largest input recent successful turns actually got through. A wide gap
         // means the provider overstates its window.
         contextWindow: typeof s.metadata.effectiveContextLimit === "number" ? s.metadata.effectiveContextLimit : undefined,
-        provenMaxInput: sessionProvenMax(s),
         lastSeen: new Date(s.lastSeen).toISOString(),
         restored: s.restored === true,
     }));

@@ -359,7 +359,10 @@ test("e2e #767: learned-limit-only variant also closes forward-once (bytes mode)
         const s = listSessions().find((x) => x.meta.label === "img-lrn-sess");
         assert.ok(s);
         assert.ok(s!.stats.lastInputTokens < WINDOW, "baseline is fresh here");
-        (s!.metadata as Record<string, unknown>).confirmedContextLimits = { "gpt-astra": WINDOW };
+        // #987 removed the window learner; the equivalent usage-grounded
+        // evidence (what an overflow 400's arm leaves behind) closes the gate.
+        (s!.stats as { lastInputTokens: number }).lastInputTokens = WINDOW;
+        (s!.stats as { lastInputTokensSource: string }).lastInputTokensSource = "usage";
 
         const r2 = await fetch(url, { method: "POST", headers, body: imageTurn("img-lrn-sess") });
         assert.equal(r2.status, 502, "overflow evidence (learned limit) closes #496 forward-once even with a fresh baseline");

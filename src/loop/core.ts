@@ -18,7 +18,6 @@ import { executeSearchContextTarget, resolveDecompress } from "../decompress-sha
 import { buildVisibilityMarker } from "../compress-loop.js";
 import { fetchWithRetry, UpstreamHttpError } from "../fetch-util.js";
 import { proxyDispatcher } from "../upstream-proxy.js";
-import { noteWeakOverflow, recordProvenInput } from "../weak-overflow.js";
 import { warnCacheCollapse } from "../cache-warn.js";
 import { dumpRejectedBody } from "../error-dump.js";
 import { dumpsDir } from "../paths.js";
@@ -719,22 +718,9 @@ export async function* runCompressLoop(
             // blind to why it failed. MAX_LOOP_ROUNDS bounds runaway loops.
             const reRequest = proxyResults.length > 0 && realCalls === 0;
             if (!reRequest) {
-                // #498: a stream that cut without a completion event is a weak
-                // overflow signal (sglang-style backends accept an oversized
-                // prompt then die mid-stream). Both shapes: !sawDone (chat /
-                // anthropic) and truncatedDone (responses synthetic failed done).
-                // #887: NOT when the client aborted — the abort breaks the parse
-                // loop at the signal check with the same !sawDone shape, and three
-                // ESCs inside 15min would arm a shrunken window (MIN_EVENTS=3)
-                // that throttles the session below its true window (#570 family).
-                if ((!sawDone || truncatedDone) && streamError === undefined && !signal?.aborted) {
-                    const reqModel = typeof requestBody["model"] === "string" ? requestBody["model"] : undefined;
-                    noteWeakOverflow(ctx.session, {
-                        inputTokens: usage.inputTokens,
-                        model: reqModel,
-                        reason: `round ${round}: upstream stream truncated without a completion event`,
-                    });
-                }
+                // #887: nothing is learned from a truncated stream — the
+                // window is a deployment property (#987), and stream cuts are
+                // indistinguishable from network noise mid-stream.
                 if (!sawDone) {
                     const partialText = assistantText.length;
                     const partialReasoning = assistantReasoning.length;
@@ -743,17 +729,6 @@ export async function* runCompressLoop(
                     ctx.log(`[acp-loop] round ${round}: ${msg}`);
                     yield adapter.emitError(msg);
                     return;
-                }
-                // #901: a normally-completed round proves the upstream accepted
-                // this input size — feed the capability baseline that
-                // noteWeakOverflow counts against (never on the truncated /
-                // error exits above).
-                if (!truncatedDone && streamError === undefined) {
-                    const total = promptInputTotal(ctx.protocol, usage.inputTokens, usage.cachedTokens, usage.creationTokens);
-                    if (total > 0) {
-                        const reqModel = typeof requestBody["model"] === "string" ? requestBody["model"] : undefined;
-                        recordProvenInput(ctx.session, total, reqModel);
-                    }
                 }
                 // A passthrough round already streamed the upstream's own finish
                 // chunk + [DONE] verbatim (original id + order); re-emitting a
@@ -860,12 +835,6 @@ export async function* runCompressLoop(
                 const suffix = e.attempts > 1 ? ` after ${e.attempts} attempt(s)` : "";
                 ctx.log(`[acp-proxy: compress loop upstream error ${e.status}${suffix}: ${e.body.slice(0, 200)}]`);
                 loggerLog("error", `[acp-loop] upstream error ${e.status}${suffix}: ${e.body.slice(0, 200)}`);
-                const reqModel = typeof requestBody["model"] === "string" ? requestBody["model"] : undefined;
-                noteWeakOverflow(ctx.session, {
-                    inputTokens: usage.inputTokens,
-                    model: reqModel,
-                    reason: `round ${round}: upstream error ${e.status}${suffix}`,
-                });
                 yield adapter.emitError(`upstream error ${e.status}${suffix}: ${e.body.slice(0, 200)}`);
                 return;
             }

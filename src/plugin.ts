@@ -13,7 +13,6 @@ import { composeStreamFilters, containsMarkerLineText, containsRenderTagText, cr
 import { log as loggerLog } from "./logger.js";
 import { emitStreamError, emitUpstreamTruncation } from "./stream-error.js";
 import { degenerateTurnWarning } from "./degenerate-turn.js";
-import { noteWeakOverflow, recordProvenInput } from "./weak-overflow.js";
 import { warnCacheCollapse } from "./cache-warn.js";
 import { recordCacheSample } from "./cache-ledger.js";
 import { promptInputTotal, type WireProtocol } from "./util.js";
@@ -1142,16 +1141,8 @@ export async function pipePluginChatWithStrip(
         }
     };
     // #498: whether a terminal event ([DONE] / message_stop) was seen. A
-    // stream that ends without one was cut mid-flight — a weak overflow
-    // signal on high-usage sessions.
+    // stream that ends without one was cut mid-flight.
     let sawTerminal = false;
-    const maybeNoteTruncated = () => {
-        if (sawTerminal || !session || res.destroyed || res.writableEnded) return;
-        noteWeakOverflow(session, {
-            inputTokens: acc.inputTokens,
-            reason: "plugin chat passthrough stream ended without a completion event",
-        });
-    };
     const maybeWarnDegenerate = () => {
         if (!sawTerminal || res.destroyed || res.writableEnded) return;
         let inputChars = 0;
@@ -1173,12 +1164,6 @@ export async function pipePluginChatWithStrip(
             loggerLog("warn", msg);
             log?.(msg);
         }
-    };
-    // #901: a terminal-delimited turn proves the upstream accepted this input size.
-    const maybeRecordProven = () => {
-        if (!sawTerminal || !session || res.destroyed || res.writableEnded) return;
-        const total = promptInputTotal(protocol, acc.inputTokens, acc.cachedTokens, acc.creationTokens);
-        if (total > 0) recordProvenInput(session, total);
     };
     const pushField = (field: string, index: number, text: string): [string, boolean] => {
         const s = filterFor(field, index);
@@ -1401,16 +1386,13 @@ export async function pipePluginChatWithStrip(
         // that reads lastInputTokens for the nudge decision) the moment the
         // stream completes, and those must already see this usage.
         settleUsage();
-        maybeNoteTruncated();
         maybeWarnDegenerate();
-        maybeRecordProven();
         if (truncated) {
             emitUpstreamTruncation(res, protocol, finalFinishReason !== undefined, log);
             return;
         }
     } catch (e) {
         settleUsage();
-        maybeNoteTruncated();
         if (res.destroyed || res.writableEnded) {
             log?.("client aborted mid-stream");
             return;
@@ -1534,16 +1516,8 @@ export async function pipePluginResponsesWithStrip(
         }
     };
     // #498: whether a terminal event (done-family / [DONE]) was seen. A
-    // stream that ends without one was cut mid-flight — a weak overflow
-    // signal on high-usage sessions.
+    // stream that ends without one was cut mid-flight.
     let sawTerminal = false;
-    const maybeNoteTruncated = () => {
-        if (sawTerminal || !session || res.destroyed || res.writableEnded) return;
-        noteWeakOverflow(session, {
-            inputTokens: acc.inputTokens,
-            reason: "plugin responses passthrough stream ended without a completion event",
-        });
-    };
     const maybeWarnDegenerate = () => {
         if (!sawTerminal || res.destroyed || res.writableEnded) return;
         const st = tagFilter.stats();
@@ -1559,12 +1533,6 @@ export async function pipePluginResponsesWithStrip(
             loggerLog("warn", msg);
             log?.(msg);
         }
-    };
-    // #901: a terminal-delimited turn proves the upstream accepted this input size.
-    const maybeRecordProven = () => {
-        if (!sawTerminal || !session || res.destroyed || res.writableEnded) return;
-        const total = promptInputTotal("responses", acc.inputTokens, acc.cachedTokens, acc.creationTokens);
-        if (total > 0) recordProvenInput(session, total);
     };
     let lastDeltaMeta: { item_id?: unknown; output_index?: unknown } | null = null;
     const flushTail = (after: string) => {
@@ -1887,8 +1855,6 @@ export async function pipePluginResponsesWithStrip(
         }
         maybeWarnDegenerate();
         settleUsage();
-        maybeNoteTruncated();
-        maybeRecordProven();
         // #721: same as the chat-pipe twin — never close bare on a missing
         // done-family event. Responses has no separate finish-reason concept
         // (terminal events carry the status), so this is always the error shape.
@@ -1898,7 +1864,6 @@ export async function pipePluginResponsesWithStrip(
         }
     } catch (e) {
         settleUsage();
-        maybeNoteTruncated();
         if (res.destroyed || res.writableEnded) {
             log?.("client aborted mid-stream");
             return;
@@ -1988,9 +1953,6 @@ export async function pipePluginJson(
                     cachedTokens: cached,
                     creationTokens: creation,
                 }, protocol);
-                // #901: a fully-read non-streaming response proves acceptance of this input size.
-                const total = promptInputTotal(protocol, input, cached, creation);
-                if (total > 0) recordProvenInput(session, total);
                 markDirty(session);
             }
         }

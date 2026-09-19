@@ -109,14 +109,14 @@ test("e2e #496 (byte-counting relay): one rejected forward, then fail-fast — t
         assert.ok(r1text.includes("context_window_exceeded"), "relay error body passes through");
         assert.deepEqual(streamForwards, [true], "request 1 was forwarded exactly once");
 
-        // #969: the relay's 400 carries NO window number, so nothing is
-        // learned — but the emergency shrink still arms at the effective
-        // window (10k, trusted provenance), which is the overflow EVIDENCE
-        // that breaks the forward-once loop below.
+        // #987: the relay's 400 carries NO window number, so nothing is
+        // learned — but the emergency shrink arms at the DECLARED window
+        // (10k, the rejection itself is evidence), which is the overflow
+        // EVIDENCE that breaks the forward-once loop below.
         const s = listSessions().find((x) => x.id === "img-relay-sess");
         assert.ok(s, "session exists");
-        assert.equal(s!.metadata.confirmedContextLimits, undefined, "#969: no window learned from a numberless rejection");
-        assert.equal((s!.stats as { lastInputTokens?: number }).lastInputTokens, 10_000, "emergency shrink armed at the effective window");
+        assert.equal(s!.metadata.confirmedContextLimits, undefined, "#987: no window ever learned");
+        assert.equal((s!.stats as { lastInputTokens?: number }).lastInputTokens, 10_000, "emergency shrink armed at the declared window");
 
         // --- Request 2: overflow EVIDENCE now exists → NO forward-once → fail-fast ---
         const r2 = await fetch(url, { method: "POST", headers, body: screenshotPayload() });

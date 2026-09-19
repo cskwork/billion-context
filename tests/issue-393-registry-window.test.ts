@@ -28,7 +28,8 @@ import { setLogCapture } from "../src/logger.ts";
 //      effectiveContextLimit was only written in plugin mode;
 //   3. variant suffixes like -thinking missed the registry (claude-opus-5 is
 //      1M in the snapshot, claude-opus-5-thinking resolved to 200K);
-//   4. the overflow self-heal only lowered the window, never raised it.
+//   4. the overflow self-heal only lowered the window, never raised it
+//      (this learner was later removed wholesale in #987).
 
 const ONE_M = 1_000_000;
 
@@ -163,33 +164,8 @@ test("#393: wire mode (no x-bili-plugin) also records effectiveContextLimit", as
 
 // --- Fix 5 (integration): upward self-heal ---
 
-test("#393: self-heal raises a too-small fallback window when a turn exceeded it", async () => {
-    setRegistryForTest({}); // empty registry -> claude-unknown falls to the static table (200K)
-    const rig = await startRig(300_000); // upstream truthfully reports a 300K input
-    try {
-        const headers = { "content-type": "application/json", "x-acp-session": "selfheal-sess" };
-
-        // Request 1: the 200K fallback window is used; the turn's real input (300K)
-        // is recorded but does not yet correct the window.
-        const r1 = await fetch(`http://127.0.0.1:${rig.proxyPort}/v1/messages`, { method: "POST", headers, body: body("claude-unknown") });
-        assert.equal(r1.status, 200);
-        await r1.text();
-        let sess = listSessions().find((s) => s.id === "selfheal-sess")!;
-        assert.equal(sess.metadata.effectiveContextLimit, 200_000, "first turn uses the 200K fallback");
-
-        // Request 2: a prior successful turn whose input (300K) exceeded the 200K
-        // window it was measured under is the only signal the real window is larger
-        // (a too-small fallback never overflows, it just compresses early) -> raise.
-        const r2 = await fetch(`http://127.0.0.1:${rig.proxyPort}/v1/messages`, { method: "POST", headers, body: body("claude-unknown") });
-        assert.equal(r2.status, 200);
-        await r2.text();
-        sess = listSessions().find((s) => s.id === "selfheal-sess")!;
-        assert.equal(sess.metadata.effectiveContextLimit, 300_000, "window raised to the observed input");
-        assert.equal((sess.metadata.confirmedContextLimits as Record<string, number>)["claude-unknown"], 300_000, "learned window persisted per model");
-    } finally {
-        await closeRig(rig);
-    }
-});
+// --- Fix 4 was the upward self-heal; removed wholesale in #987 (the
+// declared window is owned by declarations, not session traffic) ---
 
 // --- Fix 6 (integration): /models is a known discovery path ---
 

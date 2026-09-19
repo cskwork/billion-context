@@ -132,40 +132,40 @@ test("inspectContextOverflow: exceed_context_size_error pattern + (A / B > W) wi
     assert.equal(openai.window, 131_072);
 });
 
-test("sideRequestGuard: raw-body fit against resolved ∩ learned window minus output headroom (#554)", () => {
+test("sideRequestGuard: raw-body fit against declared ∩ armed window minus output headroom (#554)", () => {
     const txt = "z".repeat(8000);
     const body = { model: MODEL, max_tokens: 100, stream: true, messages: [{ role: "user", content: txt }] };
     const est = estimateRawBodyTokens(body);
     assert.ok(est > 0);
-    assert.equal(sideRequestGuard(body, "anthropic", 0, undefined).blocked, false, "unknown window → forward as before");
-    assert.equal(sideRequestGuard(body, "anthropic", est + 1, undefined).blocked, false, "fits");
-    assert.equal(sideRequestGuard(body, "anthropic", Math.floor(est / 1.15), undefined).blocked, true, "boundary: estimate == limit x 1.15 blocks");
-    assert.equal(sideRequestGuard(body, "anthropic", Math.floor(est / 1.10), undefined).blocked, false, "within the 15% estimator tolerance → forward");
-    assert.equal(sideRequestGuard(body, "anthropic", 1_000_000, Math.floor(est / 1.15)).blocked, true, "learned smaller (beyond tolerance) → blocks");
-    assert.equal(sideRequestGuard(body, "anthropic", est + 1, 1_000_000).blocked, false, "learned larger than resolved is ignored");
+    assert.equal(sideRequestGuard(body, "anthropic", 0, undefined, 1).blocked, false, "unknown window → forward as before");
+    assert.equal(sideRequestGuard(body, "anthropic", est + 1, undefined, 1).blocked, false, "fits");
+    assert.equal(sideRequestGuard(body, "anthropic", Math.floor(est / 1.15), undefined, 1).blocked, true, "boundary: estimate == limit x 1.15 blocks");
+    assert.equal(sideRequestGuard(body, "anthropic", Math.floor(est / 1.10), undefined, 1).blocked, false, "within the 15% estimator tolerance → forward");
+    assert.equal(sideRequestGuard(body, "anthropic", 1_000_000, undefined, 1, Math.floor(est / 1.15)).blocked, true, "armed smaller (beyond tolerance) → blocks");
+    assert.equal(sideRequestGuard(body, "anthropic", est + 1, undefined, 1, 1_000_000).blocked, false, "armed larger than declared is ignored");
     // OpenAI wire: the output budget counts against the window → headroom reserved.
     const oa = { model: MODEL, max_completion_tokens: 2_000, stream: true, messages: [{ role: "user", content: txt }] };
     const oaEst = estimateRawBodyTokens(oa);
     const oaLimit = Math.floor(oaEst / 1.15);
-    const g = sideRequestGuard(oa, "openai", oaLimit + 2_000, undefined);
+    const g = sideRequestGuard(oa, "openai", oaLimit + 2_000, undefined, 1);
     assert.equal(g.limit, oaLimit, "limit reduced by max_completion_tokens");
     assert.equal(g.blocked, true, "boundary after reservation (with tolerance) blocks");
-    assert.equal(sideRequestGuard(oa, "openai", oaEst + 2_001, undefined).blocked, false);
+    assert.equal(sideRequestGuard(oa, "openai", oaEst + 2_001, undefined, 1).blocked, false);
     // Image tokens count toward the estimate.
     const imgBody = { model: MODEL, max_tokens: 100, messages: [{ role: "user", content: [
         { type: "text", text: "z".repeat(4000) },
         { type: "image", source: { type: "base64", media_type: "image/png", data: "A".repeat(8000) } },
     ] }] };
     const imgEst = estimateRawBodyTokens(imgBody) + Math.ceil(8000 / 4);
-    assert.equal(sideRequestGuard(imgBody, "anthropic", Math.floor(imgEst / 1.15), undefined).blocked, true, "image cost included at boundary");
+    assert.equal(sideRequestGuard(imgBody, "anthropic", Math.floor(imgEst / 1.15), undefined, 1).blocked, true, "image cost included at boundary");
     // CJK estimator bias: defaultCountTokens counts CJK per-char (~1.6x real),
     // so a CJK-heavy payload estimated at ~110% of the window must forward —
-    // the upstream's real overflow 400 teaches the learned limit.
+    // the upstream's real overflow 400 arms the evidence that blocks re-sends.
     const cjkBody = { model: MODEL, max_tokens: 100, stream: true, messages: [{ role: "user", content: "汉".repeat(4000) }] };
     const cjkEst = estimateRawBodyTokens(cjkBody);
     assert.ok(cjkEst >= 4000, "CJK counted per-char");
-    assert.equal(sideRequestGuard(cjkBody, "anthropic", Math.floor(cjkEst / 1.10), undefined).blocked, false, "CJK over-estimation absorbed by tolerance");
-    assert.equal(sideRequestGuard(cjkBody, "anthropic", Math.floor(cjkEst / 1.20), undefined).blocked, true, "genuinely oversized CJK still blocks");
+    assert.equal(sideRequestGuard(cjkBody, "anthropic", Math.floor(cjkEst / 1.10), undefined, 1).blocked, false, "CJK over-estimation absorbed by tolerance");
+    assert.equal(sideRequestGuard(cjkBody, "anthropic", Math.floor(cjkEst / 1.20), undefined, 1).blocked, true, "genuinely oversized CJK still blocks");
 });
 
 function okSse(inputTokens: number): string {
@@ -428,7 +428,7 @@ test("e2e: oversized side request is blocked locally (413), never reaches the up
     }
 });
 
-test("e2e: overflow 400 on a side request learns the real window; next one is blocked locally (#554)", async () => {
+test("e2e: overflow 400 on a side request arms the stated window; next one is blocked locally (#554)", async () => {
     const rig = await startRig(); // 200_000 configured window
     try {
         const url = `http://127.0.0.1:${rig.proxyPort}/bili/http://127.0.0.1:${rig.upstreamPort}/v1/messages`;
@@ -436,8 +436,9 @@ test("e2e: overflow 400 on a side request learns the real window; next one is bl
 
         // ~1200 × ~130 ≈ 155k tokens: below the 200k configured window (so the
         // first attempt forwards) but above the real 120,000 window the upstream
-        // reports in its overflow marker (ratio ~1.29 > the 15% guard tolerance,
-        // so the learned window still blocks the second attempt locally).
+        // reports in its overflow marker. #987: the marker's number is no longer
+        // LEARNED, but it arms the one-shot evidence at 120k — enough for the
+        // guard to block the second attempt locally.
         const big = mainConversation(1200);
         rig.sideErrorStatus = 400;
         rig.sideErrorBody = JSON.stringify({ error: { message: "exceed_context_size_error (198,277 / 198,661 > 120,000)" } });
@@ -447,8 +448,8 @@ test("e2e: overflow 400 on a side request learns the real window; next one is bl
         await r1.text();
         const s1 = getSession(SESSION);
         assert.ok(s1);
-        assert.equal((s1.metadata.confirmedContextLimits as Record<string, number>)[MODEL], 120_000, "real window learned (confirmed channel, #572) from the overflow marker");
-        assert.equal(s1.stats.lastInputTokens, 120_000, "emergency shrink armed at the learned window");
+        assert.equal(s1.metadata.confirmedContextLimits, undefined, "#987: no window learned");
+        assert.equal(s1.stats.lastInputTokens, 120_000, "emergency shrink armed at the stated window");
 
         // Identical second request: now blocked locally — no second upstream hit.
         const r2 = await fetch(url, { method: "POST", headers, body: JSON.stringify({ model: MODEL, max_tokens: 100, stream: true, messages: big }) });

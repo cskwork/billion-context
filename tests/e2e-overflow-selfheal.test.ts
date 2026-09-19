@@ -9,24 +9,40 @@ import { defaultConfig } from "acp-kernel";
 import { startServer, type ProxyOptions } from "../src/server.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
-import { listSessions, type Session } from "../src/session.ts";
-import { noteWeakOverflow } from "../src/weak-overflow.ts";
+import { listSessions } from "../src/session.ts";
 
-// The configured window here is deliberately LARGE (400k) so it plays the role
-// of a wrong/mis-detected window (the 200k-fallback footgun for an unknown
-// model on a relay). The upstream truthfully reports its real window (128000)
-// via a context-overflow 400. The proxy must:
-//   1. detect the overflow and pass the 400 + body through verbatim;
-//   2. learn the real window (128000) into session.metadata.confirmedContextLimits,
-//      keyed by the model that overflowed;
-//   3. arm an emergency shrink (lastInputTokens >= window);
-//   4. let the NEXT request recover (self-healed window, upstream 200);
-//   5. NOT apply the learned limit to a different model in the same session
-//      (the user can switch models mid-conversation).
+// #987: the context window is a deployment property — owned by declarations
+// (config / registry / runtime-info), NEVER adjusted from session traffic.
+// An upstream overflow 400:
+//   1. is passed through verbatim (no client-visible change);
+//   2. arms the ONE-SHOT emergency shrink when (and only when) the upstream
+//      STATED a window number — so the next turn's kernel sees tokenCount at
+//      that window and can nudge/truncate;
+//   3. persists NOTHING that could re-center the declared window. No
+//      metadata.confirmedContextLimits, no upward self-heal, no retraction —
+//      those learner stores were removed wholesale.
+// Recovery from an oversized turn comes from the DECLARED window: when the
+// declaration is correct, the armed value + preflight fold the next turn
+// under it (T3). When the declaration is wrong, the fix is an operator
+// declaration change — not session-time guessing.
 
-const OVERFLOW_BODY = JSON.stringify({
+const STATED_OVERFLOW_BODY = JSON.stringify({
+    error: {
+        code: "context_length_exceeded",
+        message: "This model's maximum context length is 8192 tokens. However, your messages resulted in 13000 tokens.",
+    },
+});
+
+const STATED_OVERFLOW_BODY_128K = JSON.stringify({
     type: "error",
     error: { type: "invalid_request_error", message: "prompt is too long: 130000 tokens > 128000 maximum" },
+});
+
+const NUMBERLESS_OVERFLOW_BODY = JSON.stringify({
+    error: {
+        code: "context_window_exceeded",
+        message: "The model's context window was exceeded. Start a new thread or clear earlier history before retrying.",
+    },
 });
 
 function okSse(): string {
@@ -39,147 +55,6 @@ function okSse(): string {
         `event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}\n\n`
     );
 }
-
-test("e2e: upstream context overflow → learn window + arm shrink + pass through, then recover", async () => {
-    let call = 0;
-    const upstream = http.createServer((req, res) => {
-        const chunks: Buffer[] = [];
-        req.on("data", (c: Buffer) => chunks.push(c));
-        req.on("end", () => {
-            // First call: a context-overflow 400 with the real window in the body.
-            // Subsequent calls: a normal 200 SSE.
-            if (call === 0) {
-                res.writeHead(400, { "content-type": "application/json" });
-                res.end(OVERFLOW_BODY);
-            } else {
-                res.writeHead(200, { "content-type": "text/event-stream" });
-                res.end(okSse());
-            }
-            call += 1;
-        });
-    });
-    upstream.listen(0, "127.0.0.1");
-    await once(upstream, "listening");
-    const upstreamPort = upstream.address().port;
-
-    // Spy on scheduleSave: the overflow error path returns before
-    // forward()'s trailing markDirty, so it must schedule its own save —
-    // otherwise the learned window (metadata) and the armed emergency
-    // (lastInputTokens) live only in memory and are lost on restart.
-    // (An on-disk assertion can't prove this: the prepare phase's own
-    // markDirty schedules a debounced save that serializes the live session
-    // AFTER forward() has mutated it.)
-    const store = new SessionStore({ enabled: false });
-    const scheduleCalls: string[] = [];
-    const origSchedule = store.scheduleSave.bind(store);
-    store.scheduleSave = ((s: Session) => { scheduleCalls.push(s.id); return origSchedule(s); }) as typeof store.scheduleSave;
-    _setStoreForTest(store);
-    setRegistryForTest({});
-    const proxy = await startServer({
-        port: 0,
-        host: "127.0.0.1",
-        upstream: "http://127.0.0.1",
-        routes: { [`http://127.0.0.1:${upstreamPort}`]: { models: { "claude-test": { context: 400_000 }, "claude-big": { context: 400_000 } } } },
-        modelContextLimit: 400_000,
-        kernelConfig: defaultConfig(400_000),
-        compress: { injectTool: true, injectNudge: true },
-        promptCache: { routing: "auto" },
-        sessionHeader: "x-acp-session",
-        log: false,
-        debug: false,
-        passthrough: false,
-        autoUpdate: false,
-        mitm: { enabled: false, domains: [] },
-    } as ProxyOptions);
-    await once(proxy, "listening");
-    const proxyPort = proxy.address().port;
-
-    try {
-        const url = `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/messages`;
-        const body = JSON.stringify({ model: "claude-test", max_tokens: 1024, stream: true, messages: [{ role: "user", content: "hello" }] });
-
-        // --- Request 1: overflow 400 ---
-        const r1 = await fetch(url, {
-            method: "POST",
-            headers: { "content-type": "application/json", "x-acp-session": "overflow-sess" },
-            body,
-        });
-        // The 400 is passed through verbatim (no behavior change for the client).
-        assert.equal(r1.status, 400);
-        const r1text = await r1.text();
-        assert.ok(r1text.includes("prompt is too long"), "error body must pass through");
-
-        // The session learned the real window (per model) and armed the emergency shrink.
-        const s = listSessions().find((x) => (x.metadata.confirmedContextLimits as Record<string, number> | undefined)?.["claude-test"] === 128000);
-        assert.ok(s, "a session learned the real window from the overflow (keyed by model)");
-        assert.equal(s!.metadata.confirmedContextLimit, undefined, "no legacy scalar when the model is known");
-        assert.equal(s!.stats.lastInputTokens, 128000, "emergency shrink armed at exactly the parsed window (#570 guard)");
-
-        // The prepare phase marks the session dirty once per request; the
-        // overflow error path must add its OWN save for the learned window +
-        // armed value (it returns before forward()'s trailing markDirty).
-        const saves = scheduleCalls.filter((id) => id === s!.id).length;
-        assert.ok(saves >= 2, `overflow error path scheduled its own save (scheduleSave x${saves} for the session)`);
-
-        // --- Request 2: recovers (self-healed window; upstream is fine now) ---
-        const r2 = await fetch(url, {
-            method: "POST",
-            headers: { "content-type": "application/json", "x-acp-session": "overflow-sess" },
-            body,
-        });
-        assert.equal(r2.status, 200, "second request recovers");
-        await r2.text(); // drain
-
-        // The real usage report from the successful turn overwrote the armed value.
-        const s2 = listSessions().find((x) => x.id === s!.id);
-        assert.equal(s2?.stats.lastInputTokens, 5000);
-
-        // --- Request 3: DIFFERENT model in the same session (user switched
-        // models) — the learned limit from claude-test must NOT apply. The map
-        // gains no entry for claude-big and the session keeps its 400k window.
-        const body3 = JSON.stringify({ model: "claude-big", max_tokens: 1024, stream: true, messages: [{ role: "user", content: "hi" }] });
-        const r3 = await fetch(url, {
-            method: "POST",
-            headers: { "content-type": "application/json", "x-acp-session": "overflow-sess" },
-            body: body3,
-        });
-        assert.equal(r3.status, 200);
-        await r3.text(); // drain
-        const s3 = listSessions().find((x) => x.id === s!.id);
-        const limits = s3?.metadata.confirmedContextLimits as Record<string, number> | undefined;
-        assert.equal(limits?.["claude-big"], undefined, "no learned limit for the other model");
-        assert.deepEqual(Object.keys(limits ?? {}), ["claude-test"], "only the overflowing model is scoped");
-    } finally {
-        proxy.close();
-        await once(proxy, "close");
-        upstream.close();
-        await once(upstream, "close");
-    }
-});
-
-// #280/#969: Codex's overflow error carries NO window number
-// ("context_window_exceeded"), so the upstream never stated its real window.
-// Per #969 NOTHING is learned from a guess (the rejected payload's size kept
-// throttling sessions below their real window and the preflight cooldown then
-// blocked the contradicting success that would have retracted it). The learn-
-// and-recover loop now requires the upstream to STATE the window (OpenAI's
-// "maximum context length is N tokens" shape) — that confirmed path re-centers
-// the limit and the pre-flight compresses below it on the next request.
-
-const CODEX_OVERFLOW_BODY = JSON.stringify({
-    error: {
-        code: "context_window_exceeded",
-        message: "The model's context window was exceeded. Start a new thread or clear earlier history before retrying.",
-    },
-});
-
-// #969: an upstream that STATES its window — the only learnable shape.
-const STATED_OVERFLOW_BODY = JSON.stringify({
-    error: {
-        code: "context_length_exceeded",
-        message: "This model's maximum context length is 8192 tokens. However, your messages resulted in 13000 tokens.",
-    },
-});
 
 const SUMMARY_TEXT =
     "PREFLIGHT SUMMARY: the segment covered a multi-step debugging session. Key decisions: chose the preflight approach over lossy truncation because the payload must stay coherent. Files touched: src/a.ts:10, src/b.ts:20. Outcome: fixed and verified by tests.";
@@ -205,7 +80,26 @@ function bigConversation(): Array<{ role: string; content: string }> {
     return msgs;
 }
 
-test("e2e #969: overflow WITHOUT a window number → nothing learned, next request forwarded as-is", async () => {
+function proxyBaseOptions(upstreamPort: number, window: number): ProxyOptions {
+    return {
+        port: 0,
+        host: "127.0.0.1",
+        upstream: "http://127.0.0.1",
+        routes: { [`http://127.0.0.1:${upstreamPort}`]: { models: { "claude-test": { context: window } } } },
+        modelContextLimit: window,
+        kernelConfig: defaultConfig(window),
+        compress: { injectTool: true, injectNudge: true },
+        promptCache: { routing: "auto" },
+        sessionHeader: "x-acp-session",
+        log: false,
+        debug: false,
+        passthrough: false,
+        autoUpdate: false,
+        mitm: { enabled: false, domains: [] },
+    } as ProxyOptions;
+}
+
+test("e2e #987 T1: a stated-window overflow arms the emergency shrink but learns nothing — the declared window keeps governing", async () => {
     let streamingCall = 0;
     let summaryCalls = 0;
     const bodies: string[] = [];
@@ -229,7 +123,7 @@ test("e2e #969: overflow WITHOUT a window number → nothing learned, next reque
             }
             if (streamingCall === 0) {
                 res.writeHead(400, { "content-type": "application/json" });
-                res.end(CODEX_OVERFLOW_BODY);
+                res.end(STATED_OVERFLOW_BODY_128K);
             } else {
                 res.writeHead(200, { "content-type": "text/event-stream" });
                 res.end(okSse());
@@ -243,62 +137,39 @@ test("e2e #969: overflow WITHOUT a window number → nothing learned, next reque
 
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
-    const proxy = await startServer({
-        port: 0,
-        host: "127.0.0.1",
-        upstream: "http://127.0.0.1",
-        routes: { [`http://127.0.0.1:${upstreamPort}`]: {} },
-        kernelConfig: defaultConfig(400_000),
-        compress: { injectTool: true, injectNudge: true },
-        promptCache: { routing: "auto" },
-        sessionHeader: "x-acp-session",
-        log: false,
-        debug: false,
-        passthrough: false,
-        autoUpdate: false,
-        mitm: { enabled: false, domains: [] },
-    } as ProxyOptions);
+    const proxy = await startServer(proxyBaseOptions(upstreamPort, 400_000));
     await once(proxy, "listening");
     const proxyPort = proxy.address().port;
 
     try {
         const url = `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/messages`;
         const body = JSON.stringify({ model: "claude-test", max_tokens: 1024, stream: true, messages: bigConversation() });
+        const headers = { "content-type": "application/json", "x-acp-session": "t1-sess" };
 
-        // --- Request 1: oversized history forwarded → Codex 400 (no window number) ---
-        const r1 = await fetch(url, {
-            method: "POST",
-            headers: { "content-type": "application/json", "x-acp-session": "codex-sess" },
-            body,
-        });
+        // r1: the 400 (stating 128000) passes through verbatim and arms the
+        // one-shot emergency shrink — but persists NO learned window.
+        const r1 = await fetch(url, { method: "POST", headers, body });
         assert.equal(r1.status, 400);
         const r1text = await r1.text();
-        assert.ok(r1text.includes("context_window_exceeded"), "Codex error passes through verbatim");
-
-        // #969: nothing was learned — no confirmed window, no speculative map.
-        const s = listSessions().find((x) => x.id === "codex-sess");
+        assert.ok(r1text.includes("prompt is too long"), "error body passes through verbatim");
+        const s = listSessions().find((x) => x.id === "t1-sess");
         assert.ok(s, "session exists");
-        assert.equal(s!.metadata.confirmedContextLimits, undefined, "#969: no window learned from a numberless rejection");
-        assert.equal(s!.metadata.learnedContextLimit, undefined);
-        assert.equal(s!.metadata.learnedContextLimits, undefined);
+        assert.equal(s!.metadata.confirmedContextLimits, undefined, "#987: nothing learned");
+        assert.equal(s!.metadata.confirmedContextLimit, undefined, "#987: no legacy scalar either");
+        assert.equal(s!.stats.lastInputTokens, 128000, "emergency shrink armed at the stated window");
+        assert.equal(s!.stats.lastInputTokensSource, "usage", "a window the upstream stated is usage-grade (#857)");
 
-        // --- Request 2: the same history. The window was NOT re-centered (no
-        // learned window — the 400k arm only forces the emergency path), so the
-        // emergency pre-flight compresses and the forward succeeds. The
-        // distinguishing property vs the old behavior is the metadata above:
-        // NOTHING was learned from a guess, so the session's window can never
-        // be permanently throttled below its real size (#969's 18320 → 16161
-        // death spiral). ---
-        const r2 = await fetch(url, {
-            method: "POST",
-            headers: { "content-type": "application/json", "x-acp-session": "codex-sess" },
-            body,
-        });
-        assert.equal(r2.status, 200, "emergency shrink + preflight recover the turn without any learned window");
-        await r2.text(); // drain
-
-        assert.ok(summaryCalls >= 1, "the armed emergency forced a pre-flight summarization call");
-        const s2 = listSessions().find((x) => x.id === s!.id);
+        // r2: same payload, declared window (400k) governs — the payload is
+        // IN-window, so no preflight fold: forwarded verbatim, upstream 200.
+        const r2 = await fetch(url, { method: "POST", headers, body });
+        assert.equal(r2.status, 200);
+        await r2.text();
+        assert.equal(summaryCalls, 0, "in-window payload under the declared window — no fold");
+        const lastForward = bodies[bodies.length - 1];
+        assert.ok(lastForward.includes("MARKER_1_") && lastForward.includes("MARKER_11_"), "history forwarded verbatim");
+        assert.ok(!lastForward.includes(SUMMARY_TEXT), "no fold");
+        const s2 = listSessions().find((x) => x.id === "t1-sess");
+        assert.equal(s2?.stats.lastInputTokens, 5000, "the successful turn's usage report overwrote the armed value");
         assert.equal(s2?.metadata.confirmedContextLimits, undefined, "still nothing learned after recovery");
     } finally {
         proxy.close();
@@ -308,19 +179,16 @@ test("e2e #969: overflow WITHOUT a window number → nothing learned, next reque
     }
 });
 
-test("e2e #969: overflow with a STATED window → confirmed learning re-centers the limit and preflight recovers", async () => {
+test("e2e #987 T2: an overflow WITHOUT a window number arms at the declared window and learns nothing", async () => {
     let streamingCall = 0;
     let summaryCalls = 0;
-    const bodies: string[] = [];
     const upstream = http.createServer((req, res) => {
         const chunks: Buffer[] = [];
         req.on("data", (c: Buffer) => chunks.push(c));
         req.on("end", () => {
-            const raw = Buffer.concat(chunks).toString("utf8");
-            bodies.push(raw);
             let parsed: { stream?: boolean } = {};
             try {
-                parsed = JSON.parse(raw);
+                parsed = JSON.parse(Buffer.concat(chunks).toString("utf8"));
             } catch {
                 parsed = {};
             }
@@ -332,7 +200,7 @@ test("e2e #969: overflow with a STATED window → confirmed learning re-centers 
             }
             if (streamingCall === 0) {
                 res.writeHead(400, { "content-type": "application/json" });
-                res.end(STATED_OVERFLOW_BODY);
+                res.end(NUMBERLESS_OVERFLOW_BODY);
             } else {
                 res.writeHead(200, { "content-type": "text/event-stream" });
                 res.end(okSse());
@@ -346,169 +214,30 @@ test("e2e #969: overflow with a STATED window → confirmed learning re-centers 
 
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
-    // No operator window declaration (no routes.models entry, no compress.modelContextLimit):
-    // the learned window must be ALLOWED to re-center the fallback 400k here.
-    const proxy = await startServer({
-        port: 0,
-        host: "127.0.0.1",
-        upstream: "http://127.0.0.1",
-        routes: { [`http://127.0.0.1:${upstreamPort}`]: {} },
-        kernelConfig: defaultConfig(400_000),
-        compress: { injectTool: true, injectNudge: true },
-        promptCache: { routing: "auto" },
-        sessionHeader: "x-acp-session",
-        log: false,
-        debug: false,
-        passthrough: false,
-        autoUpdate: false,
-        mitm: { enabled: false, domains: [] },
-    } as ProxyOptions);
+    const proxy = await startServer(proxyBaseOptions(upstreamPort, 400_000));
     await once(proxy, "listening");
     const proxyPort = proxy.address().port;
 
     try {
         const url = `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/messages`;
         const body = JSON.stringify({ model: "claude-test", max_tokens: 1024, stream: true, messages: bigConversation() });
+        const headers = { "content-type": "application/json", "x-acp-session": "t2-sess" };
 
-        // --- Request 1: oversized history forwarded → 400 with a stated window ---
-        const r1 = await fetch(url, {
-            method: "POST",
-            headers: { "content-type": "application/json", "x-acp-session": "stated-sess" },
-            body,
-        });
-        assert.equal(r1.status, 400);
-        const r1text = await r1.text();
-        assert.ok(r1text.includes("maximum context length"), "stated-window error passes through verbatim");
-
-        // The upstream STATED its window — the only learnable evidence (#969).
-        const s = listSessions().find((x) => x.id === "stated-sess");
-        assert.ok(s, "session exists");
-        assert.equal((s!.metadata.confirmedContextLimits as Record<string, number> | undefined)?.["claude-test"], 8192, "stated window learned (confirmed, per model)");
-        assert.equal(s!.stats.lastInputTokens, 8192, "emergency shrink armed at the stated window");
-
-        // --- Request 2: the confirmed 8192 re-centers the limit → pre-flight
-        // compresses below it → recovery. ---
-        const r2 = await fetch(url, {
-            method: "POST",
-            headers: { "content-type": "application/json", "x-acp-session": "stated-sess" },
-            body,
-        });
-        assert.equal(r2.status, 200, "second request recovers via preflight compression");
-        await r2.text(); // drain
-
-        assert.ok(summaryCalls >= 1, "pre-flight made a summarization call before the forward");
-        const lastForward = bodies[bodies.length - 1];
-        assert.ok(!lastForward.includes("MARKER_1_"), "compressed range folded out of the rebuilt payload");
-        assert.ok(!lastForward.includes("MARKER_2_"), "compressed range folded out of the rebuilt payload");
-        assert.ok(!lastForward.includes("MARKER_3_"), "compressed range folded out of the rebuilt payload");
-        assert.ok(lastForward.includes("MARKER_11_"), "recent messages retained");
-        assert.ok(lastForward.includes(SUMMARY_TEXT), "summary replaces the compressed range");
-
-        const s2 = listSessions().find((x) => x.id === s!.id);
-        assert.equal(s2?.stats.lastInputTokens, 5000, "the recovered turn's real usage overwrote the armed value");
-    } finally {
-        proxy.close();
-        await once(proxy, "close");
-        upstream.close();
-        await once(upstream, "close");
-    }
-});
-
-// #570 review guard: three KV-pressure-style mid-stream deaths ABOVE the true
-// window inflate lastInputTokens via noteWeakOverflow. When the genuine
-// overflow then parses the real window, the armed value must be reset to
-// EXACTLY it — otherwise the next request's retraction check reads the
-// failures' size as "a later success" and deletes the just-learned confirmed
-// window, contradicting the fix's own invariant (a true overflow cannot be
-// contradicted by a success, because one cannot happen above the real window).
-// #969 C: an operator-declared window (routes.models.<id>.context — the
-// same tier as compress.modelContextLimit) is OWNED by the operator: a
-// confirmed window learned from an upstream 400 must NOT re-center it. The
-// observable difference is sized between the two windows: a 13k payload under
-// a 20k operator window needs no preflight, but would force one if the
-// learned 8192 wrongly overrode the operator's number.
-test("e2e #969: an operator-declared window is never overridden by a confirmed learned window", async () => {
-    let streamingCall = 0;
-    let summaryCalls = 0;
-    const bodies: string[] = [];
-    const upstream = http.createServer((req, res) => {
-        const chunks: Buffer[] = [];
-        req.on("data", (c: Buffer) => chunks.push(c));
-        req.on("end", () => {
-            const raw = Buffer.concat(chunks).toString("utf8");
-            bodies.push(raw);
-            let parsed: { stream?: boolean } = {};
-            try {
-                parsed = JSON.parse(raw);
-            } catch {
-                parsed = {};
-            }
-            if (parsed.stream === false) {
-                summaryCalls += 1;
-                res.writeHead(200, { "content-type": "application/json" });
-                res.end(summaryJson());
-                return;
-            }
-            if (streamingCall === 0) {
-                res.writeHead(400, { "content-type": "application/json" });
-                res.end(STATED_OVERFLOW_BODY);
-            } else {
-                res.writeHead(200, { "content-type": "text/event-stream" });
-                res.end(okSse());
-            }
-            streamingCall += 1;
-        });
-    });
-    upstream.listen(0, "127.0.0.1");
-    await once(upstream, "listening");
-    const upstreamPort = upstream.address().port;
-
-    _setStoreForTest(new SessionStore({ enabled: false }));
-    setRegistryForTest({});
-    // The operator pins 20k for this model — deployment ground truth.
-    const proxy = await startServer({
-        port: 0,
-        host: "127.0.0.1",
-        upstream: "http://127.0.0.1",
-        routes: { [`http://127.0.0.1:${upstreamPort}`]: { models: { "claude-test": { context: 20_000 } } } },
-        kernelConfig: defaultConfig(20_000),
-        compress: { injectTool: true, injectNudge: true },
-        promptCache: { routing: "auto" },
-        sessionHeader: "x-acp-session",
-        log: false,
-        debug: false,
-        passthrough: false,
-        autoUpdate: false,
-        mitm: { enabled: false, domains: [] },
-    } as ProxyOptions);
-    await once(proxy, "listening");
-    const proxyPort = proxy.address().port;
-
-    try {
-        const url = `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/messages`;
-        const body = JSON.stringify({ model: "claude-test", max_tokens: 1024, stream: true, messages: bigConversation() });
-        const headers = { "content-type": "application/json", "x-acp-session": "operator-sess" };
-
-        // --- Request 1: ~13k payload fits the operator's 20k → forwarded → 400
-        // stating 8192 → learned (confirmed) but NOT applied over the operator's window. ---
         const r1 = await fetch(url, { method: "POST", headers, body });
         assert.equal(r1.status, 400);
         await r1.text();
-        const s = listSessions().find((x) => x.id === "operator-sess");
+        const s = listSessions().find((x) => x.id === "t2-sess");
         assert.ok(s, "session exists");
-        assert.equal((s!.metadata.confirmedContextLimits as Record<string, number> | undefined)?.["claude-test"], 8192, "stated window learned (metadata)");
+        assert.equal(s!.metadata.confirmedContextLimits, undefined, "nothing learned");
+        assert.ok(s!.stats.lastInputTokens > 10_000 && s!.stats.lastInputTokens < 400_000, `armed at the payload's own size (~16k, not the 400k declaration): ${s!.stats.lastInputTokens}`);
+        assert.equal(s!.stats.lastInputTokensSource, "usage", "a rejection the upstream itself issued is usage-grade");
 
-        // --- Request 2: window stays at the operator's 20k → the 13k payload is
-        // in-window → NO preflight compression, forwarded verbatim. If the
-        // learned 8192 wrongly overrode the operator, this request would fold
-        // and carry SUMMARY_TEXT instead. ---
+        // r2: forwarded as-is (no arm, nothing learned) — the pass-through
+        // shape the old #969 test asserted is unchanged.
         const r2 = await fetch(url, { method: "POST", headers, body });
         assert.equal(r2.status, 200);
         await r2.text();
-        assert.equal(summaryCalls, 0, "no preflight — the operator's 20k window still governs");
-        const lastForward = bodies[bodies.length - 1];
-        assert.ok(lastForward.includes("MARKER_1_") && lastForward.includes("MARKER_11_"), "history forwarded verbatim");
-        assert.ok(!lastForward.includes(SUMMARY_TEXT), "no fold");
+        assert.equal(summaryCalls, 0, "no fold");
     } finally {
         proxy.close();
         await once(proxy, "close");
@@ -517,20 +246,36 @@ test("e2e #969: an operator-declared window is never overridden by a confirmed l
     }
 });
 
-test("e2e #570: failed-turn arms above the true window do not retract the learned window", async () => {
-    let call = 0;
+test("e2e #987 T3: with a CORRECT declared window, an oversized turn still recovers — stated 400 arms, the next turn preflight-folds under the declared window", async () => {
+    let streamingCall = 0;
+    let summaryCalls = 0;
+    const bodies: string[] = [];
     const upstream = http.createServer((req, res) => {
-        req.on("data", () => {});
+        const chunks: Buffer[] = [];
+        req.on("data", (c: Buffer) => chunks.push(c));
         req.on("end", () => {
-            // call 0: warmup success; call 1: genuine overflow 400; rest: 200.
-            if (call === 1) {
+            const raw = Buffer.concat(chunks).toString("utf8");
+            bodies.push(raw);
+            let parsed: { stream?: boolean } = {};
+            try {
+                parsed = JSON.parse(raw);
+            } catch {
+                parsed = {};
+            }
+            if (parsed.stream === false) {
+                summaryCalls += 1;
+                res.writeHead(200, { "content-type": "application/json" });
+                res.end(summaryJson());
+                return;
+            }
+            if (streamingCall === 0) {
                 res.writeHead(400, { "content-type": "application/json" });
-                res.end(OVERFLOW_BODY);
+                res.end(STATED_OVERFLOW_BODY);
             } else {
                 res.writeHead(200, { "content-type": "text/event-stream" });
                 res.end(okSse());
             }
-            call += 1;
+            streamingCall += 1;
         });
     });
     upstream.listen(0, "127.0.0.1");
@@ -539,60 +284,37 @@ test("e2e #570: failed-turn arms above the true window do not retract the learne
 
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
-    const proxy = await startServer({
-        port: 0,
-        host: "127.0.0.1",
-        upstream: "http://127.0.0.1",
-        routes: { [`http://127.0.0.1:${upstreamPort}`]: { models: { "claude-test": { context: 400_000 } } } },
-        modelContextLimit: 400_000,
-        kernelConfig: defaultConfig(400_000),
-        compress: { injectTool: true, injectNudge: true },
-        promptCache: { routing: "auto" },
-        sessionHeader: "x-acp-session",
-        log: false,
-        debug: false,
-        passthrough: false,
-        autoUpdate: false,
-        mitm: { enabled: false, domains: [] },
-    } as ProxyOptions);
+    // The operator declares the TRUE window (8192) — recovery works purely
+    // through the declared window + the one-shot arm. No learning required.
+    const proxy = await startServer(proxyBaseOptions(upstreamPort, 8192));
     await once(proxy, "listening");
     const proxyPort = proxy.address().port;
 
     try {
         const url = `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/messages`;
-        const body = JSON.stringify({ model: "claude-test", max_tokens: 1024, stream: true, messages: [{ role: "user", content: "hello" }] });
-        const headers = { "content-type": "application/json", "x-acp-session": "retract-sess" };
+        const body = JSON.stringify({ model: "claude-test", max_tokens: 1024, stream: true, messages: bigConversation() });
+        const headers = { "content-type": "application/json", "x-acp-session": "t3-sess" };
 
-        const before = new Set(listSessions().map((x) => x.id));
-        const r0 = await fetch(url, { method: "POST", headers, body });
-        assert.equal(r0.status, 200);
-        await r0.text();
-        const sess = listSessions().find((x) => !before.has(x.id));
-        assert.ok(sess, "warmup request created the session");
-
-        // Three mid-stream deaths at 370k — above the true window (128000) and
-        // above the warmup turn's demonstrated capability (5k): the #570
-        // KV-pressure pattern. (#901: counted against capability, not usage.)
-        for (const r of ["r1", "r2", "r3"]) {
-            noteWeakOverflow(sess!, { inputTokens: 370_000, model: "claude-test", reason: r });
-        }
-        assert.equal(sess!.stats.lastInputTokens, 370_000, "failure arms inflated the high-water mark above the true window");
-
-        // The genuine overflow learns the real window.
+        // r1: 13000-token payload vs the declared 8192 — preflight should fold
+        // BEFORE the upstream is hit... except the arm comes from this 400. In
+        // the #987 world the first oversized turn is rejected verbatim (the
+        // proxy cannot guess a window), which arms the shrink.
         const r1 = await fetch(url, { method: "POST", headers, body });
         assert.equal(r1.status, 400);
         await r1.text();
-        const s1 = listSessions().find((x) => x.id === sess!.id);
-        assert.equal((s1!.metadata.confirmedContextLimits as Record<string, number>)["claude-test"], 128000, "real window learned from the overflow body");
-        assert.equal(s1!.stats.lastInputTokens, 128000, "#570 guard: armed at exactly the parsed window, not the failures' 370k");
+        const s = listSessions().find((x) => x.id === "t3-sess");
+        assert.ok(s, "session exists");
+        assert.equal(s!.stats.lastInputTokens, 8192, "armed at the stated window");
+        assert.equal(s!.metadata.confirmedContextLimits, undefined, "nothing learned");
 
-        // Next request: retraction runs BEFORE resolution — the capped arm must
-        // not delete the just-learned window.
+        // r2: the payload (~13k) exceeds the DECLARED window (8192) — preflight
+        // folds it under the window and forwards the summary-carrying body.
         const r2 = await fetch(url, { method: "POST", headers, body });
-        assert.equal(r2.status, 200, "recovery request succeeds");
+        assert.equal(r2.status, 200, "second request recovers via preflight fold under the declared window");
         await r2.text();
-        const s2 = listSessions().find((x) => x.id === sess!.id);
-        assert.equal((s2!.metadata.confirmedContextLimits as Record<string, number>)["claude-test"], 128000, "learned window survived the next request's retraction check");
+        assert.ok(summaryCalls >= 1, "preflight ran a compress summary call");
+        const lastForward = bodies[bodies.length - 1];
+        assert.ok(lastForward.includes(SUMMARY_TEXT), "the forwarded body carries the fold summary");
     } finally {
         proxy.close();
         await once(proxy, "close");
