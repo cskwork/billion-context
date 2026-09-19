@@ -12,6 +12,9 @@
 //          (plugin entry #925: bare "billion-context" for npm installs — opencode
 //           loads it via exports["./server"] and manages install/upgrade itself;
 //           local shim dir for checkout/dev installs, which are not portable)
+//   dsh      no file of its own — drives dsh's own plugin channel per profile
+//            (`dsh plugin --profile <name> add|remove`, #966); profile copies
+//            follow global self-updates via dsh-channel.refreshDshProfileBundles
 // Installers throw on failure (bad/locked config, missing host CLI); the CLI
 // layer catches, prints `bili plugin: <msg>` and exits 1.
 
@@ -24,6 +27,7 @@ import { applyEdits, modify as jsoncModify, parse as jsoncParse, type ParseError
 import { resolveDshHome, resolvePiHome } from "./client-config.js";
 import { clearClaudeNativePort, resolveClaudeNativePort, saveClaudeNativePort } from "./config.js";
 import { isPidAlive, isProxyInstanceFile, readProxyInstanceFile } from "./instance.js";
+import { DSH_PACKAGE, dshBundleInstalled, dshHasLegacyManagedBlock, dshProfileDependsOnBili, dshProfileDirs, runDshPlugin, stripLegacyManagedBlock } from "./dsh-channel.js";
 
 /** #403: never freeze a dead or unverifiable origin into a client's
  *  persistent config — the MCP shell would dial it forever. An explicit
@@ -1082,166 +1086,67 @@ function opencodeStatus(): string {
 
 // — dsh ————————————————————————————————————————————————————————————————
 
-const DSH_PATCH_BEGIN = "# bili begin (managed by billion-context — `bili plugin install dsh`)";
-const DSH_PATCH_END = "# bili end";
-
-const DSH_PATCH_HEADER = "# Your patch layer for this dsh profile, applied after every bundle layer:\n# a top-level YAML array of loader patch entries (id-targeted config\n# overrides, disables, and insert lists; `!!js` expressions allowed).\n";
-
-/** Every profile's user-layer cordis.patch.yml under $DSH_HOME/profiles/*.
- *  dsh creates a profile dir per `--profile` on first boot; a missing
- *  profiles root means dsh has never run. Returns the dirs that exist (the
- *  patch file itself may still be absent — dsh materializes it lazily). */
-export function dshProfileDirs(env: NodeJS.ProcessEnv = process.env): string[] {
-    const profiles = path.join(resolveDshHome(env), "profiles");
-    let entries: fs.Dirent[];
-    try {
-        entries = fs.readdirSync(profiles, { withFileTypes: true });
-    } catch (err) {
-        if ((err as { code?: string }).code === "ENOENT") {
-            throw new Error(`no dsh profiles found under ${profiles} — run dsh once (any profile) so the profile dirs exist, then retry`);
-        }
-        throw err;
-    }
-    return entries.filter((e) => e.isDirectory() && e.name !== "node_modules").map((e) => path.join(profiles, e.name));
-}
-
-/** The managed block text appended to every profile's cordis.patch.yml:
- *  the native plugin insert (id bili-native, file:// URL to this install's
- *  dist/agent/dsh-native.js) plus the compaction-basic auto:false override —
- *  dsh's native auto-compaction stands down because the bili proxy owns
- *  compression. A patch replaces the target row's whole `config`, and
- *  dsh-base ships compaction-basic with no config, so {auto:false} is
- *  complete. */
-export function dshManagedPatchBlock(root: string): string {
-    const pluginUrl = pathToFileURL(path.join(root, "dist", "agent", "dsh-native.js")).href;
-    return `${DSH_PATCH_BEGIN}\n- insert:\n    - id: bili-native\n      name: ${pluginUrl}\n- id: compaction-basic\n  config:\n    auto: false\n${DSH_PATCH_END}\n`;
-}
-
-/** Text-level managed-block strip: everything from the begin marker through
- *  the end marker (inclusive). Text-level (not YAML-parse-level) on purpose —
- *  the file is user-authored and must keep every comment and entry we did
- *  not write. */
-export function stripDshManagedPatch(text: string): string {
-    const begin = text.indexOf(DSH_PATCH_BEGIN);
-    if (begin < 0) return text;
-    const endMarker = text.indexOf(DSH_PATCH_END, begin);
-    if (endMarker < 0) return text.slice(0, begin);
-    let after = endMarker + DSH_PATCH_END.length;
-    if (text[after] === "\n") after += 1;
-    return text.slice(0, begin) + text.slice(after);
-}
-
-/** Merge the managed block into one profile's patch text: strip any previous
- *  block, drop a placeholder `[]` root (appending list items after `[]`
- *  would be invalid YAML), re-append the current block. Comment header and
- *  user entries survive untouched. */
-export function mergeDshManagedPatch(text: string, block: string): string {
-    let base = stripDshManagedPatch(text).replace(/\n+$/, "\n");
-    const meaningful = base.split("\n").filter((l) => l.trim().length > 0 && !l.trimStart().startsWith("#"));
-    if (meaningful.length === 0 || (meaningful.length === 1 && meaningful[0].trim() === "[]")) {
-        // empty / comment-only / placeholder root — comments only survive
-        base = base.split("\n").filter((l) => l.trimStart().startsWith("#")).join("\n");
-        base = base.length > 0 ? `${base.replace(/\n+$/, "")}\n` : DSH_PATCH_HEADER;
-    }
-    return base + block;
-}
-
-/** Restore the pristine comment-header + `[]` shape after removal when the
- *  remainder carries no real entries (a comment-only file parses as null,
- *  and an empty file surprises nobody — but dsh's own first-boot materializes
- *  exactly this shape, so match it). */
-function restoreDshPatchPlaceholder(text: string): string {
-    const meaningful = text.split("\n").filter((l) => l.trim().length > 0 && !l.trimStart().startsWith("#"));
-    if (meaningful.length > 0) return text.replace(/\n+$/, "\n");
-    const comments = text.split("\n").filter((l) => l.trimStart().startsWith("#")).join("\n");
-    const header = comments.length > 0 ? `${comments}\n` : DSH_PATCH_HEADER;
-    return `${header}[]\n`;
-}
-
-/** True when this profile installs billion-context as a dsh bundle
- *  (`dsh plugin --profile <name> add billion-context` — the package lands in
- *  the profile's node_modules and its manifest-declared patch mounts as a
- *  bundle layer). Such a profile must NOT also receive the managed block:
- *  cordis rejects duplicate loader entry ids across layers, so a second
- *  `id: bili-native` insert would hard-fail dsh boot. */
-export function dshBundleInstalled(profileDir: string): boolean {
-    try {
-        const manifest = JSON.parse(fs.readFileSync(path.join(profileDir, "package.json"), "utf8")) as { dsh?: { profile?: { bundles?: unknown } } };
-        const bundles = manifest.dsh?.profile?.bundles;
-        return Array.isArray(bundles) && bundles.includes("billion-context");
-    } catch {
-        return false;
-    }
-}
+// #966: single install lane = dsh's own plugin channel (#950). The installer
+// drives `dsh plugin --profile <name> add|remove <spec>` per profile (dsh's
+// pnpm forwarder) instead of writing managed blocks into cordis.patch.yml —
+// one owner of each profile copy, one update path (auto-update re-runs the
+// channel via refreshDshProfileBundles). Pre-unification managed blocks are
+// migrated (stripped) on install/remove: coexistence duplicates the
+// bili-native loader id and hard-fails dsh boot. The spec follows how THIS
+// bili was installed (#925 rule): npm form → bare package name (registry),
+// checkout/dev → absolute path (pnpm link:, tracks the live source).
 
 function dshInstall(): string {
     const root = selfPackageRoot();
     requireDistFile(path.join(root, "dist", "agent", "dsh-native.js"));
-    const block = dshManagedPatchBlock(root);
+    const dirs = dshProfileDirs();
     const notes: string[] = [];
-    let touched = 0;
-    for (const dir of dshProfileDirs()) {
-        if (dshBundleInstalled(dir)) {
-            notes.push(`${path.basename(dir)}: skipped (installed as a dsh bundle — remove it with \'dsh plugin --profile ${path.basename(dir)} remove billion-context\' instead)`);
-            continue;
-        }
-        const file = path.join(dir, "cordis.patch.yml");
-        let text: string;
-        try {
-            text = fs.readFileSync(file, "utf8");
-        } catch {
-            text = DSH_PATCH_HEADER;
-        }
-        fs.writeFileSync(file, mergeDshManagedPatch(text, block));
-        touched += 1;
+    for (const dir of dirs) {
+        if (stripLegacyManagedBlock(dir)) notes.push(`${path.basename(dir)}: legacy managed block stripped`);
     }
-    if (fs.existsSync(resolveDshHome(process.env)) && touched === 0 && notes.length === 0) notes.push("no profile directories found");
-    return `wrote bili-native plugin + compaction off into ${touched} dsh profile(s) under ${path.join(resolveDshHome(process.env), "profiles")}${notes.length > 0 ? ` (${notes.join("; ")})` : ""} — restart dsh to load it`;
+    const spec = isNpmInstallForm(root) ? DSH_PACKAGE : path.resolve(root);
+    for (const dir of dirs) {
+        runDshPlugin(["plugin", "--profile", path.basename(dir), "add", spec]);
+    }
+    return `installed ${DSH_PACKAGE} into ${dirs.length} dsh profile(s) under ${path.join(resolveDshHome(process.env), "profiles")} via 'dsh plugin --profile <name> add ${spec}'${notes.length > 0 ? ` (${notes.join("; ")})` : ""} — restart dsh to load it`;
 }
 
 function dshRemove(): string {
     const notes: string[] = [];
-    let touched = 0;
+    const touched = new Set<string>();
     for (const dir of dshProfileDirs()) {
-        if (dshBundleInstalled(dir)) {
-            notes.push(`${path.basename(dir)}: installed as a dsh bundle — remove it with \'dsh plugin --profile ${path.basename(dir)} remove billion-context\' instead`);
-            continue;
+        const name = path.basename(dir);
+        if (dshProfileDependsOnBili(dir)) {
+            runDshPlugin(["plugin", "--profile", name, "remove", DSH_PACKAGE]);
+            touched.add(name);
+            notes.push(`${name}: uninstalled via the dsh plugin channel`);
         }
-        const file = path.join(dir, "cordis.patch.yml");
-        let text: string;
-        try {
-            text = fs.readFileSync(file, "utf8");
-        } catch {
-            continue;
+        if (stripLegacyManagedBlock(dir)) {
+            touched.add(name);
+            notes.push(`${name}: legacy managed block stripped`);
         }
-        if (!text.includes(DSH_PATCH_BEGIN)) continue;
-        fs.writeFileSync(file, restoreDshPatchPlaceholder(stripDshManagedPatch(text)));
-        touched += 1;
     }
-    return `removed the bili patch from ${touched} dsh profile(s)${notes.length > 0 ? ` (${notes.join("; ")})` : ""} — restart dsh to finish`;
+    if (touched.size === 0) return "nothing to remove — no dsh profile carries billion-context";
+    return `removed bili from ${touched.size} dsh profile(s) under ${path.join(resolveDshHome(process.env), "profiles")} (${notes.join("; ")}) — restart dsh to finish`;
 }
 
 function dshStatus(): string {
     const dirs = dshProfileDirs();
     const bundle = dirs.filter((dir) => dshBundleInstalled(dir));
-    const withBlock = dirs.filter((dir) => {
-        try {
-            return fs.readFileSync(path.join(dir, "cordis.patch.yml"), "utf8").includes(DSH_PATCH_BEGIN);
-        } catch {
-            return false;
-        }
-    });
-    if (bundle.length === dirs.length && dirs.length > 0) return `installed (dsh bundle in all ${dirs.length} profiles — remove with 'dsh plugin --profile <name> remove billion-context')`;
+    const withBlock = dirs.filter((dir) => dshHasLegacyManagedBlock(dir));
+    if (bundle.length === dirs.length && dirs.length > 0) return `installed (dsh bundle in all ${dirs.length} profiles)`;
     if (bundle.length > 0) return `installed as a dsh bundle in ${bundle.length}/${dirs.length} profiles`;
-    if (withBlock.length === dirs.length && dirs.length > 0) return "installed";
-    if (withBlock.length > 0) return `installed in ${withBlock.length}/${dirs.length} profiles — rerun install to fix`;
+    if (withBlock.length === dirs.length && dirs.length > 0) return "installed (legacy managed block — rerun 'bili plugin install dsh' to migrate to the dsh bundle channel)";
+    if (withBlock.length > 0) return `legacy managed block in ${withBlock.length}/${dirs.length} profiles — rerun 'bili plugin install dsh' to migrate`;
     return "not installed";
 }
 
-/** True when any profile's user layer carries the managed block. The `bili dsh`
- *  launcher consults this before adding its own --patch overlay: cordis rejects
- *  duplicate loader entry ids across layers, so a second `id: bili-native`
- *  insert would hard-fail dsh boot whenever the persistent install is present. */
+/** True when any profile carries the persistent native install — either the
+ *  bundle-channel dep or a pre-unification managed block. The `bili dsh`
+ *  launcher consults this before adding its own --patch overlay: cordis
+ *  rejects duplicate loader entry ids across layers, so a second
+ *  `id: bili-native` insert would hard-fail dsh boot whenever the persistent
+ *  install is present. */
 export function dshNativeInstalled(env: NodeJS.ProcessEnv = process.env): boolean {
     let dirs: string[];
     try {
@@ -1249,14 +1154,7 @@ export function dshNativeInstalled(env: NodeJS.ProcessEnv = process.env): boolea
     } catch {
         return false;
     }
-    return dirs.some((dir) => {
-        if (dshBundleInstalled(dir)) return true;
-        try {
-            return fs.readFileSync(path.join(dir, "cordis.patch.yml"), "utf8").includes(DSH_PATCH_BEGIN);
-        } catch {
-            return false;
-        }
-    });
+    return dirs.some((dir) => dshBundleInstalled(dir) || dshHasLegacyManagedBlock(dir));
 }
 
 // — dispatch ————————————————————————————————————————————————————————————

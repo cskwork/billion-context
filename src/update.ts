@@ -28,6 +28,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { cacheDir } from "./paths.js";
 import { log as loggerLog, type Logger } from "./logger.js";
+import { refreshDshProfileBundles } from "./dsh-channel.js";
 import { proxyDispatcher } from "./upstream-proxy.js";
 import type { FetchOptions } from "./fetch-util.js";
 
@@ -511,6 +512,11 @@ export async function checkForUpdate(opts: UpdateOptions, force = false): Promis
             const result = await installViaTarball(latest, tarballUrl, installDir, integrity, shasum, egressDispatcher(opts, tarballUrl));
             if (result.ok) {
                 loggerLog("info", `[update] installed ${currentVersion} \u2192 ${latest}. Restart to finish.`);
+                // #966: dsh profile copies load their own plugin+proxy from the
+                // profile's node_modules — without this they would keep running
+                // the old version next to the new global one (#953). Best-effort:
+                // never fails the update itself.
+                await refreshDshProfileBundles(latest, loggerLog);
             } else {
                 loggerLog("warn", `[update] install failed: ${result.error}. Will retry next cycle.`);
             }

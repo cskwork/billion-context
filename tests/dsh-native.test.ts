@@ -6,7 +6,8 @@ import path from "node:path";
 import http from "node:http";
 import { pathToFileURL } from "node:url";
 import { apply, planNativeDsh, shouldBootstrapNativeDsh, _resetRegisterForTest, _stateHeadersForTest } from "../src/agent/dsh-native.ts";
-import { dshManagedPatchBlock, dshNativeInstalled, dshProfileDirs, mergeDshManagedPatch, stripDshManagedPatch, dshBundleInstalled, pluginInstall, pluginRemove, pluginStatusAll } from "../src/plugin-install.ts";
+import { dshNativeInstalled, isNpmInstallForm, pluginInstall, pluginRemove, pluginStatusAll, selfPackageRoot } from "../src/plugin-install.ts";
+import { DSH_PATCH_BEGIN, DSH_PATCH_END, dshBundleInstalled, dshProfileDirs, stripDshManagedPatch, stripLegacyManagedBlock, _setDshRunnersForTest, type DshPlan } from "../src/dsh-channel.ts";
 
 test("planNativeDsh: kill-switches > attach > spawn precedence (#941)", () => {
     assert.deepEqual(planNativeDsh({}), { mode: "spawn" });
@@ -27,53 +28,73 @@ test("shouldBootstrapNativeDsh: spawn-gated by env shape", () => {
     assert.equal(shouldBootstrapNativeDsh({ BILI_NATIVE_DSH: "0" }), false);
 });
 
-// — patch-file text surgery —————————————————————————————————————————
+// — legacy managed-block migration (#966) ————————————————————————
 
 const HEADER = "# Your patch layer for this dsh profile, applied after every bundle layer:\n# a top-level YAML array of loader patch entries (id-targeted config\n# overrides, disables, and insert lists; `!!js` expressions allowed).\n";
 
-// Platform-dependent by construction (win32 path shape) — mirror dshManagedPatchBlock, never hardcode a URL literal here.
-const pluginUrlOf = (root: string): string => pathToFileURL(path.join(root, "dist", "agent", "dsh-native.js")).href;
+// Block as written by pre-#966 installs: the markers are stable constants,
+// the body is what the retired managed lane used to append.
+const legacyBlockOf = (root: string): string => `${DSH_PATCH_BEGIN}\n- insert:\n    - id: bili-native\n      name: ${pathToFileURL(path.join(root, "dist", "agent", "dsh-native.js")).href}\n- id: compaction-basic\n  config:\n    auto: false\n${DSH_PATCH_END}\n`;
 
-test("mergeDshManagedPatch: placeholder [] is replaced, comments survive", () => {
-    const block = dshManagedPatchBlock("/opt/bili");
-    const merged = mergeDshManagedPatch(`${HEADER}[]\n`, block);
-    assert.ok(merged.startsWith(HEADER));
-    assert.ok(merged.includes(`- insert:\n    - id: bili-native\n      name: ${pluginUrlOf("/opt/bili")}\n`));
-    assert.ok(merged.includes("- id: compaction-basic\n  config:\n    auto: false\n"));
-    assert.ok(!merged.includes("[]"));
-});
-
-test("mergeDshManagedPatch: user entries survive before the managed block", () => {
-    const block = dshManagedPatchBlock("/opt/bili");
-    const user = `${HEADER}[]\n- id: my-thing\n  name: "@deepseek-ai/cordis-plugin-timer"\n`;
-    const merged = mergeDshManagedPatch(user, block);
-    const lines = merged.split("\n");
-    const userIdx = lines.findIndex((l) => l === "- id: my-thing");
-    const biliIdx = lines.findIndex((l) => l.includes("bili begin"));
-    assert.ok(userIdx >= 0 && biliIdx > userIdx);
-    assert.ok(merged.includes("- id: my-thing"));
-});
-
-test("mergeDshManagedPatch/stripDshManagedPatch roundtrip restores the placeholder", () => {
-    const block = dshManagedPatchBlock("/opt/bili");
-    const merged = mergeDshManagedPatch(`${HEADER}[]\n`, block);
-    const stripped = stripDshManagedPatch(merged);
-    assert.equal(stripped, HEADER);
-    // strip is a no-op without the markers
+test("stripDshManagedPatch: removes only the marked span; no-op without markers", () => {
+    const merged = `${HEADER}[]\n${legacyBlockOf("/opt/bili")}`;
+    assert.equal(stripDshManagedPatch(merged), `${HEADER}[]\n`);
     assert.equal(stripDshManagedPatch(HEADER), HEADER);
 });
 
-test("mergeDshManagedPatch is idempotent and rewrites a moved install path", () => {
-    const first = mergeDshManagedPatch(`${HEADER}[]\n`, dshManagedPatchBlock("/old/root"));
-    const second = mergeDshManagedPatch(first, dshManagedPatchBlock("/new/root"));
-    assert.ok(second.includes(pluginUrlOf("/new/root")));
-    assert.ok(!second.includes("/old/root"));
-    assert.equal(second.match(/bili begin/g)?.length, 1);
-    const third = mergeDshManagedPatch(second, dshManagedPatchBlock("/new/root"));
-    assert.equal(third, second);
+test("stripLegacyManagedBlock: restores the placeholder when nothing meaningful remains", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-legacy-"));
+    try {
+        fs.writeFileSync(path.join(dir, "cordis.patch.yml"), `${HEADER}${legacyBlockOf("/opt/bili")}`);
+        assert.equal(stripLegacyManagedBlock(dir), true);
+        assert.equal(fs.readFileSync(path.join(dir, "cordis.patch.yml"), "utf8"), `${HEADER}[]\n`);
+        assert.equal(stripLegacyManagedBlock(dir), false);
+    } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
 });
 
-// — installer roundtrip under a fake DSH_HOME ————————————————————————
+test("stripLegacyManagedBlock: preserves user entries; leaves non-managed files alone", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-legacy2-"));
+    try {
+        const userEntry = '- id: my-thing\n  name: "@deepseek-ai/cordis-plugin-timer"\n';
+        fs.writeFileSync(path.join(dir, "cordis.patch.yml"), `${HEADER}${userEntry}${legacyBlockOf("/opt/bili")}`);
+        assert.equal(stripLegacyManagedBlock(dir), true);
+        const out = fs.readFileSync(path.join(dir, "cordis.patch.yml"), "utf8");
+        assert.ok(out.includes(userEntry));
+        assert.ok(!out.includes(DSH_PATCH_BEGIN));
+        fs.writeFileSync(path.join(dir, "cordis.patch.yml"), `${HEADER}[]\n`);
+        assert.equal(stripLegacyManagedBlock(dir), false);
+        assert.equal(fs.readFileSync(path.join(dir, "cordis.patch.yml"), "utf8"), `${HEADER}[]\n`);
+    } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+// — channel-driven installer roundtrip under a fake DSH_HOME ——————————
+
+/** Recording stand-in for the real spawn: applies the manifest effect the
+ *  dsh pnpm forwarder would leave behind (dep + bundle entry) so status /
+ *  remove / dshNativeInstalled assertions see realistic state. */
+function channelRunner(home: string, calls: string[][]): { sync: (p: DshPlan) => { stdout: string; stderr: string }; async: (p: DshPlan) => Promise<{ stdout: string; stderr: string }> } {
+    const apply = (plan: DshPlan): { stdout: string; stderr: string } => {
+        calls.push([...plan.args]);
+        const pi = plan.args.indexOf("--profile");
+        const name = plan.args[pi + 1];
+        const action = plan.args[pi + 2];
+        const dir = path.join(home, "profiles", name);
+        if (action === "add") {
+            fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: `dsh-profile-${name}`, dependencies: { "billion-context": "^0.1.120" }, dsh: { profile: { bundles: ["@deepseek-ai/dsh-base", "billion-context"] } } }));
+        } else if (action === "remove") {
+            const m = JSON.parse(fs.readFileSync(path.join(dir, "package.json"), "utf8")) as { dependencies?: Record<string, string>; dsh?: { profile?: { bundles?: string[] } } };
+            delete m.dependencies?.["billion-context"];
+            if (m.dsh?.profile?.bundles) m.dsh.profile.bundles = m.dsh.profile.bundles.filter((b) => b !== "billion-context");
+            fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify(m));
+        }
+        return { stdout: "", stderr: "" };
+    };
+    return { sync: apply, async: async (p) => apply(p) };
+}
 
 async function withEnv<T>(env: Record<string, string | undefined>, fn: () => Promise<T> | T): Promise<T> {
     const saved: Record<string, string | undefined> = {};
@@ -93,56 +114,144 @@ async function withEnv<T>(env: Record<string, string | undefined>, fn: () => Pro
     }
 }
 
-test("dsh install/remove/status roundtrip under a fake DSH_HOME", async () => {
+const USER_ENTRY = '- id: my-thing\n  name: "@deepseek-ai/cordis-plugin-timer"\n';
+
+// Mirrors the production spec rule (#925): npm-form install → registry name,
+// checkout/dev build → absolute path the forwarder turns into a link: dep.
+const expectedSpec = (): string => (isNpmInstallForm(selfPackageRoot()) ? "billion-context" : path.resolve(selfPackageRoot()));
+
+test("dsh install drives the dsh plugin channel per profile, no managed blocks written", async () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-home-"));
+    const calls: string[][] = [];
+    _setDshRunnersForTest(channelRunner(home, calls));
     try {
         await withEnv({ DSH_HOME: home }, async () => {
-            // no profiles yet → the installer says run dsh first
             assert.throws(() => pluginInstall("dsh"), /run dsh once/);
             assert.equal(dshNativeInstalled(), false);
 
             fs.mkdirSync(path.join(home, "profiles", "headless"), { recursive: true });
             fs.mkdirSync(path.join(home, "profiles", "web"), { recursive: true });
-            fs.writeFileSync(path.join(home, "profiles", "headless", "cordis.patch.yml"), `${HEADER}[]\n`);
-            // web/ has no patch file yet — the installer materializes it
+            // headless carries a pre-unification managed block plus a user entry (upgrade path)
+            fs.writeFileSync(path.join(home, "profiles", "headless", "cordis.patch.yml"), `${HEADER}${USER_ENTRY}${legacyBlockOf("/opt/bili")}`);
 
             const msg = pluginInstall("dsh");
             assert.match(msg, /2 dsh profile/);
-            const headlessTxt = fs.readFileSync(path.join(home, "profiles", "headless", "cordis.patch.yml"), "utf8");
-            assert.ok(headlessTxt.startsWith(HEADER));
-            assert.ok(headlessTxt.includes("dsh-native.js"));
-            assert.ok(headlessTxt.includes("auto: false"));
-            const webTxt = fs.readFileSync(path.join(home, "profiles", "web", "cordis.patch.yml"), "utf8");
-            assert.ok(webTxt.includes("dsh-native.js"));
+            assert.match(msg, /headless: legacy managed block stripped/);
+            assert.ok(msg.includes(`add ${expectedSpec()}`));
 
-            assert.equal(pluginStatusAll().find((r) => r.agent === "dsh")?.status, "installed");
+            assert.deepEqual(calls.map((c) => c.join(" ")).sort(), [
+                `plugin --profile headless add ${expectedSpec()}`,
+                `plugin --profile web add ${expectedSpec()}`,
+            ].sort());
+
+            const headlessTxt = fs.readFileSync(path.join(home, "profiles", "headless", "cordis.patch.yml"), "utf8");
+            assert.ok(headlessTxt.includes(USER_ENTRY));
+            assert.ok(!headlessTxt.includes(DSH_PATCH_BEGIN));
+            // the channel owns profile state — bili wrote no patch file of its own
+            assert.ok(!fs.existsSync(path.join(home, "profiles", "web", "cordis.patch.yml")));
+
+            assert.equal(pluginStatusAll().find((r) => r.agent === "dsh")?.status, "installed (dsh bundle in all 2 profiles)");
             assert.equal(dshNativeInstalled(), true);
+        });
+    } finally {
+        _setDshRunnersForTest(undefined);
+        fs.rmSync(home, { recursive: true, force: true });
+    }
+});
+
+test("dsh remove uninstalls through the same channel and migrates legacy blocks", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-remove-"));
+    const calls: string[][] = [];
+    _setDshRunnersForTest(channelRunner(home, calls));
+    try {
+        await withEnv({ DSH_HOME: home }, async () => {
+            fs.mkdirSync(path.join(home, "profiles", "headless"), { recursive: true });
+            fs.mkdirSync(path.join(home, "profiles", "web"), { recursive: true });
+            fs.writeFileSync(
+                path.join(home, "profiles", "web", "package.json"),
+                JSON.stringify({ name: "dsh-profile-web", dependencies: { "billion-context": "^0.1.120" }, dsh: { profile: { bundles: ["@deepseek-ai/dsh-base", "billion-context"] } } }),
+            );
+            fs.writeFileSync(path.join(home, "profiles", "headless", "cordis.patch.yml"), `${HEADER}${legacyBlockOf("/opt/bili")}`);
 
             const removed = pluginRemove("dsh");
-            assert.match(removed, /2 dsh profile/); // install wrote both files
-            const after = fs.readFileSync(path.join(home, "profiles", "headless", "cordis.patch.yml"), "utf8");
-            assert.equal(after, `${HEADER}[]\n`);
+            assert.match(removed, /removed bili from 2 dsh profile/);
+            assert.match(removed, /web: uninstalled via the dsh plugin channel/);
+            assert.match(removed, /headless: legacy managed block stripped/);
+            assert.deepEqual(calls.map((c) => c.join(" ")).sort(), [`plugin --profile web remove billion-context`]);
+
+            assert.equal(fs.readFileSync(path.join(home, "profiles", "headless", "cordis.patch.yml"), "utf8"), `${HEADER}[]\n`);
+            const webManifest = JSON.parse(fs.readFileSync(path.join(home, "profiles", "web", "package.json"), "utf8")) as Record<string, unknown>;
+            assert.equal((webManifest.dependencies as Record<string, string>)["billion-context"], undefined);
             assert.match(pluginStatusAll().find((r) => r.agent === "dsh")?.status ?? "", /not installed/);
             assert.equal(dshNativeInstalled(), false);
+
+            assert.match(pluginRemove("dsh"), /nothing to remove/);
+            assert.equal(calls.length, 1);
+        });
+    } finally {
+        _setDshRunnersForTest(undefined);
+        fs.rmSync(home, { recursive: true, force: true });
+    }
+});
+
+test("dsh install surfaces channel failures with context", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-fail-"));
+    try {
+        await withEnv({ DSH_HOME: home }, async () => {
+            fs.mkdirSync(path.join(home, "profiles", "headless"), { recursive: true });
+            _setDshRunnersForTest({ sync: () => { throw Object.assign(new Error("spawn failed"), { status: 127, stderr: "pnpm not found on PATH (corepack enable pnpm)" }); } });
+            assert.throws(() => pluginInstall("dsh"), /pnpm not found on PATH/);
+            _setDshRunnersForTest({ sync: () => { throw Object.assign(new Error("spawn failed"), { code: "ENOENT" }); } });
+            assert.throws(() => pluginInstall("dsh"), /dsh CLI not found/);
+        });
+    } finally {
+        _setDshRunnersForTest(undefined);
+        fs.rmSync(home, { recursive: true, force: true });
+    }
+});
+
+test("dsh status: bundle / mixed / legacy / absent", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-status-"));
+    try {
+        await withEnv({ DSH_HOME: home }, async () => {
+            fs.mkdirSync(path.join(home, "profiles", "a"), { recursive: true });
+            fs.mkdirSync(path.join(home, "profiles", "b"), { recursive: true });
+            const st = (): string => pluginStatusAll().find((r) => r.agent === "dsh")?.status ?? "";
+            const bundleManifest = JSON.stringify({ dsh: { profile: { bundles: ["billion-context"] } } });
+
+            assert.match(st(), /not installed/);
+            fs.writeFileSync(path.join(home, "profiles", "a", "package.json"), bundleManifest);
+            assert.match(st(), /installed as a dsh bundle in 1\/2 profiles/);
+            fs.writeFileSync(path.join(home, "profiles", "b", "package.json"), bundleManifest);
+            assert.equal(st(), "installed (dsh bundle in all 2 profiles)");
+
+            fs.rmSync(path.join(home, "profiles", "a", "package.json"));
+            fs.rmSync(path.join(home, "profiles", "b", "package.json"));
+            fs.writeFileSync(path.join(home, "profiles", "a", "cordis.patch.yml"), `${HEADER}${legacyBlockOf("/opt/bili")}`);
+            assert.match(st(), /legacy managed block in 1\/2 profiles — rerun/);
+            fs.writeFileSync(path.join(home, "profiles", "b", "cordis.patch.yml"), `${HEADER}${legacyBlockOf("/opt/bili")}`);
+            assert.match(st(), /legacy managed block — rerun 'bili plugin install dsh' to migrate/);
         });
     } finally {
         fs.rmSync(home, { recursive: true, force: true });
     }
 });
 
-test("dshNativeInstalled: true iff any profile carries the managed block", async () => {
+test("dshNativeInstalled: true iff any profile has the bundle or a legacy managed block", async () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-installed-"));
     try {
         await withEnv({ DSH_HOME: home }, () => {
             fs.mkdirSync(path.join(home, "profiles", "headless"), { recursive: true });
             fs.mkdirSync(path.join(home, "profiles", "web"), { recursive: true });
             assert.equal(dshNativeInstalled(), false);
-            fs.writeFileSync(
-                path.join(home, "profiles", "headless", "cordis.patch.yml"),
-                mergeDshManagedPatch(`${HEADER}[]\n`, dshManagedPatchBlock(home)),
-            );
+            fs.writeFileSync(path.join(home, "profiles", "headless", "cordis.patch.yml"), legacyBlockOf("/opt/bili"));
+            assert.equal(dshNativeInstalled(), true);
+            fs.rmSync(path.join(home, "profiles", "headless", "cordis.patch.yml"));
+            fs.writeFileSync(path.join(home, "profiles", "web", "package.json"), JSON.stringify({ dsh: { profile: { bundles: ["billion-context"] } } }));
             assert.equal(dshNativeInstalled(), true);
         });
+        // no profiles root at all — nothing can be installed
+        assert.equal(dshNativeInstalled(), false);
     } finally {
         fs.rmSync(home, { recursive: true, force: true });
     }
@@ -159,43 +268,6 @@ test("dshBundleInstalled: true iff the profile manifest lists billion-context as
         assert.equal(dshBundleInstalled(path.join(home, "web")), false);
         fs.writeFileSync(path.join(home, "web", "package.json"), JSON.stringify({ dsh: { profile: { bundles: ["billion-context"] } } }));
         assert.equal(dshBundleInstalled(path.join(home, "web")), true);
-    } finally {
-        fs.rmSync(home, { recursive: true, force: true });
-    }
-});
-
-test("dsh install/remove/status skip bundle-installed profiles, dshNativeInstalled recognizes them", async () => {
-    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-home-bundle-"));
-    try {
-        await withEnv({ DSH_HOME: home }, async () => {
-            fs.mkdirSync(path.join(home, "profiles", "headless"), { recursive: true });
-            fs.mkdirSync(path.join(home, "profiles", "web"), { recursive: true });
-            fs.writeFileSync(path.join(home, "profiles", "headless", "cordis.patch.yml"), `${HEADER}[]\n`);
-            // web/ installed billion-context via `dsh plugin add` — manifest carries the bundle
-            fs.writeFileSync(path.join(home, "profiles", "web", "package.json"), JSON.stringify({ dsh: { profile: { bundles: ["billion-context"] } } }));
-
-            // the bundle profile already provides bili-native
-            assert.equal(dshNativeInstalled(), true);
-
-            // install only touches the non-bundle profile and says so
-            const msg = pluginInstall("dsh");
-            assert.match(msg, /1 dsh profile/);
-            assert.match(msg, /web: skipped \(installed as a dsh bundle/);
-            assert.ok(!fs.existsSync(path.join(home, "profiles", "web", "cordis.patch.yml")));
-            const headlessTxt = fs.readFileSync(path.join(home, "profiles", "headless", "cordis.patch.yml"), "utf8");
-            assert.ok(headlessTxt.includes("dsh-native.js"));
-
-            assert.match(pluginStatusAll().find((r) => r.agent === "dsh")?.status ?? "", /installed as a dsh bundle in 1\/2 profiles/);
-
-            // remove also skips the bundle profile with a pointer to the dsh-side command
-            const removed = pluginRemove("dsh");
-            assert.match(removed, /1 dsh profile/);
-            assert.match(removed, /dsh plugin --profile web remove billion-context/);
-            const after = fs.readFileSync(path.join(home, "profiles", "headless", "cordis.patch.yml"), "utf8");
-            assert.equal(after, `${HEADER}[]\n`);
-            // web/ still counts as installed via its bundle
-            assert.equal(dshNativeInstalled(), true);
-        });
     } finally {
         fs.rmSync(home, { recursive: true, force: true });
     }
