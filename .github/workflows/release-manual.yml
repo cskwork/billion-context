@@ -96,6 +96,7 @@ jobs:
           npm run build
 
       - name: Commit and push to master
+        id: push
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -105,33 +106,63 @@ jobs:
           git commit -q -m "release v$VER"
           if git push -q origin HEAD:master; then
             echo "pushed release commit to master"
+            echo "direct=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          echo "::error::direct push to master was blocked (branch protection). Fallback: opening a release PR."
+          echo "::warning::direct push to master was blocked (branch protection). Fallback: release prepared on a branch; a PR is needed to publish."
           BR="$(date -u +%Y-%m-%d)_release-v${VER}"
           if ! git push -q origin "HEAD:$BR"; then
             echo "::error::fallback branch push to ${BR} failed — nothing published, aborting."
             exit 1
           fi
+          echo "fallback release branch pushed: ${BR}"
+          echo "needs_pr=true" >> "$GITHUB_OUTPUT"
+          echo "pr_branch=${BR}" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Open fallback PR (best effort)
+        if: steps.push.outputs.needs_pr == 'true'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_BRANCH: ${{ steps.push.outputs.pr_branch }}
+        run: |
+          VER="${{ steps.version.outputs.version }}"
+          LINK="https://github.com/${{ github.repository }}/pull/new/${PR_BRANCH}"
           RESP_FILE="$(mktemp)"
           HTTP_CODE=$(curl -sS -o "$RESP_FILE" -w '%{http_code}' -X POST \
             -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
             -H "Content-Type: application/json" \
             "https://api.github.com/repos/${{ github.repository }}/pulls" \
-            -d "{\"title\":\"release v${VER}\",\"head\":\"${BR}\",\"base\":\"master\",\"body\":\"Auto-fallback from the one-click release workflow: direct push to master was blocked by branch protection. Merging this PR publishes via the standard release.yml flow.\\n\\n<!-- ework-agent-pr -->\"}")
+            -d "{\"title\":\"release v${VER}\",\"head\":\"${PR_BRANCH}\",\"base\":\"master\",\"body\":\"Auto-fallback from the one-click release workflow: direct push to master was blocked by branch protection. Merging this PR publishes via the standard release.yml flow.\\n\\n<!-- ework-agent-pr -->\"}")
           PR_URL=$(node -e 'try{console.log(JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).html_url||"")}catch(e){console.log("")}' "$RESP_FILE")
           echo "POST /pulls HTTP: $HTTP_CODE"
-          if [ -z "$PR_URL" ]; then
-            echo "::error::failed to open the fallback PR automatically (HTTP $HTTP_CODE): $(cat "$RESP_FILE")"
+          if [ -n "$PR_URL" ]; then
+            {
+              echo "### :rotating_light: Release v${VER} prepared — NOT PUBLISHED yet"
+              echo ""
+              echo "Direct push to master was blocked (branch protection); the release commit is on branch \`${PR_BRANCH}\`."
+              echo "Release PR opened automatically: **${PR_URL}** — merge it to publish via CI."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::notice::Release PR opened automatically: ${PR_URL} — merge it to publish v${VER}"
+            exit 0
           fi
-          echo ""
-          echo "::notice::nothing was published yet. Finish the release by merging:"
-          echo "::notice::${PR_URL:-https://github.com/${{ github.repository }}/pull/new/${BR}}"
-          exit 1
+          {
+            echo "### :rotating_light: Release v${VER} prepared — NOTHING PUBLISHED YET"
+            echo ""
+            echo "The release commit passed the full pre-flight gate and is on branch \`${PR_BRANCH}\`."
+            echo "Auto-opening the release PR failed (HTTP ${HTTP_CODE}): $(cat "$RESP_FILE")"
+            echo ""
+            echo "**Finish with one click:** [open the release PR](${LINK}), then merge it to publish."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::warning::NOTHING WAS PUBLISHED YET — auto-PR failed (HTTP ${HTTP_CODE}): $(cat "$RESP_FILE")"
+          echo "::warning::Finish the release with one click: ${LINK} (then merge to publish v${VER})"
+          exit 0
 
       - name: Check if prerelease
         id: pre
+        if: steps.push.outputs.direct == 'true'
         run: |
           if echo "${{ steps.version.outputs.version }}" | grep -q '-'; then
             echo "tag=dev" >> "$GITHUB_OUTPUT"
@@ -142,16 +173,19 @@ jobs:
           fi
 
       - name: Create tag
+        if: steps.push.outputs.direct == 'true'
         run: |
           git tag "v${{ steps.version.outputs.version }}" || true
           git push origin "v${{ steps.version.outputs.version }}" || true
 
       - name: Publish
+        if: steps.push.outputs.direct == 'true'
         run: npm publish --tag ${{ steps.pre.outputs.tag }} --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       - name: Create GitHub Release
+        if: steps.push.outputs.direct == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
