@@ -1418,7 +1418,7 @@ async function updateLane(agent: PluginAgent, opts: PluginUpdateOpts, log: (leve
             return ["pi: the plugin copy is pi-managed (npm:billion-context) — `pi update` upgrades it; bili never overwrites it (#991)"];
         }
         if (list.some((p) => isPiEntry(p, root))) {
-            return ["pi: entry points at this checkout — rebuild the checkout (`npm run build`) to pick up changes"]; 
+            return ["pi: entry points at this checkout — rebuild the checkout (`npm run build`) to pick up changes"];
         }
         return ["pi: not installed"];
     }
@@ -1427,10 +1427,10 @@ async function updateLane(agent: PluginAgent, opts: PluginUpdateOpts, log: (leve
         const { data } = loadOpencodeConfig(file);
         const dir = opencodePluginDir(file);
         if (PLUGIN_KEYS.some((k) => pluginEntries(data, k).some((p) => p === OPENCODE_NPM_ENTRY))) {
-            return ["opencode: the plugin copy is opencode-managed — upgrade/reload it via opencode's plugin manager; bili never overwrites it (#991)"]; 
+            return ["opencode: the plugin copy is opencode-managed — upgrade/reload it via opencode's plugin manager; bili never overwrites it (#991)"];
         }
         if (PLUGIN_KEYS.some((k) => pluginEntries(data, k).some((p) => p === dir))) {
-            return ["opencode: plugin points at this checkout — rebuild the checkout (`npm run build`) to pick up changes"]; 
+            return ["opencode: plugin points at this checkout — rebuild the checkout (`npm run build`) to pick up changes"];
         }
         return ["opencode: not installed"];
     }
