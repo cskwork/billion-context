@@ -312,26 +312,33 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void): TagEcho
             for (const cand of [p, o, c]) {
                 if (cand && (m === null || cand.index < m.index)) m = cand;
             }
+            // An opening whose attribute list never terminates (see
+            // BROKEN_ATTRS): everything after it is the imitation's payload,
+            // the turn's own tool call among it. Dropping the head alone
+            // would hand the client the orphan markup that makes the turn
+            // unusable, so the span is swallowed whole and the turn reaches
+            // the client empty, where the degenerate-turn retry re-asks for
+            // it (#732/#821). A loose close still ends the span, so genuine
+            // prose after a closed imitation survives.
+            // The span's payload runs THROUGH any later tag match — the
+            // imitation's own markup, and the loose close that ends it, are
+            // inside the span — so a broken opening starting FIRST owns the
+            // buffer. Checked only under `!m`, a close sharing the chunk won the
+            // earliest-match race and the imitation reached the client verbatim.
+            // A properly terminated opening can never match here: its attribute
+            // list ends at its `>`, which the class cannot cross.
+            const broken = BROKEN_ATTRS.exec(buf);
+            if (broken && (m === null || broken.index < m.index)) {
+                drop(broken[0]);
+                out += buf.slice(0, broken.index);
+                buf = buf.slice(broken.index + broken[0].length);
+                swallowUntilClose = true;
+                swallowLimit = IMITATION_SWALLOW_CAP;
+                swallowReleases = false;
+                swallowed = "";
+                continue;
+            }
             if (!m) {
-                // An opening whose attribute list never terminates (see
-                // BROKEN_ATTRS): everything after it is the imitation's payload,
-                // the turn's own tool call among it. Dropping the head alone
-                // would hand the client the orphan markup that makes the turn
-                // unusable, so the span is swallowed whole and the turn reaches
-                // the client empty, where the degenerate-turn retry re-asks for
-                // it (#732/#821). A loose close still ends the span, so genuine
-                // prose after a closed imitation survives.
-                const broken = BROKEN_ATTRS.exec(buf);
-                if (broken) {
-                    drop(broken[0]);
-                    out += buf.slice(0, broken.index);
-                    buf = buf.slice(broken.index + broken[0].length);
-                    swallowUntilClose = true;
-                    swallowLimit = IMITATION_SWALLOW_CAP;
-                    swallowReleases = false;
-                    swallowed = "";
-                    continue;
-                }
                 const t = PARTIAL_TAIL.exec(buf);
                 if (t) {
                     // A definite \x3c<name> opening is never prose — hold it far
