@@ -46,8 +46,15 @@ export function clientConversationHeader(headers: Record<string, string | string
     // strongest legacy signal. The name is client-specific, so no other agent
     // (opencode/codex/zcode/curl) ever hits it; their own headers are
     // unchanged below.
+    // x-grok-session-id next: grok-shell (xAI's CLI) stamps its per-session
+    // UUID on every model request (verified against grok-shell 1.0.34; the
+    // parallel x-grok-conv-id carries the same value and stays as a
+    // fallback). Client-specific name — same trust class as the claude
+    // header above: without it the request is anonymous and falls to
+    // prefix-affinity, which forks every turn because grok-shell reorders
+    // its replayed history head between turns.
     const pluginMarker = typeof headers["x-bili-plugin"] === "string";
-    const names = ["x-bili-plugin-conversation", "x-claude-code-session-id", "x-session-affinity", "x-acp-session", "x-session-id", "x-opencode-session", "session-id", "session_id"];
+    const names = ["x-bili-plugin-conversation", "x-claude-code-session-id", "x-grok-session-id", "x-grok-conv-id", "x-session-affinity", "x-acp-session", "x-session-id", "x-opencode-session", "session-id", "session_id"];
     for (const name of names) {
         if (name === "x-bili-plugin-conversation" && !pluginMarker) continue;
         const v = headers[name];
