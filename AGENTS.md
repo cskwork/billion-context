@@ -543,6 +543,24 @@ after that succeeded was the Windows fix shipped in a follow-up release.
 
 ### 7.3 Correctness Guardrails
 
+- **Root cause, not symptom (疏, not 堵 — first principle for every fix).**
+  A fix removes the mechanism that PRODUCES the defect; it never merely hides
+  the defect's visible trace at whatever layer is cheapest to intercept.
+  Before writing any fix, name the producer of the offending bytes/behavior
+  and fix it at the source or at the decision point — never by rewriting or
+  filtering payload in transit to make the symptom invisible. Litmus test:
+  "if the same root cause surfaced in a different shape tomorrow, would this
+  fix still hold?" If not, it is a mask, and a mask is a latent bug. Canonical
+  failure: #933 (model-echoed render tags leaking into a TUI) was "fixed" by
+  stripping tool-call arguments mid-stream; the mask itself became #1039's
+  silent data corruption once users legitimately wrote tag-shaped payloads
+  through write/edit/bash. When the true root cause is out of scope (another
+  repo, a product decision), fix the in-scope part, leave a documented
+  boundary note pointing at the real home of the fix, and do NOT compensate
+  in the wrong layer (#1039's echo-noise belongs on the injection side —
+  host renderTags policy — not on the wire). See also "Symptom ≠ mechanism"
+  below (attribution discipline) and the tool-args-verbatim invariant in the
+  Wire fidelity bullet.
 - **Never silently clobber or drop user config.** Any read-modify-write on user
   config needs a parse-state guard; reject malformed input loudly (HTTP 400/409)
   instead of merging into defaults or dropping fields. Whitelists must be
@@ -560,6 +578,19 @@ after that succeeded was the Windows fix shipped in a follow-up release.
   intended injection: preserve tool_call ids/ordering, SSE structure, and
   upstream invariants (e.g. `compaction_trigger` must remain the last input
   item, #283/#209). Reason in BOTH compression modes (§6).
+  - *Tool-call arguments are user intent (#1039).* Any payload a host will
+    EXECUTE or PERSIST — tool-call `arguments` in every wire shape (OpenAI
+    `tool_calls[].function.arguments`, Anthropic `input_json_delta.partial_json`
+    / `tool_use.input`, Responses `function_call_arguments.*`), fragment or
+    whole — is forwarded **byte-exact**. NEVER filter, strip, or "clean" it,
+    not even to remove model-echoed render tags: a shape-based filter cannot
+    distinguish an echo from a literal the user genuinely wants written (bash
+    command strings, write/edit file contents), so any such "fix" silently
+    corrupts executed/persisted data. Echoed tags surfacing in a host TUI is
+    cosmetic noise — the fix for that belongs on the injection side (host
+    renderTags policy, #933), never in the argument path. Tag-echo stripping
+    applies to model PROSE only (content/reasoning/thinking/summary text
+    fields); see the invariant block atop `src/loop/tag-echo-filter.ts`.
   - *Kernel-owned split:* the FORMAT CONTRACT of the kernel-emitted ACP
     artifacts (the compression tags, block refs, `acp_summary` structure — see
     Key Design Decision #2) and the **id-never-reused guarantee** belong to
