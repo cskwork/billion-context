@@ -1,5 +1,6 @@
 import { fetchWithTimeout } from "./fetch-util.js";
 import { normalizeSseLineEndings } from "./sse-util.js";
+import { awaitDrain } from "./server/stream-io.js";
 
 /** Minimal server-response surface the guard writes SSE frames to. Kept apart
  *  from node:http so the live fold can be unit-tested against a recording sink. */
@@ -7,10 +8,11 @@ export interface SseSink {
     headersSent: boolean;
     writableEnded: boolean;
     writableNeedDrain?: boolean;
+    destroyed?: boolean;
     writeHead(status: number, headers: Record<string, string>): void;
     write(chunk: string | Uint8Array): unknown;
     end(): void;
-    once(event: "drain", cb: () => void): unknown;
+    once(event: "drain" | "close" | "error", cb: () => void): unknown;
 }
 
 /** Guard against OpenAI gpt-5.x/gpt-6.x "lattice" reasoning truncation (#739): these
@@ -442,8 +444,9 @@ async function pipeThroughRaw(stream: ReadableStream<Uint8Array>, res: SseSink):
         for (;;) {
             const { done, value } = await reader.read();
             if (done) break;
+            if (res.destroyed || res.writableEnded) break;
             res.write(value);
-            if (res.writableNeedDrain) await new Promise<void>((r) => res.once("drain", r));
+            if (res.writableNeedDrain) await awaitDrain(res);
         }
     } finally {
         reader.releaseLock();
