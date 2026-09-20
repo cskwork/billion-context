@@ -238,6 +238,21 @@ async function runForkScenario(forkAdoption: boolean): Promise<{ parentBlocks: n
         };
         assert.equal(snapshot.lineage, "forked", "child lineage must record the fork");
 
+        if (forkAdoption) {
+            // Seeded refs must preserve the parent's exact raw→ref mapping for
+            // every adopted id. Order-based assignment only coincides with it
+            // while the edit sits AFTER the folded span — pin the contract.
+            for (const b of child.state.blocks.filter((x) => x.active)) {
+                for (const raw of b.effectiveMessageIds) {
+                    const parentRef = parent.state.messageRefs.byRaw[raw];
+                    assert.ok(parentRef, `parent must hold a ref for adopted id (${b.blockId})`);
+                    assert.equal(child.state.messageRefs.byRaw[raw], parentRef, `child ref for ${raw} must equal the parent's seeded ref`);
+                }
+            }
+            assert.ok(child.state.nextBlockId >= parent.state.nextBlockId, "child block-id cursor must not fall behind the parent's");
+            assert.ok(child.state.nextRunId >= parent.state.nextRunId, "child run-id cursor must not fall behind the parent's");
+        }
+
         // The fork branch keeps talking — the adopted state must reconcile.
         forkHistory.push({ role: "assistant", content: forkReply });
         forkHistory.push({ role: "user", content: userText(run, 9) });
