@@ -469,8 +469,8 @@ small node scripts that do the work around the client:
 - **Known limitations:** subagent conversations get their own derived proxy
   sessions (kimi exposes no stable session id; tool calls bind via the
   per-call `conversation_id` argument), and kimi's native auto-compaction is
-   NOT pushed out — ACP compression simply fires first, as in launcher mode.
-   Opt-out: `BILI_NATIVE_KIMI=0`.
+  NOT pushed out — ACP compression simply fires first, as in launcher mode.
+  Opt-out: `BILI_NATIVE_KIMI=0`.
 
 ### Gemini family (Gemini CLI / iFlow CLI / Qwen Code)
 
