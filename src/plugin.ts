@@ -18,6 +18,7 @@ import { warnCacheCollapse } from "./cache-warn.js";
 import { recordCacheSample } from "./cache-ledger.js";
 import { promptInputTotal, type WireProtocol } from "./util.js";
 import { stateDir } from "./paths.js";
+import { awaitDrain } from "./server/stream-io.js";
 
 // The proxy's own version, read from package.json at runtime (works in both dev
 // via tsx and bundled via tsup). Shown in the /acp panel header, aligned with
@@ -1163,8 +1164,9 @@ export async function pipePluginChatWithStrip(
         return out;
     };
     const write = (s: string) => {
+        if (res.destroyed || res.writableEnded) return;
         if (!res.write(Buffer.from(s, "utf8"))) {
-            return new Promise<void>((r) => res.once("drain", () => r()));
+            return awaitDrain(res);
         }
     };
     // #411: an aborted read (client cancel / upstream cut) must still land the
@@ -1662,8 +1664,9 @@ export async function pipePluginResponsesWithStrip(
     let heldOutputIndex: unknown;
     let heldResponseId: unknown;
     const write = (s: string): Promise<void> => {
+        if (res.destroyed || res.writableEnded) return Promise.resolve();
         if (!res.write(Buffer.from(s, "utf8"))) {
-            return new Promise<void>((r) => res.once("drain", () => r()));
+            return awaitDrain(res);
         }
         return Promise.resolve();
     };
