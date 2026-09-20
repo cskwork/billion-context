@@ -445,6 +445,11 @@ export type ProxyOptions = {
      *  (#970, default on). Opt out with env BILI_SUBAGENT_SPLIT=0 or
      *  `subagentSplit: false` in the config file (env wins). */
     subagentSplit?: boolean;
+    /** Opt-in fork block-adoption (#629, default off). Anonymous clients
+     *  (prefix-affinity) that fork their history inherit the parent's
+     *  fully-present compression blocks instead of restarting at zero.
+     *  Enable with `forkAdoption: true` or env BILI_FORK_ADOPTION=1. */
+    forkAdoption?: boolean;
 };
 
 /** Re-read ONLY the routes from the current config sources, returning a fresh
@@ -614,6 +619,7 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
         },
         maskHosts: (env.BILI_LOG_MASK_HOSTS ?? (fileConfig.maskHosts === false ? "0" : "1")) !== "0",
         subagentSplit: (env.BILI_SUBAGENT_SPLIT ?? (fileConfig.subagentSplit === false ? "0" : "1")) !== "0",
+        forkAdoption: (env.BILI_FORK_ADOPTION ?? (fileConfig.forkAdoption === true ? "1" : "0")) !== "0",
     };
 }
 
@@ -657,6 +663,14 @@ type FileConfig = {
     /** Set `false` to keep Claude Code subagents on the main session (#970;
      *  env BILI_SUBAGENT_SPLIT=0 wins). */
     subagentSplit?: boolean;
+    /** Opt-in fork block-adoption (#629): when an anonymous (prefix-affinity)
+     *  client forks its history mid-conversation (edit / regenerate), the new
+     *  session inherits the parent's compression blocks whose source content
+     *  is fully present in the forked request, instead of restarting with
+     *  zero compression state. Default false; env BILI_FORK_ADOPTION=1 wins
+     *  over the file only when enabling (the file's explicit false cannot be
+     *  re-enabled by env). */
+    forkAdoption?: boolean;
     /** Global wire-compat block. `roles` maps message roles to the role name
      *  upstreams accept (e.g. `{"developer":"system"}`) — applied to the
      *  final forwarded body for openai/responses requests (#552). */
