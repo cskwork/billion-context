@@ -1614,7 +1614,10 @@ export async function pipePluginResponsesWithStrip(
     // Degenerate-turn retry (#732/#821 for this pipe). The first attempt's
     // done-family events are HELD until its completion event decides the turn:
     // released in place on a healthy turn, dropped whole when the retry takes
-    // over, so the client sees one turn carrying one set of ids.
+    // over, so the client sees one turn carrying one set of ids. An opening
+    // output_item.added releases them early instead — clients require
+    // done(itemN) before added(itemN+1) (#1061) — so by the terminal only the
+    // last item's family can still be held.
     let degenerateRetried = false;
     let inRetry = false;
     /** Text the client actually assembled from this attempt's deltas. */
@@ -1700,10 +1703,13 @@ export async function pipePluginResponsesWithStrip(
         inRetry && (heldItemId !== undefined || heldOutputIndex !== undefined || heldResponseId !== undefined);
     /** While the retry stream feeds the client, the framing the FIRST attempt
      *  opened is still open: the retry's own created/added events would hand the
-     *  client a second set of ids, so they are dropped. Returns true when the
-     *  event was consumed. */
+     *  client a second set of ids, so they are dropped. The retry's reasoning
+     *  surface is suppressed with them: its items were never announced (their
+     *  added is dropped), so forwarding their part frames would leak ids the
+     *  client cannot resolve (#1061). Returns true when the event was consumed. */
     const retryFraming = (type: unknown): boolean => {
         if (!inRetry) return false;
+        if (typeof type === "string" && type.startsWith("response.reasoning_summary_")) return true;
         return type === "response.created" || type === "response.output_item.added" || type === "response.content_part.added";
     };
     /** Every id the retry carries is rewritten onto the first attempt's, so the
@@ -1890,6 +1896,22 @@ export async function pipePluginResponsesWithStrip(
                         rewriteRetryIds(evOut);
                         heldVisibleChars += responsesEventTextLength(evOut);
                         heldEvents.push(rebuild ? rebuildEvent(rawEvent, evOut) : rawEvent + "\n\n");
+                        continue;
+                    }
+                    if (type === "response.output_item.added") {
+                        // Everything still held belongs to items upstream opened
+                        // before this frame, and strict clients require
+                        // done(itemN) before added(itemN+1) — opencode v2 hard-
+                        // errors on a new reasoning item while the previous one
+                        // is still open (#1061). Flush tails first: a pending
+                        // tag/arg tail belongs to the previous item's text and
+                        // must precede that item's held done. heldVisibleChars
+                        // is kept — flushed text still counts against the
+                        // empty-turn gate.
+                        let out = flushArgTails() + flushTail("");
+                        for (const held of heldEvents) out += held;
+                        heldEvents = [];
+                        await write(out + rawEvent + "\n\n");
                         continue;
                     }
                     if (type === "response.completed" || type === "response.failed" || type === "response.incomplete") {
