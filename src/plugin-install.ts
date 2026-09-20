@@ -36,7 +36,7 @@ import { applyEdits, modify as jsoncModify, parse as jsoncParse, type ParseError
 import { resolveDshHome, resolveHermesHome, resolveKimiHome, resolvePiHome } from "./client-config.js";
 import { clearClaudeNativePort, resolveClaudeNativePort, saveClaudeNativePort } from "./config.js";
 import { isPidAlive, isProxyInstanceFile, readProxyInstanceFile } from "./instance.js";
-import { DSH_PACKAGE, dshBundleInstalled, dshHasLegacyManagedBlock, dshProfileDependsOnBili, dshProfileDirs, refreshDshProfileBundles, runDshPlugin, stripLegacyManagedBlock } from "./dsh-channel.js";
+import { DSH_PACKAGE, dshBundleInstalled, dshHasLegacyManagedBlock, dshProfileDependsOnBili, dshProfileDirs, planDshSpawn, refreshDshProfileBundles, runDshPlugin, stripLegacyManagedBlock } from "./dsh-channel.js";
 import { fetchRegistryVersion } from "./update.js";
 import { restoreKimiBackup, unrouteKimi } from "./kimi/native.js";
 
@@ -1419,13 +1419,24 @@ interface HermesSidecar {
 
 function runHermesCli(args: string[]): { ok: true } | { ok: false; reason: string } {
     try {
-        execFileSync("hermes", args, { timeout: 15_000, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
-        return { ok: true };
+        // #679 spawn rules: on Windows a bare `hermes` name or a .cmd shim needs the
+        // comspec wrap — a plain execFileSync("hermes") ENOENTs there. planDshSpawn
+        // is the generic host-CLI planner (dsh-named for historical reasons).
+        const plan = planDshSpawn("hermes", args);
+        const res = spawnSync(plan.command, plan.args, {
+            timeout: 15_000,
+            encoding: "utf8",
+            stdio: ["ignore", "pipe", "pipe"],
+            windowsVerbatimArguments: plan.windowsVerbatimArguments,
+            windowsHide: true,
+        });
+        if (res.error) return { ok: false, reason: (res.error as NodeJS.ErrnoException).code === "ENOENT" ? "not-found" : String(res.error) };
+        if (res.status === 0) return { ok: true };
+        if (process.platform === "win32" && res.status === 9009) return { ok: false, reason: "not-found" };
+        const detail = (res.stderr ?? "").trim();
+        return { ok: false, reason: detail || `exit ${res.status}` };
     } catch (err) {
-        if ((err as NodeJS.ErrnoException).code === "ENOENT") return { ok: false, reason: "not-found" };
-        const stderr = (err as { stderr?: Buffer | string }).stderr;
-        const detail = typeof stderr === "string" ? stderr.trim() : stderr?.toString().trim();
-        return { ok: false, reason: detail || (err instanceof Error ? err.message : String(err)) };
+        return { ok: false, reason: err instanceof Error ? err.message : String(err) };
     }
 }
 
