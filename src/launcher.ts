@@ -54,7 +54,7 @@ import { selfPackageRoot, isBiliPiEntry, ompPluginLoadedFrom, dshNativeInstalled
 function selfDistFile(name: string): string {
     return path.join(selfPackageRoot(), "dist", name);
 }
-import { nonEmpty, resolvePiHome, resolveOmpHome, resolveDshHome, resolveCodexHome, loadClientConfig, collectModelWindows, collectModelMaxOutputs, type ClientConfig, type CodexConfig, resolveOpencodeConfigFile, readOpencodeConfigRoot, opencodePluginBaseDir, type OpencodeConfig, type OpencodeProvider, type HermesConfig, type HermesProvider, qoderIsCnSite, QODER_DEFAULT_MODEL_HOSTS, resolveTraeHome, readTraeConfig, TRAE_DEFAULT_MODEL_HOSTS, JCODE_DEFAULT_MODEL_HOSTS, type TraeConfig, resolveKimiHome, readKimiConfig, parseKimiToml, KIMI_DEFAULT_MODEL_HOSTS, type KimiConfig, type KimiProvider, readOpencodeProjectLayer, type OpencodeProjectLayer } from "./client-config.js";
+import { nonEmpty, resolvePiHome, resolveOmpHome, resolveDshHome, resolveCodexHome, loadClientConfig, collectModelWindows, collectModelMaxOutputs, type ClientConfig, type CodexConfig, resolveOpencodeConfigFile, readOpencodeConfigRoot, opencodePluginBaseDir, type OpencodeConfig, type OpencodeProvider, type HermesConfig, type HermesProvider, qoderIsCnSite, QODER_DEFAULT_MODEL_HOSTS, resolveTraeHome, readTraeConfig, TRAE_DEFAULT_MODEL_HOSTS, JCODE_DEFAULT_MODEL_HOSTS, type TraeConfig, resolveKimiHome, readKimiConfig, parseKimiToml, KIMI_DEFAULT_MODEL_HOSTS, QWEN_DEFAULT_MODEL_HOSTS, type KimiConfig, type KimiProvider, readOpencodeProjectLayer, type OpencodeProjectLayer } from "./client-config.js";
 import { loadRoutes, resolveConfiguredContextLimit, lookupContextLimit, type ProviderRoutes } from "./config.js";
 import { contextFromRegistry } from "./registry.js";
 
@@ -114,12 +114,13 @@ export {
     KIMI_DEFAULT_MODEL_HOSTS,
     type KimiConfig,
     type KimiProvider,
+    QWEN_DEFAULT_MODEL_HOSTS,
 } from "./client-config.js";
 
 export const LAUNCHER_DEFAULT_HOST = "127.0.0.1";
-export const LAUNCH_CLIENTS = ["pi", "codex", "claude", "omp", "opencode", "hermes", "dsh", "codebuddy", "qoder", "trae", "jcode", "kimi", "pi-test"] as const;
+export const LAUNCH_CLIENTS = ["pi", "codex", "claude", "omp", "opencode", "hermes", "dsh", "codebuddy", "qoder", "trae", "jcode", "kimi", "gemini", "iflow", "qwen", "pi-test"] as const;
 export type ClientName = (typeof LAUNCH_CLIENTS)[number];
-export type BaseClientName = "claude" | "codex" | "pi" | "omp" | "opencode" | "hermes" | "dsh" | "codebuddy" | "qoder" | "trae" | "jcode" | "kimi";
+export type BaseClientName = "claude" | "codex" | "pi" | "omp" | "opencode" | "hermes" | "dsh" | "codebuddy" | "qoder" | "trae" | "jcode" | "kimi" | "gemini" | "iflow" | "qwen";
 
 const HEALTH_PATH = "/__bili/health";
 const HEALTH_POLL_INTERVAL_MS = 200;
@@ -551,6 +552,56 @@ export function discoverRoutes(client: ClientName, config: ClientConfig): Discov
                 httpsDomains.push(host);
             }
         }
+    } else if (client === "gemini") {
+        // #1047: gemini-cli's @google/genai client switches to GATEWAY mode
+        // whenever GOOGLE_GEMINI_BASE_URL is set and sends model traffic
+        // DIRECTLY to that URL (its model-call fetch ignores proxy envs), so
+        // the /bili/ URL form is the only route. The SDK appends
+        // `<apiVersion>/models/…` itself (default v1beta), so wrap the bare
+        // host origin — no /v1beta suffix. A user-exported base URL is a
+        // relay: wrap IT instead of the stock endpoint (claude semantics).
+        const raw = nonEmpty(config.gemini?.baseUrl) ? config.gemini!.baseUrl! : "https://generativelanguage.googleapis.com";
+        const real = unwrapUpstream(raw);
+        try {
+            const url = new URL(real);
+            if ((url.protocol === "https:" || url.protocol === "http:") && !rewriteKeys.has("GOOGLE_GEMINI_BASE_URL")) {
+                rewriteKeys.add("GOOGLE_GEMINI_BASE_URL");
+                httpRewrites.push({ key: "GOOGLE_GEMINI_BASE_URL", realUpstream: real });
+            }
+        } catch {
+            // Unparseable base URL: leave routes empty (proxy still runs;
+            // gemini-cli falls back to its own default endpoint).
+        }
+    } else if (client === "iflow") {
+        // #1047: iFlow CLI honors IFLOW_BASE_URL natively; its stock endpoint
+        // is apis.iflow.cn/v1 (OpenAI wire — bili routes it by path). Same
+        // relay-wrap semantics as gemini.
+        const raw = nonEmpty(config.iflow?.baseUrl) ? config.iflow!.baseUrl! : "https://apis.iflow.cn/v1";
+        const real = unwrapUpstream(raw);
+        try {
+            const url = new URL(real);
+            if ((url.protocol === "https:" || url.protocol === "http:") && !rewriteKeys.has("IFLOW_BASE_URL")) {
+                rewriteKeys.add("IFLOW_BASE_URL");
+                httpRewrites.push({ key: "IFLOW_BASE_URL", realUpstream: real });
+            }
+        } catch {
+            // Unparseable base URL: leave routes empty (proxy still runs;
+            // iFlow falls back to its own default endpoint).
+        }
+    } else if (client === "qwen") {
+        // #1047: qwen-code is a heavily diverged multi-protocol fork of
+        // gemini-cli with NO base-URL override env for routing; its undici
+        // stack honors HTTPS_PROXY (setGlobalDispatcher(EnvHttpProxyAgent)),
+        // so cert-MITM is the only route. Whitelist the stock DashScope/Qwen
+        // gateways + common third-party provider hosts; custom relays go
+        // through --mitm-domain.
+        for (const h of QWEN_DEFAULT_MODEL_HOSTS) {
+            const host = h.toLowerCase();
+            if (!httpsSeen.has(host)) {
+                httpsSeen.add(host);
+                httpsDomains.push(host);
+            }
+        }
     } else {
         for (const [name, prov] of Object.entries(config.codex?.providers ?? {})) {
             classify(prov.baseUrl, `model_providers.${name}.base_url`);
@@ -798,6 +849,59 @@ export function buildQoderEnv(origin: string, caPath: string, baseEnv: NodeJS.Pr
     return { ...baseEnv, HTTPS_PROXY: origin, NODE_EXTRA_CA_CERTS: caPath, BILLION_CONTEXT_PROXY: origin };
 }
 
+export function buildGeminiEnv(
+    origin: string,
+    caPath: string,
+    httpRewrites: HttpRewrite[],
+    httpsRewrites: HttpRewrite[],
+    baseEnv: NodeJS.ProcessEnv,
+): NodeJS.ProcessEnv {
+    // No proxy/CA env: model traffic goes straight to the loopback proxy via
+    // GOOGLE_GEMINI_BASE_URL (GATEWAY mode), never through HTTPS_PROXY.
+    const env: NodeJS.ProcessEnv = { ...baseEnv, BILLION_CONTEXT_PROXY: origin };
+    const r = httpRewrites.find((rw) => rw.key === "GOOGLE_GEMINI_BASE_URL");
+    if (r) env.GOOGLE_GEMINI_BASE_URL = wrapUpstream(origin, r.realUpstream);
+    const hr = httpsRewrites.find((rw) => rw.key === "GOOGLE_GEMINI_BASE_URL");
+    if (hr) env.GOOGLE_GEMINI_BASE_URL = hr.realUpstream;
+    return env;
+}
+
+export function buildIflowEnv(
+    origin: string,
+    caPath: string,
+    httpRewrites: HttpRewrite[],
+    httpsRewrites: HttpRewrite[],
+    baseEnv: NodeJS.ProcessEnv,
+): NodeJS.ProcessEnv {
+    // iFlow accepts case variants of the base-URL env; set both documented
+    // forms so whichever the client reads first wins.
+    const env: NodeJS.ProcessEnv = { ...baseEnv, BILLION_CONTEXT_PROXY: origin };
+    const r = httpRewrites.find((rw) => rw.key === "IFLOW_BASE_URL");
+    if (r) {
+        env.IFLOW_BASE_URL = wrapUpstream(origin, r.realUpstream);
+        env.IFLOW_baseUrl = env.IFLOW_BASE_URL;
+    }
+    const hr = httpsRewrites.find((rw) => rw.key === "IFLOW_BASE_URL");
+    if (hr) {
+        env.IFLOW_BASE_URL = hr.realUpstream;
+        env.IFLOW_baseUrl = hr.realUpstream;
+    }
+    return env;
+}
+
+/** #1047: qwen-code honors HTTPS_PROXY + NODE_EXTRA_CA_CERTS (undici,
+ *  additive CA semantics like qoder); NO_PROXY keeps loopback legs direct. */
+export function buildQwenEnv(origin: string, caPath: string, baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+    return {
+        ...baseEnv,
+        HTTPS_PROXY: origin,
+        NODE_EXTRA_CA_CERTS: caPath,
+        BILLION_CONTEXT_PROXY: origin,
+        NO_PROXY: "localhost,127.0.0.1,::1",
+        no_proxy: "localhost,127.0.0.1,::1",
+    };
+}
+
 /**
  * #653: qoder's auto-compact window is a single env knob —
  * `QODER_AUTOCOMPACT_WINDOW` (`QODERCN_` prefix on the CN site) caps the
@@ -902,9 +1006,10 @@ function isPrivateIPv4(host: string): boolean {
  *  yet verified against a real build, so v1 runs pure wire mode (the proxy
  *  injects the context tools on the wire). kimi is excluded as well: its
  *  mcp.json path is hardcoded in the binary with no ephemeral-config flag,
- *  so v1 runs pure wire mode (#757). */
+ *  so v1 runs pure wire mode (#757). gemini/iflow/qwen (#1047) are excluded
+ *  like codebuddy: their MCP-injection flags are unverified, v1 is pure wire. */
 export function launcherInjectMcp(env: NodeJS.ProcessEnv, base: string, codexUpstream?: string): boolean {
-    if (base === "pi" || base === "omp" || base === "opencode" || base === "hermes" || base === "dsh" || base === "codebuddy" || base === "qoder" || base === "trae" || base === "jcode" || base === "kimi") return false;
+    if (base === "pi" || base === "omp" || base === "opencode" || base === "hermes" || base === "dsh" || base === "codebuddy" || base === "qoder" || base === "trae" || base === "jcode" || base === "kimi" || base === "gemini" || base === "iflow" || base === "qwen") return false;
     if (env.BILI_LAUNCHER_PLUGIN === "0") return false;
     if (base === "codex" && env.BILI_LAUNCHER_PLUGIN === undefined && codexUpstream !== undefined && isPrivateUpstreamHost(codexUpstream)) {
         return false;
@@ -2729,6 +2834,30 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         // Rust reqwest honors HTTPS_PROXY + SSL_CERT_FILE; NO_PROXY keeps the
         // loopback legs (unsloth endpoint, MCP) out of the proxy.
         env = buildJcodeEnv(origin, resolveCombinedCaPath(process.env), stripInheritedProxy(process.env));
+    } else if (base === "gemini") {
+        // #1047: GOOGLE_GEMINI_BASE_URL points gemini-cli's genai client
+        // straight at the loopback proxy (GATEWAY auth mode); no proxy/CA env.
+        env = buildGeminiEnv(origin, ca, routes.httpRewrites, routes.httpsRewrites, stripInheritedProxy(process.env));
+        if (routes.httpRewrites.length === 0 && routes.httpsRewrites.length === 0) {
+            console.error(
+                "bili: no routable gemini upstream found (unparseable GOOGLE_GEMINI_BASE_URL?) — traffic will NOT go through the proxy.",
+            );
+        }
+    } else if (base === "iflow") {
+        // #1047: IFLOW_BASE_URL points iFlow straight at the loopback proxy
+        // (OpenAI wire); no proxy/CA env.
+        env = buildIflowEnv(origin, ca, routes.httpRewrites, routes.httpsRewrites, stripInheritedProxy(process.env));
+        if (routes.httpRewrites.length === 0 && routes.httpsRewrites.length === 0) {
+            console.error(
+                "bili: no routable iFlow upstream found (unparseable IFLOW_BASE_URL?) — traffic will NOT go through the proxy.",
+            );
+        }
+    } else if (base === "qwen") {
+        // #1047: cert-MITM only — qwen-code has no base-URL override env, so
+        // the stock DashScope/Qwen gateways (+ --mitm-domain extras) are
+        // whitelisted for the proxy's CA. NODE_EXTRA_CA_CERTS is additive, so
+        // the plain root CA suffices.
+        env = buildQwenEnv(origin, resolveCaCertPath(process.env), stripInheritedProxy(process.env));
     } else if (base === "codex") {
         // Per-spawn conversation id for the MCP shell's headless
         // self-registration (codex provides no session id of its own).

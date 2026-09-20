@@ -50,6 +50,9 @@ Usage:
   bili trae [opts --] [args]       start a proxy + launch Trae CLI against it (cert-MITM)
   bili jcode [opts --] [args]      start a proxy + launch jcode against it (cert-MITM)
   bili kimi [opts --] [args]       start a proxy + launch Kimi Code against it (cert-MITM)
+  bili gemini [opts --] [args]     start a proxy + launch Gemini CLI against it (GOOGLE_GEMINI_BASE_URL /bili/ rewrite)
+  bili iflow [opts --] [args]      start a proxy + launch iFlow CLI against it (IFLOW_BASE_URL /bili/ rewrite)
+  bili qwen [opts --] [args]       start a proxy + launch Qwen Code against it (cert-MITM)
   bili test pi                     non-polluting pi smoke test through the proxy
   bili export [session] [--full]   list sessions / export one as a Markdown handoff
                                     (--full includes original messages; --output FILE)
@@ -71,7 +74,7 @@ Usage:
   bili --version                   print version
   bili --help                      show this help
 
-Launcher (bili pi / bili codex / bili claude / bili omp / bili opencode / bili hermes / bili dsh / bili codebuddy / bili qoder / bili trae / bili jcode / bili kimi):
+Launcher (bili pi / bili codex / bili claude / bili omp / bili opencode / bili hermes / bili dsh / bili codebuddy / bili qoder / bili trae / bili jcode / bili kimi / bili gemini / bili iflow / bili qwen):
   Brings up a proxy on an independent port (a fresh instance every launch), then runs the client pointed at it via HTTPS_PROXY + the proxy's
   MITM CA — no config-file edits. Discovered HTTPS upstream domains are
   auto-whitelisted for MITM so the proxy TLS-terminates exactly the hosts the
@@ -92,6 +95,9 @@ Launcher (bili pi / bili codex / bili claude / bili omp / bili opencode / bili h
     bili trae                             # launch Trae CLI through the proxy (cert-MITM; model host via TRAE_CLI_API_HOST or --mitm-domain)
     bili jcode                            # launch jcode through the proxy (cert-MITM; zai leg whitelisted by default)
     bili kimi                             # launch Kimi Code through the proxy (cert-MITM; provider/model hosts from ~/.kimi-code/config.toml or the managed OAuth endpoints)
+    bili gemini                           # launch Gemini CLI through the proxy (GOOGLE_GEMINI_BASE_URL /bili/ rewrite; API-key & gateway auth)
+    bili iflow                            # launch iFlow CLI through the proxy (IFLOW_BASE_URL /bili/ rewrite of apis.iflow.cn/v1)
+    bili qwen                             # launch Qwen Code through the proxy (cert-MITM; DashScope/Qwen gateways whitelisted by default, custom relays via --mitm-domain)
     bili test pi                          # quick end-to-end check of the pi path
     bili --mitm-domain api.foo.com pi     # add a domain to the MITM whitelist (flags precede the client)
     bili -F http://127.0.0.1:7897 codex   # route bili's upstream through a proxy (gost-style -F)
