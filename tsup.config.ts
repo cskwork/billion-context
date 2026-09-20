@@ -1,7 +1,7 @@
 import { defineConfig } from "tsup";
 
 export default defineConfig({
-    entry: ["src/index.ts"],
+    entry: ["src/index.ts", "src/mcp.ts", "src/claude-native-bootstrap.ts", "src/agent/pi.ts", "src/agent/pi-native.ts", "src/agent/omp.ts", "src/agent/omp-native.ts", "src/agent/opencode.ts", "src/agent/opencode-native.ts", "src/agent/dsh-acp.ts", "src/agent/dsh-native.ts", "src/kimi/native-mcp.ts", "src/kimi/bootstrap-hook.ts"],
     format: ["esm"],
     target: "node20",
     platform: "node",
@@ -15,7 +15,7 @@ export default defineConfig({
     // noExternal, esbuild keeps `import ... from "acp-kernel"` in dist, and
     // npm then installs acp-kernel as a runtime dep — breaking the
     // "dist/index.js is self-contained" contract (AGENTS.md §2.1).
-    noExternal: ["acp-kernel", "fzstd", "node-forge", "tar", "undici"],
+    noExternal: ["acp-kernel", "fzstd", "node-forge", "tar", "undici", "jsonc-parser"],
     banner: {
         // node-forge is a CommonJS dependency that calls require("crypto") etc.
         // inlined into our ESM output, esbuild's __require shim throws in an

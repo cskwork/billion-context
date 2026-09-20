@@ -1,18 +1,27 @@
 {
   "name": "billion-context",
-  "version": "0.1.32",
-  "description": "Universal context-compression proxy for AI coding agents. Sits between any agent and its model API, rewriting Anthropic/OpenAI streams with acp-kernel compression. Any agent that can set a base URL (Claude Code, Codex, Cursor, Aider) works out of the box.",
+  "version": "0.1.128",
+  "description": "Context-compression proxy that lets AI coding agents run for days — billions of tokens through one context window. Sits between any agent (Claude Code, Codex, Cursor, Aider, …) and its model API, folding consumed conversation into reversible, prefix-cache-friendly summaries. Zero per-agent code: just point your base URL at the proxy.",
   "type": "module",
   "main": "dist/index.js",
+  "exports": {
+    ".": "./dist/index.js",
+    "./server": "./dist/agent/opencode-native.js",
+    "./dsh": "./dist/agent/dsh-native.js"
+  },
   "bin": {
     "bili": "./dist/index.js",
     "bili-proxy": "./dist/index.js"
   },
   "scripts": {
     "build": "tsup",
+    "registry:snapshot": "node scripts/update-registry-snapshot.mjs",
+    "codex-models:snapshot": "node scripts/update-codex-models-snapshot.mjs",
     "typecheck": "tsc --noEmit --project tsconfig.build.json",
     "test": "node --import tsx --test tests/*.test.ts",
-    "start": "node dist/index.js"
+    "start": "node dist/index.js",
+    "test:e2e": "node --import tsx --test tests/e2e/e2e-codex.test.ts",
+    "test:e2e:fake": "node --import tsx --test tests/e2e/e2e-codex-fake.test.ts"
   },
   "keywords": [
     "context",
@@ -26,7 +35,8 @@
     "codex",
     "aider",
     "anthropic",
-    "openai"
+    "openai",
+    "pi-package"
   ],
   "license": "MIT",
   "author": "ranxianglei",
@@ -38,11 +48,15 @@
   "bugs": {
     "url": "https://github.com/ranxianglei/billion-context/issues"
   },
+  "dependencies": {
+    "zod": "4.1.8"
+  },
   "devDependencies": {
     "@types/node": "^22.0.0",
     "@types/node-forge": "^1.3.14",
-    "acp-kernel": "0.0.17",
+    "acp-kernel": "0.0.80",
     "fzstd": "0.1.1",
+    "jsonc-parser": "^3.3.1",
     "node-forge": "^1.4.0",
     "tar": "^7.5.22",
     "tsup": "^8.0.0",
@@ -54,12 +68,24 @@
     "node": ">=20"
   },
   "files": [
-    "dist",
+    "LICENSE",
     "README.md",
-    "LICENSE"
+    "dist",
+    "dsh.bundle.patch.yml"
   ],
+  "pi": {
+    "image": "https://raw.githubusercontent.com/ranxianglei/billion-context/master/docs/logo.png",
+    "extensions": [
+      "./dist/agent/pi-native.js"
+    ]
+  },
   "publishConfig": {
     "access": "public",
     "registry": "https://registry.npmjs.org"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./dsh.bundle.patch.yml"
+    }
   }
 }

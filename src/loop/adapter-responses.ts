@@ -1,8 +1,14 @@
 import type { CoreMessage } from "acp-kernel";
-import { coreToResponses, injectResponsesDeveloperMessage, patchResponsesInput, type ResponseInputItem, type ResponsesProjection } from "../responses.js";
+import { injectResponsesDeveloperMessage, type ResponseInputItem, type ResponsesProjection } from "acp-kernel/wire";
+import { coreToResponsesWithToolImages as coreToResponses, patchResponsesInputWithToolImages as patchResponsesInput } from "../responses-tool-output.js";
 import { buildVisibilityMarker } from "../compress-loop.js";
-import { ACP_TEXT_OPEN, ACP_TEXT_CLOSE, ACP_STATUS_OPEN, ACP_STATUS_CLOSE, ACP_SEARCH_OPEN, ACP_SEARCH_CLOSE, ACP_DECOMPRESS_OPEN, ACP_DECOMPRESS_CLOSE, COMPRESS_TOOL_NAME } from "../compress-tool.js";
-import type { BiliMessage } from "../bili-message.js";
+import { hoistTrappedToolItems } from "../tool-pair-order.js";
+import { hashId } from "../util.js";
+import { composeStreamFilters, createMarkerLineFilter, createTagEchoFilter, stripResponsesText, stripAcpTags, containsMarkerLineText, containsRenderTagText, ACP_NAME_ALT } from "./tag-echo-filter.js";
+import { degenerateTurnWarning } from "../degenerate-turn.js";
+import { log as loggerLog } from "../logger.js";
+import { ACP_TEXT_OPEN, ACP_TEXT_CLOSE, ACP_STATUS_OPEN, ACP_STATUS_CLOSE, ACP_SEARCH_OPEN, ACP_SEARCH_CLOSE, ACP_DECOMPRESS_OPEN, ACP_DECOMPRESS_CLOSE, COMPRESS_TOOL_NAME, PROXY_TOOL_NAMES } from "../compress-tool.js";
+import type { BiliMessage } from "acp-kernel/wire";
 import type {
     CompressLoopAdapter,
     EmitCompletionOpts,
@@ -18,8 +24,129 @@ interface FunctionCallBuffer {
     arguments: string;
 }
 
+// Upstream rejects Responses input item ids longer than 64 chars. All
+// proxy-synthesized ids stay well below this cap (#242).
+const RESPONSES_ITEM_ID_MAX = 64;
+
+/**
+ * Heal client rollouts already poisoned with over-long ids (they 400 every
+ * request otherwise). Rewrites in place, deterministically, so repeated
+ * requests keep referencing the same replacement id (#242).
+ */
+export function normalizeResponsesMessageItems(input: unknown): number {
+    if (!Array.isArray(input)) return 0;
+    let typed = 0;
+    for (const item of input) {
+        if (typeof item !== "object" || item === null) continue;
+        const rec = item as Record<string, unknown>;
+        if (rec["type"] !== undefined) continue;
+        if (rec["role"] !== "user" && rec["role"] !== "assistant") continue;
+        if (rec["content"] === undefined) continue;
+        // omp (pi-ai) sends user items without the spec-required "type" field;
+        // responsesToCore switches on item.type and silently drops type-less
+        // items, so user prompts never enter the kernel (no refs, never
+        // compressible, invisible to nudge/preflight). Stamp the standard
+        // type at ingress.
+        rec["type"] = "message";
+        typed++;
+    }
+    return typed;
+}
+
+export function sanitizeResponsesInputIds(input: unknown): void {
+    if (!Array.isArray(input)) return;
+    for (const item of input) {
+        const rec = item as Record<string, unknown>;
+        if (typeof rec?.id === "string" && rec.id.length > RESPONSES_ITEM_ID_MAX) {
+            rec.id = `msg-fix-${hashId(rec.id)}`;
+        }
+    }
+}
+
+/**
+ * Responses input flattens a mixed assistant turn (text + tool calls) into
+ * separate items, so the whitespace-only text deltas SGLang/vllm-class models
+ * emit before tool calls land as standalone 1-2 token message items (omp
+ * serializes exactly this shape). Left alone, every one gets an acp render
+ * tag — a 42-token wrapper around pure whitespace — and burns a message ref
+ * the model later has to reason about. Content-free by definition, so drop
+ * them before projection; deterministic per request, keeping refs stable.
+ */
+export function dropWhitespaceResponsesMessages(input: unknown): number {
+    if (!Array.isArray(input)) return 0;
+    let dropped = 0;
+    for (let i = input.length - 1; i >= 0; i--) {
+        const rec = input[i] as Record<string, unknown>;
+        if (rec === null || typeof rec !== "object") continue;
+        const type = rec.type;
+        // message items carry type "message"; omp's user items omit the field
+        // entirely (role + content only) — treat those as messages too.
+        if (type !== "message" && type !== undefined) continue;
+        const role = rec.role;
+        if (role !== "user" && role !== "assistant") continue;
+        const content = rec.content;
+        let text: string | undefined;
+        if (typeof content === "string") text = content;
+        else if (Array.isArray(content)) {
+            let mixed = false;
+            let joined = "";
+            for (const part of content) {
+                const p = part as Record<string, unknown>;
+                // Malformed parts (non-objects) make emptiness unknowable —
+                // treat as mixed and preserve the item.
+                if (p === null || typeof p !== "object") {
+                    mixed = true;
+                    break;
+                }
+                const pt = p.type;
+                if (pt !== undefined && pt !== "input_text" && pt !== "output_text" && pt !== "text") {
+                    mixed = true;
+                    break;
+                }
+                if (typeof p.text === "string") joined += p.text;
+            }
+            if (!mixed) text = joined;
+        }
+        // Replay stickiness: an originally-whitespace message comes back on
+        // every later request carrying the render tag a previous turn
+        // stamped onto it (tag + whitespace, still semantically empty). A
+        // tag wrapping a real ref over real content keeps the message alive;
+        // only tag-over-nothing is droppable.
+        if (text !== undefined && stripRenderTags(text).trim() === "") {
+            input.splice(i, 1);
+            dropped++;
+        }
+    }
+    return dropped;
+}
+
+const RENDER_TAG_RE = new RegExp("\x3c" + ACP_NAME_ALT + "\\s[^\x3e]*\x3e[^\x3c]*\x3c\\/" + ACP_NAME_ALT + "\x3e|\x3c" + ACP_NAME_ALT + "\\s[^\x3e]*\\/\x3e", "g");
+
+function stripRenderTags(text: string): string {
+    return text.replace(RENDER_TAG_RE, "");
+}
+
+interface MappedItem {
+    id: string;
+    index: number;
+}
+
+function rewriteItemEvent(type: string, obj: Record<string, unknown>, mapped: MappedItem): Buffer {
+    const item = { ...((obj.item as Record<string, unknown>) ?? {}), id: mapped.id };
+    return Buffer.from(`event: ${type}\ndata: ${JSON.stringify({ ...obj, output_index: mapped.index, item })}\n\n`, "utf8");
+}
+
+function rewriteRefEvent(type: string, obj: Record<string, unknown>, mapped: MappedItem): Buffer {
+    return Buffer.from(`event: ${type}\ndata: ${JSON.stringify({ ...obj, item_id: mapped.id, output_index: mapped.index })}\n\n`, "utf8");
+}
+
+function rebuildResponsesEvent(type: string, obj: Record<string, unknown>): Buffer {
+    return Buffer.from(`event: ${type}\ndata: ${JSON.stringify(obj)}\n\n`, "utf8");
+}
+
 async function* iterSseEvents(stream: ReadableStream<Uint8Array>): AsyncGenerator<string> {
     const reader = stream.getReader();
+    const decoder = new TextDecoder();
     let buf = "";
     try {
         while (true) {
@@ -31,7 +158,7 @@ async function* iterSseEvents(stream: ReadableStream<Uint8Array>): AsyncGenerato
                 break;
             }
             if (done) break;
-            buf += new TextDecoder().decode(value, { stream: true });
+            buf += decoder.decode(value, { stream: true });
             buf = buf.replace(/\r\n|\r/g, "\n");
             let idx: number;
             while ((idx = buf.indexOf("\n\n")) >= 0) {
@@ -88,6 +215,7 @@ function buildMessageItemSequence(itemId: string, outputIndex: number, text: str
 }
 
 function buildFunctionCallEvents(fc: ToolCallEmit, itemId: string, outputIndex: number): Buffer {
+    const args = stripAcpTags(fc.arguments);
     return Buffer.from(
         [
             `event: response.output_item.added\ndata: ${JSON.stringify({
@@ -98,17 +226,17 @@ function buildFunctionCallEvents(fc: ToolCallEmit, itemId: string, outputIndex: 
             `event: response.function_call_arguments.delta\ndata: ${JSON.stringify({
                 type: "response.function_call_arguments.delta",
                 item_id: itemId,
-                delta: fc.arguments,
+                delta: args,
             })}\n\n`,
             `event: response.function_call_arguments.done\ndata: ${JSON.stringify({
                 type: "response.function_call_arguments.done",
                 item_id: itemId,
-                arguments: fc.arguments,
+                arguments: args,
             })}\n\n`,
             `event: response.output_item.done\ndata: ${JSON.stringify({
                 type: "response.output_item.done",
                 output_index: outputIndex,
-                item: { type: "function_call", id: itemId, call_id: fc.callId, name: fc.name, arguments: fc.arguments },
+                item: { type: "function_call", id: itemId, call_id: fc.callId, name: fc.name, arguments: args },
             })}\n\n`,
         ].join(""),
         "utf8",
@@ -123,12 +251,25 @@ function buildCompleted(responseObj: Record<string, unknown> | null): Buffer {
     );
 }
 
-export function createResponsesAdapter(textProtocol?: boolean, projection?: ResponsesProjection): CompressLoopAdapter {
+export function createResponsesAdapter(textProtocol?: boolean, projection?: ResponsesProjection, absorbName?: string): CompressLoopAdapter {
     const suppressTextLifecycle = !!textProtocol;
     let outputIndex = 0;
     let responseObj: Record<string, unknown> | null = null;
     let terminalRaw: Buffer | null = null;
     let terminalKind: string | null = null;
+    // #440: response.failed with no preceding response.created is an orphan that
+    // crashes strict clients (codex) — same class as the anthropic gap (#413).
+    let createdForwarded = false;
+    let createdRespId: string | null = null;
+    const ensureCreated = (): Buffer | null => {
+        if (createdForwarded) return null;
+        createdForwarded = true;
+        if (!createdRespId) createdRespId = `resp-proxy-${Date.now()}`;
+        return Buffer.from(
+            `event: response.created\ndata: ${JSON.stringify({ type: "response.created", response: { id: createdRespId, status: "in_progress", output: [] } })}\n\n`,
+            "utf8",
+        );
+    };
 
     return {
         buildRequest(coreMessages, systemPrompt, requestBody) {
@@ -150,73 +291,160 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
             } else {
                 inputItems = coreToResponses(coreMessages, customToolCallIds);
             }
+            inputItems = hoistTrappedToolItems(inputItems);
             const devParts = projection && projection.systemParts.length > 0
                 ? [...projection.systemParts, systemPrompt]
                 : [systemPrompt];
             const withDev = injectResponsesDeveloperMessage(inputItems, devParts.join("\n\n---\n\n"));
             const rebuilt: Record<string, unknown> = { ...requestBody, input: withDev };
-            delete rebuilt.previous_response_id;
+            if (process.env.ACP_KEEP_RESPONSE_ID !== "1") delete rebuilt.previous_response_id;
             delete rebuilt.instructions;
             return rebuilt;
         },
 
         async *parseStream(upstream, round) {
             const pending = new Map<string, FunctionCallBuffer>();
+            const remapped = new Map<string, MappedItem>();
+            // #206: render-tag echo filter — deltas stream through the filter;
+            // full-text events (.done / output_item.done / completed response)
+            // are stripped wholesale via stripResponsesText.
+            const tagFilter = composeStreamFilters(
+                createTagEchoFilter((snippet) => {
+                    loggerLog("warn", `[tag-echo] stripped model-emitted render tag: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
+                }),
+                createMarkerLineFilter((snippet) => {
+                    loggerLog("warn", `[marker-echo] stripped model-emitted ACP confirmation marker: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
+                }),
+            );
+            let lastTextRef: { itemId: string; outputIndex: number } | null = null;
+            const flushFilter = function* (): Generator<ParsedStreamEvent> {
+                const tail = tagFilter.flush();
+                if (tail.length > 0) {
+                    const raw = lastTextRef
+                        ? rebuildResponsesEvent("response.output_text.delta", { type: "response.output_text.delta", item_id: lastTextRef.itemId, output_index: lastTextRef.outputIndex, delta: tail })
+                        : undefined;
+                    yield { kind: "text", delta: tail, ...(raw ? { raw } : {}) } as ParsedStreamEvent;
+                }
+            };
+            let sawReasoning = false;
+            let toolCallsEmitted = 0;
+            let degenerateWarned = false;
+            const maybeWarnDegenerate = (reason: string | undefined) => {
+                if (degenerateWarned) return;
+                const msg = degenerateTurnWarning({ reason, terminalReason: "completed", toolCalls: toolCallsEmitted, text: tagFilter.stats(), sawThinking: sawReasoning, wire: "responses" });
+                if (msg) {
+                    degenerateWarned = true;
+                    loggerLog("warn", msg);
+                }
+            };
             for await (const eventStr of iterSseEvents(upstream)) {
-                const type = extractEventType(eventStr);
+                const explicitType = extractEventType(eventStr);
                 const dataLine = extractDataLine(eventStr);
-                if (!type || !dataLine) continue;
+                if (!dataLine) continue;
                 let obj: Record<string, unknown>;
                 try {
                     obj = JSON.parse(dataLine);
                 } catch {
                     continue;
                 }
+                // #549: `event:` is optional per the WHATWG SSE spec (defaults to
+                // "message"); many OpenAI-compatible gateways emit pure data: frames.
+                // Responses payloads carry a `type` equal to the event name — fall
+                // back to it when no event: line is present (explicit line still wins).
+                const type = explicitType ?? (typeof obj.type === "string" ? obj.type : null);
+                if (!type) continue;
+                if (type.startsWith("response.reasoning")) sawReasoning = true;
                 const rawBuf = Buffer.from(eventStr + "\n\n", "utf8");
                 if (round === 1 && typeof obj.output_index === "number") {
                     outputIndex = Math.max(outputIndex, obj.output_index + 1);
                 }
 
                 if (type === "response.created" || type === "response.in_progress") {
+                    if (type === "response.created") {
+                        const resp = obj.response as Record<string, unknown> | undefined;
+                        if (resp && typeof resp.id === "string") createdRespId = resp.id;
+                        if (round === 1) createdForwarded = true;
+                    }
                     yield { kind: "meta", chunk: rawBuf, firstRoundOnly: true } as ParsedStreamEvent;
                 } else if (type === "response.output_item.added") {
                     const item = obj.item as Record<string, unknown> | undefined;
                     if (item?.type === "function_call") {
-                        const itemId = typeof item.id === "string" ? item.id : "";
-                        pending.set(itemId, {
-                            itemId,
-                            callId: typeof item.call_id === "string" ? item.call_id : "",
-                            name: typeof item.name === "string" ? item.name : "",
-                            arguments: "",
-                        });
+                        const fcName = typeof item.name === "string" ? item.name : "";
+                        // absorb is deliberately outside PROXY_TOOL_NAMES (kernel ACP_TOOL_NAMES);
+                        // without absorbName it would be raw-replayed as a real call and never executed.
+                        if (PROXY_TOOL_NAMES.has(fcName) || fcName === absorbName) {
+                            const itemId = typeof item.id === "string" ? item.id : "";
+                            pending.set(itemId, {
+                                itemId,
+                                callId: typeof item.call_id === "string" ? item.call_id : "",
+                                name: fcName,
+                                arguments: "",
+                            });
+                        } else {
+                            const chunk = (containsRenderTagText(eventStr) || containsMarkerLineText(eventStr)) ? rebuildResponsesEvent(type, stripResponsesText(obj)) : rawBuf;
+                            yield { kind: "meta", chunk, firstRoundOnly: false } as ParsedStreamEvent;
+                        }
                     } else if (item?.type === "custom_tool_call") {
-                        yield { kind: "meta", chunk: rawBuf, firstRoundOnly: false } as ParsedStreamEvent;
-                    } else if (!suppressTextLifecycle) {
-                        yield { kind: "meta", chunk: rawBuf, firstRoundOnly: true } as ParsedStreamEvent;
+                        const chunk = (containsRenderTagText(eventStr) || containsMarkerLineText(eventStr)) ? rebuildResponsesEvent(type, stripResponsesText(obj)) : rawBuf;
+                        yield { kind: "meta", chunk, firstRoundOnly: false } as ParsedStreamEvent;
+                    } else if (item?.type === "message" && round > 1 && !suppressTextLifecycle) {
+                        const origId = typeof item.id === "string" ? item.id : "";
+                        const mapped = { id: `msg-proxy-${round}-${hashId(origId || String(outputIndex))}`, index: outputIndex++ };
+                        if (origId) remapped.set(origId, mapped);
+                        yield { kind: "meta", chunk: rewriteItemEvent(type, obj, mapped), firstRoundOnly: false } as ParsedStreamEvent;
+                    } else if (item?.type !== "message" || !suppressTextLifecycle) {
+                        const chunk = (containsRenderTagText(eventStr) || containsMarkerLineText(eventStr)) ? rebuildResponsesEvent(type, stripResponsesText(obj)) : rawBuf;
+                        yield { kind: "meta", chunk, firstRoundOnly: true } as ParsedStreamEvent;
                     }
                 } else if (
                     type === "response.content_part.added" ||
                     type === "response.content_part.done" ||
                     type === "response.output_text.done"
                 ) {
-                    if (!suppressTextLifecycle) {
-                        yield { kind: "meta", chunk: rawBuf, firstRoundOnly: true } as ParsedStreamEvent;
+                    const mapped = remapped.get(typeof obj.item_id === "string" ? obj.item_id : "");
+                    if (mapped) {
+                        yield { kind: "meta", chunk: rewriteRefEvent(type, stripResponsesText(obj), mapped), firstRoundOnly: false } as ParsedStreamEvent;
+                    } else if (!suppressTextLifecycle) {
+                        const chunk = (containsRenderTagText(eventStr) || containsMarkerLineText(eventStr)) ? rebuildResponsesEvent(type, stripResponsesText(obj)) : rawBuf;
+                        yield { kind: "meta", chunk, firstRoundOnly: true } as ParsedStreamEvent;
                     }
                 } else if (type === "response.output_text.delta") {
                     const delta = typeof obj.delta === "string" ? obj.delta : "";
                     if (delta.length > 0) {
-                        yield { kind: "text", delta, raw: rawBuf } as ParsedStreamEvent;
+                        const itemId = typeof obj.item_id === "string" ? obj.item_id : "";
+                        const outputIndex = typeof obj.output_index === "number" ? obj.output_index : 0;
+                        const mapped = remapped.get(itemId);
+                        lastTextRef = { itemId: mapped ? mapped.id : itemId, outputIndex: mapped ? mapped.index : outputIndex };
+                        const clean = tagFilter.push(delta);
+                        if (clean.length > 0) {
+                            if (mapped) {
+                                yield { kind: "text", delta: clean, raw: rewriteRefEvent(type, { ...obj, delta: clean }, mapped) } as ParsedStreamEvent;
+                            } else if (round === 1) {
+                                const raw = clean === delta ? rawBuf : rebuildResponsesEvent(type, { ...obj, delta: clean });
+                                yield { kind: "text", delta: clean, raw } as ParsedStreamEvent;
+                            } else {
+                                yield { kind: "text", delta: clean } as ParsedStreamEvent;
+                            }
+                        }
                     }
                 } else if (type === "response.function_call_arguments.delta") {
                     const itemId = typeof obj.item_id === "string" ? obj.item_id : "";
                     const delta = typeof obj.delta === "string" ? obj.delta : "";
                     const fc = pending.get(itemId);
                     if (fc) fc.arguments += delta;
+                    else {
+                        const chunk = (containsRenderTagText(eventStr) || containsMarkerLineText(eventStr)) ? rebuildResponsesEvent(type, stripResponsesText(obj)) : rawBuf;
+                        yield { kind: "meta", chunk, firstRoundOnly: false } as ParsedStreamEvent;
+                    }
                 } else if (type === "response.function_call_arguments.done") {
                     const itemId = typeof obj.item_id === "string" ? obj.item_id : "";
                     const args = typeof obj.arguments === "string" ? obj.arguments : "";
                     const fc = pending.get(itemId);
                     if (fc && args) fc.arguments = args;
+                    else {
+                        const chunk = (containsRenderTagText(eventStr) || containsMarkerLineText(eventStr)) ? rebuildResponsesEvent(type, stripResponsesText(obj)) : rawBuf;
+                        yield { kind: "meta", chunk, firstRoundOnly: false } as ParsedStreamEvent;
+                    }
                 } else if (type === "response.output_item.done") {
                     const item = obj.item as Record<string, unknown> | undefined;
                     if (item?.type === "function_call") {
@@ -225,20 +453,45 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
                         if (fc) {
                             if (typeof item.arguments === "string" && item.arguments) fc.arguments = item.arguments;
                             pending.delete(itemId);
+                            toolCallsEmitted++;
                             yield {
                                 kind: "tool_call",
                                 name: fc.name,
                                 callId: fc.callId,
-                                arguments: fc.arguments,
+                                arguments: stripAcpTags(fc.arguments),
+                            } as ParsedStreamEvent;
+                        } else {
+                            const chunk = (containsRenderTagText(eventStr) || containsMarkerLineText(eventStr)) ? rebuildResponsesEvent(type, stripResponsesText(obj)) : rawBuf;
+                            yield { kind: "meta", chunk, firstRoundOnly: false } as ParsedStreamEvent;
+                            toolCallsEmitted++;
+                            yield {
+                                kind: "tool_call",
+                                name: typeof item.name === "string" ? item.name : "",
+                                callId: typeof item.call_id === "string" ? item.call_id : "",
+                                arguments: typeof item.arguments === "string" ? stripAcpTags(item.arguments) : "",
+                                passthrough: true,
                             } as ParsedStreamEvent;
                         }
                     } else if (item?.type === "custom_tool_call") {
-                        yield { kind: "meta", chunk: rawBuf, firstRoundOnly: false } as ParsedStreamEvent;
-                    } else if (!suppressTextLifecycle) {
-                        yield { kind: "meta", chunk: rawBuf, firstRoundOnly: true } as ParsedStreamEvent;
+                        const chunk = (containsRenderTagText(eventStr) || containsMarkerLineText(eventStr)) ? rebuildResponsesEvent(type, stripResponsesText(obj)) : rawBuf;
+                        yield { kind: "meta", chunk, firstRoundOnly: false } as ParsedStreamEvent;
+                    } else if (item?.type === "message") {
+                        const origId = typeof item.id === "string" ? item.id : "";
+                        const mapped = remapped.get(origId);
+                        if (mapped) {
+                            remapped.delete(origId);
+                            yield { kind: "meta", chunk: rewriteItemEvent(type, stripResponsesText(obj), mapped), firstRoundOnly: false } as ParsedStreamEvent;
+                        } else if (!suppressTextLifecycle) {
+                            const chunk = (containsRenderTagText(eventStr) || containsMarkerLineText(eventStr)) ? rebuildResponsesEvent(type, stripResponsesText(obj)) : rawBuf;
+                            yield { kind: "meta", chunk, firstRoundOnly: true } as ParsedStreamEvent;
+                        }
+                    } else if (item?.type !== "message" || !suppressTextLifecycle) {
+                        const chunk = (containsRenderTagText(eventStr) || containsMarkerLineText(eventStr)) ? rebuildResponsesEvent(type, stripResponsesText(obj)) : rawBuf;
+                        yield { kind: "meta", chunk, firstRoundOnly: true } as ParsedStreamEvent;
                     }
                 } else if (type === "response.completed") {
-                    responseObj = (obj.response as Record<string, unknown>) ?? null;
+                    yield* flushFilter();
+                    responseObj = stripResponsesText((obj.response as Record<string, unknown>) ?? null);
                     terminalKind = "completed";
                     terminalRaw = null;
                     const respUsage = (responseObj as Record<string, unknown> | null)?.usage as
@@ -251,12 +504,15 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
                         outputTokens: typeof respUsage?.output_tokens === "number" ? respUsage.output_tokens : undefined,
                         cachedTokens: typeof pd?.cached_tokens === "number" ? pd.cached_tokens : undefined,
                     } as ParsedStreamEvent;
-                    yield { kind: "done", finishReason: "completed" } as ParsedStreamEvent;
+                    maybeWarnDegenerate("completed");
+                    yield { kind: "done", finishReason: "completed", thinking: sawReasoning } as ParsedStreamEvent;
                 } else if (type === "response.incomplete") {
+                    yield* flushFilter();
                     terminalKind = "incomplete";
                     terminalRaw = rawBuf;
                     yield { kind: "done", finishReason: "incomplete" } as ParsedStreamEvent;
                 } else if (type === "response.failed" || type === "response.error") {
+                    yield* flushFilter();
                     terminalKind = "failed";
                     terminalRaw = rawBuf;
                     yield { kind: "done", finishReason: "failed" } as ParsedStreamEvent;
@@ -265,7 +521,7 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
                 }
             }
             if (!terminalKind) {
-                yield { kind: "done", finishReason: "failed" } as ParsedStreamEvent;
+                yield { kind: "done", finishReason: "failed", truncated: true } as ParsedStreamEvent;
             }
         },
 
@@ -292,15 +548,19 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
                 return terminalRaw;
             }
             if (!responseObj && opts?.finishReason === "failed") {
+                const parts: Buffer[] = [];
+                const created = ensureCreated();
+                if (created) parts.push(created);
                 const failed = {
-                    id: `resp-error-${Date.now()}`,
+                    id: createdRespId ?? `resp-error-${Date.now()}`,
                     status: "failed",
                     error: { code: "server_error", message: "upstream returned no response" },
                 };
-                return Buffer.from(
+                parts.push(Buffer.from(
                     `event: response.failed\ndata: ${JSON.stringify({ type: "response.failed", response: failed })}\n\n`,
                     "utf8",
-                );
+                ));
+                return Buffer.concat(parts);
             }
             let resp = responseObj
                 ? ({ ...responseObj } as Record<string, unknown>)
@@ -325,15 +585,19 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
         },
 
         emitError(message) {
+            const parts: Buffer[] = [];
+            const created = ensureCreated();
+            if (created) parts.push(created);
             const resp = {
-                id: `resp-error-${Date.now()}`,
+                id: createdRespId ?? `resp-error-${Date.now()}`,
                 status: "failed",
                 error: { code: "server_error", message },
             };
-            return Buffer.from(
+            parts.push(Buffer.from(
                 `event: response.failed\ndata: ${JSON.stringify({ type: "response.failed", response: resp })}\n\n`,
                 "utf8",
-            );
+            ));
+            return Buffer.concat(parts);
         },
 
         extractTextTriggers(text) {

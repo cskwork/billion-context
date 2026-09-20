@@ -1,8 +1,11 @@
 import { execFileSync } from "node:child_process";
 import net from "node:net";
 import tls from "node:tls";
-import { ProxyAgent } from "undici";
+import { Pool, ProxyAgent } from "undici";
 import type { ProviderRoutes } from "./config.js";
+import { log as loggerLog } from "./logger.js";
+import { maskHostInText, maskUrlForLog } from "./log-mask.js";
+import { upstreamTimeoutMs } from "./fetch-util.js";
 
 export type ParsedHttpProxy = {
     url: string;
@@ -20,6 +23,10 @@ export type ProxyFallbackOptions = {
     biliPort?: number;
     systemProxy?: WindowsSystemProxy;
     globalSource?: "bili-env" | "web-manual" | "config" | "auto" | "direct";
+    /** True only when the user EXPLICITLY set proxy mode "direct". The default
+     *  unset mode also parses as "direct" but means "no preference" — in that
+     *  case an empty globalProxy must fall through to env proxy discovery. */
+    explicitDirect?: boolean;
 };
 
 export type UpstreamProxyDecision = {
@@ -110,8 +117,37 @@ export function parseHttpProxy(proxy?: string, biliPort?: number): ParsedHttpPro
     };
 }
 
+/** Non-http(s) scheme of a proxy value (e.g. "socks5h"), or undefined when the
+ *  value is empty/unparseable/http(s). MUST stay in sync with parseHttpProxy's
+ *  schemeless `http://` normalization — otherwise a bare `host:port` would be
+ *  flagged unsupported while parseHttpProxy accepts it. */
+export function unsupportedProxyScheme(proxy?: string): string | undefined {
+    if (!proxy || typeof proxy !== "string" || !proxy.trim()) return undefined;
+    const candidate = /^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(proxy.trim()) ? proxy.trim() : `http://${proxy.trim()}`;
+    let url: URL;
+    try {
+        url = new URL(candidate);
+    } catch {
+        return undefined;
+    }
+    return url.protocol === "http:" || url.protocol === "https:" ? undefined : url.protocol.replace(/:$/, "");
+}
+
+const warnedUnsupportedSchemes = new Set<string>();
+
+function warnUnsupportedScheme(source: string, value: string, scheme: string): void {
+    const key = `${source}\u0000${scheme}`;
+    if (warnedUnsupportedSchemes.has(key)) return;
+    warnedUnsupportedSchemes.add(key);
+    loggerLog("warn", `[upstream-proxy] ignoring ${source}=${redactProxyUrl(value)}: scheme "${scheme}" is not supported — only http:// and https:// proxy origins work. For Clash/mihomo, point bili at the same mixed port over http:// (e.g. http://127.0.0.1:7890).`);
+}
+
 export function validateHttpProxy(proxy: string | undefined, biliPort?: number): void {
     if (!proxy?.trim()) return;
+    const scheme = unsupportedProxyScheme(proxy);
+    if (scheme) {
+        throw new Error(`upstream proxy uses unsupported scheme "${scheme}" (${redactProxyUrl(proxy)}) — only http:// and https:// proxies are supported; for Clash/mihomo use the same mixed port over http:// (e.g. http://127.0.0.1:7890)`);
+    }
     if (!parseHttpProxy(proxy, biliPort)) {
         throw new Error(`upstream proxy must be an HTTP/HTTPS proxy origin: ${redactProxyUrl(proxy)}`);
     }
@@ -237,7 +273,7 @@ export function resolveProxyDecision(
             return { proxy: parsed.url, source: "provider" };
         }
     }
-    if (globalProxy === "") return { source: "direct" };
+    if (globalProxy === "" && fallback.explicitDirect) return { source: "direct" };
     const explicit = parseHttpProxy(globalProxy, fallback.biliPort)?.url;
     if (explicit) return { proxy: explicit, source: fallback.globalSource ?? "global" };
     if (target && matchesNoProxy(target, fallback.noProxy)) return { source: "no-proxy" };
@@ -247,12 +283,17 @@ export function resolveProxyDecision(
     for (const [source, value] of environmentCandidates) {
         const parsed = parseFallbackProxy(value, fallback.biliPort);
         if (parsed) return { proxy: parsed.url, source };
+        if (!value) continue;
+        const scheme = unsupportedProxyScheme(value);
+        if (scheme) warnUnsupportedScheme(source, value, scheme);
     }
     const system = fallback.systemProxy ?? readWindowsSystemProxy();
     if (target && matchesNoProxy(target, system.bypass)) {
         return { source: "windows-bypass", ...(system.autoConfigUrl ? { autoConfigUrl: system.autoConfigUrl } : {}) };
     }
     const systemValue = target?.protocol === "http:" ? system.http : system.https ?? system.http;
+    const systemScheme = unsupportedProxyScheme(systemValue);
+    if (systemValue && systemScheme) warnUnsupportedScheme("windows-system", systemValue, systemScheme);
     const systemProxy = parseFallbackProxy(systemValue, fallback.biliPort)?.url;
     if (systemProxy) {
         return {
@@ -273,12 +314,26 @@ export function resolveProxy(
     return resolveProxyDecision(routes, globalProxy, upstreamUrl, fallback).proxy;
 }
 
-export function proxyDispatcher(proxyUrl: string | undefined): object | undefined {
+/** Proxy dispatchers carry the same timeout policy as direct ones (#551):
+ *  headersTimeout/bodyTimeout on the ProxyAgent cover every origin pool it
+ *  creates (undici spreads its options into the internal Agent), while the
+ *  explicit factory/clientFactory set them on hops undici builds with a bare
+ *  `{ connect }` option bag (proxy-side CONNECT client, HTTP/1 proxy wrapper). */
+export function proxyDispatcher(proxyUrl: string | undefined, timeoutMs?: number): object | undefined {
     if (!proxyUrl) return undefined;
-    let agent = dispatcherCache.get(proxyUrl);
+    const t = timeoutMs ?? upstreamTimeoutMs();
+    const key = `${proxyUrl}\u0000${t}`;
+    let agent = dispatcherCache.get(key);
     if (!agent) {
-        agent = new ProxyAgent({ uri: proxyUrl });
-        dispatcherCache.set(proxyUrl, agent);
+        const withTimeouts = (options: object): object => ({ ...options, headersTimeout: t, bodyTimeout: t });
+        agent = new ProxyAgent({
+            uri: proxyUrl,
+            headersTimeout: t,
+            bodyTimeout: t,
+            factory: (origin, options) => new Pool(origin, withTimeouts(options)),
+            clientFactory: (origin, options) => new Pool(origin, withTimeouts(options)),
+        });
+        dispatcherCache.set(key, agent);
     }
     return agent;
 }
@@ -298,13 +353,47 @@ function openProxySocket(proxy: ParsedHttpProxy): net.Socket {
     return net.connect(proxy.port, proxy.host);
 }
 
+const CONNECT_TIMEOUT_MS = 10_000;
+
+// Test seam: lets tests substitute a connect factory that never completes,
+// so the direct-path timeout can be asserted in milliseconds instead of
+// simulating a black-holed port (ESM namespaces are immutable — the repo's
+// established _...ForTest pattern instead of module mocking).
+let connectFactory: (port: number, host: string) => net.Socket = (port, host) => net.connect(port, host);
+
+export function _setConnectFactoryForTest(factory: ((port: number, host: string) => net.Socket) | undefined): void {
+    connectFactory = factory ?? ((port, host) => net.connect(port, host));
+}
+
+/** Plain (non-proxied) outbound TCP connect with a bounded handshake:
+ *  a black-holed upstream (firewall drop, routing hole) must fail in seconds,
+ *  not after the OS default ~127s (tcp_syn_retries). Mirrors the proxied
+ *  branch's 10s handshake timeout (see #78). */
+export function connectDirect(host: string, port: number, timeoutMs: number = CONNECT_TIMEOUT_MS): Promise<net.Socket> {
+    return new Promise((resolve, reject) => {
+        const socket = connectFactory(port, host);
+        let settled = false;
+        const finishError = (error: Error) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            socket.destroy();
+            reject(error);
+        };
+        const timer = setTimeout(() => finishError(new Error(`upstream connect ${host}:${port} timed out after ${timeoutMs}ms`)), timeoutMs);
+        socket.once("error", finishError);
+        socket.once("connect", () => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            resolve(socket);
+        });
+    });
+}
+
 export function connectThroughProxy(host: string, port: number, proxyUrl: string | undefined): Promise<net.Socket> {
     if (!proxyUrl) {
-        return new Promise((resolve, reject) => {
-            const socket = net.connect(port, host);
-            socket.once("connect", () => resolve(socket));
-            socket.once("error", reject);
-        });
+        return connectDirect(host, port);
     }
     const proxy = parseHttpProxy(proxyUrl);
     if (!proxy) return Promise.reject(new Error(`invalid upstream proxy: ${redactProxyUrl(proxyUrl)}`));
@@ -318,7 +407,7 @@ export function connectThroughProxy(host: string, port: number, proxyUrl: string
             socket.destroy();
             reject(error);
         };
-        const timer = setTimeout(() => finishError(new Error(`upstream proxy CONNECT ${host}:${port} handshake timeout`)), 10_000);
+        const timer = setTimeout(() => finishError(new Error(`upstream proxy CONNECT ${host}:${port} handshake timeout`)), CONNECT_TIMEOUT_MS);
         socket.once("error", finishError);
         const connectedEvent = proxy.protocol === "https:" ? "secureConnect" : "connect";
         socket.once(connectedEvent, () => {
@@ -394,13 +483,23 @@ export function formatUpstreamError(error: unknown, url: string, proxyUrl?: stri
     const chain = errorChain(error);
     const fields = ["code", "errno", "syscall", "address", "port"];
     const parts: string[] = [];
+    // Error text from undici/OS layers embeds the endpoint identity
+    // ("connect ECONNREFUSED 10.0.0.5:8443", "getaddrinfo ENOTFOUND
+    // relay.internal") — swap in the placeholder when the upstream is a
+    // non-public host so the failure log leaks nothing either.
+    const maskHostIn = (s: string): string => {
+        try {
+            return maskHostInText(s, new URL(url).hostname);
+        } catch { /* not a URL — nothing to mask */ }
+        return s;
+    };
     for (const field of fields) {
         const value = chain.find((entry) => entry[field] !== undefined)?.[field];
-        if (value !== undefined) parts.push(`${field}=${String(value)}`);
+        if (value !== undefined) parts.push(`${field}=${maskHostIn(String(value))}`);
     }
-    const messages = chain.map((entry) => String(entry.message ?? "")).filter(Boolean);
+    const messages = chain.map((entry) => maskHostIn(String(entry.message ?? ""))).filter(Boolean);
     if (messages.length > 0) parts.push(`message=${messages.join(" <- ")}`);
-    parts.push(`url=${url}`);
+    parts.push(`url=${maskUrlForLog(url)}`);
     parts.push(`proxy=${redactProxyUrl(proxyUrl) ?? "direct"}`);
     return parts.join(" ");
 }
@@ -423,4 +522,5 @@ export function _resetUpstreamProxyForTest(): void {
     resetProxyCache();
     lastConnection = {};
     windowsProxyCache = undefined;
+    warnedUnsupportedSchemes.clear();
 }

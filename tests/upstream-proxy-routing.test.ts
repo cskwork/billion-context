@@ -4,12 +4,14 @@ import http from "node:http";
 import net from "node:net";
 import { once } from "node:events";
 import { defaultConfig } from "acp-kernel";
-import { loadOptions, type ProxyOptions } from "../src/config.ts";
+import { loadOptions, resolveConfiguredContextLimit, type ProxyOptions, type ProviderRoutes } from "../src/config.ts";
 import { resolveUpstream, startServer } from "../src/server.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { fetchWithTimeout } from "../src/fetch-util.ts";
+import { setLogCapture } from "../src/logger.ts";
 import {
+    _resetUpstreamProxyForTest,
     formatUpstreamError,
     matchesNoProxy,
     parseHttpProxy,
@@ -17,6 +19,8 @@ import {
     resetProxyCache,
     resolveProxy,
     resolveProxyDecision,
+    unsupportedProxyScheme,
+    validateHttpProxy,
 } from "../src/upstream-proxy.ts";
 
 function listen(server: http.Server, port: number = 0): Promise<void> {
@@ -34,23 +38,76 @@ test("/bili/ resolves upstream host and full path from embedded URL", () => {
         upstream: "https://relay.example",
         rewrittenUrl: "https://relay.example/openai/v1/responses?foo=a%2Fb",
         explicitProtocol: undefined,
+        tunnel: true,
     });
     assert.deepEqual(resolveUpstream(opts, "/bili/https://relay.example/openai/v1/future/unknown?x=1"), {
         upstream: "https://relay.example",
         rewrittenUrl: "https://relay.example/openai/v1/future/unknown?x=1",
         explicitProtocol: undefined,
+        tunnel: true,
     });
     assert.deepEqual(resolveUpstream(opts, "/bili/responses/https://relay.example/custom-path"), {
         upstream: "https://relay.example",
         rewrittenUrl: "https://relay.example/custom-path",
         explicitProtocol: "responses",
+        tunnel: true,
     });
     assert.deepEqual(resolveUpstream(opts, "/bili/anthropic/https://relay.example/api/generate"), {
         upstream: "https://relay.example",
         rewrittenUrl: "https://relay.example/api/generate",
         explicitProtocol: "anthropic",
+        tunnel: true,
     });
     assert.equal(resolveUpstream(opts, "/bili-not-owned/responses"), undefined);
+});
+
+test("#535/#562: absolute-form request URLs route as forward-proxy targets", () => {
+    const opts = loadOptions({ ACP_PORT: "8787" });
+    // httpx through an http_proxy emits absolute form for plain-http base URLs
+    assert.deepEqual(resolveUpstream(opts, "http://127.0.0.1:8199/v1/chat/completions", { headers: { host: "127.0.0.1:8787" } } as never), {
+        upstream: "http://127.0.0.1:8199",
+        rewrittenUrl: "http://127.0.0.1:8199/v1/chat/completions",
+        tunnel: true,
+    });
+    assert.deepEqual(resolveUpstream(opts, "https://relay.example/v1/responses?x=1", { headers: { host: "127.0.0.1:8787" } } as never), {
+        upstream: "https://relay.example",
+        rewrittenUrl: "https://relay.example/v1/responses?x=1",
+        tunnel: true,
+    });
+    // #562: the real transport form — every genuine forward-proxy request has
+    // Host == the URL authority (the client points Host at the UPSTREAM, not the
+    // proxy). These MUST route as tunnels; previously they were dropped to
+    // undefined (misread as self), silently losing per-upstream window config.
+    assert.deepEqual(resolveUpstream(opts, "http://model-server.example.invalid:8080/v1/responses", { headers: { host: "model-server.example.invalid:8080" } } as never), {
+        upstream: "http://model-server.example.invalid:8080",
+        rewrittenUrl: "http://model-server.example.invalid:8080/v1/responses",
+        tunnel: true,
+    });
+    // A target pointing back at the proxy's own listen endpoint is still marked
+    // a tunnel here — the client Host header cannot distinguish it from a real
+    // upstream in a forward proxy. It is rejected downstream by
+    // checkTunnelDestination's self-layer (bound port + local IP) before any
+    // forwarding; see the forward-absolute-url self-target integration test.
+    assert.deepEqual(resolveUpstream(opts, "http://127.0.0.1:8787/v1/chat/completions", { headers: { host: "127.0.0.1:8787" } } as never), {
+        upstream: "http://127.0.0.1:8787",
+        rewrittenUrl: "http://127.0.0.1:8787/v1/chat/completions",
+        tunnel: true,
+    });
+    assert.equal(resolveUpstream(opts, "http://127.0.0.1:8787:bad/v1"), undefined, "malformed absolute URL falls through");
+    assert.equal(resolveUpstream(opts, "/v1/chat/completions", { headers: { host: "127.0.0.1:8787" } } as never), undefined, "origin-form stays own-API");
+});
+
+test("#562: forward-proxy and /bili/ forms of the same upstream resolve the same model window", () => {
+    const opts = loadOptions({ ACP_PORT: "8787" });
+    const fwd = resolveUpstream(opts, "http://model-server.example.invalid:8080/v1/responses", { headers: { host: "model-server.example.invalid:8080" } } as never);
+    const bili = resolveUpstream(opts, "/bili/http://model-server.example.invalid:8080/v1/responses");
+    assert.ok(fwd && bili, "both access modes must produce a route");
+    assert.equal(fwd.rewrittenUrl, bili.rewrittenUrl, "forward-proxy and /bili/ must share one target resolution");
+    const routes: ProviderRoutes = {
+        "http://model-server.example.invalid:8080": { models: { "example-model": { context: 120_000 } } },
+    };
+    assert.equal(resolveConfiguredContextLimit(routes, fwd.rewrittenUrl, "example-model"), 120_000, "forward-proxy hits the per-upstream window, not the global default");
+    assert.equal(resolveConfiguredContextLimit(routes, bili.rewrittenUrl, "example-model"), 120_000);
 });
 
 test("/bili/ integration preserves query, subscription, account and thread headers", async () => {
@@ -162,7 +219,49 @@ test("loadOptions keeps BILI_UPSTREAM_PROXY above config/environment fallback", 
         noProxy: "localhost,127.0.0.1",
         biliPort: 9100,
         globalSource: "bili-env",
+        explicitDirect: false,
     });
+});
+
+test("default (unset mode) is direct, not env auto-detect (#346)", () => {
+    const prevConfig = process.env.BILI_CONFIG_FILE;
+    process.env.BILI_CONFIG_FILE = "/nonexistent/bili-test-config.json";
+    try {
+        // No BILI_UPSTREAM_PROXY_MODE and no BILI_UPSTREAM_PROXY, but HTTPS_PROXY is
+        // set in the environment. Before the #346 fix, unset mode auto-detected the
+        // env proxy; now unset means "direct" (matches the web UI default + ZCode).
+        const opts = loadOptions({
+            ACP_PORT: "9101",
+            HTTPS_PROXY: "http://fallback.example:8080",
+        });
+        assert.equal(opts.proxy, "");
+        assert.equal(opts.proxySource, "direct");
+        assert.equal(opts.proxyFallback.explicitDirect, true);
+        const decision = resolveProxyDecision(opts.routes, opts.proxy, "https://api.example.com/v1", opts.proxyFallback);
+        assert.deepEqual(decision, { source: "direct" });
+    } finally {
+        if (prevConfig === undefined) delete process.env.BILI_CONFIG_FILE;
+        else process.env.BILI_CONFIG_FILE = prevConfig;
+    }
+});
+
+test("explicit 'auto' mode still follows the env proxy (#346 opt-in)", () => {
+    const prevConfig = process.env.BILI_CONFIG_FILE;
+    process.env.BILI_CONFIG_FILE = "/nonexistent/bili-test-config.json";
+    try {
+        const opts = loadOptions({
+            ACP_PORT: "9102",
+            BILI_UPSTREAM_PROXY_MODE: "auto",
+            HTTPS_PROXY: "http://fallback.example:8080",
+        });
+        assert.equal(opts.proxySource, "auto");
+        assert.equal(opts.proxyFallback.explicitDirect, false);
+        const decision = resolveProxyDecision(opts.routes, opts.proxy, "https://api.example.com/v1", opts.proxyFallback);
+        assert.deepEqual(decision, { proxy: "http://fallback.example:8080/", source: "HTTPS_PROXY" });
+    } finally {
+        if (prevConfig === undefined) delete process.env.BILI_CONFIG_FILE;
+        else process.env.BILI_CONFIG_FILE = prevConfig;
+    }
 });
 
 test("PR #67 ProxyAgent remains the sole HTTP egress transport", async () => {
@@ -209,6 +308,75 @@ test("PR #67 ProxyAgent remains the sole HTTP egress transport", async () => {
         upstream.closeAllConnections();
         await close(upstream);
     }
+});
+
+test("#1014: unsupportedProxyScheme classifies schemes without false positives on bare host:port", () => {
+    assert.equal(unsupportedProxyScheme("socks5h://127.0.0.1:7890"), "socks5h");
+    assert.equal(unsupportedProxyScheme("socks5://127.0.0.1:1080"), "socks5");
+    assert.equal(unsupportedProxyScheme("socks://proxy.example:1080"), "socks");
+    assert.equal(unsupportedProxyScheme("http://proxy.example:8080"), undefined);
+    assert.equal(unsupportedProxyScheme("https://proxy.example:9443"), undefined);
+    assert.equal(unsupportedProxyScheme("127.0.0.1:7890"), undefined, "schemeless host:port normalizes to http like parseHttpProxy");
+    assert.equal(unsupportedProxyScheme(undefined), undefined);
+    assert.equal(unsupportedProxyScheme(""), undefined);
+});
+
+test("#1014: env proxy with unsupported scheme falls through to direct loudly, once per source+scheme", () => {
+    _resetUpstreamProxyForTest();
+    const captured: Array<{ level: string; msg: string }> = [];
+    setLogCapture((level, msg) => captured.push({ level, msg }));
+    try {
+        const fallback = {
+            httpsProxy: "socks5h://user:secret@127.0.0.1:7890",
+            allProxy: "socks5://127.0.0.1:1080",
+            systemProxy: { enabled: false },
+            biliPort: 8787,
+        };
+        const first = resolveProxyDecision({}, undefined, "https://api.example.com/v1", fallback);
+        assert.deepEqual(first, { source: "direct" });
+        const warnings = () => captured.filter((entry) => entry.level === "warn" && entry.msg.startsWith("[upstream-proxy] ignoring"));
+        assert.equal(warnings().length, 2, `expected 2 warnings, got: ${captured.map((e) => e.msg).join(" | ")}`);
+        assert.ok(warnings().some((entry) => entry.msg.includes("HTTPS_PROXY=socks5h://***:***@127.0.0.1:7890")), "redacted HTTPS_PROXY warning");
+        assert.ok(!captured.some((entry) => entry.msg.includes("secret")), "credential must not leak into the log");
+        assert.ok(warnings().some((entry) => entry.msg.includes("ALL_PROXY=socks5://127.0.0.1:1080") && entry.msg.includes('scheme "socks5"')));
+        assert.ok(warnings().every((entry) => entry.msg.includes("mixed port over http://")));
+        const before = captured.length;
+        const second = resolveProxyDecision({}, undefined, "https://api.example.com/v1", fallback);
+        assert.deepEqual(second, { source: "direct" });
+        assert.equal(captured.length, before, "warning must not repeat on later requests");
+    } finally {
+        setLogCapture(null);
+        _resetUpstreamProxyForTest();
+    }
+});
+
+test("#1014: a valid env proxy still wins while an earlier unsupported one warns and drops", () => {
+    _resetUpstreamProxyForTest();
+    const captured: Array<{ level: string; msg: string }> = [];
+    setLogCapture((level, msg) => captured.push({ level, msg }));
+    try {
+        const decision = resolveProxyDecision({}, undefined, "https://api.example.com/v1", {
+            httpsProxy: "socks5h://127.0.0.1:7890",
+            httpProxy: "http://fallback.example:8080",
+            systemProxy: { enabled: false },
+            biliPort: 8787,
+        });
+        assert.deepEqual(decision, { proxy: "http://fallback.example:8080/", source: "HTTP_PROXY" });
+        const warnings = captured.filter((entry) => entry.level === "warn" && entry.msg.startsWith("[upstream-proxy] ignoring"));
+        assert.equal(warnings.length, 1);
+        assert.ok(warnings[0].msg.includes("HTTPS_PROXY=socks5h://127.0.0.1:7890"));
+    } finally {
+        setLogCapture(null);
+        _resetUpstreamProxyForTest();
+    }
+});
+
+test("#1014: explicit socks proxy fails startup with an actionable error, not the generic origin message", () => {
+    assert.throws(() => validateHttpProxy("socks5h://127.0.0.1:7890"), /unsupported scheme "socks5h"/);
+    assert.throws(() => validateHttpProxy("socks5://127.0.0.1:1080"), /mixed port over http/);
+    assert.throws(() => validateHttpProxy("http://proxy.example/bad-path"), /must be an HTTP\/HTTPS proxy origin/);
+    assert.doesNotThrow(() => validateHttpProxy("http://127.0.0.1:7890"));
+    assert.doesNotThrow(() => validateHttpProxy(undefined));
 });
 
 test("upstream failures expand nested causes with redacted proxy context", () => {

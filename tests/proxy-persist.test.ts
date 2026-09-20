@@ -1,12 +1,13 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
-import { join, relative, sep } from "node:path";
+import { mkdirSync, mkdtempSync, rmSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { SessionStore } from "../src/persist.ts";
-import { createInitialState } from "acp-kernel";
+import { setLogCapture } from "../src/logger.ts";
+import { dirname, join, relative, sep } from "node:path";
 import type { Session, BlockContent } from "../src/session.ts";
-
+import { createInitialState } from "acp-kernel";
 /** Recursively collect *.json files under dir (sessions are namespaced into
  *  protocol/ subdirs). */
 function jsonFilesUnder(dir: string): string[] {
@@ -52,6 +53,21 @@ async function settle(ms = 30): Promise<void> {
     await new Promise((r) => setTimeout(r, ms));
 }
 
+/** Poll probe() until it returns non-nullish, failing after deadlineMs.
+ *  Used where a write can legitimately land late: acp-kernel retries
+ *  transient ENOENT/ENOTDIR (CI Windows temp sweeps) with backoff, so a
+ *  debounced flush may surface seconds after its 5ms timer — a fixed
+ *  sleep would flake even though the data is safe. */
+async function waitFor<T>(probe: () => T | null | undefined, deadlineMs: number, what: string): Promise<T> {
+    const start = Date.now();
+    for (;;) {
+        const v = probe();
+        if (v != null) return v;
+        if (Date.now() - start > deadlineMs) throw new Error(`timed out after ${deadlineMs}ms waiting for ${what}`);
+        await settle(10);
+    }
+}
+
 await withTempStore("writeNow round-trips state + blockContents", async (store, dir) => {
     const s = makeSession("sess-1");
     s.stats.requests = 42;
@@ -64,8 +80,12 @@ await withTempStore("writeNow round-trips state + blockContents", async (store, 
 
     const files = jsonFilesUnder(dir);
     assert.ok(files.length > 0, "a session json file was written");
-    const raw = JSON.parse(readFileSync(files[0], "utf8"));
-    assert.equal(raw.id, "sess-1");
+    // Files are envelope-wrapped {version, savedAt, id, payload}; the record
+    // itself moved under `payload` (acp-kernel StateStore mechanism).
+    const envelope = JSON.parse(readFileSync(files[0], "utf8"));
+    assert.equal(envelope.version, 3);
+    assert.equal(envelope.id, "sess-1");
+    const raw = envelope.payload;
     assert.equal(raw.requests, undefined);
     assert.equal(raw.stats.requests, 42);
     assert.equal(raw.stats.tokensSaved, 1234);
@@ -99,9 +119,12 @@ await withTempStore("scheduleSave debounces and eventually writes", async (store
     store.scheduleSave(s);
     s.stats.requests = 3;
     store.scheduleSave(s);
-    await settle();
+    // Poll rather than one fixed settle(): if the flush hits a transient
+    // ENOENT (temp sweep) the kernel retries with backoff, so the write can
+    // land well past the 5ms debounce. Deadline covers the retry ladder
+    // (~1.5s) with headroom.
+    const loaded = await waitFor(() => store.loadSync("debounce-1"), 5000, "debounced write to land");
     assert.equal(readdirSync(dir).length, 1, "exactly one top-level entry (the _unknown subdir) happened");
-    const loaded = store.loadSync("debounce-1");
     assert.equal(loaded!.stats.requests, 3, "latest value persisted");
 });
 
@@ -219,6 +242,35 @@ await withTempStore("hasPending reflects the debounce timer", async (store) => {
     assert.equal(store.hasPending(s.id), false);
 });
 
+// Regression (2026-08-15, windows-latest CI flake on PR #158): the writeNow
+// per-session chain cleaned itself up via `next.finally(...)` — a derived
+// promise nobody held. When the chain rejected (the test's tmpdir was
+// removed before the async write hit the disk → ENOENT), that orphan
+// surfaced as a process-level unhandledRejection and failed the whole test
+// file. In production the same leak means a transient persist failure
+// (disk full, EPERM) crashes the proxy. The caller of writeNow still gets
+// the real rejection; only the cleanup side-effect must swallow.
+await withTempStore("writeNow rejection does not leak an unhandled rejection", async (store) => {
+    // Deterministic failure: point the store at a path whose parent is a
+    // regular FILE, so mkdir(recursive) cannot recreate the directory and
+    // the tmp-file write fails with ENOENT.
+    const blocker = join(tmpdir(), `bili-persist-blocker-${Date.now()}-${process.pid}`);
+    writeFileSync(blocker, "x");
+    const dead = new SessionStore({ dir: join(blocker, "sessions"), debounceMs: 5, enabled: true });
+    const unhandled: unknown[] = [];
+    const onUnhandled = (e: unknown) => unhandled.push(e);
+    process.on("unhandledRejection", onUnhandled);
+    try {
+        const s = makeSession("orphan-check");
+        await assert.rejects(dead.writeNow(s), /ENOENT|ENOTDIR/);
+        await settle(50); // give any orphan a chance to surface
+    } finally {
+        process.off("unhandledRejection", onUnhandled);
+        rmSync(blocker, { force: true });
+    }
+    assert.equal(unhandled.length, 0, `orphan rejection leaked: ${unhandled.map(String).join("; ")}`);
+});
+
 await withTempStore("sessions are namespaced by protocol + provider on disk", async (store, dir) => {
     // A human should be able to tell sessions apart at a glance from the path:
     //   anthropic/dashscope_<hash>.json
@@ -260,7 +312,7 @@ await withTempStore("protocol-less session lands under _unknown/ (legacy compat)
     assert.ok(loaded && loaded.id === "legacy-1", "legacy session loads back");
 });
 
-await withTempStore("loadSync uses protocol meta to locate namespaced file", async (store) => {
+await withTempStore("loadSync uses protocol meta to locate namespaced file", async (store, dir) => {
     // After an LRU eviction, loadSync must find the file by protocol/host,
     // not by scanning. Passing the meta must hit the right path.
     const s = makeSession("meta-1");
@@ -269,7 +321,155 @@ await withTempStore("loadSync uses protocol meta to locate namespaced file", asy
     await store.writeNow(s);
     // With correct meta → found.
     assert.ok(store.loadSync("meta-1", { protocol: "openai", upstreamOrigin: "https://open.bigmodel.cn" }));
-    // With wrong meta → not found at the namespaced path (and no _unknown fallback
-    // because protocol is given, so it does not scan the legacy location).
-    assert.equal(store.loadSync("meta-1", { protocol: "anthropic", upstreamOrigin: "https://other.example" }), null);
+    // A fresh store with WRONG meta → not found at the namespaced path (and
+    // no scan: the flat fallback name differs from the namespaced file). In
+    // the SAME store a wrong-meta probe still resolves via the kernel's
+    // discovered-file cache — the id is authoritative, the meta is only a
+    // path hint — which is why the isolation probe uses a second store.
+    const cold = new SessionStore({ dir });
+    assert.equal(cold.loadSync("meta-1", { protocol: "anthropic", upstreamOrigin: "https://other.example" }), null);
+});
+
+await withTempStore("pre-envelope flat file is adopted and re-persisted as envelope", async (store, dir) => {
+    // Files written before the acp-kernel StateStore extraction are FLAT
+    // records (no {version,savedAt,id,payload} wrapper). They must keep
+    // loading via the kernel's legacy adoption hook, and the next dirty
+    // write migrates them to the envelope format.
+    const flat = {
+        version: 3,
+        savedAt: Date.now(),
+        id: "flat-1",
+        meta: { protocol: "openai", upstreamOrigin: "https://open.bigmodel.cn" },
+        stats: { requests: 5, tokensSaved: 111 },
+        createdAt: Date.now() - 1000,
+        state: createInitialState(),
+        blockContents: {},
+    };
+    const hash = createHash("sha256").update("flat-1", "utf8").digest("hex").slice(0, 24);
+    const file = join(dir, "openai", `open.bigmodel.cn_${hash}.json`);
+    mkdirSync(dirname(file), { recursive: true });
+    writeFileSync(file, JSON.stringify(flat));
+
+    const loaded = store.loadSync("flat-1", { protocol: "openai", upstreamOrigin: "https://open.bigmodel.cn" });
+    assert.ok(loaded && loaded.id === "flat-1", "flat file adopted on load");
+    assert.equal(loaded!.stats.requests, 5, "stats survive adoption");
+    loaded!.stats.requests = 6;
+    await store.writeNow(loaded!);
+
+    const envelope = JSON.parse(readFileSync(file, "utf8"));
+    assert.ok("payload" in envelope, "re-persisted as envelope");
+    assert.equal(envelope.payload.stats.requests, 6, "payload carries the update");
+});
+
+await withTempStore("one-time migration re-keys legacy hash-id sessions to their client-provided label (#286)", async (store, dir) => {
+    const label = "conv-legacy-1";
+    const legacyA = "legacy-" + "a".repeat(24);
+    const legacyB = "legacy-" + "b".repeat(24);
+
+    const a = makeSession(legacyA);
+    a.meta.label = label;
+    a.meta.protocol = "responses";
+    a.meta.upstreamOrigin = "https://chatgpt.com";
+    a.stats.requests = 7;
+    await store.writeNow(a);
+
+    const b = makeSession(legacyB);
+    b.meta.label = label;
+    b.meta.protocol = "responses";
+    b.meta.upstreamOrigin = "https://chatgpt.com";
+    b.stats.requests = 1;
+    await store.writeNow(b);
+
+    const fileB = jsonFilesUnder(dir).find((f) => JSON.parse(readFileSync(f, "utf8")).id === legacyB)!;
+    const envB = JSON.parse(readFileSync(fileB, "utf8"));
+    envB.savedAt -= 1000; // A is newer → A wins the same-label collision
+    writeFileSync(fileB, JSON.stringify(envB));
+
+    // A fresh store mirrors a new process: no discovered-file cache.
+    const cold = new SessionStore({ dir, debounceMs: 5, enabled: true });
+    try {
+        await cold.migrateLegacyIds();
+
+        const all = await cold.loadAll();
+        assert.ok(all.has(label), "re-keyed under the client-provided label");
+        assert.ok(!all.has(legacyA) && !all.has(legacyB), "legacy ids no longer resolve");
+        assert.equal(all.get(label)!.stats.requests, 7, "newest savedAt wins the collision");
+        assert.equal(jsonFilesUnder(dir).length, 1, "loser and old files removed");
+
+        await cold.migrateLegacyIds();
+        assert.equal((await cold.loadAll()).size, 1, "second migration is a no-op");
+    } finally {
+        cold.cancelAll();
+    }
+});
+
+await withTempStore("migration leaves anonymous pfa sessions untouched (#499)", async (store, dir) => {
+    // Anonymous prefix-affinity sessions (#309) all share the display label
+    // "prefix-affinity" ≠ their id, which trips the #286 self-termination
+    // invariant: without the guard, every boot re-keys them all to the single
+    // id "prefix-affinity" and deletes every sibling but the newest — silent
+    // loss of saved compression state for anonymous clients.
+    const mk = (id: string, requests: number) => {
+        const s = makeSession(id);
+        s.meta.label = "prefix-affinity";
+        s.meta.protocol = "openai";
+        s.meta.upstreamOrigin = "https://relay.example/v1";
+        s.stats.requests = requests;
+        return s;
+    };
+    await store.writeNow(mk("pfa-bc1eaaaaaaaaaaaa", 7));
+    await store.writeNow(mk("pfa-8588bbbbbbbbbbbb", 3));
+
+    const fileB = jsonFilesUnder(dir).find((f) => JSON.parse(readFileSync(f, "utf8")).id === "pfa-8588bbbbbbbbbbbb")!;
+    const envB = JSON.parse(readFileSync(fileB, "utf8"));
+    envB.savedAt -= 1000; // bc1e is newer → it would win a label collision if migrated
+    writeFileSync(fileB, JSON.stringify(envB));
+
+    const legacy = makeSession("legacy-" + "c".repeat(24));
+    legacy.meta.label = "conv-legacy-499";
+    legacy.meta.protocol = "responses";
+    legacy.meta.upstreamOrigin = "https://chatgpt.com";
+    legacy.stats.requests = 2;
+    await store.writeNow(legacy);
+
+    const cold = new SessionStore({ dir, debounceMs: 5, enabled: true });
+    try {
+        await cold.migrateLegacyIds();
+        const all = await cold.loadAll();
+        assert.ok(all.has("pfa-bc1eaaaaaaaaaaaa"), "newer anonymous session survives");
+        assert.ok(all.has("pfa-8588bbbbbbbbbbbb"), "older anonymous sibling survives (no shared-label deletion)");
+        assert.equal(all.get("pfa-bc1eaaaaaaaaaaaa")!.stats.requests, 7, "state intact");
+        assert.ok(!all.has("legacy-" + "c".repeat(24)), "true legacy session is still re-keyed");
+        assert.ok(all.has("conv-legacy-499"), "legacy re-key still works alongside the guard");
+        assert.equal(all.size, 3, "exactly the two pfa sessions plus the re-keyed legacy one");
+    } finally {
+        cold.cancelAll();
+    }
+});
+
+test("SessionStore routes write failures through the EPERM detector (no false alert on non-lock error)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "bili-eperm-wire-"));
+    rmSync(dir, { recursive: true, force: true });
+    writeFileSync(dir, "block", "utf8");
+    const store = new SessionStore({ dir, debounceMs: 5, enabled: true });
+    const captured: { level: string; msg: string }[] = [];
+    setLogCapture((level, msg) => captured.push({ level, msg }));
+    try {
+        store.scheduleSave(makeSession("wire-1"));
+        // acp-kernel 0.0.53 retries the whole write cycle on transient
+        // ENOTDIR (~1.5s ladder) before the failure line is logged — poll
+        // with headroom instead of a fixed settle().
+        await waitFor(
+            () => captured.find((c) => c.level === "error" && c.msg.startsWith("[persist] write failed for ")) ?? null,
+            5000,
+            "kernel write-failure line to reach the wrapped log",
+        );
+        const failLines = captured.filter((c) => c.level === "error" && c.msg.startsWith("[persist] write failed for "));
+        assert.ok(failLines.some((c) => c.msg.includes("wire-1")), "failure is for our session id");
+        assert.equal(captured.filter((c) => c.msg.includes("Defender exclusions")).length, 0, "no EPERM alert for a non-lock (ENOTDIR) error");
+    } finally {
+        setLogCapture(null);
+        store.cancelAll();
+        rmSync(dir, { force: true });
+    }
 });

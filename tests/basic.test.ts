@@ -5,7 +5,7 @@ import {
     coreToAnthropic,
     conversationSignalAnthropic,
     type AnthropicRequestBody,
-} from "../src/anthropic.js";
+} from "acp-kernel/wire";
 import {
     COMPRESS_TOOL,
     COMPRESS_TOOL_NAME,
@@ -19,7 +19,7 @@ import {
     injectOpenaiSystem,
     conversationSignalOpenai,
     type OpenAIRequestBody,
-} from "../src/openai.js";
+} from "acp-kernel/wire";
 
 function bigToolResult(text: string): AnthropicRequestBody {
     return {
@@ -119,7 +119,7 @@ test("parseCompressInput handles batch {content:[...]} form", () => {
             { startId: "m00001", endId: "m00010", summary: "first batch", topic: "intro" },
             { startId: "m00020", endId: "m00030", summary: "second batch" },
         ],
-    });
+    }).ranges;
     assert.equal(parsed.length, 2);
     assert.equal(parsed[0]?.startRef, "m00001");
     assert.equal(parsed[0]?.endRef, "m00010");
@@ -129,7 +129,7 @@ test("parseCompressInput handles batch {content:[...]} form", () => {
 });
 
 test("parseCompressInput handles single {startId,endId,summary} form", () => {
-    const parsed = parseCompressInput({ startId: "m00005", endId: "m00008", summary: "solo" });
+    const parsed = parseCompressInput({ startId: "m00005", endId: "m00008", summary: "solo" }).ranges;
     assert.equal(parsed.length, 1);
     assert.equal(parsed[0]?.startRef, "m00005");
     assert.equal(parsed[0]?.endRef, "m00008");
@@ -137,10 +137,78 @@ test("parseCompressInput handles single {startId,endId,summary} form", () => {
 });
 
 test("parseCompressInput returns empty for malformed input", () => {
-    assert.deepEqual(parseCompressInput(null), []);
-    assert.deepEqual(parseCompressInput("nope"), []);
-    assert.deepEqual(parseCompressInput({ content: "not-an-array" }), []);
-    assert.deepEqual(parseCompressInput({ content: [{ startId: "m1" }] }), []);
+    assert.deepEqual(parseCompressInput(null).ranges, []);
+    assert.deepEqual(parseCompressInput("nope").ranges, []);
+    assert.deepEqual(parseCompressInput({ content: "not-an-array" }).ranges, []);
+    assert.deepEqual(parseCompressInput({ content: [{ startId: "m1" }] }).ranges, []);
+});
+
+test("parseCompressInput accepts JSON-string content (non-strict providers stringify arrays)", () => {
+    const parsed = parseCompressInput({
+        content: JSON.stringify([
+            { startId: "m00001", endId: "m00010", summary: "first", topic: "intro" },
+            { startId: "m00020", endId: "m00030", summary: "second" },
+        ]),
+    }).ranges;
+    assert.equal(parsed.length, 2);
+    assert.equal(parsed[0]?.startRef, "m00001");
+    assert.equal(parsed[0]?.endRef, "m00010");
+    assert.equal(parsed[0]?.summary, "first");
+    assert.equal(parsed[0]?.topic, "intro");
+    assert.equal(parsed[1]?.startRef, "m00020");
+    assert.equal(parsed[1]?.endRef, "m00030");
+    assert.deepEqual(parseCompressInput({ content: "not-json" }).ranges, []);
+});
+
+test("parseCompressInput salvages single-quoted JSON args (#603)", () => {
+    const parsed = parseCompressInput(
+        `{'content':[{'startId':'m00010','endId':'m00020','summary':'first'},{'startId':'m00030','endId':'m00040','summary':'second','topic':'mid'}],'topic':'intro'}`,
+        "call-q",
+    ).ranges;
+    assert.equal(parsed.length, 2);
+    assert.equal(parsed[0]?.startRef, "m00010");
+    assert.equal(parsed[0]?.endRef, "m00020");
+    assert.equal(parsed[0]?.summary, "first");
+    assert.equal(parsed[0]?.topic, "intro");
+    assert.equal(parsed[0]?.compressCallId, "call-q");
+    assert.equal(parsed[1]?.startRef, "m00030");
+    assert.equal(parsed[1]?.topic, "mid");
+});
+
+test("parseCompressInput salvages mixed single/double quotes, keeps apostrophes in data (#603)", () => {
+    const parsed = parseCompressInput(`{'content': [{'startId': "m00001", 'endId': "m00009", 'summary': "it's done, really"}]}`).ranges;
+    assert.equal(parsed.length, 1);
+    assert.equal(parsed[0]?.startRef, "m00001");
+    assert.equal(parsed[0]?.endRef, "m00009");
+    assert.equal(parsed[0]?.summary, "it's done, really");
+});
+
+test("parseCompressInput salvages truncated single-quoted content array (#603)", () => {
+    const parsed = parseCompressInput(`{'content':[{'startId':'m00010','endId':'m00020','summary':'first'},{'startId':'m00030','endId':'m00040','summary':'secon`).ranges;
+    assert.equal(parsed.length, 1);
+    assert.equal(parsed[0]?.startRef, "m00010");
+    assert.equal(parsed[0]?.endRef, "m00020");
+    assert.equal(parsed[0]?.summary, "first");
+});
+
+test("parseCompressInput salvages object input whose content string is single-quoted (#603)", () => {
+    const parsed = parseCompressInput({ content: `[{'startId':'m00005','endId':'m00006','summary':'ok'}]` }).ranges;
+    assert.equal(parsed.length, 1);
+    assert.equal(parsed[0]?.startRef, "m00005");
+    assert.equal(parsed[0]?.endRef, "m00006");
+    assert.equal(parsed[0]?.summary, "ok");
+});
+
+test("parseCompressInput still rejects prose with apostrophes unchanged (#603)", () => {
+    const result = parseCompressInput("I couldn't believe {that} would 'work'");
+    assert.deepEqual(result.ranges, []);
+    assert.equal(result.diagnostics.ok, false);
+});
+
+test("parseCompressInput leaves valid double-quoted args untouched by salvage (#603)", () => {
+    const parsed = parseCompressInput(JSON.stringify({ content: [{ startId: "m00001", endId: "m00002", summary: "don't panic" }] })).ranges;
+    assert.equal(parsed.length, 1);
+    assert.equal(parsed[0]?.summary, "don't panic");
 });
 
 test("buildCompressSystemPrompt includes compression philosophy", () => {
@@ -229,72 +297,6 @@ test("conversationSignalOpenai is stable for same first-user content", () => {
     assert.equal(a, b);
     assert.ok(a.length > 0);
 });
-
-test("OpenAI SSE rewriter passes through real tool calls when no compress detected", async () => {
-    const { rewriteOpenaiSseStream } = await import("../src/stream-openai.js");
-    const { createCore, createInitialState, defaultConfig } = await import("acp-kernel");
-    const core = createCore();
-    const state = createInitialState();
-    const config = defaultConfig(200000);
-    const ctx = { core, config, messages: [], session: { id: "s1", meta: {}, stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, contextTokens: 0 }, metadata: {}, state }, log: () => {} };
-
-    // Simulate a provider that sends the LAST tool_call arguments fragment
-    // in the SAME chunk as finish_reason (common in GLM/OpenAI-compatible APIs).
-    // Before the fix, the rewriter suppressed this entire chunk, dropping the
-    // last arguments fragment → opencode got SchemaError(Missing key at ["command"]).
-    const sse = [
-        `data: ${JSON.stringify({ object: "chat.completion.chunk", choices: [{ index: 0, delta: { role: "assistant" as const, tool_calls: [{ index: 0, id: "call_1", type: "function", function: { name: "bash", arguments: "{\"command\":\"" } }] }, finish_reason: null }] })}\n\n`,
-        `data: ${JSON.stringify({ object: "chat.completion.chunk", choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { arguments: "echo test\"}" } }] }, finish_reason: null }] })}\n\n`,
-        `data: ${JSON.stringify({ object: "chat.completion.chunk", choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] })}\n\n`,
-        `data: [DONE]\n\n`,
-    ].join("");
-    const upstream = new ReadableStream<Uint8Array>({
-        start(c) {
-            c.enqueue(new TextEncoder().encode(sse));
-            c.close();
-        },
-    });
-    const chunks: string[] = [];
-    for await (const buf of rewriteOpenaiSseStream(upstream, ctx as never)) {
-        chunks.push(buf.toString("utf8"));
-    }
-    const combined = chunks.join("");
-    assert.ok(combined.includes('"bash"'), "tool name must pass through");
-    assert.ok(combined.includes("echo test"), "tool arguments must pass through");
-    assert.ok(combined.includes("tool_calls"), "finish_reason tool_calls must be present");
-    assert.ok(combined.includes("[DONE]"), "[DONE] marker must be present");
-    assert.ok(!combined.includes("acp-proxy:"), "no compress note expected");
-});
-
-test("OpenAI SSE rewriter suppresses compress tool call and injects note", async () => {
-    const { rewriteOpenaiSseStream } = await import("../src/stream-openai.js");
-    const { createCore, createInitialState, defaultConfig } = await import("acp-kernel");
-    const core = createCore();
-    const config = defaultConfig(200000);
-    const state = createInitialState();
-    const ctx = { core, config, messages: [], session: { id: "s1", meta: {}, stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, contextTokens: 0 }, metadata: {}, state }, log: () => {} };
-
-    const sse = [
-        `data: ${JSON.stringify({ object: "chat.completion.chunk", choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: "call_1", type: "function", function: { name: "compress", arguments: '{"content":[{"startId":"m00001","endId":"m00001","summary":"test"}]}' } }] }, finish_reason: null }] })}\n\n`,
-        `data: ${JSON.stringify({ object: "chat.completion.chunk", choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] })}\n\n`,
-        `data: [DONE]\n\n`,
-    ].join("");
-    const upstream = new ReadableStream<Uint8Array>({
-        start(c) {
-            c.enqueue(new TextEncoder().encode(sse));
-            c.close();
-        },
-    });
-    const chunks: string[] = [];
-    for await (const buf of rewriteOpenaiSseStream(upstream, ctx as never)) {
-        chunks.push(buf.toString("utf8"));
-    }
-    const combined = chunks.join("");
-    assert.ok(!combined.includes('"compress"'), "compress tool name must be suppressed");
-    assert.ok(combined.includes('"stop"'), "finish_reason should be stop");
-    assert.ok(combined.includes("[DONE]"), "[DONE] must be present");
-});
-
 
 test("ACP tag regex strips tag prefix from tool-call arguments", () => {
     const ACP_TAG_RE = /^\x3cacp [^>]*\x3e[^\x3c]*\x3c\/acp\x3e\n?/;

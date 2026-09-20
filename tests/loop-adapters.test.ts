@@ -6,8 +6,8 @@ import type { Session } from "../src/session.ts";
 import { runCompressLoop, createOpenaiAdapter, createAnthropicAdapter, createResponsesAdapter } from "../src/loop/index.ts";
 import type { ParsedStreamEvent } from "../src/loop/index.ts";
 import { buildCompressSystemPrompt } from "../src/compress-tool.ts";
-import { responsesToCore } from "../src/responses.ts";
-import type { ResponsesRequestBody } from "../src/responses.ts";
+import { responsesToCore } from "acp-kernel/wire";
+import type { ResponsesRequestBody } from "acp-kernel/wire";
 
 function makeCtx(id: string, messages: CoreMessage[] = []): {
     core: ReturnType<typeof createCore>;
@@ -41,7 +41,7 @@ function makeCtx(id: string, messages: CoreMessage[] = []): {
 async function drain(
     stream: ReadableStream<Uint8Array>,
     ctx: ReturnType<typeof makeCtx>,
-    adapter: ReturnType<typeof createOpenaiAdapter> | ReturnType<typeof createAnthropicAdapter>,
+    adapter: ReturnType<typeof createOpenaiAdapter> | ReturnType<typeof createAnthropicAdapter> | ReturnType<typeof createResponsesAdapter>,
     requestBody: Record<string, unknown>,
 ): Promise<string> {
     const chunks: Buffer[] = [];
@@ -84,6 +84,39 @@ test("openai adapter: separated usage chunk (choices:[] + usage) captured → la
         { model: "gpt", messages: [], stream: true },
     );
     assert.ok((ctx.session.stats.lastInputTokens ?? 0) > 0, "usage from choices:[] chunk captured (lastInputTokens > 0)");
+});
+
+test("openai adapter: DeepSeek prompt_cache_hit_tokens normalized into stats + completion usage (#779)", async () => {
+    const round1 = [
+        `data: ${JSON.stringify({ id: "c1", object: "chat.completion.chunk", created: 1, model: "gpt", choices: [{ index: 0, delta: { content: "Hi" }, finish_reason: null }] })}\n\n`,
+        `data: ${JSON.stringify({ id: "c1", object: "chat.completion.chunk", created: 1, model: "gpt", choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}\n\n`,
+        `data: ${JSON.stringify({ id: "c1", object: "chat.completion.chunk", created: 1, model: "gpt", choices: [], usage: { prompt_tokens: 42, completion_tokens: 7, prompt_cache_hit_tokens: 30 } })}\n\n`,
+        `data: [DONE]\n\n`,
+    ].join("");
+    const ctx = makeCtx("openai-deepseek-cache");
+    const out = await drain(
+        new Response(round1, { status: 200 }).body!,
+        ctx,
+        createOpenaiAdapter({ model: "gpt" }),
+        { model: "gpt", messages: [], stream: true },
+    );
+    assert.equal(ctx.session.stats.cachedTokens, 30, "top-level prompt_cache_hit_tokens counted");
+    assert.equal(ctx.session.stats.cacheSamples, 1, "cache sample recorded");
+    assert.ok(out.includes('"prompt_tokens_details":{"cached_tokens":30}'), `synthesized completion carries normalized cached_tokens: ${out}`);
+});
+
+test("openai adapter: finish-frame usage — standard field wins over prompt_cache_hit_tokens (#779)", async () => {
+    const adapter = createOpenaiAdapter({ model: "gpt" });
+    const stream = new Response([
+        `data: ${JSON.stringify({ id: "c1", object: "chat.completion.chunk", created: 1, model: "gpt", choices: [{ index: 0, delta: { content: "Hi" }, finish_reason: null }] })}\n\n`,
+        `data: ${JSON.stringify({ id: "c1", object: "chat.completion.chunk", created: 1, model: "gpt", choices: [{ index: 0, delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: 42, completion_tokens: 7, prompt_tokens_details: { cached_tokens: 25 }, prompt_cache_hit_tokens: 30 } })}\n\n`,
+        `data: [DONE]\n\n`,
+    ].join("")).body!;
+    let cached: number | undefined;
+    for await (const ev of adapter.parseStream(stream, 1)) {
+        if (ev.kind === "usage") cached = ev.cachedTokens;
+    }
+    assert.equal(cached, 25, "standard field wins when both present");
 });
 
 test("openai adapter: acp_status-only round → marker + re-request, no crash", async () => {
@@ -133,6 +166,106 @@ test("anthropic adapter: plain text round-trips live + message_delta/message_sto
     assert.ok(out.includes("Hello"), "round-1 text streamed live");
     assert.ok(out.includes("message_delta"), "message_delta terminal present");
     assert.ok(out.includes("message_stop"), "message_stop terminal present");
+});
+
+test("anthropic adapter: relay-echoed message_delta with input_tokens: 0 must NOT overwrite message_start usage", async () => {
+    // Some relays echo a schema-shaped `usage` in message_delta where
+    // `input_tokens` is present but 0 (the spec field is normally absent).
+    // The input context is fixed within a turn — message_start is
+    // authoritative — so a 0 in message_delta must be ignored, not merged
+    // (it used to zero roundInput → lastInputTokens = cached-only → the nudge
+    // denominator collapsed and compression never fired on cached sessions).
+    const round1 = [
+        `event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { id: "msg_1", usage: { input_tokens: 55, cache_read_input_tokens: 11 } } })}\n\n`,
+        `event: content_block_start\ndata: ${JSON.stringify({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } })}\n\n`,
+        `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "ok" } })}\n\n`,
+        `event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index: 0 })}\n\n`,
+        `event: message_delta\ndata: ${JSON.stringify({ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { input_tokens: 0, cache_read_input_tokens: 0, output_tokens: 7 } })}\n\n`,
+        `event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}\n\n`,
+    ].join("");
+    const ctx = { ...makeCtx("anthropic-delta-zero"), protocol: "anthropic" };
+    await drain(
+        new Response(round1, { status: 200 }).body!,
+        ctx,
+        createAnthropicAdapter({ model: "claude" }),
+        { model: "claude", messages: [], stream: true, max_tokens: 10 },
+    );
+    assert.equal(ctx.session.stats.lastInputTokens, 66, "total = input_tokens(55) + cache_read(11); the 0 in message_delta is ignored");
+    assert.equal(ctx.session.stats.cachedTokens, 11, "cached portion from message_start preserved");
+});
+
+test("anthropic adapter (#299): stitched stream — terminal's complete usage adopts atomically, no double-count", async () => {
+    // After a compress re-request, the stream handed to a downstream bili is
+    // two rounds stitched: round1's message_start (pre-compress cache_read) +
+    // the final synthetic terminal (post-compress input, cache_read
+    // legitimately 0). The terminal carries a COMPLETE usage object
+    // (input_tokens > 0 AND cache_read_input_tokens present), so it must be
+    // adopted atomically — the 0 overwrites the stale cache_read, else the
+    // total double-counts (142543 + 118663 = 261206 instead of 142543 →
+    // false 131% EMERGENCY nudge + preflight compression).
+    const stitched = [
+        `event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { id: "msg_1", usage: { input_tokens: 50000, cache_read_input_tokens: 118663 } } })}\n\n`,
+        `event: content_block_start\ndata: ${JSON.stringify({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } })}\n\n`,
+        `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "ok" } })}\n\n`,
+        `event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index: 0 })}\n\n`,
+        `event: message_delta\ndata: ${JSON.stringify({ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { input_tokens: 142543, cache_read_input_tokens: 0, output_tokens: 7 } })}\n\n`,
+        `event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}\n\n`,
+    ].join("");
+    const ctx = { ...makeCtx("anthropic-stitched"), protocol: "anthropic" };
+    await drain(
+        new Response(stitched, { status: 200 }).body!,
+        ctx,
+        createAnthropicAdapter({ model: "claude" }),
+        { model: "claude", messages: [], stream: true, max_tokens: 10 },
+    );
+    assert.equal(ctx.session.stats.lastInputTokens, 142543, "total = terminal input(142543) + terminal cache(0); stale message_start cache_read(118663) NOT double-counted");
+    assert.equal(ctx.session.stats.cachedTokens, 0, "cached portion = terminal's 0 (atomically adopted)");
+});
+
+test("anthropic adapter (#299): stitched terminal after proxy-tool re-request carries complete authoritative usage", async () => {
+    // Generation-side contract: the synthetic terminal emitted after a
+    // compress/proxy-tool re-request must carry BOTH input_tokens and
+    // cache_read_input_tokens with the final round's true values (0 included)
+    // so a downstream parser can adopt the usage atomically.
+    const round1 = [
+        `event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { id: "msg_1", usage: { input_tokens: 50000, cache_read_input_tokens: 118663 } } })}\n\n`,
+        `event: content_block_start\ndata: ${JSON.stringify({ type: "content_block_start", index: 0, content_block: { type: "tool_use", id: "toolu_s", name: "acp_status", input: {} } })}\n\n`,
+        `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: "{}" } })}\n\n`,
+        `event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index: 0 })}\n\n`,
+        `event: message_delta\ndata: ${JSON.stringify({ type: "message_delta", delta: { stop_reason: "tool_use" }, usage: { output_tokens: 1 } })}\n\n`,
+        `event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}\n\n`,
+    ].join("");
+    const round2 = [
+        `event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { id: "msg_2", usage: { input_tokens: 142543, cache_read_input_tokens: 0 } } })}\n\n`,
+        `event: content_block_start\ndata: ${JSON.stringify({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } })}\n\n`,
+        `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "done" } })}\n\n`,
+        `event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index: 0 })}\n\n`,
+        `event: message_delta\ndata: ${JSON.stringify({ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 3 } })}\n\n`,
+        `event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}\n\n`,
+    ].join("");
+    let fetchCalls = 0;
+    const orig = globalThis.fetch;
+    globalThis.fetch = (async () => { fetchCalls++; return new Response(round2, { status: 200 }); }) as typeof fetch;
+    try {
+        const out = await drain(
+            new Response(round1, { status: 200 }).body!,
+            makeCtx("anthropic-stitched-terminal"),
+            createAnthropicAdapter({ model: "claude" }),
+            { model: "claude", messages: [], stream: true, max_tokens: 10 },
+        );
+        assert.equal(fetchCalls, 1, "re-request after proxy tool");
+        const terminalLines = out
+            .split("\n")
+            .filter((l) => l.startsWith("data: ") && l.includes('"message_delta"'))
+            .map((l) => JSON.parse(l.slice("data: ".length)) as Record<string, unknown>);
+        assert.equal(terminalLines.length, 1, "exactly one (synthetic) message_delta in the stitched output");
+        const usage = (terminalLines[0]?.usage ?? {}) as Record<string, unknown>;
+        assert.equal(usage.input_tokens, 142543, "terminal carries final round's input_tokens");
+        assert.equal(usage.cache_read_input_tokens, 0, "terminal carries final round's cache_read (explicit 0, so downstream can adopt atomically)");
+        assert.equal(usage.output_tokens, 3, "terminal carries final round's output_tokens");
+    } finally {
+        globalThis.fetch = orig;
+    }
 });
 
 test("anthropic adapter: acp_status-only round → marker + re-request, no crash", async () => {
@@ -309,6 +442,53 @@ test("F2: responses custom_tool_call meta events have firstRoundOnly=false (pass
     }
 });
 
+const absorbFcStream = () => mockStream(
+    sseLf("response.output_item.added", {
+        type: "response.output_item.added",
+        output_index: 0,
+        item: { type: "function_call", id: "fc_1", call_id: "call_a1", name: "absorb", arguments: "" },
+    }),
+    sseLf("response.function_call_arguments.delta", {
+        type: "response.function_call_arguments.delta",
+        item_id: "fc_1",
+        output_index: 0,
+        delta: '{"ref":"m00003"',
+    }),
+    sseLf("response.function_call_arguments.done", {
+        type: "response.function_call_arguments.done",
+        item_id: "fc_1",
+        output_index: 0,
+        arguments: '{"ref":"m00003","summary":"s"}',
+    }),
+    sseLf("response.output_item.done", {
+        type: "response.output_item.done",
+        output_index: 0,
+        item: { type: "function_call", id: "fc_1", call_id: "call_a1", name: "absorb", arguments: '{"ref":"m00003","summary":"s"}' },
+    }),
+);
+
+test("absorb: responses adapter buffers absorb function_call when absorbName is set (PR #615 fix)", async () => {
+    const events = await collectParseEvents(createResponsesAdapter(false, undefined, "absorb"), absorbFcStream(), 1);
+    const toolCall = events.find((e) => e.kind === "tool_call");
+    assert.ok(toolCall, "absorb call surfaced as a structured tool_call event for loop execution");
+    if (toolCall && toolCall.kind === "tool_call") {
+        assert.equal(toolCall.name, "absorb");
+        assert.equal(toolCall.callId, "call_a1");
+        assert.equal(toolCall.arguments, '{"ref":"m00003","summary":"s"}');
+        assert.ok(!toolCall.passthrough, "buffered proxy call, not a passthrough");
+    }
+    const rawReplay = events.some((e) => e.kind === "meta" && e.firstRoundOnly === false);
+    assert.ok(!rawReplay, "no absorb SSE event raw-replayed to the client");
+});
+
+test("absorb: without absorbName the same call is raw-replayed + passthrough (documents pre-fix behavior)", async () => {
+    const events = await collectParseEvents(createResponsesAdapter(), absorbFcStream(), 1);
+    const toolCall = events.find((e) => e.kind === "tool_call");
+    assert.ok(toolCall?.kind === "tool_call" && toolCall.passthrough, "no absorbName → passthrough tool_call (loop skips execution)");
+    const rawReplay = events.filter((e) => e.kind === "meta" && e.firstRoundOnly === false);
+    assert.ok(rawReplay.length >= 3, "added/delta/done events raw-replayed to the client pre-fix");
+});
+
 test("F3: anthropic remaps forwarded block indices to be strictly sequential when tool_use is suppressed", async () => {
     const stream = mockStream(
         sseLf("message_start", { type: "message_start", message: { id: "msg_1", usage: { input_tokens: 3 } } }),
@@ -477,4 +657,131 @@ test("F7: anthropic buildRequest preserves client system + cache_control + merge
     assert.ok(text.includes(systemPrompt), "compress prompt merged into system");
     const hasCc = Array.isArray(system) && (system as Array<Record<string, unknown>>).some((b) => b.cache_control);
     assert.ok(hasCc, "cache_control marker preserved on system block (Anthropic prefix-cache anchor)");
+});
+
+function byteStream(chunks: Uint8Array[]): ReadableStream<Uint8Array> {
+    return new ReadableStream<Uint8Array>({
+        start(controller) {
+            for (const c of chunks) controller.enqueue(c);
+            controller.close();
+        },
+    });
+}
+
+function splitAfterLeadByte(full: Uint8Array, ch: string): [Uint8Array, Uint8Array] {
+    const needle = new TextEncoder().encode(ch);
+    let off = -1;
+    for (let i = 0; i + needle.length <= full.length && off < 0; i++) {
+        let match = true;
+        for (let j = 0; j < needle.length; j++) {
+            if (full[i + j] !== needle[j]) { match = false; break; }
+        }
+        if (match) off = i;
+    }
+    assert.ok(off >= 0, `bytes of ${ch} found in payload`);
+    return [full.slice(0, off + 1), full.slice(off + 1)];
+}
+
+async function cjkChunkSplitRoundTrip(
+    name: string,
+    adapter: ReturnType<typeof createResponsesAdapter> | ReturnType<typeof createOpenaiAdapter> | ReturnType<typeof createAnthropicAdapter>,
+    payload: string,
+): Promise<void> {
+    const [c1, c2] = splitAfterLeadByte(new TextEncoder().encode(payload), "留");
+    const events = await collectParseEvents(adapter, byteStream([c1, c2]), 1);
+    let text = "";
+    for (const ev of events) {
+        if (ev.kind === "text") text += ev.delta;
+    }
+    assert.equal(text, "残留", `${name}: multi-byte CJK split across chunk boundary round-trips intact`);
+    assert.ok(!text.includes("\uFFFD"), `${name}: no U+FFFD replacement characters`);
+}
+
+test("F8 (#541): responses adapter — CJK char split across SSE chunk boundary decodes intact (no U+FFFD)", async () => {
+    const payload = sseLf("response.output_text.delta", {
+        type: "response.output_text.delta",
+        item_id: "m1",
+        output_index: 0,
+        delta: "残留",
+    });
+    await cjkChunkSplitRoundTrip("responses", createResponsesAdapter(), payload);
+});
+
+test("F8 (#541): openai adapter — CJK char split across SSE chunk boundary decodes intact (no U+FFFD)", async () => {
+    const payload =
+        `data: ${JSON.stringify({ id: "c1", object: "chat.completion.chunk", created: 1, model: "gpt", choices: [{ index: 0, delta: { content: "残留" }, finish_reason: null }] })}\n\n` +
+        `data: [DONE]\n\n`;
+    await cjkChunkSplitRoundTrip("openai", createOpenaiAdapter({ model: "gpt" }), payload);
+});
+
+test("F8 (#541): anthropic adapter — CJK char split across SSE chunk boundary decodes intact (no U+FFFD)", async () => {
+    const payload = sseLf("content_block_delta", {
+        type: "content_block_delta",
+        index: 0,
+        delta: { type: "text_delta", text: "残留" },
+    });
+    await cjkChunkSplitRoundTrip("anthropic", createAnthropicAdapter({ model: "claude" }), payload);
+});
+
+test("openai emitCompletion: usage with absent token counts still serializes complete numeric fields (#dsh)", () => {
+    const adapter = createOpenaiAdapter({ model: "deepseek-v4-flash" });
+    const out = adapter.emitCompletion({ finishReason: "stop", usage: { inputTokens: undefined, outputTokens: undefined } }).toString("utf8");
+    const finishLine = out.split("\n").find((l) => l.startsWith("data: ") && l.includes("finish_reason"));
+    assert.ok(finishLine, "finish chunk present");
+    const parsed = JSON.parse(finishLine.slice("data: ".length)) as { usage?: Record<string, unknown> };
+    assert.ok(parsed.usage, "usage object present");
+    assert.equal(parsed.usage!.prompt_tokens, 0, "prompt_tokens defaults to 0 (never dropped)");
+    assert.equal(parsed.usage!.completion_tokens, 0, "completion_tokens defaults to 0 (never dropped)");
+    assert.equal(parsed.usage!.total_tokens, 0);
+    const real = adapter.emitCompletion({ finishReason: "stop", usage: { inputTokens: 7, outputTokens: 3 } }).toString("utf8");
+    const realLine = real.split("\n").find((l) => l.startsWith("data: ") && l.includes("finish_reason"));
+    const realParsed = JSON.parse(realLine!.slice("data: ".length)) as { usage?: Record<string, unknown> };
+    assert.deepEqual({ p: realParsed.usage!.prompt_tokens, c: realParsed.usage!.completion_tokens, t: realParsed.usage!.total_tokens }, { p: 7, c: 3, t: 10 });
+});
+
+test("F8 (#549): responses adapter accepts data-only SSE frames (no event: lines)", async () => {
+    const stream = mockStream(
+        `data: ${JSON.stringify({ type: "response.created", response: { id: "resp_1", status: "in_progress", output: [] } })}\n\n`,
+        `data: ${JSON.stringify({ type: "response.output_item.added", output_index: 0, item: { type: "message", id: "m1", role: "assistant", content: [] } })}\n\n`,
+        `data: ${JSON.stringify({ type: "response.output_text.delta", item_id: "m1", output_index: 0, delta: "HelloDataOnly" })}\n\n`,
+        `data: ${JSON.stringify({ type: "response.completed", response: { id: "resp_1", status: "completed", output: [], usage: { input_tokens: 10, output_tokens: 5 } } })}\n\n`,
+    );
+    const events = await collectParseEvents(createResponsesAdapter(), stream, 1);
+    const textEv = events.find((e) => e.kind === "text");
+    assert.ok(textEv, "text delta yielded from data-only frame");
+    if (textEv && textEv.kind === "text") assert.equal(textEv.delta, "HelloDataOnly", "delta content intact");
+    const done = events.find((e) => e.kind === "done");
+    assert.ok(done, "terminal done yielded");
+    if (done && done.kind === "done") {
+        assert.equal(done.finishReason, "completed", "terminal kind taken from data payload type");
+        assert.notEqual(done.truncated, true, "not a synthetic truncation failure");
+    }
+});
+
+test("F8 (#549): explicit event: line wins over data payload type", async () => {
+    const stream = mockStream(
+        `event: response.completed\ndata: ${JSON.stringify({ type: "response.output_text.delta", item_id: "m1", output_index: 0, delta: "X" })}\n\n`,
+    );
+    const events = await collectParseEvents(createResponsesAdapter(), stream, 1);
+    const done = events.find((e) => e.kind === "done");
+    assert.ok(done, "done yielded");
+    if (done && done.kind === "done") assert.equal(done.finishReason, "completed", "explicit event: takes precedence over data type");
+});
+
+test("F8 (#549): data-only responses stream completes cleanly end-to-end (no synthetic failure)", async () => {
+    const round1 = [
+        `data: ${JSON.stringify({ type: "response.created", response: { id: "resp_1", status: "in_progress", output: [] } })}\n\n`,
+        `data: ${JSON.stringify({ type: "response.output_item.added", output_index: 0, item: { type: "message", id: "m1", role: "assistant", content: [] } })}\n\n`,
+        `data: ${JSON.stringify({ type: "response.output_text.delta", item_id: "m1", output_index: 0, delta: "HelloDataOnly" })}\n\n`,
+        `data: ${JSON.stringify({ type: "response.completed", response: { id: "resp_1", status: "completed", output: [], usage: { input_tokens: 10, output_tokens: 5 } } })}\n\n`,
+    ].join("");
+    const out = await drain(
+        new Response(round1, { status: 200 }).body!,
+        makeCtx("responses-dataonly"),
+        createResponsesAdapter(),
+        { model: "gpt-5", input: [], stream: true },
+    );
+    assert.ok(out.includes("HelloDataOnly"), "text streamed live");
+    assert.ok(out.includes('"status":"completed"'), "completion emitted with completed status");
+    assert.ok(!out.includes("upstream returned no response"), "no synthetic failure for a valid data-only stream");
 });

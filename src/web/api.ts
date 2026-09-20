@@ -6,8 +6,10 @@ import { configFile } from "../paths.js";
 import {
     loadRoutes,
     normalizeUrlKey,
+    parseCompressSettings,
     parseRouteEntry,
     parseUpstreamProxyMode,
+    passthroughState,
     safeReadJson,
     type ProviderRoute,
     type ProviderRoutes,
@@ -25,6 +27,17 @@ type ConfigShape = Record<string, unknown> & {
 function readConfig(): ConfigShape {
     const parsed = safeReadJson(configFile());
     return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as ConfigShape : {};
+}
+
+/** The config file exists on disk but does not parse as JSON (hand-edited
+ *  comment, trailing comma, …). Distinct from "missing": a broken file must
+ *  never be silently rebuilt from {} by a PUT — that would wipe every field
+ *  the loader could not read. */
+function configParseError(): string | null {
+    if (!existsSync(configFile())) return null;
+    const parsed = safeReadJson(configFile());
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return null;
+    return `config file is not valid JSON: ${configFile()}`;
 }
 
 export function readProviders(): ProviderRoutes {
@@ -63,12 +76,18 @@ function atomicWriteConfig(config: ConfigShape): void {
 
 export async function handleConfigGet(res: ServerResponse): Promise<void> {
     const upstream = readUpstreamSettings();
+    const config = readConfig();
+    const parseError = configParseError();
+    if (parseError) log("warn", `[acp-web] ${parseError} — showing empty view; PUT is blocked until fixed`);
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({
         path: configFile(),
         providers: readProviders(),
         upstreamProxy: upstream.proxy ?? null,
         upstreamProxyMode: upstream.mode,
+        compress: config.compress ?? null,
+        passthrough: passthroughState(process.env),
+        ...(parseError ? { parseError } : {}),
     }, null, 2));
 }
 
@@ -80,11 +99,20 @@ export async function handleConfigPut(
 ): Promise<void> {
     const raw = await readJsonBody(req);
     if (!raw || typeof raw !== "object" || Array.isArray(raw)) return sendError(res, 400, "expected JSON object");
+    // Guard the unreadable-config footgun: if the on-disk file exists but
+    // does not parse, merging into an empty {} and saving would silently
+    // drop every field the JSON loader could not read. Refuse instead —
+    // the user fixes the syntax error by hand (the GET view surfaces
+    // parseError with the path) and PUT works again.
+    const parseError = configParseError();
+    if (parseError) return sendError(res, 409, `${parseError} — fix the syntax error by hand, then retry; refusing to overwrite`);
     const body = raw as Record<string, unknown>;
     const hasProviders = Object.prototype.hasOwnProperty.call(body, "providers");
     const hasProxy = Object.prototype.hasOwnProperty.call(body, "upstreamProxy");
     const hasMode = Object.prototype.hasOwnProperty.call(body, "upstreamProxyMode");
-    if (!hasProviders && !hasProxy && !hasMode) return sendError(res, 400, "expected providers or upstream proxy settings");
+    const hasCompress = Object.prototype.hasOwnProperty.call(body, "compress");
+    const hasPassthrough = Object.prototype.hasOwnProperty.call(body, "passthrough");
+    if (!hasProviders && !hasProxy && !hasMode && !hasCompress && !hasPassthrough) return sendError(res, 400, "expected providers, upstream proxy, compress, or passthrough settings");
 
     const routes: Record<string, ProviderRoute> = {};
     if (hasProviders) {
@@ -122,6 +150,25 @@ export async function handleConfigPut(
         return sendError(res, 400, "manual mode requires an upstream proxy URL");
     }
 
+    let compress: ReturnType<typeof parseCompressSettings>;
+    if (hasCompress) {
+        compress = body.compress === null ? {} : parseCompressSettings(body.compress);
+        if (compress === undefined) return sendError(res, 400, "invalid compress settings");
+    }
+
+    // #405: the panel must be able to READ and CLEAR passthrough. An env
+    // ACP_PASSTHROUGH (or --passthrough flag, which lands in env) outranks
+    // the file on every reload — a file write would be a silent no-op, so
+    // refuse with the exact way out instead.
+    if (hasPassthrough) {
+        if (body.passthrough !== null && typeof body.passthrough !== "boolean") {
+            return sendError(res, 400, "passthrough must be a boolean or null");
+        }
+        if (passthroughState(process.env).source === "env") {
+            return sendError(res, 409, "passthrough is forced by the ACP_PASSTHROUGH environment variable (or --passthrough flag); unset it and restart to change here");
+        }
+    }
+
     const config = readConfig();
     if (hasProviders) config.providers = routes;
     if (hasProxy) {
@@ -129,13 +176,26 @@ export async function handleConfigPut(
         else delete config.upstreamProxy;
     }
     if (hasMode && mode) config.upstreamProxyMode = mode;
+    if (hasCompress) {
+        if (compress && Object.keys(compress).length > 0) config.compress = compress;
+        else delete config.compress;
+    }
+    if (hasPassthrough) {
+        if (body.passthrough === true) config.passthrough = true;
+        else delete config.passthrough;
+    }
     try {
         atomicWriteConfig(config);
         onChanged?.();
     } catch (error) {
         return sendError(res, 500, `failed to apply config: ${String(error)}`);
     }
-    log("info", `[acp-web] configuration updated (${hasProviders ? `${Object.keys(routes).length} routes` : "network only"})`);
+    const changed: string[] = [];
+    if (hasProviders) changed.push(`${Object.keys(routes).length} routes`);
+    if (hasProxy || hasMode) changed.push("network");
+    if (hasCompress) changed.push("compress");
+    if (hasPassthrough) changed.push("passthrough");
+    log("info", `[acp-web] configuration updated (${changed.join(", ") || "none"})`);
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({ ok: true, providers: hasProviders ? Object.keys(routes).length : undefined }));
 }

@@ -1,81 +1,64 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { deriveSessionId, affinityToken, clientConversationHeader } from "../src/session-id.ts";
-import { conversationIdentityResponses, conversationSignalResponses } from "../src/responses.ts";
+import { affinityToken, clientConversationHeader, codexTurnIdentity, preferPromptCacheKeyIdentity } from "../src/session-id.ts";
+import { conversationIdentityResponses, conversationSignalResponses } from "acp-kernel/wire";
 
-/** Helper: build a minimal headers object. */
-function hdrs(auth?: string, sessionAffinity?: string): Record<string, string> {
-    const h: Record<string, string> = {};
-    if (auth) h.authorization = auth;
-    if (sessionAffinity) h["x-session-affinity"] = sessionAffinity;
-    return h;
-}
-
-test("deriveSessionId: same conversation + same key + same protocol + same upstream → stable", () => {
-    const a = deriveSessionId(hdrs("Bearer keyA"), "anthropic", "https://bailian.example", "hello world");
-    const b = deriveSessionId(hdrs("Bearer keyA"), "anthropic", "https://bailian.example", "hello world");
-    assert.equal(a, b);
+test("preferPromptCacheKeyIdentity: fingerprint + prompt_cache_key → stable client-provided identity (omp stateless replay)", () => {
+    // omp replays full history with no headers/session_id/previous_response_id:
+    // kernel mints a per-request fingerprint. Two turns (different tails) must
+    // both resolve to the SAME prompt_cache_key identity.
+    const body1 = { input: [{ type: "message", role: "user", content: "hi" }], prompt_cache_key: "01a03971-c498-7000-a904-1c6bb148cccf" };
+    const body2 = { input: [...body1.input, { type: "message", role: "user", content: "and more" }], prompt_cache_key: "01a03971-c498-7000-a904-1c6bb148cccf" };
+    const id1 = preferPromptCacheKeyIdentity(conversationIdentityResponses(body1, undefined), body1);
+    const id2 = preferPromptCacheKeyIdentity(conversationIdentityResponses(body2, undefined), body2);
+    assert.ok(id1 && id2);
+    assert.equal(id1.source, "prompt-cache-key");
+    assert.equal(id1.value, "01a03971-c498-7000-a904-1c6bb148cccf");
+    assert.equal(id1.value, id2.value);
+    assert.equal(id1.clientProvided, true);
+    // without the key the two turns would have diverged (per-request sessions)
+    assert.notEqual(
+        conversationIdentityResponses(body1, undefined).value,
+        conversationIdentityResponses(body2, undefined).value,
+    );
 });
 
-test("deriveSessionId: stable for same (key, protocol, upstream, conversation)", () => {
-    const a = deriveSessionId(hdrs("Bearer keyA"), "anthropic", "https://bailian.example", "hello world");
-    const b = deriveSessionId(hdrs("Bearer keyA"), "anthropic", "https://bailian.example", "hello world");
-    assert.equal(a, b);
+test("preferPromptCacheKeyIdentity: stronger signals win over prompt_cache_key", () => {
+    const pckBody = { input: [], prompt_cache_key: "cache-key-x" };
+    const header = preferPromptCacheKeyIdentity(
+        conversationIdentityResponses(pckBody, "hdr-conv-1"),
+        pckBody,
+    );
+    assert.equal(header!.source, "header");
+    assert.equal(header!.value, "hdr-conv-1");
+    const bodySession = preferPromptCacheKeyIdentity(
+        conversationIdentityResponses({ input: [], session_id: "sess-1", prompt_cache_key: "cache-key-x" }, undefined),
+        { prompt_cache_key: "cache-key-x" },
+    );
+    assert.equal(bodySession!.source, "body-session");
+    const prevResp = preferPromptCacheKeyIdentity(
+        conversationIdentityResponses({ input: [], previous_response_id: "resp_1" }, undefined),
+        { prompt_cache_key: "cache-key-x" },
+    );
+    assert.equal(prevResp!.source, "previous-response");
 });
 
-test("deriveSessionId: different API key → different session (no cross-account bleed)", () => {
-    const a = deriveSessionId(hdrs("Bearer keyA"), "anthropic", "https://bailian.example", "hello world");
-    const b = deriveSessionId(hdrs("Bearer keyB"), "anthropic", "https://bailian.example", "hello world");
-    assert.notEqual(a, b);
+test("preferPromptCacheKeyIdentity: no/blank/non-string prompt_cache_key keeps fingerprint", () => {
+    for (const body of [{ input: [] }, { input: [], prompt_cache_key: "   " }, { input: [], prompt_cache_key: 42 }]) {
+        const id = preferPromptCacheKeyIdentity(conversationIdentityResponses(body, undefined), body);
+        assert.equal(id!.source, "content-fingerprint");
+        assert.equal(id!.clientProvided, false);
+    }
+    assert.equal(preferPromptCacheKeyIdentity(undefined, { prompt_cache_key: "x" }), undefined);
 });
 
-test("deriveSessionId: credentials remain case-sensitive opaque values", () => {
-    const upper = deriveSessionId(hdrs("Bearer AbCd"), "responses", "https://chatgpt.com", "session");
-    const lower = deriveSessionId(hdrs("Bearer abcd"), "responses", "https://chatgpt.com", "session");
-    assert.notEqual(upper, lower);
-});
-
-test("deriveSessionId: different upstream origin → different session (no cross-provider bleed)", () => {
-    const a = deriveSessionId(hdrs("Bearer keyA"), "openai", "https://zhipu.example", "hello");
-    const b = deriveSessionId(hdrs("Bearer keyA"), "openai", "https://bailian.example", "hello");
-    assert.notEqual(a, b);
-});
-
-test("deriveSessionId: different protocol → different session (no cross-format bleed)", () => {
-    const a = deriveSessionId(hdrs("Bearer keyA"), "anthropic", "https://bailian.example", "hello");
-    const b = deriveSessionId(hdrs("Bearer keyA"), "openai", "https://bailian.example", "hello");
-    assert.notEqual(a, b);
-});
-
-test("deriveSessionId: different conversation → different session", () => {
-    const a = deriveSessionId(hdrs("Bearer keyA"), "anthropic", "https://bailian.example", "hello");
-    const b = deriveSessionId(hdrs("Bearer keyA"), "anthropic", "https://bailian.example", "goodbye");
-    assert.notEqual(a, b);
-});
-
-test("deriveSessionId: conversation signal is the only conversation dimension", () => {
-    // The conversation dimension is whatever the caller passes — typically the
-    // output of conversationSignal*, which already prefers a client header
-    // and falls back to a content hash. Here we just confirm the passed value
-    // is what matters (same key/proto/upstream, different convo → different).
-    const a = deriveSessionId(hdrs("Bearer keyA"), "anthropic", "https://up", "ses_111");
-    const b = deriveSessionId(hdrs("Bearer keyA"), "anthropic", "https://up", "ses_222");
-    assert.notEqual(a, b);
-    // Same convo signal → same session, regardless of anything else.
-    assert.equal(a, deriveSessionId(hdrs("Bearer keyA"), "anthropic", "https://up", "ses_111"));
-});
-
-test("deriveSessionId: no Authorization header → still works (uses placeholder key)", () => {
-    const id = deriveSessionId({}, "anthropic", "https://up", "convo-1");
-    assert.ok(id.length > 0);
-    // Two keyless requests with same content → same session.
-    assert.equal(id, deriveSessionId({}, "anthropic", "https://up", "convo-1"));
-});
-
-test("deriveSessionId: empty conversation dimension THROWS (no silent collapse)", () => {
-    // A caller that forgets to pass the conversation signal must fail loudly,
-    // not silently collapse every anonymous session onto one id.
-    assert.throws(() => deriveSessionId({}, "anthropic", "https://up", ""), /conversation dimension is required/);
+test("preferPromptCacheKeyIdentity: client-provided value IS the session id, stable across growing turns (#286)", () => {
+    const body1 = { input: [{ type: "message", role: "user", content: "hi" }], prompt_cache_key: "pck-omp-1" };
+    const body2 = { input: [...body1.input, { type: "message", role: "user", content: "turn 2" }], prompt_cache_key: "pck-omp-1" };
+    const id1 = preferPromptCacheKeyIdentity(conversationIdentityResponses(body1, undefined), body1)!;
+    const id2 = preferPromptCacheKeyIdentity(conversationIdentityResponses(body2, undefined), body2)!;
+    assert.equal(id1.value, id2.value);
+    assert.equal(affinityToken(id1), "pck-omp-1");
 });
 
 test("affinityToken: uses client signal when present (passthrough, preserves ses_ format)", () => {
@@ -102,8 +85,8 @@ test("clientConversationHeader: reads known session header names in priority ord
 });
 
 test("affinityToken: client-provided identity passes through verbatim (credentials never in scope)", () => {
-    // After the refactor, affinityToken receives only the resolved identity
-    // object ({ value, source, clientProvided }) — never raw headers or the
+    // affinityToken receives only the resolved identity object
+    // ({ value, source, clientProvided }) — never raw headers or the
     // API key — so credential leakage is impossible by construction.
     const token = affinityToken({ value: "client-session", source: "body-session", clientProvided: true });
     assert.equal(token, "client-session");
@@ -135,7 +118,7 @@ test("conversationSignalResponses: header (opencode x-session-affinity) still wi
     assert.equal(sig, "ses_opencode-123");
 });
 
-test("conversationIdentityResponses: previous_response_id provides a stable conversation link", () => {
+test("conversationIdentityResponses: previous_response_id is NOT client-provided (per-turn, not a stable conversation id)", () => {
     const body = {
         input: "hello",
         previous_response_id: "resp_xyz",
@@ -146,10 +129,109 @@ test("conversationIdentityResponses: previous_response_id provides a stable conv
     assert.equal(identity.clientProvided, false);
 });
 
-test("conversationIdentityResponses: identical anonymous openers share a content fingerprint (enables compression)", () => {
+test("conversationIdentityResponses: identical anonymous openers share a content fingerprint (rejected upstream by the server, #286)", () => {
     const body = { input: "hello world" } as unknown as Parameters<typeof conversationSignalResponses>[0];
     const a = conversationSignalResponses(body, undefined);
     const b = conversationSignalResponses({ input: "hello world" } as never, undefined);
     assert.equal(a, b);
     assert.match(a, /^[0-9a-f]{16}$/);
+});
+
+// ---- codexTurnIdentity (#316 / PR-A): codex turn-metadata partitioning ----
+
+const ROOT_SESSION = "01a048b8-c704-7c00-8000-000000000000";
+const SUB_THREAD = "01a048b8-c728-7c00-8000-000000000000";
+const rootMeta = (over: Record<string, unknown> = {}) =>
+    JSON.stringify({ request_kind: "turn", thread_source: "user", thread_id: ROOT_SESSION, turn_id: "turn-1", window_id: "win-1", ...over });
+const subMeta = (over: Record<string, unknown> = {}) =>
+    JSON.stringify({ request_kind: "turn", thread_source: "subagent", thread_id: SUB_THREAD, turn_id: "turn-2", window_id: "win-1", ...over });
+
+test("codexTurnIdentity: thread_source user → undefined (legacy precedence chain owns the root id)", () => {
+    const id = codexTurnIdentity({
+        "session-id": ROOT_SESSION,
+        "thread-id": ROOT_SESSION,
+        "x-codex-turn-metadata": rootMeta(),
+    });
+    assert.equal(id, undefined, "validated root turn must fall through to the legacy chain (stronger headers may win)");
+});
+
+test("codexTurnIdentity: thread_source subagent → thread-id header (fresh per-thread state, #150)", () => {
+    // A subagent REUSES the root's session-id header but carries its own
+    // thread-id — it must resolve to the thread-id, NOT the root session.
+    const id = codexTurnIdentity({
+        "session-id": ROOT_SESSION,
+        "thread-id": SUB_THREAD,
+        "x-codex-turn-metadata": subMeta(),
+    });
+    assert.deepEqual(id, { value: SUB_THREAD, threadSource: "subagent" });
+});
+
+test("codexTurnIdentity: root identity is stable across turns (turn_id/window_id churn is irrelevant)", () => {
+    const a = codexTurnIdentity({ "session-id": ROOT_SESSION, "thread-id": ROOT_SESSION, "x-codex-turn-metadata": rootMeta({ turn_id: "turn-1", window_id: "w1" }) });
+    const b = codexTurnIdentity({ "session-id": ROOT_SESSION, "thread-id": ROOT_SESSION, "x-codex-turn-metadata": rootMeta({ turn_id: "turn-99", window_id: "w42" }) });
+    assert.deepEqual(a, b);
+    assert.equal(a, undefined);
+});
+
+test("codexTurnIdentity: metadata.thread_id must equal the thread-id header (cross-check, PR #249)", () => {
+    // metadata says one thread, header says another → do not trust.
+    const mismatch = codexTurnIdentity({
+        "session-id": ROOT_SESSION,
+        "thread-id": SUB_THREAD,
+        "x-codex-turn-metadata": rootMeta({ thread_id: "01a048b8-ffff-7c00-8000-000000000000" }),
+    });
+    assert.equal(mismatch, undefined);
+    // header missing entirely → do not trust.
+    const noHeader = codexTurnIdentity({
+        "session-id": ROOT_SESSION,
+        "x-codex-turn-metadata": subMeta(),
+    });
+    assert.equal(noHeader, undefined);
+});
+
+test("codexTurnIdentity: JSON parse failure / non-object → do not trust (legacy chain)", () => {
+    assert.equal(codexTurnIdentity({ "session-id": ROOT_SESSION, "thread-id": ROOT_SESSION, "x-codex-turn-metadata": "{not json" }), undefined);
+    assert.equal(codexTurnIdentity({ "session-id": ROOT_SESSION, "thread-id": ROOT_SESSION, "x-codex-turn-metadata": "42" }), undefined);
+    assert.equal(codexTurnIdentity({ "session-id": ROOT_SESSION, "thread-id": ROOT_SESSION, "x-codex-turn-metadata": "[1,2,3]" }), undefined);
+    assert.equal(codexTurnIdentity({ "session-id": ROOT_SESSION, "thread-id": ROOT_SESSION, "x-codex-turn-metadata": "null" }), undefined);
+    assert.equal(codexTurnIdentity({ "session-id": ROOT_SESSION, "thread-id": ROOT_SESSION, "x-codex-turn-metadata": "   " }), undefined);
+});
+
+test("codexTurnIdentity: non-string/missing thread_source → do not trust (legacy chain)", () => {
+    assert.equal(codexTurnIdentity({ "session-id": ROOT_SESSION, "thread-id": ROOT_SESSION, "x-codex-turn-metadata": rootMeta({ thread_source: undefined }) }), undefined);
+    assert.equal(codexTurnIdentity({ "session-id": ROOT_SESSION, "thread-id": ROOT_SESSION, "x-codex-turn-metadata": rootMeta({ thread_source: 42 }) }), undefined);
+    assert.equal(codexTurnIdentity({ "session-id": ROOT_SESSION, "thread-id": ROOT_SESSION, "x-codex-turn-metadata": rootMeta({ thread_source: "  " }) }), undefined);
+    assert.equal(codexTurnIdentity({ "session-id": ROOT_SESSION, "thread-id": ROOT_SESSION, "x-codex-turn-metadata": rootMeta({ thread_id: 123 }) }), undefined);
+});
+
+test("codexTurnIdentity: any non-user thread_source partitions by thread-id (guardian family, #150)", () => {
+    // codex ThreadSource serializes more than user/subagent: review sessions
+    // send "guardian_review", the guardian-v2 async scorer sends
+    // "guardian_classifier" (Feature string), and memory consolidation sends
+    // "memory_consolidation". All are internal threads that must NOT inherit
+    // the root session's compression state — the discrimination is inverted:
+    // only "user" joins the root, everything else gets its own thread state.
+    for (const source of ["subagent", "guardian_review", "guardian_classifier", "memory_consolidation", "collab_spawn", "system"]) {
+        const id = codexTurnIdentity({
+            "session-id": ROOT_SESSION,
+            "thread-id": SUB_THREAD,
+            "x-codex-turn-metadata": subMeta({ thread_source: source, thread_id: SUB_THREAD }),
+        });
+        assert.deepEqual(id, { value: SUB_THREAD, threadSource: source }, `thread_source=${source}`);
+    }
+});
+
+test("codexTurnIdentity: user turn with no session-id header → do not trust (legacy chain)", () => {
+    assert.equal(codexTurnIdentity({ "thread-id": ROOT_SESSION, "x-codex-turn-metadata": rootMeta() }), undefined);
+});
+
+test("codexTurnIdentity: no metadata header (omp / other Responses clients) → undefined, legacy chain untouched", () => {
+    // omp-style stateless replay: prompt_cache_key identity, no codex headers.
+    // codexTurnIdentity must return undefined so the pck promotion chain runs.
+    const id = codexTurnIdentity({});
+    assert.equal(id, undefined);
+    const body = { input: [{ type: "message", role: "user", content: "hi" }], prompt_cache_key: "omp-pck-1" };
+    const promoted = preferPromptCacheKeyIdentity(conversationIdentityResponses(body, undefined), body);
+    assert.equal(promoted!.source, "prompt-cache-key");
+    assert.equal(promoted!.value, "omp-pck-1");
 });

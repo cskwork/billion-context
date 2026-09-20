@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { writeFileSync, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { loadOptions, lookupContextLimit, resolveContextLimit, resolveConfiguredContextLimit, parseRouteEntry, parsePromptCacheRouting } from "../src/config.ts";
+import { loadOptions, lookupContextLimit, resolveContextLimit, resolveConfiguredContextLimit, resolveConfiguredOutputLimit, resolveCompressProtocol, parseRouteEntry, parsePromptCacheRouting } from "../src/config.ts";
 
 const TMP = (s: string) => join(tmpdir(), `test-acp-${process.pid}-${s}.json`);
 const writeRoutes = (name: string, obj: unknown) => {
@@ -74,10 +74,30 @@ test("lookupContextLimit returns known windows", () => {
     assert.equal(lookupContextLimit("o1-preview"), 200_000);
     assert.equal(lookupContextLimit("gemini-2.5-pro"), 1_000_000);
     assert.equal(lookupContextLimit("glm-4.6"), 128_000);
-    assert.equal(lookupContextLimit("glm-4.5-air"), 128_000);
-    assert.equal(lookupContextLimit("deepseek-chat"), 64_000);
-    assert.equal(lookupContextLimit("qwen-max"), 128_000);
-    assert.equal(lookupContextLimit("kimi-k2"), 128_000);
+    assert.equal(lookupContextLimit("glm-4.5-air"), 200_000);
+    assert.equal(lookupContextLimit("deepseek-chat"), 1_000_000);
+    assert.equal(lookupContextLimit("deepseek-reasoner"), 1_000_000);
+    assert.equal(lookupContextLimit("MiniMax-M2.1"), 204_800);
+    assert.equal(lookupContextLimit("minimax-m2"), 204_800);
+    assert.equal(lookupContextLimit("qwen-max"), 200_000);
+    assert.equal(lookupContextLimit("kimi-k2"), 200_000);
+});
+
+test("lookupContextLimit keeps DeepSeek flagship at 1M and legacy r1/v3/ocr at 128k (#852)", () => {
+    assert.equal(lookupContextLimit("deepseek-flash"), 1_000_000);
+    assert.equal(lookupContextLimit("deepseek-v4-flash"), 1_000_000);
+    assert.equal(lookupContextLimit("deepseek-v4-pro"), 1_000_000);
+    assert.equal(lookupContextLimit("deepseek-r1"), 128_000);
+    assert.equal(lookupContextLimit("deepseek-r1-distill-qwen-32b"), 128_000);
+    assert.equal(lookupContextLimit("deepseek-v3"), 128_000);
+    assert.equal(lookupContextLimit("deepseek-v3.2"), 128_000);
+    assert.equal(lookupContextLimit("deepseek-ocr-2"), 128_000);
+});
+
+test("lookupContextLimit matches relay/vLLM 'prefix/name' ids via the bare basename (#736)", () => {
+    assert.equal(lookupContextLimit("meta-llama/Llama-4-Maverick"), 200_000);
+    assert.equal(lookupContextLimit("qwen/qwen3.8-27b"), 200_000);
+    assert.equal(lookupContextLimit("unknown-org/unknown-model"), undefined);
 });
 
 test("lookupContextLimit returns undefined for unknown models", () => {
@@ -147,14 +167,29 @@ test("model not in route falls through to lookup table", () => {
     const routes = {
         "https://open.bigmodel.cn": { models: { "glm-5.2": { context: 1000000 } } },
     };
-    // glm-5.2 not in this route's models, but in the built-in table (1000000)
-    assert.equal(resolveContextLimit(routes, "https://api.deepseek.com", "deepseek-chat"), 64000);
+    // deepseek-chat is not declared on this route -> falls through to the built-in table (#852)
+    assert.equal(resolveContextLimit(routes, "https://api.deepseek.com", "deepseek-chat"), 1_000_000);
 });
 
 test("configured context lookup stays separate from registry/built-in fallbacks", () => {
     const routes = { "https://api.openai.com": { models: {} } };
     assert.equal(resolveConfiguredContextLimit(routes, "https://api.openai.com/v1/responses", "gpt-5"), undefined);
     assert.equal(resolveContextLimit(routes, "https://api.openai.com/v1/responses", "gpt-5"), 400_000);
+});
+
+// #924: configured ModelEntry.output feeds the output-headroom fallback chain
+// (request carries no budget → configured output → registry ceiling → 0).
+test("resolveConfiguredOutputLimit mirrors the context-limit resolution", () => {
+    const routes = {
+        "https://api.openai.com": { models: { "gpt-5": { context: 400_000, output: 128_000 } } },
+        "https://api.openai.com/v1/responses": { models: { "gpt-5": { output: 64_000 } } },
+    };
+    assert.equal(resolveConfiguredOutputLimit(routes, "https://api.openai.com/v1/responses", "gpt-5"), 64_000, "longest key wins");
+    assert.equal(resolveConfiguredOutputLimit(routes, "https://api.openai.com/v1/chat/completions", "gpt-5"), 128_000);
+    assert.equal(resolveConfiguredOutputLimit(routes, "https://api.openai.com", "other-model"), undefined, "undeclared model");
+    assert.equal(resolveConfiguredOutputLimit(routes, "https://api.other.com", "gpt-5"), undefined, "unmatched route");
+    assert.equal(resolveConfiguredOutputLimit({ "https://api.openai.com": { models: { "gpt-5": { context: 400_000 } } } }, "https://api.openai.com", "gpt-5"), undefined, "context-only entry has no output");
+    assert.equal(resolveConfiguredOutputLimit({ "https://api.openai.com": { models: { "gpt-5": { output: 0 } } } }, "https://api.openai.com", "gpt-5"), undefined, "non-positive output ignored");
 });
 
 test("no matching key and unknown model returns undefined", () => {
@@ -173,4 +208,15 @@ test("normalizeUrlKey strips trailing slashes", () => {
     assert.equal(normalizeUrlKey("https://open.bigmodel.cn///"), "https://open.bigmodel.cn");
     assert.equal(normalizeUrlKey("https://open.bigmodel.cn"), "https://open.bigmodel.cn");
     assert.equal(normalizeUrlKey(""), "");
+});
+
+test("resolveCompressProtocol: longest-prefix URL match, undefined = default tools", () => {
+    const routes = {
+        "https://chatgpt.com": { compressProtocol: "marker" },
+        "https://ai.comfly.org": { models: { "gpt-5.6-sol": { context: 400000 } } },
+    };
+    assert.equal(resolveCompressProtocol(routes, "https://chatgpt.com/backend-api/codex"), "marker");
+    assert.equal(resolveCompressProtocol(routes, "https://ai.comfly.org/v1/responses"), undefined);
+    assert.equal(resolveCompressProtocol(routes, "https://api.openai.com/v1"), undefined);
+    assert.equal(resolveCompressProtocol(routes, undefined), undefined);
 });

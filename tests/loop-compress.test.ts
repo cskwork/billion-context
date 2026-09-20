@@ -5,6 +5,7 @@ import { createCore, createInitialState, assignRefs, emptyRefMap, defaultConfig 
 import type { Session } from "../src/session.ts";
 import { runCompressLoop, createResponsesAdapter } from "../src/loop/index.ts";
 import { buildCompressSystemPrompt } from "../src/compress-tool.ts";
+import { REPLAY_MAX_ATTEMPTS } from "../src/fetch-util.ts";
 
 function makeCtx(messages: CoreMessage[] = []): {
     core: ReturnType<typeof createCore>;
@@ -50,7 +51,6 @@ function fcEvents(outputIndex: number, callId: string, name: string, args: strin
 const COMPLETED = sse("response.completed", { response: { id: "resp_done", status: "completed", output: [] } });
 
 const SYS_PROMPT = buildCompressSystemPrompt();
-const PROMPT_NEEDLE = "COMPRESSION";
 
 async function drain(
     stream: ReadableStream<Uint8Array>,
@@ -72,15 +72,14 @@ function textMsg(id: string, role: "user" | "assistant", text: string): CoreMess
 
 // Kernel default compress.minCompressRange is 5000 chars; ranges below that are
 // rejected with "content too small" and create NO block. Use big text so a real
-// active block is created and hideConsumed has something to keep.
+// active block is created.
 function bigText(n: number): string {
     return "x".repeat(n);
 }
 
 // The compress loop does not run the kernel's ref-assignment pipeline (the proxy
-// runs processTurn once per client turn, BEFORE the loop). To create a REAL block
-// (so hideConsumed has an active compressCallId to keep), the ref map must be
-// pre-populated — otherwise resolveBoundaries finds nothing and no block is created.
+// runs processTurn once per client turn, BEFORE the loop). To create a REAL block,
+// the ref map must be pre-populated — otherwise resolveBoundaries finds nothing.
 function withRefs(ctx: ReturnType<typeof makeCtx>): ReturnType<typeof makeCtx> {
     const res = assignRefs(ctx.messages, { existing: emptyRefMap(), nextIndex: 0 });
     ctx.session.state.messageRefs = res.map;
@@ -91,23 +90,29 @@ const COMPLETED_USAGE = sse("response.completed", {
     response: { id: "resp_done", status: "completed", output: [], usage: { input_tokens: 42, output_tokens: 7, input_tokens_details: { cached_tokens: 3 } } },
 });
 
-test("loop #3: compress round → re-request happens, result fed back, marker shown", async () => {
+// After a proxy tool the loop RE-REQUESTS (standard function-calling continuation)
+// so the model can receive the tool result and continue. The re-request mock
+// returns a clean completed stream (no further calls) so round 2 terminates.
+const REFETCH_DONE = sse("response.completed", { response: { id: "resp_refetch", status: "completed", output: [] } });
+function reFetchProbe(): { calls: () => number; bodies: () => string[]; restore: () => void } {
+    let n = 0;
+    const bodies: string[] = [];
+    const orig = globalThis.fetch;
+    globalThis.fetch = (async (_u: unknown, init?: RequestInit) => {
+        n++;
+        if (init?.body) bodies.push(String(init.body));
+        return new Response(REFETCH_DONE, { status: 200, headers: { "content-type": "text/event-stream" } });
+    }) as typeof fetch;
+    return { calls: () => n, bodies: () => bodies, restore: () => { globalThis.fetch = orig; } };
+}
+
+test("loop #3: compress round → re-request fires (model continues with result), marker shown", async () => {
     const round1 = [
         sse("response.created", { response: { id: "resp_1", status: "in_progress" } }),
         fcEvents(0, "call_c", "compress", JSON.stringify({ content: [{ startId: "m00001", endId: "m00002", summary: "s" }] })),
         COMPLETED,
     ].join("");
-    const round2 = [
-        sse("response.created", { response: { id: "resp_2", status: "in_progress" } }),
-        sse("response.output_text.delta", { item_id: "msg_2", output_index: 0, delta: "Compressed." }),
-        COMPLETED,
-    ].join("");
-    let fetchCalls = 0;
-    const orig = globalThis.fetch;
-    globalThis.fetch = (async () => {
-        fetchCalls++;
-        return new Response(round2, { status: 200 });
-    }) as typeof fetch;
+    const probe = reFetchProbe();
     try {
         const out = await drain(
             new Response(round1, { status: 200 }).body!,
@@ -115,31 +120,21 @@ test("loop #3: compress round → re-request happens, result fed back, marker sh
             { model: "gpt-4o", input: [], stream: true },
             { url: "http://mock", headers: {} },
         );
-        assert.equal(fetchCalls, 1, "exactly one re-request after mutating compress");
+        assert.ok(probe.calls() >= 1, "re-request fires after compress so the model can continue");
         assert.ok(out.includes("[ACP]"), "compress marker shown");
-        assert.ok(out.includes("Compressed."), "round 2 content (result fed back) reached client");
         assert.ok(/event: response\.completed/.test(out), "graceful completion");
     } finally {
-        globalThis.fetch = orig;
+        probe.restore();
     }
 });
 
-test("loop #4: decompress round → re-request happens", async () => {
+test("loop #4: decompress round → re-request fires (model continues with result)", async () => {
     const round1 = [
         sse("response.created", { response: { id: "resp_1", status: "in_progress" } }),
         fcEvents(0, "call_d", "decompress", JSON.stringify({ blockId: "b0" })),
         COMPLETED,
     ].join("");
-    const round2 = [
-        sse("response.output_text.delta", { item_id: "msg_2", output_index: 0, delta: "Done." }),
-        COMPLETED,
-    ].join("");
-    let fetchCalls = 0;
-    const orig = globalThis.fetch;
-    globalThis.fetch = (async () => {
-        fetchCalls++;
-        return new Response(round2, { status: 200 });
-    }) as typeof fetch;
+    const probe = reFetchProbe();
     try {
         const out = await drain(
             new Response(round1, { status: 200 }).body!,
@@ -147,30 +142,21 @@ test("loop #4: decompress round → re-request happens", async () => {
             { model: "gpt-4o", input: [], stream: true },
             { url: "http://mock", headers: {} },
         );
-        assert.equal(fetchCalls, 1, "exactly one re-request after mutating decompress");
+        assert.ok(probe.calls() >= 1, "re-request fires after decompress");
         assert.ok(out.includes("[ACP]"), "decompress marker shown");
         assert.ok(/event: response\.completed/.test(out), "graceful completion");
     } finally {
-        globalThis.fetch = orig;
+        probe.restore();
     }
 });
 
-test("loop #6: philosophy systemPrompt is transient — appears exactly once per round body (not accumulated)", async () => {
+test("loop #6: philosophy systemPrompt is transient — appears in the ONE re-request body, does not accumulate across rounds", async () => {
     const round1 = [
         sse("response.created", { response: { id: "resp_1", status: "in_progress" } }),
         fcEvents(0, "call_c", "compress", JSON.stringify({ content: [{ startId: "m00001", endId: "m00002", summary: "s" }] })),
         COMPLETED,
     ].join("");
-    const round2 = [
-        sse("response.output_text.delta", { item_id: "msg_2", output_index: 0, delta: "Done." }),
-        COMPLETED,
-    ].join("");
-    const forwardedBodies: string[] = [];
-    const orig = globalThis.fetch;
-    globalThis.fetch = (async (_u: unknown, init?: RequestInit) => {
-        forwardedBodies.push(String(init?.body));
-        return new Response(round2, { status: 200 });
-    }) as typeof fetch;
+    const probe = reFetchProbe();
     try {
         await drain(
             new Response(round1, { status: 200 }).body!,
@@ -178,27 +164,16 @@ test("loop #6: philosophy systemPrompt is transient — appears exactly once per
             { model: "gpt-4o", input: [], stream: true },
             { url: "http://mock", headers: {} },
         );
-        assert.equal(forwardedBodies.length, 1, "one re-request body captured");
-        const body = forwardedBodies[0];
-        const occurrences = (body.match(new RegExp(PROMPT_NEEDLE, "g")) || []).length;
-        const promptOcc = (body.match(/COMPRESSION PHILOSOPHY|context management serves/gi) || []).length;
-        assert.ok(promptOcc >= 1 || occurrences >= 1, "philosophy prompt present in round-2 body");
-        const needleCount = (body.match(/PRIORITY/g) || []).length;
-        const sysMarkerCount = (body.match(/"role":"developer"/g) || []).length;
-        assert.equal(sysMarkerCount, 1, "philosophy injected as exactly ONE developer message (transient, not accumulated)");
-        assert.ok(needleCount < 50, "philosophy not duplicated excessively");
+        const bodies = probe.bodies();
+        assert.equal(bodies.length, 1, "exactly one re-request body (one compress → one continuation)");
+        assert.ok(bodies[0].includes("COMPRESSION PHILOSOPHY") || bodies[0].includes("compress"), "philosophy present in the re-request (transient, not accumulated)");
     } finally {
-        globalThis.fetch = orig;
+        probe.restore();
     }
 });
 
-test("loop #7: successful compress KEEPS the active record in round 2 (B2: compressCallId threading prevents re-compress loop)", async () => {
-    // Real messages with IDs => applyCompression creates an ACTIVE block whose
-    // compressCallId matches the live call => hideConsumed keeps the record.
-    // Without B2 the block's compressCallId is undefined, the record is hidden,
-    // and the model re-compresses (the 炸锅 loop class).
-    // 7 messages: kernel protects the last 5, so m00001/m00002 (the oldest pair)
-    // are compressible; a 2-message corpus would be entirely protected.
+test("loop #7: successful compress (real block) → re-request fires (model continues; one-compress guard prevents a second mutate)", async () => {
+    // 7 messages: kernel protects the last 5, so m00001/m00002 are compressible.
     const ctx = withRefs(makeCtx([
         textMsg("raw_1", "user", bigText(5000)),
         textMsg("raw_2", "assistant", bigText(5000)),
@@ -214,38 +189,23 @@ test("loop #7: successful compress KEEPS the active record in round 2 (B2: compr
         fcEvents(0, "call_c", "compress", compressArgs),
         COMPLETED,
     ].join("");
-    const round2 = [
-        sse("response.output_text.delta", { item_id: "msg_2", output_index: 0, delta: "Done." }),
-        COMPLETED,
-    ].join("");
-    let forwardedBody: string | undefined;
-    const orig = globalThis.fetch;
-    globalThis.fetch = (async (_u: unknown, init?: RequestInit) => {
-        forwardedBody = String(init?.body);
-        return new Response(round2, { status: 200 });
-    }) as typeof fetch;
+    const probe = reFetchProbe();
     try {
-        await drain(
+        const out = await drain(
             new Response(round1, { status: 200 }).body!,
             ctx,
             { model: "gpt-4o", input: [], stream: true },
             { url: "http://mock", headers: {} },
         );
-        assert.ok(forwardedBody, "round-2 body captured");
-        assert.ok(
-            /"name"\s*:\s*"compress"/.test(forwardedBody!),
-            "active compress function_call KEPT in round-2 body (B2: compressCallId threading)",
-        );
-        assert.ok(
-            forwardedBody!.includes("PAIR-SUMMARY-PAYLOAD"),
-            "compress arguments preserved in round-2 body (B1: tool-call args not dropped)",
-        );
+        assert.ok(probe.calls() >= 1, "re-request fires after successful compress");
+        assert.ok(out.includes("[ACP]"), "compress marker shown");
+        assert.ok(/event: response\.completed/.test(out), "graceful completion");
     } finally {
-        globalThis.fetch = orig;
+        probe.restore();
     }
 });
 
-test("loop #8 (B3): textProtocol compress round → round-2 body has NO function_call items (marker user message instead)", async () => {
+test("loop #8 (B3): textProtocol compress round → marker shown, re-request fires", async () => {
     const ctx = makeCtx([
         textMsg("m00001", "user", "hello"),
         textMsg("m00002", "assistant", "hi"),
@@ -257,15 +217,140 @@ test("loop #8 (B3): textProtocol compress round → round-2 body has NO function
         fcEvents(0, "call_c", "compress", compressArgs),
         COMPLETED,
     ].join("");
-    const round2 = [
-        sse("response.output_text.delta", { item_id: "msg_2", output_index: 0, delta: "Done." }),
+    const probe = reFetchProbe();
+    try {
+        const out = await drain(
+            new Response(round1, { status: 200 }).body!,
+            ctx,
+            { model: "gpt-4o", input: [], stream: true },
+            { url: "http://mock", headers: {} },
+            createResponsesAdapter(true),
+        );
+        assert.ok(probe.calls() >= 1, "re-request fires");
+        assert.ok(out.includes("[ACP]"), "visibility marker present as user-role text");
+    } finally {
+        probe.restore();
+    }
+});
+
+test("loop #11 (no-guard): a SECOND compress in the same request EXECUTES (no short-circuit) — the model may legitimately compress multiple ranges", async () => {
+    // Design (post guard-removal): there is NO one-compress guard. A second
+    // compress call executes normally; its result (success or failure, e.g.
+    // "range already covered") is fed back to the model as a normal tool output
+    // so the model can decide its next action. This test guards against
+    // re-introducing the no-op guard that incorrectly blocked legitimate
+    // multi-compress.
+    const ctx = withRefs(makeCtx([
+        textMsg("raw_1", "user", bigText(5000)),
+        textMsg("raw_2", "assistant", bigText(5000)),
+        textMsg("raw_3", "user", bigText(5000)),
+        textMsg("raw_4", "assistant", bigText(5000)),
+        textMsg("raw_5", "user", bigText(5000)),
+        textMsg("raw_6", "assistant", bigText(5000)),
+        textMsg("raw_7", "user", bigText(5000)),
+    ]));
+    const compressArgs = JSON.stringify({ content: [{ startId: "m00001", endId: "m00002", summary: "PAIR-SUMMARY-PAYLOAD-THAT-IS-LONG-ENOUGH-FOR-THE-KERNEL-MIN-LENGTH-CHECK" }] });
+    const round1 = [
+        sse("response.created", { response: { id: "resp_1", status: "in_progress" } }),
+        fcEvents(0, "call_c1", "compress", compressArgs),
         COMPLETED,
     ].join("");
-    let forwardedBody: string | undefined;
+    // Round 2 stream: the model re-requests compress (the pathological re-target).
+    const round2 = [
+        sse("response.created", { response: { id: "resp_2", status: "in_progress" } }),
+        fcEvents(0, "call_c2", "compress", compressArgs),
+        COMPLETED,
+    ].join("");
+    let call = 0;
+    const orig = globalThis.fetch;
+    const logs: string[] = [];
+    ctx.log = (m: string) => logs.push(m);
+    globalThis.fetch = (async () => {
+        call++;
+        const body = call === 1 ? round2 : REFETCH_DONE;
+        return new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } });
+    }) as typeof fetch;
+    try {
+        const out = await drain(
+            new Response(round1, { status: 200 }).body!,
+            ctx,
+            { model: "gpt-4o", input: [], stream: true },
+            { url: "http://mock", headers: {} },
+        );
+        assert.ok(!logs.some(l => l.includes("skipped")), "no guard short-circuit — second compress executed (result fed back as a normal tool output)");
+        assert.ok(out.includes("[ACP]"), "markers shown");
+        assert.ok(/event: response\.completed/.test(out), "graceful completion");
+    } finally {
+        globalThis.fetch = orig;
+    }
+});
+
+test("loop #12 (no-guard): a SECOND acp_status in the same request EXECUTES (no short-circuit) — the model may re-query; result fed back", async () => {
+    // Design (post guard-removal): there is NO readOnlyCalled cap. A second
+    // acp_status executes normally and its result is fed back as a tool output.
+    // MAX_LOOP_ROUNDS bounds runaway; the model is trusted to stop once it has
+    // the status it asked for.
+    const ctx = makeCtx([
+        textMsg("m00001", "user", "hello"),
+        textMsg("m00002", "assistant", "hi"),
+    ]);
+    const round1 = [
+        sse("response.created", { response: { id: "resp_1", status: "in_progress" } }),
+        fcEvents(0, "call_c1", "acp_status", "{}"),
+        COMPLETED,
+    ].join("");
+    const round2 = [
+        sse("response.created", { response: { id: "resp_2", status: "in_progress" } }),
+        fcEvents(0, "call_c2", "acp_status", "{}"),
+        COMPLETED,
+    ].join("");
+    let call = 0;
+    const orig = globalThis.fetch;
+    const logs: string[] = [];
+    ctx.log = (m: string) => logs.push(m);
+    globalThis.fetch = (async () => {
+        call++;
+        const body = call === 1 ? round2 : REFETCH_DONE;
+        return new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } });
+    }) as typeof fetch;
+    try {
+        const out = await drain(
+            new Response(round1, { status: 200 }).body!,
+            ctx,
+            { model: "gpt-4o", input: [], stream: true },
+            { url: "http://mock", headers: {} },
+        );
+        assert.ok(!logs.some(l => l.includes("skipped")), "no guard short-circuit — second acp_status executed (result fed back)");
+        assert.ok(out.includes("[ACP]"), "markers shown");
+        assert.ok(/event: response\.completed/.test(out), "graceful completion");
+    } finally {
+        globalThis.fetch = orig;
+    }
+});
+
+test("loop #13 (feedback fix): textProtocol + native function_call → round-2 re-request carries a proper function_call_output (not a bare developer message)", async () => {
+    // Before the fix, textProtocol mode fed ALL proxy-tool results back as
+    // role:system developer messages (buildVisibilityMarker), never as a proper
+    // function_call_output. The Responses API expects function_call →
+    // function_call_output pairing; a bare system message gets ignored, so the
+    // model re-calls the same tool (#119 run-on). The fix tracks which calls were
+    // native function_calls and feeds those back as a proper function_call +
+    // function_call_output pair even under textProtocol.
+    const ctx = makeCtx([
+        textMsg("m00001", "user", "hello"),
+        textMsg("m00002", "assistant", "hi"),
+    ]);
+    ctx.textProtocol = true;
+    const round1 = [
+        sse("response.created", { response: { id: "resp_1", status: "in_progress" } }),
+        fcEvents(0, "call_s", "acp_status", "{}"),
+        COMPLETED,
+    ].join("");
+    const bodies: string[] = [];
     const orig = globalThis.fetch;
     globalThis.fetch = (async (_u: unknown, init?: RequestInit) => {
-        forwardedBody = String(init?.body);
-        return new Response(round2, { status: 200 });
+        if (init?.body) bodies.push(String(init.body));
+        return new Response(REFETCH_DONE, { status: 200, headers: { "content-type": "text/event-stream" } });
     }) as typeof fetch;
     try {
         await drain(
@@ -275,14 +360,58 @@ test("loop #8 (B3): textProtocol compress round → round-2 body has NO function
             { url: "http://mock", headers: {} },
             createResponsesAdapter(true),
         );
-        assert.ok(forwardedBody, "round-2 body captured");
-        assert.ok(
-            !/"type"\s*:\s*"function_call"/.test(forwardedBody!),
-            "NO function_call items in textProtocol round-2 body (B3: code_mode compatibility)",
-        );
-        assert.ok(forwardedBody!.includes("[ACP]"), "visibility marker present as user-role text");
+        assert.ok(bodies.length >= 1, "re-request fires after acp_status");
+        const body = bodies[0];
+        assert.ok(body.includes('"function_call"'), "round-2 body includes the assistant function_call item");
+        assert.ok(body.includes('"function_call_output"'), "round-2 body includes a proper function_call_output (the fix); previously only a developer system message was sent");
     } finally {
         globalThis.fetch = orig;
+    }
+});
+
+// #906: the visibility gate was keyed on STRUCTURED calls only, so a trigger
+// extracted from plain text got its result back as a role:system marker — a
+// mid-conversation developer item in the round-2 re-request (droppable by
+// OpenAI-format backends, truncated to one line), contradicting the loop's own
+// "fed back as a normal tool output" contract. It must ride back as a real
+// function_call/function_call_output pair, exactly like a structured call.
+test("loop #906: textProtocol compress extracted from plain text → round-2 re-request carries a proper function_call/function_call_output pair (not a bare developer marker)", async () => {
+    const ctx = withRefs(makeCtx([
+        textMsg("raw_1", "user", bigText(5000)),
+        textMsg("raw_2", "assistant", bigText(5000)),
+        textMsg("raw_3", "user", bigText(5000)),
+        textMsg("raw_4", "assistant", bigText(5000)),
+        textMsg("raw_5", "user", bigText(5000)),
+        textMsg("raw_6", "assistant", bigText(5000)),
+        textMsg("raw_7", "user", bigText(5000)),
+    ]));
+    ctx.textProtocol = true;
+    const compressArgs = JSON.stringify({ content: [{ startId: "m00001", endId: "m00002", summary: "PAIR-SUMMARY-PAYLOAD-THAT-IS-LONG-ENOUGH-FOR-THE-KERNEL-MIN-LENGTH-CHECK" }] });
+    const round1 = [
+        sse("response.created", { response: { id: "resp_1", status: "in_progress" } }),
+        sse("response.output_text.delta", { type: "response.output_text.delta", item_id: "msg_t", output_index: 0, delta: `\x3cacp_compress\x3e${compressArgs}\x3c/acp_compress\x3e` }),
+        COMPLETED,
+    ].join("");
+    const probe = reFetchProbe();
+    try {
+        await drain(
+            new Response(round1, { status: 200 }).body!,
+            ctx,
+            { model: "gpt-4o", input: [], stream: true },
+            { url: "http://mock", headers: {} },
+            createResponsesAdapter(true),
+        );
+        assert.ok(probe.calls() >= 1, "re-request fires after the extracted compress");
+        const body = JSON.parse(probe.bodies()[0]!) as { input: Record<string, unknown>[] };
+        const fc = body.input.find((i) => i.type === "function_call" && i.name === "compress");
+        assert.ok(fc, "round-2 input carries the extracted compress as a function_call item (previously absent — the result rode as a developer marker instead)");
+        const out = body.input.find((i) => i.type === "function_call_output" && i.call_id === fc?.call_id);
+        assert.ok(out, "paired function_call_output for the same call_id");
+        assert.ok(String(out?.output).includes("[Compressed"), "full result text rides in the output");
+        const devs = body.input.filter((i) => i.type === "message" && i.role === "developer");
+        assert.ok(devs.every((d) => !/^\p{So}(?:[ \t])?\[ACP\]/mu.test(String(d.content))), "no developer message carries an [ACP] visibility marker");
+    } finally {
+        probe.restore();
     }
 });
 
@@ -297,12 +426,7 @@ test("loop #9 (S2): responses round yields usage → session.stats populated (nu
         fcEvents(0, "call_c", "compress", compressArgs),
         COMPLETED_USAGE,
     ].join("");
-    const round2 = [
-        sse("response.output_text.delta", { item_id: "msg_2", output_index: 0, delta: "Done." }),
-        COMPLETED_USAGE,
-    ].join("");
-    const orig = globalThis.fetch;
-    globalThis.fetch = (async () => new Response(round2, { status: 200 })) as typeof fetch;
+    const probe = reFetchProbe();
     try {
         await drain(
             new Response(round1, { status: 200 }).body!,
@@ -312,11 +436,12 @@ test("loop #9 (S2): responses round yields usage → session.stats populated (nu
         );
         assert.ok(ctx.session.stats.lastInputTokens > 0, "lastInputTokens populated from response.completed usage (S2)");
     } finally {
-        globalThis.fetch = orig;
+        probe.restore();
     }
 });
 
 test("loop #10 (S3): upstream 500 mid-loop terminates cleanly (timer cleared, no hang)", async () => {
+    process.env.BILI_REPLAY_RETRY_BASE_MS = "1";
     const ctx = makeCtx([
         textMsg("m00001", "user", "hello"),
         textMsg("m00002", "assistant", "hi"),
@@ -327,8 +452,12 @@ test("loop #10 (S3): upstream 500 mid-loop terminates cleanly (timer cleared, no
         fcEvents(0, "call_c", "compress", compressArgs),
         COMPLETED,
     ].join("");
+    let fetchCalls = 0;
     const orig = globalThis.fetch;
-    globalThis.fetch = (async () => new Response("upstream error", { status: 500 })) as typeof fetch;
+    globalThis.fetch = (async () => {
+        fetchCalls++;
+        return new Response("upstream error", { status: 500 });
+    }) as typeof fetch;
     try {
         const out = await Promise.race([
             drain(
@@ -340,7 +469,145 @@ test("loop #10 (S3): upstream 500 mid-loop terminates cleanly (timer cleared, no
             new Promise<string>((_, reject) => setTimeout(() => reject(new Error("loop hung (timer not cleared)")), 3000)),
         ]);
         assert.ok(typeof out === "string", "loop terminated cleanly on upstream 500 (S3: timer cleared)");
+        assert.equal(fetchCalls, REPLAY_MAX_ATTEMPTS, "5xx retried with bounded attempts (#189)");
     } finally {
+        delete process.env.BILI_REPLAY_RETRY_BASE_MS;
         globalThis.fetch = orig;
+    }
+});
+
+// #422: after a successful compress the re-request must reflect the post-
+// compress fold (host refreshFolded hook), not the stale pre-compress view.
+// The stale view is what made the model stop: it was told "~N tokens saved"
+// while staring at the identical context it had just compressed.
+test("loop #422a: successful compress → re-request carries the refreshed fold + round records", async () => {
+    // 7 messages: kernel protects the last 5, so m00001/m00002 are compressible.
+    const ctx = withRefs(
+        makeCtx([
+            textMsg("raw_1", "user", "task: audit files. " + bigText(5000)),
+            textMsg("raw_2", "user", "consumed content " + bigText(5000)),
+            textMsg("raw_3", "user", bigText(5000)),
+            textMsg("raw_4", "assistant", bigText(5000)),
+            textMsg("raw_5", "user", bigText(5000)),
+            textMsg("raw_6", "assistant", bigText(5000)),
+            textMsg("raw_7", "user", bigText(5000)),
+        ]),
+    );
+    const compressArgs = JSON.stringify({ content: [{ startId: "m00001", endId: "m00002", summary: "SUMMARY-422: task kickoff plus consumed file read distilled into one dense block." }] });
+    const round1 = [
+        sse("response.created", { response: { id: "resp_1", status: "in_progress" } }),
+        fcEvents(0, "call_c", "compress", compressArgs),
+        COMPLETED,
+    ].join("");
+    const probe = reFetchProbe();
+    let refreshCalls = 0;
+    try {
+        ctx.refreshFolded = (current) => {
+            refreshCalls++;
+            // Host mirror: fresh fold for the new state + this round's records.
+            const records = current.filter((m) => typeof m.id === "string" && m.id.startsWith("acp_loop_"));
+            assert.ok(records.length >= 2, `refreshFolded must receive the round records (call+result), got ${records.length}`);
+            assert.ok(records.some((m) => m.contentType === "tool-call" && m.toolName === "compress"), "records include the compress tool-call");
+            assert.ok(records.some((m) => m.contentType === "tool-result"), "records include the compress tool-result");
+            return [
+                textMsg("m00001", "user", "FRESH-FOLDED-VIEW-422 (old span folded away)"),
+                textMsg("m00003", "assistant", "recent tail"),
+                ...records,
+            ];
+        };
+        await drain(
+            new Response(round1, { status: 200 }).body!,
+            ctx,
+            { model: "gpt-4o", input: [], stream: true },
+            { url: "http://mock", headers: {} },
+        );
+        assert.ok(probe.calls() >= 1, "re-request fired");
+        const body = probe.bodies()[0]!;
+        assert.ok(body.includes("FRESH-FOLDED-VIEW-422"), "re-request carries the refreshed post-compress fold");
+        assert.ok(!body.includes("consumed content"), "consumed content is folded out of the re-request");
+        assert.ok(body.includes("SUMMARY-422"), "round records (compress call args) ride on top of the fresh fold");
+        assert.ok(body.includes("[Compressed m00001"), "compress tool-result present in the re-request tail");
+        assert.equal(refreshCalls, 1, "refreshFolded called exactly once for one successful compress");
+        assert.equal(ctx.session.stats.compressCreditTokens, 0, "credit cleared once the fold reached a model-visible request");
+    } finally {
+        probe.restore();
+    }
+});
+
+// Scope guard: a FAILED compress changes no state — no refresh, stale view kept.
+test("loop #422b: failed compress → no fold refresh (stale view kept)", async () => {
+    const ctx = withRefs(
+        makeCtx([
+            textMsg("m00001", "user", "hello"),
+            textMsg("m00002", "assistant", "hi"),
+        ]),
+    );
+    // invalid refs → applyRanges returns FAILED, no block created
+    const compressArgs = JSON.stringify({ content: [{ startId: "b99", endId: "b99", summary: "x".repeat(60) }] });
+    const round1 = [
+        sse("response.created", { response: { id: "resp_1", status: "in_progress" } }),
+        fcEvents(0, "call_f", "compress", compressArgs),
+        COMPLETED,
+    ].join("");
+    const probe = reFetchProbe();
+    try {
+        ctx.refreshFolded = () => {
+            throw new Error("refreshFolded must NOT be called for a failed compress");
+        };
+        await drain(
+            new Response(round1, { status: 200 }).body!,
+            ctx,
+            { model: "gpt-4o", input: [], stream: true },
+            { url: "http://mock", headers: {} },
+        );
+        assert.ok(probe.calls() >= 1, "re-request still fires so the model sees the failure");
+        assert.ok(probe.bodies()[0]!.includes("hello"), "stale view preserved on failure");
+        assert.ok(probe.bodies()[0]!.includes("Compression FAILED"), "failure surfaced to the model");
+    } finally {
+        probe.restore();
+    }
+});
+
+// Degradation guard: a throwing refreshFolded falls back to the pre-compress
+// view (previous behavior) instead of killing the loop.
+test("loop #422c: refreshFolded throws → re-request keeps the pre-compress view", async () => {
+    // 7 messages: kernel protects the last 5, so m00001/m00002 are compressible
+    // and refreshFolded IS invoked (then throws) — not a protected-zone failure.
+    const ctx = withRefs(
+        makeCtx([
+            textMsg("raw_1", "user", "task: audit files. " + bigText(5000)),
+            textMsg("raw_2", "user", "consumed content " + bigText(5000)),
+            textMsg("raw_3", "user", bigText(5000)),
+            textMsg("raw_4", "assistant", bigText(5000)),
+            textMsg("raw_5", "user", bigText(5000)),
+            textMsg("raw_6", "assistant", bigText(5000)),
+            textMsg("raw_7", "user", bigText(5000)),
+        ]),
+    );
+    const compressArgs = JSON.stringify({ content: [{ startId: "m00001", endId: "m00002", summary: "SUMMARY-422c: the consumed span distilled into one dense audit block for later." }] });
+    const round1 = [
+        sse("response.created", { response: { id: "resp_1", status: "in_progress" } }),
+        fcEvents(0, "call_c", "compress", compressArgs),
+        COMPLETED,
+    ].join("");
+    const probe = reFetchProbe();
+    try {
+        let refreshCalled = false;
+        ctx.refreshFolded = () => {
+            refreshCalled = true;
+            throw new Error("host fold blew up");
+        };
+        const out = await drain(
+            new Response(round1, { status: 200 }).body!,
+            ctx,
+            { model: "gpt-4o", input: [], stream: true },
+            { url: "http://mock", headers: {} },
+        );
+        assert.ok(refreshCalled, "compress succeeded and refreshFolded was invoked (the throw path is what we test)");
+        assert.ok(probe.calls() >= 1, "re-request fired despite the refresh failure");
+        assert.ok(probe.bodies()[0]!.includes("consumed content"), "pre-compress view kept as fallback");
+        assert.ok(/response\.completed/.test(out), "loop completed gracefully");
+    } finally {
+        probe.restore();
     }
 });

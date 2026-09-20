@@ -1,46 +1,123 @@
 import {
-    buildStatusReport,
-    estimateTokensFast,
     hideConsumedCompressCalls,
     type CompressionCore,
     type Config,
     type CoreMessage,
 } from "acp-kernel";
-import type { Session } from "../session.js";
+import { handleAcpStatus } from "../acp-status.js";
+import { handleAcpCache, recordCacheSample } from "../cache-ledger.js";
+import { lastCompressSuffix, withSessionLock, type Session } from "../session.js";
+import type { BiliMessage } from "acp-kernel/wire";
 import {
     parseCompressInput,
-    PROXY_TOOL_NAMES,
+    ABSORB_TOOL_NAME,
+    RULE_TOOL_NAME,
 } from "../compress-tool.js";
+import { effectiveAbsorbConfig, executeAbsorb, isProxyToolFor } from "../absorb.js";
+import { effectiveRulesConfig, executeRule } from "../rules-feature.js";
 import { applyRanges } from "../stream.js";
-import { resolveDecompress } from "../decompress-shared.js";
+import { executeSearchContextTarget, resolveDecompress } from "../decompress-shared.js";
 import { buildVisibilityMarker } from "../compress-loop.js";
-import { fetchWithTimeout } from "../fetch-util.js";
+import { fetchWithRetry, UpstreamHttpError } from "../fetch-util.js";
 import { proxyDispatcher } from "../upstream-proxy.js";
+import { warnCacheCollapse } from "../cache-warn.js";
+import { dumpRejectedBody } from "../error-dump.js";
+import { dumpsDir } from "../paths.js";
+import { isStrictReasoningEcho, modelIdOf, normalizeStrictEchoBody } from "../strict-echo.js";
 import { log as loggerLog } from "../logger.js";
+import { promptInputTotal, type WireProtocol } from "../util.js";
+import { DEGENERATE_RETRY_NUDGE } from "../degenerate-retry.js";
 
 export const MAX_LOOP_ROUNDS = 10;
+
+// #413 follow-up: when the stream dies AFTER visible text has already been
+// forwarded (final-report shape — heavy reasoning, then the answer starts,
+// then the relay cuts), a blind re-fetch would make the client watch the
+// answer regrow from scratch on top of the partial one. Instead, re-fetch
+// once with a continuation nudge that quotes the forwarded tail and asks the
+// model to pick up exactly where the text ended; the retry's output appends
+// seamlessly to what the client already has. Ephemeral like #732: never
+// committed to coreMessages/session state.
+const TRUNCATION_CONTINUATION_TAIL_CHARS = 800;
+const truncationContinuationNudge = (tail: string): string =>
+    `[billion-context] Your previous response was cut off mid-transmission by a network failure before the stream could complete. The client already received the response up to and including this text:\n\n---\n${tail}\n---\n\nContinue the response seamlessly from exactly where that text ends (mid-sentence if necessary). Do not repeat any part of the received text and do not start over — just pick up where it stopped and finish the response.`;
+
+function isLoopThinking(m: CoreMessage): boolean {
+    return m.contentType === "reasoning" && typeof m.id === "string" && m.id.startsWith("acp_loop_");
+}
+
+function stripLoopThinking(messages: CoreMessage[]): CoreMessage[] {
+    return messages.filter((m) => !isLoopThinking(m));
+}
+
+// Canonical args for repeat-detection: key-order/whitespace differences must not
+// defeat an identical-call match, so parse + re-stringify with sorted keys.
+function canonicalArgs(args: string): string {
+    try {
+        return JSON.stringify(sortKeys(JSON.parse(args)));
+    } catch {
+        return args;
+    }
+}
+
+function sortKeys(v: unknown): unknown {
+    if (Array.isArray(v)) return v.map(sortKeys);
+    if (v !== null && typeof v === "object") {
+        const src = v as Record<string, unknown>;
+        const out: Record<string, unknown> = {};
+        for (const k of Object.keys(src).sort()) out[k] = sortKeys(src[k]);
+        return out;
+    }
+    return v;
+}
 
 export interface LoopCtx {
     core: CompressionCore;
     config: Config;
     messages: CoreMessage[];
+    /** View handed to applyCompression (see RewriteCtx.compressMessages). */
+    compressMessages?: CoreMessage[];
     session: Session;
     log: (msg: string) => void;
     proxyUrl?: string;
     textProtocol?: boolean;
     debug?: boolean;
+    /** #422: host hook that re-runs the kernel fold (processTurn) on the
+     *  original messages with the CURRENT session state, re-attaching this
+     *  loop's round records. Called after a successful compress so the
+     *  re-request reflects the compression the model just performed instead
+     *  of the pre-compress view (stale view = model sees zero effect + a
+     *  finished deliverable → wraps up and stops). */
+     refreshFolded?: (current: CoreMessage[]) => CoreMessage[] | Promise<CoreMessage[]>;
+    // Which wire protocol produced the usage the loop records. Needed to
+    // compute the true context total correctly (Anthropic reports
+    // input_tokens as NEW-only; OpenAI/Responses report the TOTAL).
+    protocol?: WireProtocol;
+    /** #862: when `false`, suppress the 📦/❌ ACP visibility markers emitted
+     *  after proxy tool executions — both the marker line streamed to the
+     *  client (`emitMarker`) and the orphan marker message re-injected into
+     *  rebuilt history. Default (undefined) keeps markers on. Paired
+     *  tool-call/tool-result messages are unaffected. */
+    visibilityMarkers?: boolean;
 }
 
 export interface RequestOptions {
     url: string;
     headers: Record<string, string>;
+    /** Final-stage wire transform (e.g. compat.roles role rewrite, #552).
+     *  Applied to every outgoing body this loop re-sends — truncation retry,
+     *  degraded retry, rebuilt rounds — so re-sent bodies carry the same
+     *  compat the initial forward() applied. Returns the body to serialize. */
+    wireTransform?: (body: Record<string, unknown>) => Record<string, unknown>;
 }
 
 export type ParsedStreamEvent =
     | { kind: "text"; delta: string; raw?: Buffer }
-    | { kind: "tool_call"; name: string; callId: string; arguments: string }
-    | { kind: "usage"; inputTokens?: number; outputTokens?: number; cachedTokens?: number }
-    | { kind: "done"; finishReason?: string }
+    | { kind: "reasoning"; delta: string; raw?: Buffer; signature?: string; blockEnd?: boolean }
+    | { kind: "tool_call"; name: string; callId: string; arguments: string; passthrough?: boolean; signature?: string }
+    | { kind: "usage"; inputTokens?: number; outputTokens?: number; cachedTokens?: number; creationTokens?: number }
+    | { kind: "done"; finishReason?: string; suppressCompletion?: boolean; truncated?: boolean; thinking?: boolean }
+    | { kind: "error"; message: string }
     | { kind: "meta"; chunk: Buffer; firstRoundOnly?: boolean };
 
 export interface EmitCompletionOpts {
@@ -52,6 +129,11 @@ export interface ToolCallEmit {
     name: string;
     callId: string;
     arguments: string;
+    passthrough?: boolean;
+    /** Protocol signature for the call part (Gemini thoughtSignature). A
+     *  reconstructed functionCall replayed without it is rejected by Gemini 3,
+     *  so it rides the call through to the re-request and to emitToolCall. */
+    signature?: string;
 }
 
 export interface ExtractedTextTriggers {
@@ -67,6 +149,7 @@ export interface CompressLoopAdapter {
     ): Record<string, unknown>;
     parseStream(upstream: ReadableStream<Uint8Array>, round: number): AsyncGenerator<ParsedStreamEvent>;
     emitText(delta: string): Buffer;
+    emitReasoning?(delta: string): Buffer;
     emitToolCall(call: ToolCallEmit): Buffer;
     emitMarker(toolName: string, result: string): Buffer;
     emitCompletion(opts?: EmitCompletionOpts): Buffer;
@@ -87,45 +170,59 @@ export function executeProxyTool(
         return resolveDecompress(args, ctx);
     }
     if (toolName === "search_context") {
-        const query = typeof args.query === "string" ? args.query : "";
-        if (query.length === 0) return "[search_context FAILED: query is required]";
-        const limit = typeof args.limit === "number" && args.limit > 0 ? Math.floor(args.limit) : 5;
-        const blocks = ctx.core.search(query, ctx.session.state).slice(0, limit);
-        if (blocks.length === 0) return `[No blocks matched "${query}"]`;
-        const lines = blocks.map((b) => {
-            const topic = b.topic ?? "(no topic)";
-            const preview = b.summary.length > 200 ? b.summary.slice(0, 200) + "..." : b.summary;
-            return `${b.blockId} (T${b.tier}) "${topic}"\n  ${preview}`;
-        });
-        return `Found ${blocks.length} block(s) for "${query}":\n\n${lines.join("\n\n")}`;
+        return executeSearchContextTarget(args, ctx.core, ctx.session.id, ctx.session.state);
     }
     if (toolName === "acp_status") {
-        return buildStatusReport(ctx.session.state, ctx.messages, estimateTokensFast);
+        return handleAcpStatus(args, ctx);
+    }
+    if (toolName === "acp_cache") {
+        return handleAcpCache(ctx.session, args);
+    }
+    const absorb = effectiveAbsorbConfig(ctx.session, ctx.config);
+    if (absorb?.enabled === true && toolName === (absorb.toolName ?? ABSORB_TOOL_NAME)) {
+        return executeAbsorb(args, callId, absorb, ctx);
+    }
+    if (effectiveRulesConfig(ctx.session, ctx.config)?.enabled === true && toolName === RULE_TOOL_NAME) {
+        return executeRule(args, ctx);
     }
     return `[Unknown proxy tool: ${toolName}]`;
 }
 
 function recordUsage(
     ctx: LoopCtx,
-    usage: { inputTokens?: number; outputTokens?: number; cachedTokens?: number },
+    usage: { inputTokens?: number; outputTokens?: number; cachedTokens?: number; creationTokens?: number },
     round: number,
 ): void {
     const prompt = usage.inputTokens;
     const cached = usage.cachedTokens;
     const out = usage.outputTokens;
-    if (typeof prompt === "number") ctx.session.stats.inputTokens += prompt;
-    ctx.session.stats.lastInputTokens =
-        (typeof prompt === "number" ? prompt : 0) + (typeof cached === "number" ? cached : 0);
-    if (typeof cached === "number") ctx.session.stats.cachedTokens += cached;
+    const total = promptInputTotal(ctx.protocol, prompt, cached, usage.creationTokens);
+    if (total > 0) ctx.session.stats.inputTokens += total;
+    // Net out this turn's compress credit: the post-compress re-request
+    // re-sends the unfolded history, so its usage report over-reports the
+    // context the NEXT request will actually carry (see stream.ts applyRanges).
+    // #793: a zero-total sample (missing or placeholder input) must not
+    // clobber the last trusted value — mirrors applyUsageSample (plugin mode).
+    if (total > 0) {
+        ctx.session.stats.lastInputTokens = Math.max(0, total - (ctx.session.stats.compressCreditTokens ?? 0));
+        ctx.session.stats.lastInputTokensSource = "usage";
+    }
+    if (typeof cached === "number" && total > 0) {
+        ctx.session.stats.cachedTokens += cached;
+        ctx.session.stats.cacheSamples += 1;
+    }
     if (typeof out === "number") ctx.session.stats.outputTokens += out;
-    ctx.session.stats.cacheSamples += 1;
     const hitPct =
-        typeof prompt === "number" && typeof cached === "number" && prompt + cached > 0
-            ? Math.round((cached / (prompt + cached)) * 100)
-            : 0;
+        typeof cached === "number" && total > 0 ? Math.round((cached / total) * 100) : 0;
+    warnCacheCollapse(ctx.session, total, cached ?? 0);
+    const foldNew = ctx.session.stats.pendingFoldUsage === true;
+    if (foldNew) ctx.session.stats.pendingFoldUsage = false;
     ctx.log(
-        `[acp-usage] round ${round} input=${ctx.session.stats.lastInputTokens} cached=${cached ?? 0} (cache hit ${hitPct}%)`,
+        `[acp-usage] round ${round} input=${total} cached=${cached ?? 0} (cache hit ${hitPct}%)${foldNew ? " fold=new" : ""}${total <= 0 ? " (zero-total: lastInputTokens kept)" : ""}`,
     );
+    if (total > 0 || typeof cached === "number") {
+        recordCacheSample(ctx.session, { at: Date.now(), input: total, cached: cached ?? 0, output: out });
+    }
 }
 
 export async function* runCompressLoop(
@@ -135,39 +232,321 @@ export async function* runCompressLoop(
     requestOptions: RequestOptions,
     adapter: CompressLoopAdapter,
     systemPrompt: string,
+    signal?: AbortSignal,
 ): AsyncGenerator<Buffer> {
     let activeClearTimer: (() => void) | null = null;
     let currentUpstream = upstream;
+    let roundBody: Record<string, unknown> = requestBody;
     const coreMessages: CoreMessage[] = [...ctx.messages];
+    let degradedRetried = false;
+    let truncationRetried = false;
+    // Independent one-shot for the visible-text continuation retry (#413
+    // follow-up): the two retry shapes must not share a budget — a visible
+    // cut that continues and then cuts again invisibly still needs the blind
+    // re-fetch available, because the second attempt added nothing the
+    // client can see.
+    let continuationRetried = false;
+    let degenerateRetried = false;
+    // #1029: a retry storm re-executes the same failing proxy call every round;
+    // re-streaming the identical status marker each time only accumulates noise
+    // in client-stored history (incoming-history stripping removes it next turn,
+    // but one copy per request is enough signal for humans).
+    const seenMarkers = new Set<string>();
+
+    const fetchUpstream = (body: Record<string, unknown>) =>
+        fetchWithRetry(
+            requestOptions.url,
+            {
+                method: "POST",
+                headers: requestOptions.headers,
+                body: JSON.stringify(requestOptions.wireTransform ? requestOptions.wireTransform(body) : body),
+                ...(ctx.proxyUrl ? { dispatcher: proxyDispatcher(ctx.proxyUrl) } : {}),
+            },
+            undefined,
+            signal,
+            (info) => {
+                // #189: correlate the rejection with the rewrite that
+                // preceded it (shrink ratio + fold point), if any.
+                const lc = lastCompressSuffix(ctx.session.lastCompress);
+                ctx.log(`[acp-proxy: upstream rejected replay (HTTP ${info.status}: ${info.detail.slice(0, 120)}); likely provider risk-control — retrying in ${info.delayMs}ms (attempt ${info.attempt}/${info.maxAttempts})${lc}]`);
+                loggerLog("warn", `[acp-loop] upstream rejected replay (HTTP ${info.status}); retrying in ${info.delayMs}ms (attempt ${info.attempt}/${info.maxAttempts})${lc}`);
+            },
+        );
+
+    // #156: compress/decompress calls already failed this loop. Validation is
+    // deterministic (identical args → identical failure), so a byte-identical
+    // re-submission can never succeed — break early instead of at MAX_LOOP_ROUNDS.
+    const failedSignatures = new Set<string>();
+
+    // #762: strict-echo origin for re-request normalization (the learned flag
+    // rides on ctx.session.metadata; mirrors prepareOpenai's static gate).
+    let strictEchoOrigin: string | undefined;
+    try {
+        strictEchoOrigin = new URL(requestOptions.url).origin;
+    } catch {
+        strictEchoOrigin = undefined;
+    }
 
     try {
         for (let round = 1; round <= MAX_LOOP_ROUNDS; round++) {
+            if (signal?.aborted) break;
             let assistantText = "";
+            let assistantReasoning = "";
+            const reasoningSegments: { text: string; signature: string }[] = [];
+            let reasoningSealed = true;
             const calls: ToolCallEmit[] = [];
-            let usage: { inputTokens?: number; outputTokens?: number; cachedTokens?: number } = {};
+            let usage: { inputTokens?: number; outputTokens?: number; cachedTokens?: number; creationTokens?: number } = {};
             let finishReason: string | undefined;
+            let streamError: string | undefined;
+            let sawDone = false;
+            let suppressCompletion = false;
+            let truncatedDone = false;
+            let sawThinking = false;
+            // #821: on wires that stream reasoning verbatim (openai/anthropic) a thinking-only
+            // turn marks output forwarded before done, making the #732 retry unreachable there.
+            // Track model-VISIBLE output separately: a reasoning prefix is invisible to host turn
+            // semantics, so the degenerate retry may still append a fresh attempt to the stream.
+            // forwardedAny counts every forwarded byte (incl. meta/framing) — the original
+            // #413 zero-side-effect condition.
+            let forwardedAny = false;
+            let forwardedVisible = false;
+            const fwd = (chunk: Buffer, visible = false): Buffer => {
+                forwardedAny = true;
+                if (visible) forwardedVisible = true;
+                return chunk;
+            };
 
-            for await (const ev of adapter.parseStream(currentUpstream, round)) {
-                if (ev.kind === "text") {
-                    assistantText += ev.delta;
-                    if (!ctx.textProtocol && round === 1 && ev.raw) {
-                        yield ev.raw;
-                    }
-                } else if (ev.kind === "tool_call") {
-                    calls.push({ name: ev.name, callId: ev.callId, arguments: ev.arguments });
-                } else if (ev.kind === "usage") {
-                    usage = {
-                        inputTokens: ev.inputTokens,
-                        outputTokens: ev.outputTokens,
-                        cachedTokens: ev.cachedTokens,
-                    };
-                } else if (ev.kind === "done") {
-                    finishReason = ev.finishReason;
-                } else if (ev.kind === "meta") {
-                    if (round === 1 || !ev.firstRoundOnly) {
-                        yield ev.chunk;
+            for (;;) {
+                assistantText = "";
+                assistantReasoning = "";
+                reasoningSegments.length = 0;
+                reasoningSealed = true;
+                calls.length = 0;
+                usage = {};
+                finishReason = undefined;
+                streamError = undefined;
+                sawDone = false;
+                suppressCompletion = false;
+                truncatedDone = false;
+                sawThinking = false;
+                forwardedAny = false;
+                forwardedVisible = false;
+
+                for await (const ev of adapter.parseStream(currentUpstream, round)) {
+                    if (signal?.aborted) break;
+                    if (ev.kind === "text") {
+                        assistantText += ev.delta;
+                        if (!ctx.textProtocol && ev.raw) {
+                            yield fwd(ev.raw, true);
+                        } else if (!ctx.textProtocol && round > 1 && ev.delta.length > 0) {
+                            yield fwd(adapter.emitText(ev.delta), true);
+                        }
+                    } else if (ev.kind === "reasoning") {
+                        assistantReasoning += ev.delta;
+                        let seg = reasoningSegments[reasoningSegments.length - 1];
+                        if (reasoningSealed || !seg) {
+                            seg = { text: "", signature: "" };
+                            reasoningSegments.push(seg);
+                            reasoningSealed = false;
+                        }
+                        seg.text += ev.delta;
+                        if (ev.signature) seg.signature += ev.signature;
+                        if (ev.blockEnd) reasoningSealed = true;
+                        if (!ctx.textProtocol) {
+                            if (ev.raw) {
+                                yield fwd(ev.raw);
+                            } else if (round > 1 && ev.delta.length > 0 && adapter.emitReasoning) {
+                                yield fwd(adapter.emitReasoning(ev.delta));
+                            }
+                        }
+                    } else if (ev.kind === "tool_call") {
+                        calls.push({ name: ev.name, callId: ev.callId, arguments: ev.arguments, passthrough: ev.passthrough, signature: ev.signature });
+                    } else if (ev.kind === "usage") {
+                        usage = {
+                            inputTokens: ev.inputTokens,
+                            outputTokens: ev.outputTokens,
+                            cachedTokens: ev.cachedTokens,
+                            creationTokens: ev.creationTokens,
+                        };
+                    } else if (ev.kind === "done") {
+                        sawDone = true;
+                        finishReason = ev.finishReason;
+                        suppressCompletion = ev.suppressCompletion === true;
+                        truncatedDone = ev.truncated === true;
+                        sawThinking = ev.thinking === true;
+                    } else if (ev.kind === "error") {
+                        // A 200 SSE response can still carry a provider error.
+                        // Preserve it as an error path; never let the absence of
+                        // choices fall through to a synthetic successful stop.
+                        streamError = ev.message;
+                    } else if (ev.kind === "meta") {
+                        if (round === 1 || !ev.firstRoundOnly) {
+                            yield fwd(ev.chunk);
+                        }
                     }
                 }
+
+                // An in-band error has no completion event. Keep it on the
+                // same zero-side-effect retry path as an abruptly truncated
+                // stream; importantly, do not synthesize a successful stop.
+                if (streamError !== undefined) {
+                    ctx.log(`[acp-loop] round ${round}: upstream stream error: ${streamError}`);
+                    loggerLog("warn", `[acp-loop] upstream stream error: ${streamError}`);
+                }
+
+                // #413: zero-side-effect truncation — re-fetching the same round is
+                // invisible to the client in two shapes:
+                // (a) NO bytes were forwarded at all (any wire — the original guarantee);
+                // (b) only INVISIBLE bytes were forwarded (reasoning/meta prefix):
+                //     invisible to host turn semantics, so a high-reasoning model that
+                //     thinks and then truncates still retries. OpenAI wire ONLY, whose
+                //     chunks are stateless — a re-fetched response duplicates nothing
+                //     client-side. Stateful wires keep shape (a) only: once anything was
+                //     forwarded their per-response identity framing is already live
+                //     (anthropic message_start with open content blocks, responses
+                //     response.created — #440's single-created invariant), and a
+                //     re-fetched response would emit it a second time.
+                // One retry per request; 200+early-EOF flakiness (common on relays) no
+                // longer lands in the agent session.
+                // `truncatedDone` covers adapters that surface truncation as a synthetic
+                // failed done (responses) instead of ending with !sawDone (anthropic) —
+                // same retry, both shapes.
+                if (
+                    (!sawDone || truncatedDone) &&
+                    (!forwardedAny || (ctx.protocol === "openai" && !forwardedVisible)) &&
+                    calls.length === 0 &&
+                    !(ctx.textProtocol && assistantText.length > 0) &&
+                    !signal?.aborted &&
+                    !truncationRetried
+                ) {
+                    truncationRetried = true;
+                    ctx.log(`[acp-loop] round ${round}: upstream truncated with no visible output reaching the client; retrying fetch once`);
+                    try {
+                        const respResult = await fetchUpstream(roundBody);
+                        if (!respResult.response.body) {
+                            respResult.clearTimer();
+                            throw new UpstreamHttpError(respResult.response.status, "(empty response body)", 1);
+                        }
+                        currentUpstream = respResult.response.body as ReadableStream<Uint8Array>;
+                        if (activeClearTimer) activeClearTimer();
+                        activeClearTimer = respResult.clearTimer;
+                        continue;
+                    } catch (e) {
+                        if (e instanceof UpstreamHttpError) {
+                            const suffix = e.attempts > 1 ? ` after ${e.attempts} attempt(s)` : "";
+                            ctx.log(`[acp-loop] round ${round}: truncation retry failed (upstream error ${e.status}${suffix}: ${e.body.slice(0, 200)})`);
+                        } else {
+                            ctx.log(`[acp-loop] round ${round}: truncation retry failed (${e instanceof Error ? e.message : String(e)})`);
+                        }
+                    }
+                }
+
+                // #413 follow-up: the stream died AFTER visible text already
+                // reached the client. A blind re-fetch would make it watch the
+                // answer regrow on top of the partial one, so re-fetch once with
+                // a continuation nudge quoting the forwarded tail: the retry's
+                // output appends seamlessly to what the client already has.
+                // Independent one-shot budget (continuationRetried), separate
+                // from #413's truncationRetried: a visible cut that continues
+                // and then cuts again invisibly must still leave the blind
+                // re-fetch available, because the second attempt added nothing
+                // the client can see. Gate keeps calls.length === 0 — a round
+                // with tool-call fragments falls through to the plain
+                // truncation error, since their semantics only survive a
+                // completed stream. OpenAI wire only: visible text means the
+                // stateful wires' identity framing (message_start /
+                // response.created) already reached the client, and a
+                // re-fetched response would duplicate it.
+                if (
+                    (!sawDone || truncatedDone) &&
+                    forwardedVisible &&
+                    ctx.protocol === "openai" &&
+                    !ctx.textProtocol &&
+                    assistantText.length > 0 &&
+                    calls.length === 0 &&
+                    !signal?.aborted &&
+                    !continuationRetried
+                ) {
+                    continuationRetried = true;
+                    const tail = assistantText.length <= TRUNCATION_CONTINUATION_TAIL_CHARS
+                        ? assistantText
+                        : `…${assistantText.slice(-TRUNCATION_CONTINUATION_TAIL_CHARS)}`;
+                    ctx.log(`[acp-loop] round ${round}: upstream truncated after ${assistantText.length} text chars reached the client; retrying once with continuation nudge`);
+                    const nudge: CoreMessage = {
+                        id: `acp_truncation_retry_r${round}`,
+                        role: "user",
+                        contentType: "text",
+                        text: truncationContinuationNudge(tail),
+                    };
+                    try {
+                        const retryBody = adapter.buildRequest([...coreMessages, nudge], systemPrompt, requestBody);
+                        const respResult = await fetchUpstream(retryBody);
+                        if (!respResult.response.body) {
+                            respResult.clearTimer();
+                            throw new UpstreamHttpError(respResult.response.status, "(empty response body)", 1);
+                        }
+                        currentUpstream = respResult.response.body as ReadableStream<Uint8Array>;
+                        roundBody = retryBody;
+                        if (activeClearTimer) activeClearTimer();
+                        activeClearTimer = respResult.clearTimer;
+                        continue;
+                    } catch (e) {
+                        if (e instanceof UpstreamHttpError) {
+                            ctx.log(`[acp-loop] round ${round}: continuation retry failed (upstream error ${e.status}: ${e.body.slice(0, 200)}); falling back to the truncation error`);
+                        } else {
+                            ctx.log(`[acp-loop] round ${round}: continuation retry failed (${e instanceof Error ? e.message : String(e)}); falling back to the truncation error`);
+                        }
+                        loggerLog("warn", `[acp-loop] truncation continuation retry failed round ${round}: ${e instanceof Error ? e.message : String(e)}`);
+                    }
+                }
+
+                // #732 (completes the auto-retry groundwork of #673/#674), extended by #821: a reasoning model can end a turn with ONLY a thinking block — zero visible text, zero tool calls, status completed — most often right after a post-compress re-request, where it sees the freshly-shrunk context and "wraps up" into a silent thought. The client then receives an empty completed turn and stalls until manually nudged. Retriable when no VISIBLE output reached the client yet (!forwardedVisible): on Responses rounds the framing is suppressed so nothing was forwarded at all; on openai/anthropic a thinking-only prefix WAS streamed verbatim, but it is invisible to host turn semantics and its chunks carry no finish_reason, so appending the retry's content to the same stream is safe. Re-fetch once with a continuation nudge (a plain re-fetch reproduces the same silent output deterministically). One-shot per request. `sawThinking` is mandatory so a genuinely empty (no-reasoning) terminal turn is left untouched — only the "silent thought" shape retries.
+                if (
+                    !degenerateRetried &&
+                    sawDone &&
+                    sawThinking &&
+                    !truncatedDone &&
+                    !suppressCompletion &&
+                    typeof finishReason === "string" &&
+                    finishReason !== "failed" &&
+                    finishReason !== "incomplete" &&
+                    finishReason !== "error" &&
+                    assistantText.length === 0 &&
+                    calls.length === 0 &&
+                    !forwardedVisible &&
+                    !signal?.aborted
+                ) {
+                    degenerateRetried = true;
+                    ctx.log(`[acp-loop] round ${round}: degenerate terminal turn (completed, zero visible output); retrying once with continuation nudge (#732/#821)`);
+                    loggerLog("warn", `[acp-loop] degenerate-turn auto-retry round ${round} (session ${ctx.session.id})`);
+                    const nudge: CoreMessage = {
+                        id: `acp_degenerate_retry_r${round}`,
+                        role: "user",
+                        contentType: "text",
+                        text: DEGENERATE_RETRY_NUDGE,
+                    };
+                    try {
+                        const retryBody = adapter.buildRequest([...coreMessages, nudge], systemPrompt, requestBody);
+                        const respResult = await fetchUpstream(retryBody);
+                        if (!respResult.response.body) {
+                            respResult.clearTimer();
+                            throw new UpstreamHttpError(respResult.response.status, "(empty response body)", 1);
+                        }
+                        currentUpstream = respResult.response.body as ReadableStream<Uint8Array>;
+                        roundBody = retryBody;
+                        if (activeClearTimer) activeClearTimer();
+                        activeClearTimer = respResult.clearTimer;
+                        continue;
+                    } catch (e) {
+                        if (e instanceof UpstreamHttpError) {
+                            ctx.log(`[acp-loop] round ${round}: degenerate retry failed (upstream error ${e.status}: ${e.body.slice(0, 200)}); passing the empty turn through`);
+                        } else {
+                            ctx.log(`[acp-loop] round ${round}: degenerate retry failed (${e instanceof Error ? e.message : String(e)}); passing the empty turn through`);
+                        }
+                        loggerLog("warn", `[acp-loop] degenerate-turn auto-retry failed round ${round}: ${e instanceof Error ? e.message : String(e)}`);
+                    }
+                }
+                break;
             }
 
             if (
@@ -177,7 +556,6 @@ export async function* runCompressLoop(
             ) {
                 recordUsage(ctx, usage, round);
             }
-
             let resolvedText = assistantText;
             let allCalls = calls;
             if (ctx.textProtocol && assistantText.length > 0 && adapter.extractTextTriggers) {
@@ -185,28 +563,40 @@ export async function* runCompressLoop(
                 resolvedText = extracted.clean;
                 allCalls = [...calls, ...extracted.calls];
             }
+            // #906: gate on allCalls (structured + text-extracted), not just
+            // structured calls — an extracted trigger executes identically, so
+            // its result must ride back as a real tool-call/tool-result pair;
+            // the marker fallback below would become a mid-conversation
+            // developer item the backend may drop (and truncates the result).
+            const functionCallIds = new Set(allCalls.map(c => c.callId));
 
             if (ctx.textProtocol && resolvedText.length > 0) {
-                yield adapter.emitText(resolvedText);
-            } else if (!ctx.textProtocol && round > 1 && resolvedText.length > 0) {
                 yield adapter.emitText(resolvedText);
             }
 
             let realCalls = 0;
             const realToolCalls: ToolCallEmit[] = [];
-            const proxyResults: { name: string; callId: string; result: string; arguments: string }[] = [];
+            const proxyResults: { name: string; callId: string; result: string; arguments: string; signature?: string }[] = [];
 
             for (const call of allCalls) {
-                if (PROXY_TOOL_NAMES.has(call.name)) {
+                if (isProxyToolFor(call.name, ctx.session, ctx.config)) {
                     let parsedArgs: Record<string, unknown>;
                     try {
                         parsedArgs = call.arguments.length > 0 ? JSON.parse(call.arguments) : {};
                     } catch {
                         parsedArgs = {};
                     }
-                    const result = executeProxyTool(call.name, parsedArgs, ctx, call.callId);
-                    proxyResults.push({ name: call.name, callId: call.callId, result, arguments: call.arguments });
-                    yield adapter.emitMarker(call.name, result);
+                    const result = await withSessionLock(ctx.session, () => executeProxyTool(call.name, parsedArgs, ctx, call.callId));
+                    proxyResults.push({ name: call.name, callId: call.callId, result, arguments: call.arguments, signature: call.signature });
+                    if (ctx.visibilityMarkers !== false) {
+                        const markerKey = `${call.name}\u0000${result}`;
+                        if (seenMarkers.has(markerKey)) {
+                            ctx.log(`[acp-loop] suppressed duplicate ${call.name} status marker (identical failure repeated this request)`);
+                        } else {
+                            seenMarkers.add(markerKey);
+                            yield adapter.emitMarker(call.name, result);
+                        }
+                    }
                 } else {
                     realToolCalls.push(call);
                     realCalls += 1;
@@ -231,23 +621,46 @@ export async function* runCompressLoop(
             // never in coreMessages), and hideConsumedCompressCalls runs each
             // round so consumed compress records cannot re-prime the model.
             if (proxyResults.length > 0) {
-                if (resolvedText.length > 0) {
+                // #539: only wires that VERIFY thinking+signature pairs need a
+                // signature to replay a thinking block — Anthropic and Gemini 3
+                // (its thoughtSignature is rejected when dropped, same fatality).
+                // OpenAI/DeepSeek and Responses echo reasoning_content back
+                // verbatim and emit no signature — gating on one dropped every
+                // such round's reasoning from the re-request, leaving the
+                // proxy-tool assistant message without reasoning_content
+                // (DeepSeek 400 invalid_request_error: "reasoning_content ...
+                // must be passed back"). Relies on the invariant that the single
+                // production call site (server.ts) always populates ctx.protocol.
+                const requiresThinkingSignature = ctx.protocol === "anthropic" || ctx.protocol === "google";
+                if (reasoningSegments.length > 0) {
+                    for (let i = 0; i < reasoningSegments.length; i++) {
+                        const seg = reasoningSegments[i];
+                        if (seg.text.length === 0 || (requiresThinkingSignature && seg.signature.length === 0)) continue;
+                        const reasoningMsg: BiliMessage = {
+                            id: i === 0 ? `acp_loop_r${round}_reasoning` : `acp_loop_r${round}_reasoning_${i + 1}`,
+                            role: "assistant",
+                            contentType: "reasoning",
+                            text: seg.text,
+                            reasoningContent: seg.text,
+                            ...(seg.signature.length > 0
+                                ? ctx.protocol === "google"
+                                    ? { googleThoughtSignature: seg.signature }
+                                    : { thinkingSignature: seg.signature }
+                                : {}),
+                        };
+                        coreMessages.push(reasoningMsg);
+                    }
+                }
+                if (assistantText.length > 0) {
                     coreMessages.push({
                         id: `acp_loop_r${round}_asst`,
                         role: "assistant",
                         contentType: "text",
-                        text: resolvedText,
+                        text: assistantText,
                     });
                 }
                 for (const pr of proxyResults) {
-                    if (ctx.textProtocol) {
-                        coreMessages.push({
-                            id: `acp_loop_r${round}_marker_${pr.callId}`,
-                            role: "user",
-                            contentType: "text",
-                            text: buildVisibilityMarker(pr.name, pr.result),
-                        });
-                    } else {
+                    if (functionCallIds.has(pr.callId)) {
                         coreMessages.push({
                             id: `acp_loop_r${round}_asst_tc_${pr.callId}`,
                             role: "assistant",
@@ -255,17 +668,29 @@ export async function* runCompressLoop(
                             toolName: pr.name,
                             toolCallId: pr.callId,
                             text: pr.arguments,
+                            ...(ctx.protocol === "google" && pr.signature ? { googleThoughtSignature: pr.signature } : {}),
                         });
                         coreMessages.push({
                             id: `acp_loop_r${round}_tool_${pr.callId}`,
                             role: "tool",
                             contentType: "tool-result",
+                            toolName: pr.name,
                             toolCallId: pr.callId,
                             text: pr.result,
                         });
+                    } else if (ctx.visibilityMarkers !== false) {
+                        coreMessages.push({
+                            id: `acp_loop_r${round}_marker_${pr.callId}`,
+                            role: "system",
+                            contentType: "text",
+                            text: buildVisibilityMarker(pr.name, pr.result),
+                        });
                     }
                 }
-                if (!ctx.textProtocol) {
+                const anyCompressFailed = proxyResults.some(
+                    (pr) => (pr.name === "compress" || pr.name === "decompress") && pr.result.includes("FAILED"),
+                );
+                if (!ctx.textProtocol && !anyCompressFailed) {
                     const hidden = hideConsumedCompressCalls(ctx.session.state, coreMessages);
                     if (hidden.hidden > 0) {
                         ctx.log(`[acp-loop] round ${round} hideConsumed hid ${hidden.hidden} compress record(s)`);
@@ -273,15 +698,74 @@ export async function* runCompressLoop(
                         coreMessages.push(...hidden.messages);
                     }
                 }
+                // #422: a successful compress changed the session state — refresh
+                // the fold so the re-request shows the post-compress view. A
+                // successful absorb does the same (state.absorbed grew; the
+                // refresh's processTurn + hideAbsorbedView drop the pair). A
+                // no-op re-absorb ("already absorbed") also passes this check —
+                // its refresh is a harmless identical-view re-fold. Falls back
+                // to the pre-compress view (previous behavior) if the host hook
+                // is absent or throws.
+                const absorbName = (() => {
+                    const a = effectiveAbsorbConfig(ctx.session, ctx.config);
+                    return a?.enabled === true ? a.toolName ?? ABSORB_TOOL_NAME : undefined;
+                })();
+                if (
+                    ctx.refreshFolded &&
+                    proxyResults.some((pr) => (pr.name === "compress" || pr.name === absorbName) && !pr.result.includes("FAILED"))
+                ) {
+                    try {
+                        const refreshed = await ctx.refreshFolded(coreMessages);
+                        if (refreshed.length > 0) {
+                            coreMessages.length = 0;
+                            coreMessages.push(...refreshed);
+                            // The fold has now materialized in a request the
+                            // model actually sees — the next usage report is
+                            // post-fold reality; keeping the credit would net
+                            // the savings twice (recordUsage).
+                            ctx.session.stats.compressCreditTokens = 0;
+                            ctx.log(`[acp-loop] round ${round}: re-request view refreshed to post-compress fold`);
+                        }
+                    } catch (err) {
+                        ctx.log(`[acp-loop] round ${round}: fold refresh failed (${String(err)}); keeping pre-compress view`);
+                        loggerLog("warn", `[acp-loop] fold refresh failed: ${String(err)}`);
+                    }
+                }
             }
 
             for (const tc of realToolCalls) {
+                if (tc.passthrough) continue;
                 yield adapter.emitToolCall(tc);
             }
 
+            // Re-request so the model receives the proxy-tool result and can
+            // continue (standard function-calling continuation: the proxy acts as
+            // the client, executes compress/decompress/acp_status/search, then
+            // feeds the result back as a normal tool output via functionCallIds
+            // above — success OR failure alike). The model sees the result and
+            // decides its next action (retry a different range, or stop). A failed
+            // compress returns its failure as the tool output, so the model is not
+            // blind to why it failed. MAX_LOOP_ROUNDS bounds runaway loops.
             const reRequest = proxyResults.length > 0 && realCalls === 0;
             if (!reRequest) {
-                yield adapter.emitCompletion({ finishReason, usage });
+                // #887: nothing is learned from a truncated stream — the
+                // window is a deployment property (#987), and stream cuts are
+                // indistinguishable from network noise mid-stream.
+                if (!sawDone) {
+                    const partialText = assistantText.length;
+                    const partialReasoning = assistantReasoning.length;
+                    const detail = streamError !== undefined ? `upstream stream error: ${streamError}` : "no completion event";
+                    const msg = `upstream stream truncated (${detail}; round ${round}, ${partialText} text chars + ${partialReasoning} reasoning chars received)`;
+                    ctx.log(`[acp-loop] round ${round}: ${msg}`);
+                    yield adapter.emitError(msg);
+                    return;
+                }
+                // A passthrough round already streamed the upstream's own finish
+                // chunk + [DONE] verbatim (original id + order); re-emitting a
+                // regenerated completion would duplicate them.
+                if (!suppressCompletion) {
+                    yield adapter.emitCompletion({ finishReason, usage });
+                }
                 return;
             }
 
@@ -294,37 +778,109 @@ export async function* runCompressLoop(
                 return;
             }
 
-            ctx.log(`[acp-loop] round ${round} saw mutating proxy tool; re-requesting`);
+            // #156: if this round is only failed compress/decompress and one of
+            // them re-submits args that already failed, the model is stuck in a
+            // deterministic failure loop — break early instead of burning rounds.
+            const failedMutating = proxyResults.filter(
+                (pr) => (pr.name === "compress" || pr.name === "decompress") && pr.result.includes("FAILED"),
+            );
+            if (reRequest && failedMutating.length > 0 && failedMutating.length === proxyResults.length) {
+                const repeated = failedMutating.some((pr) => failedSignatures.has(`${pr.name}\u0000${canonicalArgs(pr.arguments)}`));
+                if (repeated) {
+                    ctx.log(`[acp-loop] round ${round}: model re-submitted an already-failed compress with identical arguments; stopping after ${round} round(s) instead of ${MAX_LOOP_ROUNDS}`);
+                    loggerLog("warn", `[acp-loop] repeated identical compress failure at round ${round}; breaking early (#156)`);
+                    yield adapter.emitCompletion({ finishReason: "length", usage });
+                    return;
+                }
+            }
+            for (const pr of failedMutating) failedSignatures.add(`${pr.name}\u0000${canonicalArgs(pr.arguments)}`);
 
-            const newBody = adapter.buildRequest(coreMessages, systemPrompt, requestBody);
-            if (process.env.ACP_DUMP_REQ !== "0" && ctx.debug) {
+            ctx.log(`[acp-loop] round ${round}: proxy tool executed; re-requesting so the model sees the result`);
+
+            if (signal?.aborted) break;
+
+            let newBody = adapter.buildRequest(coreMessages, systemPrompt, requestBody);
+            // #762: this re-request bypasses prepareOpenai, whose strict-echo
+            // repair never reaches it — the kernel round-trip drops blank
+            // reasoning echoes, so DeepSeek thinking rejects the rebuilt body.
+            newBody = normalizeStrictEchoBody(newBody, isStrictReasoningEcho(ctx.session, strictEchoOrigin, modelIdOf(requestBody)), (level, msg) => loggerLog(level, `[acp-loop] ${msg}`), ctx.session.id ?? "unknown");
+            if (process.env.ACP_DUMP_BODY === "1") {
                 try {
                     const fs = await import("node:fs");
-                    const dumpDir = process.env.ACP_DUMP_DIR || `${process.env.HOME}/.local/state/billion-context/dumps`;
+                    const path = await import("node:path");
+                    const dumpDir = dumpsDir();
                     fs.mkdirSync(dumpDir, { recursive: true });
-                    const sid = ctx.session.id ?? "unknown";
-                    fs.writeFileSync(`${dumpDir}/req-${Date.now()}-${sid}-REREQUEST.json`, JSON.stringify(newBody, null, 2));
+                    const sid = (ctx.session.id ?? "unknown").replace(/[^a-zA-Z0-9_-]/g, "_");
+                    fs.writeFileSync(path.join(dumpDir, `req-${Date.now()}-${sid}-REREQUEST.json`), JSON.stringify(newBody, null, 2));
                 } catch { /* best-effort */ }
             }
-            const { response: resp, clearTimer } = await fetchWithTimeout(requestOptions.url, {
-                method: "POST",
-                headers: requestOptions.headers,
-                body: JSON.stringify(newBody),
-                ...(ctx.proxyUrl ? { dispatcher: proxyDispatcher(ctx.proxyUrl) } : {}),
-            });
-
-            if (!resp.ok || !resp.body) {
-                clearTimer();
-                const errText = await resp.text().catch(() => "upstream error");
-                ctx.log(`[acp-proxy: compress loop upstream error ${resp.status}: ${errText.slice(0, 200)}]`);
-                loggerLog("error", `[acp-loop] upstream error ${resp.status}: ${errText.slice(0, 200)}`);
-                yield adapter.emitError(`upstream error ${resp.status}: ${errText.slice(0, 200)}`);
+            let respResult: { response: Response; clearTimer: () => void };
+            try {
+                try {
+                    respResult = await fetchUpstream(newBody);
+                } catch (e) {
+                    // #539 follow-up: stripping replayed thinking only recovers a
+                    // backend where thinking is OPTIONAL (Anthropic, and Gemini —
+                    // its thoughtSignature check is what a stripped replay drops).
+                    // On OpenAI/DeepSeek thinking mode reasoning_content is
+                    // MANDATORY, so a strip-retry there guarantees another 400 plus
+                    // a misleading log — gate the degraded retry to the wires that
+                    // verify signatures.
+                    if (
+                        !(e instanceof UpstreamHttpError) ||
+                        e.status < 400 ||
+                        e.status >= 500 ||
+                        degradedRetried ||
+                        (ctx.protocol !== "anthropic" && ctx.protocol !== "google") ||
+                        !coreMessages.some(isLoopThinking)
+                    ) {
+                        throw e;
+                    }
+                    degradedRetried = true;
+                    const stripped = stripLoopThinking(coreMessages);
+                    coreMessages.length = 0;
+                    coreMessages.push(...stripped);
+                    ctx.log(`[acp-loop] round ${round}: re-request rejected (${e.status}: ${e.body.slice(0, 200)}); retrying without replayed thinking blocks`);
+                    loggerLog("warn", `[acp-loop] re-request rejected (${e.status}); retrying without thinking replay: ${e.body.slice(0, 200)}`);
+                    newBody = adapter.buildRequest(coreMessages, systemPrompt, requestBody);
+                    respResult = await fetchUpstream(newBody);
+                }
+            } catch (e) {
+                if (!(e instanceof UpstreamHttpError)) throw e;
+                // #684 learn-on-failure: a 400 mentioning reasoning_content on
+                // a thinking session is the split-turn signature — remember it
+                // on the session so #651's reasoning-drop never fires here
+                // again (kernel gate prevents the split; this closes the loop).
+                if (
+                    e.status === 400 &&
+                    /reasoning_content/i.test(e.body) &&
+                    ctx.session.metadata.strictReasoningEcho !== true
+                ) {
+                    ctx.session.metadata.strictReasoningEcho = true;
+                    ctx.log(`[acp-loop] 400 mentions reasoning_content — learned strict reasoning echo for this session; #651 reasoning-drop disabled (#684)`);
+                    loggerLog("warn", `[acp-loop] learned strictReasoningEcho (session ${ctx.session.id}); reasoning-drop disabled (#684)`);
+                }
+                // #762: persist the exact re-requested body on 4xx (env-gated: BILI_DUMP_4XX=1).
+                if (e.status >= 400 && e.status < 500) {
+                    dumpRejectedBody(e.status, ctx.session.id ?? "unknown", JSON.stringify(newBody));
+                }
+                const suffix = e.attempts > 1 ? ` after ${e.attempts} attempt(s)` : "";
+                ctx.log(`[acp-proxy: compress loop upstream error ${e.status}${suffix}: ${e.body.slice(0, 200)}]`);
+                loggerLog("error", `[acp-loop] upstream error ${e.status}${suffix}: ${e.body.slice(0, 200)}`);
+                yield adapter.emitError(`upstream error ${e.status}${suffix}: ${e.body.slice(0, 200)}`);
                 return;
             }
 
-            currentUpstream = resp.body as ReadableStream<Uint8Array>;
+            if (!respResult.response.body) {
+                respResult.clearTimer();
+                yield adapter.emitError(`upstream error ${respResult.response.status}: empty response body`);
+                return;
+            }
+
+            currentUpstream = respResult.response.body as ReadableStream<Uint8Array>;
+            roundBody = newBody;
             if (activeClearTimer) activeClearTimer();
-            activeClearTimer = clearTimer;
+            activeClearTimer = respResult.clearTimer;
         }
     } finally {
         if (activeClearTimer) {
