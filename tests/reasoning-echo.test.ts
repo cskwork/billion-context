@@ -1,7 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { isStrictReasoningEcho, normalizeStrictEchoReasoning, warnReasoningPairs, warnAnthropicThinkingPairs, warnResponsesReasoningPairs } from "../src/server.js";
-import { normalizeStrictEchoBody } from "../src/strict-echo.js";
+import { modelIdOf, normalizeStrictEchoBody } from "../src/strict-echo.js";
 import type { Session } from "../src/session.js";
 import type { OpenAIMessage } from "acp-kernel/wire";
 import { createInitialState } from "acp-kernel";
@@ -34,6 +34,29 @@ describe("#684 strict-echo gate", () => {
 
     it("learned flag (400 mentioning reasoning_content) wins on any origin", () => {
         assert.equal(isStrictReasoningEcho(fakeSession({ strictReasoningEcho: true }), "https://openrouter.ai"), true);
+    });
+
+    it("#1027 static: deepseek model id matches on a non-deepseek origin", () => {
+        assert.equal(isStrictReasoningEcho(fakeSession(), "https://opencode.ai", "deepseek-flash"), true);
+        assert.equal(isStrictReasoningEcho(fakeSession(), "https://openrouter.ai", "DeepSeek-V4-Pro"), true);
+        assert.equal(isStrictReasoningEcho(fakeSession(), undefined, "deepseek-v4-flash"), true);
+    });
+
+    it("#1027 static: non-deepseek model ids do not match", () => {
+        assert.equal(isStrictReasoningEcho(fakeSession(), "https://opencode.ai", "gpt-5"), false);
+        assert.equal(isStrictReasoningEcho(fakeSession(), "https://opencode.ai", "glm-5.2"), false);
+        assert.equal(isStrictReasoningEcho(fakeSession(), "https://opencode.ai", ""), false);
+        assert.equal(isStrictReasoningEcho(fakeSession(), "https://opencode.ai"), false);
+    });
+});
+
+describe("#1027 modelIdOf", () => {
+    it("extracts the string model id only", () => {
+        assert.equal(modelIdOf({ model: "deepseek-flash" }), "deepseek-flash");
+        assert.equal(modelIdOf({}), undefined);
+        assert.equal(modelIdOf({ model: 42 }), undefined);
+        assert.equal(modelIdOf(null), undefined);
+        assert.equal(modelIdOf(undefined), undefined);
     });
 });
 

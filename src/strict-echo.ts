@@ -6,11 +6,21 @@ import type { Logger } from "./logger.js";
  *  thinking-mode "reasoning_content ... must be passed back to the API" —
  *  a rebuilt request whose assistant tool-call turns lost their reasoning is
  *  rejected with 400. Learned flag first (set on first 400 whose body mentions
- *  reasoning_content, see the loop's UpstreamHttpError handler), then the
- *  static host check. */
-export function isStrictReasoningEcho(session: Session, upstreamOrigin: string | undefined): boolean {
+ *  reasoning_content, see the loop's UpstreamHttpError handler), then static
+ *  detection: the upstream origin OR the request's own model id (#1027 —
+ *  DeepSeek models served from non-deepseek gateways never trip the host
+ *  check, so every fresh session re-paid the 400 through the learned flag). */
+export function isStrictReasoningEcho(session: Session, upstreamOrigin: string | undefined, model?: string): boolean {
     if (session.metadata.strictReasoningEcho === true) return true;
-    return upstreamOrigin !== undefined && /deepseek/i.test(upstreamOrigin);
+    if (upstreamOrigin !== undefined && /deepseek/i.test(upstreamOrigin)) return true;
+    return typeof model === "string" && model.length > 0 && /deepseek/i.test(model);
+}
+
+/** [#1027] The request body's model id for the static strict-echo criterion
+ *  (undefined when absent or not a string). */
+export function modelIdOf(body: { model?: unknown } | null | undefined): string | undefined {
+    const m = body?.model;
+    return typeof m === "string" ? m : undefined;
 }
 
 /** [#762] Strict-echo normalization: DeepSeek thinking mode accepts a BLANK
