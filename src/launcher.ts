@@ -54,7 +54,7 @@ import { selfPackageRoot, isBiliPiEntry, ompPluginLoadedFrom, dshNativeInstalled
 function selfDistFile(name: string): string {
     return path.join(selfPackageRoot(), "dist", name);
 }
-import { nonEmpty, resolvePiHome, resolveOmpHome, resolveDshHome, resolveCodexHome, loadClientConfig, collectModelWindows, collectModelMaxOutputs, type ClientConfig, type CodexConfig, resolveOpencodeConfigFile, readOpencodeConfigRoot, opencodePluginBaseDir, type OpencodeConfig, type OpencodeProvider, type HermesConfig, type HermesProvider, qoderIsCnSite, QODER_DEFAULT_MODEL_HOSTS, resolveTraeHome, readTraeConfig, TRAE_DEFAULT_MODEL_HOSTS, JCODE_DEFAULT_MODEL_HOSTS, type TraeConfig, resolveKimiHome, readKimiConfig, parseKimiToml, KIMI_DEFAULT_MODEL_HOSTS, QWEN_DEFAULT_MODEL_HOSTS, type KimiConfig, type KimiProvider, readOpencodeProjectLayer, type OpencodeProjectLayer } from "./client-config.js";
+import { nonEmpty, resolvePiHome, resolveOmpHome, resolveDshHome, resolveCodexHome, loadClientConfig, collectModelWindows, collectModelMaxOutputs, type ClientConfig, type CodexConfig, resolveOpencodeConfigFile, readOpencodeConfigRoot, opencodePluginBaseDir, type OpencodeConfig, type OpencodeProvider, type HermesConfig, type HermesProvider, qoderIsCnSite, QODER_DEFAULT_MODEL_HOSTS, resolveTraeHome, readTraeConfig, TRAE_DEFAULT_MODEL_HOSTS, JCODE_DEFAULT_MODEL_HOSTS, type TraeConfig, resolveKimiHome, readKimiConfig, parseKimiToml, KIMI_DEFAULT_MODEL_HOSTS, QWEN_DEFAULT_MODEL_HOSTS, type KimiConfig, type KimiProvider, readOpencodeProjectLayer, type OpencodeProjectLayer, readMcodeConfig, resolveMcodeInstallDir, MCODE_DEFAULT_MODEL_HOSTS, type McodeConfig } from "./client-config.js";
 import { loadRoutes, resolveConfiguredContextLimit, lookupContextLimit, type ProviderRoutes } from "./config.js";
 import { contextFromRegistry } from "./registry.js";
 
@@ -115,12 +115,18 @@ export {
     type KimiConfig,
     type KimiProvider,
     QWEN_DEFAULT_MODEL_HOSTS,
+    parseMcodeYaml,
+    readMcodeConfig,
+    resolveMcodeInstallDir,
+    mcodeConfigFiles,
+    MCODE_DEFAULT_MODEL_HOSTS,
+    type McodeConfig,
 } from "./client-config.js";
 
 export const LAUNCHER_DEFAULT_HOST = "127.0.0.1";
-export const LAUNCH_CLIENTS = ["pi", "codex", "claude", "omp", "opencode", "hermes", "dsh", "codebuddy", "qoder", "trae", "jcode", "kimi", "gemini", "iflow", "qwen", "pi-test"] as const;
+export const LAUNCH_CLIENTS = ["pi", "codex", "claude", "omp", "opencode", "hermes", "dsh", "codebuddy", "qoder", "trae", "jcode", "kimi", "gemini", "iflow", "qwen", "mcode", "pi-test"] as const;
 export type ClientName = (typeof LAUNCH_CLIENTS)[number];
-export type BaseClientName = "claude" | "codex" | "pi" | "omp" | "opencode" | "hermes" | "dsh" | "codebuddy" | "qoder" | "trae" | "jcode" | "kimi" | "gemini" | "iflow" | "qwen";
+export type BaseClientName = "claude" | "codex" | "pi" | "omp" | "opencode" | "hermes" | "dsh" | "codebuddy" | "qoder" | "trae" | "jcode" | "kimi" | "gemini" | "iflow" | "qwen" | "mcode";
 
 const HEALTH_PATH = "/__bili/health";
 const HEALTH_POLL_INTERVAL_MS = 200;
@@ -501,6 +507,51 @@ export function discoverRoutes(client: ClientName, config: ClientConfig): Discov
         }
         if (kimiUrls.length === 0) {
             for (const h of KIMI_DEFAULT_MODEL_HOSTS) {
+                if (!httpsSeen.has(h)) {
+                    httpsSeen.add(h);
+                    httpsDomains.push(h);
+                }
+            }
+        }
+    } else if (client === "mcode") {
+        // #1050: MiniMax Code honors standard proxy envs for all outbound
+        // traffic EXCEPT an unconditional loopback NO_PROXY bypass (verified
+        // against @minimax-ai/code 0.4.12, packages/tui/src/cli/network-proxy.ts),
+        // same shape as kimi above. Loopback upstreams need a manual /bili/
+        // prefix in config.yaml — inventory only, feeding the banner.
+        const mcodeSeen = new Set<string>();
+        let anon = 0;
+        const mcodeUrls: string[] = [];
+        for (const prov of Object.values(config.mcode?.providers ?? {})) {
+            if (nonEmpty(prov.baseUrl)) mcodeUrls.push(prov.baseUrl!);
+        }
+        for (const raw of mcodeUrls) {
+            const real = unwrapUpstream(raw);
+            try {
+                const url = new URL(real);
+                if (url.protocol !== "http:" && url.protocol !== "https:") continue;
+                if (mcodeSeen.has(real)) continue;
+                mcodeSeen.add(real);
+                if (isLoopbackHost(url.hostname)) {
+                    if (raw !== real) continue;
+                    anon += 1;
+                    rewriteKeys.add(`mcode-${anon}`);
+                    httpRewrites.push({ key: `mcode-${anon}`, realUpstream: real });
+                } else if (url.protocol === "https:") {
+                    const host = url.hostname.toLowerCase();
+                    if (host && !httpsSeen.has(host)) {
+                        httpsSeen.add(host);
+                        httpsDomains.push(host);
+                    }
+                } else if (!httpEnvRoutes.includes(real)) {
+                    httpEnvRoutes.push(real);
+                }
+            } catch {
+                // Unparseable endpoint: skip.
+            }
+        }
+        if (mcodeUrls.length === 0) {
+            for (const h of MCODE_DEFAULT_MODEL_HOSTS) {
                 if (!httpsSeen.has(h)) {
                     httpsSeen.add(h);
                     httpsDomains.push(h);
@@ -1009,7 +1060,7 @@ function isPrivateIPv4(host: string): boolean {
  *  so v1 runs pure wire mode (#757). gemini/iflow/qwen (#1047) are excluded
  *  like codebuddy: their MCP-injection flags are unverified, v1 is pure wire. */
 export function launcherInjectMcp(env: NodeJS.ProcessEnv, base: string, codexUpstream?: string): boolean {
-    if (base === "pi" || base === "omp" || base === "opencode" || base === "hermes" || base === "dsh" || base === "codebuddy" || base === "qoder" || base === "trae" || base === "jcode" || base === "kimi" || base === "gemini" || base === "iflow" || base === "qwen") return false;
+    if (base === "pi" || base === "omp" || base === "opencode" || base === "hermes" || base === "dsh" || base === "codebuddy" || base === "qoder" || base === "trae" || base === "jcode" || base === "kimi" || base === "gemini" || base === "iflow" || base === "qwen" || base === "mcode") return false;
     if (env.BILI_LAUNCHER_PLUGIN === "0") return false;
     if (base === "codex" && env.BILI_LAUNCHER_PLUGIN === undefined && codexUpstream !== undefined && isPrivateUpstreamHost(codexUpstream)) {
         return false;
@@ -2515,6 +2566,22 @@ export function resolveClientCommand(
         if (resolved) return { command: resolved, prefixArgs: [] };
         return { command: path.join(resolveKimiHome(env), "bin", "kimi"), prefixArgs: [] };
     }
+    if (client === "mcode") {
+        // Installer / npm @minimax-ai/code place the launcher at
+        // <MCODE_INSTALL_DIR|~/.minimax-code>/bin/mcode (mcode.cmd/.ps1 on Windows).
+        const resolved = resolveOnPath("mcode", env);
+        if (resolved) return { command: resolved, prefixArgs: [] };
+        const binBase = path.join(resolveMcodeInstallDir(env), "bin", "mcode");
+        for (const ext of process.platform === "win32" ? [".cmd", ".bat", ".exe", ""] : [""]) {
+            const candidate = binBase + ext;
+            try {
+                if (fs.existsSync(candidate)) return { command: candidate, prefixArgs: [] };
+            } catch {
+                // Unreadable candidate: fall through to the next extension.
+            }
+        }
+        return { command: binBase, prefixArgs: [] };
+    }
     const resolved = resolveOnPath(client, env);
     return { command: resolved ?? client, prefixArgs: [] };
 }
@@ -2590,7 +2657,7 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
     const handle = await ensureProxyRunning({ host, port, passthrough, debug, mitmDomains: domains, modelWindows: collectModelWindows(config, base), modelMaxOutputs: collectModelMaxOutputs(config, base) }, deps);
     console.error(
         `bili: started proxy at ${handle.origin} (MITM domains: ${domains.length ? domains.join(", ") : "defaults"})` +
-            ((base !== "kimi" && routes.httpRewrites.length > 0) ? ` (HTTP /bili/ rewrites: ${routes.httpRewrites.length})` : "") +
+            ((base !== "kimi" && base !== "mcode" && routes.httpRewrites.length > 0) ? ` (HTTP /bili/ rewrites: ${routes.httpRewrites.length})` : "") +
             (routes.httpsRewrites.length > 0 ? ` (HTTPS cert rewrites: ${routes.httpsRewrites.length})` : "") +
             (routes.httpEnvRoutes.length > 0 ? ` (HTTP proxy-env routes: ${routes.httpEnvRoutes.length})` : "") +
             (params.client === "pi-test" ? " (no extensions)" : ""),
@@ -2797,6 +2864,36 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         } else if (!usesProxyEnv) {
             console.error(
                 `bili: no routable providers found in ${resolveKimiHome(process.env)}/config.toml — traffic will NOT go through the proxy (configure a provider first).`,
+            );
+        }
+    } else if (base === "mcode") {
+        // #1050: cert-MITM like kimi — MiniMax Code honors standard proxy envs
+        // for all outbound traffic EXCEPT an unconditional loopback NO_PROXY
+        // bypass (verified against @minimax-ai/code 0.4.12, packages/tui/src/cli/network-proxy.ts).
+        // Non-loopback https rides CONNECT + cert MITM; non-loopback plain-http
+        // rides absolute-form forward-proxy requests. The COMBINED bundle goes
+        // to BOTH SSL_CERT_FILE and NODE_EXTRA_CA_CERTS (#710). Loopback
+        // endpoints are inventoried only — no rewrite channel exists without
+        // editing the user's config.yaml. No budget env: mcode's built-in
+        // auto-compaction fires on input-token footprint, which ACP compression
+        // precedes once windows align via BILI_LAUNCHER_MODEL_WINDOWS.
+        const usesProxyEnv = routes.httpsDomains.length > 0 || routes.httpEnvRoutes.length > 0;
+        env = usesProxyEnv ? stripInheritedProxy(process.env) : { ...process.env };
+        if (usesProxyEnv) {
+            const caBundle = resolveCombinedCaPath(process.env);
+            env.HTTPS_PROXY = origin;
+            env.SSL_CERT_FILE = caBundle;
+            env.NODE_EXTRA_CA_CERTS = caBundle;
+            if (routes.httpEnvRoutes.length > 0) env.HTTP_PROXY = origin;
+        }
+        const mcodeConfigPath = `${process.env.MINIMAX_DATA_DIR?.trim() || process.env.MAVIS_DATA_DIR?.trim() || path.join(os.homedir(), ".minimax")}/config.yaml`;
+        if (routes.httpRewrites.length > 0) {
+            console.error(
+                `bili: ${routes.httpRewrites.length} loopback endpoint(s) in your MiniMax Code ${mcodeConfigPath} (profile variants ~/.minimax-<profile>/config.yaml count too) bypass its unconditional loopback NO_PROXY rule and will NOT go through the proxy — prefix their base_url with ${origin}/bili/ manually to compress them.`,
+            );
+        } else if (!usesProxyEnv) {
+            console.error(
+                `bili: no routable providers found in your MiniMax Code ${mcodeConfigPath} — traffic will NOT go through the proxy (configure a provider first).`,
             );
         }
     } else if (base === "qoder") {

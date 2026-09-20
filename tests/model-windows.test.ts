@@ -198,6 +198,16 @@ test("collectModelWindows(scope): kimi scope only; unscoped merge still max-wins
     assert.deepEqual(collectModelWindows(config), { m: 1048576 });
 });
 
+test("collectModelWindows(scope): mcode scope only; unscoped merge still max-wins (#1050)", () => {
+    const config: ClientConfig = {
+        codex: { providers: {}, modelWindows: [{ id: "m", contextWindow: 272000 }] },
+        mcode: { providers: {}, models: [{ id: "m", contextWindow: 1048576 }] },
+    };
+    assert.deepEqual(collectModelWindows(config, "mcode"), { m: 1048576 });
+    assert.deepEqual(collectModelWindows(config, "codex"), { m: 272000 });
+    assert.deepEqual(collectModelWindows(config), { m: 1048576 });
+});
+
 test("parseLauncherModelWindows: valid JSON, invalid input, non-numeric filtered", () => {
     assert.deepEqual(parseLauncherModelWindows('{"qwen3.8-27b": 262144.9, "x": 100}'), { "qwen3.8-27b": 262144, x: 100 });
     assert.deepEqual(parseLauncherModelWindows(undefined), {});

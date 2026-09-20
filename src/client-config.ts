@@ -170,6 +170,22 @@ export interface IflowConfig {
     baseUrl?: string;
 }
 
+export interface McodeProvider {
+    baseUrl?: string;
+}
+
+export interface McodeConfig {
+    /** Provider base URLs keyed by provider key: top-level
+     *  `minimax_api.baseURL`, or `custom_provider.<key>.options.baseURL`
+     *  (BYOK, `mcode provider add`). The managed-login tree (`provider:`)
+     *  carries no configurable URL — its hosts live in
+     *  MCODE_DEFAULT_MODEL_HOSTS. */
+    providers: Record<string, McodeProvider>;
+    /** Per-model context windows from `custom_provider.<key>.models.<id>.limit`
+     *  (budget alignment). */
+    models?: ModelWindow[];
+}
+
 export interface ClientConfig {
     claude?: ClaudeSettings;
     codex?: CodexConfig;
@@ -185,6 +201,7 @@ export interface ClientConfig {
     kimi?: KimiConfig;
     gemini?: GeminiConfig;
     iflow?: IflowConfig;
+    mcode?: McodeConfig;
 }
 
 /** qoder's default model-inference hosts, hardcoded in the binary (no config
@@ -624,6 +641,18 @@ export function readCodexConfig(codexHome: string): CodexConfig {
  *  declares no provider/model endpoints at all (qoder/trae precedent). */
 export const KIMI_DEFAULT_MODEL_HOSTS = ["api.kimi.com", "api.kimi.ai"];
 
+/** Managed-login model gateways (global/CN + legacy) plus the official raw
+ *  API hosts the minimax_api BYOK default resolves to — absent from
+ *  config.yaml, so the launcher falls back to them when no provider base
+ *  URL is declared (kimi/qoder default-hosts precedent). */
+export const MCODE_DEFAULT_MODEL_HOSTS = [
+    "agent.minimax.io",
+    "agent.minimax.cn",
+    "agent.minimaxi.com",
+    "api.minimax.io",
+    "api.minimaxi.com",
+];
+
 /** Split a TOML table header into path parts, honoring quoted segments
  *  (`[providers."managed:kimi-code"]` → ["providers", "managed:kimi-code"]). */
 function tomlPathParts(header: string): string[] {
@@ -729,6 +758,137 @@ export function readKimiConfig(kimiHome: string, env: NodeJS.ProcessEnv = proces
         if (win) config.models = [...(config.models ?? []), win];
     }
     return config;
+}
+
+/** Trim a YAML line to its content: drop whole-line comments and trailing
+ *  ` # ...` comments (a `#` inside quotes is data, e.g. URL fragments). */
+function yamlLineContent(raw: string): string | null {
+    const t = raw.trim();
+    if (!t || t.startsWith("#")) return null;
+    let dq = false;
+    let sq = false;
+    for (let i = 0; i < t.length; i++) {
+        const ch = t[i];
+        if (ch === '"' && !sq) dq = !dq;
+        else if (ch === "'" && !dq) sq = !sq;
+        else if (ch === "#" && !dq && !sq && (i === 0 || t[i - 1] === " " || t[i - 1] === "\t")) {
+            const cut = t.slice(0, i).trimEnd();
+            return cut.length > 0 ? cut : null;
+        }
+    }
+    return t;
+}
+
+function unquoteYaml(value: string): string {
+    const v = value.trim();
+    if (v.length >= 2 && ((v[0] === '"' && v.endsWith('"')) || (v[0] === "'" && v.endsWith("'")))) {
+        return v.slice(1, -1);
+    }
+    return v;
+}
+
+// `mcode provider add` reserves these keys for built-in providers; anything
+// else under custom_provider is user BYOK config.
+const MCODE_RESERVED_PROVIDER_KEYS = new Set(["minimax", "minimax_api", "provider", "custom_provider"]);
+
+/** Targeted block-YAML reader for mcode's config.yaml (no YAML dependency —
+ *  same targeted-parser discipline as parseOmpYaml/parseDshSettingsYaml).
+ *  Extracts only what routing needs: minimax_api.baseURL,
+ *  custom_provider.<key>.options.baseURL, and custom_provider.<key>.models.<id>.limit. */
+export function parseMcodeYaml(text: string): McodeConfig {
+    const result: McodeConfig = { providers: {} };
+    const limits = new Map<string, { context?: number; output?: number }>();
+    const stack: { indent: number; key: string }[] = [];
+    for (const raw of text.split(/\r?\n/)) {
+        const line = yamlLineContent(raw);
+        if (line === null) continue;
+        const colon = line.indexOf(":");
+        if (colon <= 0) continue;
+        const indent = raw.length - raw.trimStart().length;
+        while (stack.length > 0 && stack[stack.length - 1].indent >= indent) stack.pop();
+        const key = unquoteYaml(line.slice(0, colon));
+        const value = unquoteYaml(line.slice(colon + 1).trim());
+        stack.push({ indent, key });
+        const p = stack.map((s) => s.key);
+        if (p[0] === "minimax_api" && p.length === 2 && p[1] === "baseURL" && value) {
+            result.providers["minimax_api"] ??= {};
+            result.providers["minimax_api"]!.baseUrl = value;
+        } else if (p[0] === "custom_provider") {
+            const prov = p[1];
+            if (!prov || MCODE_RESERVED_PROVIDER_KEYS.has(prov)) continue;
+            if (p.length === 4 && p[2] === "options" && p[3] === "baseURL" && value) {
+                result.providers[prov] ??= {};
+                if (!result.providers[prov]!.baseUrl) result.providers[prov]!.baseUrl = value;
+            } else if (p.length === 6 && p[2] === "models" && p[4] === "limit" && (p[5] === "context" || p[5] === "output")) {
+                const n = Number(value);
+                if (!Number.isFinite(n) || n <= 0) continue;
+                const lim = limits.get(p[3]) ?? {};
+                if (p[5] === "context") lim.context = n;
+                else lim.output = n;
+                limits.set(p[3], lim);
+            }
+        }
+    }
+    if (limits.size > 0) {
+        result.models = [...limits.entries()]
+            .map(([id, lim]) => toModelWindow(id, lim.context, lim.output))
+            .filter((w): w is ModelWindow => w !== null);
+    }
+    return result;
+}
+
+/** mcode's install dir (launchers at <dir>/bin/mcode): MCODE_INSTALL_DIR or
+ *  ~/.minimax-code (installer default). */
+export function resolveMcodeInstallDir(env: NodeJS.ProcessEnv = process.env): string {
+    return nonEmpty(env.MCODE_INSTALL_DIR) ? env.MCODE_INSTALL_DIR! : path.join(os.homedir(), ".minimax-code");
+}
+
+/** Data dirs whose config.yaml files carry provider base URLs: an explicit
+ *  MINIMAX_DATA_DIR/MAVIS_DATA_DIR points at exactly one profile dir;
+ *  otherwise union-scan ~/.minimax plus every ~/.minimax-<profile> (the
+ *  active-profile selection logic lives in mcode; a superset whitelist is
+ *  safe — extra hosts only matter if traffic actually flows to them). */
+export function mcodeConfigFiles(env: NodeJS.ProcessEnv = process.env): string[] {
+    if (nonEmpty(env.MINIMAX_DATA_DIR) || nonEmpty(env.MAVIS_DATA_DIR)) {
+        const dir = nonEmpty(env.MINIMAX_DATA_DIR) ? env.MINIMAX_DATA_DIR! : env.MAVIS_DATA_DIR!;
+        return [path.join(dir, "config.yaml")];
+    }
+    const home = os.homedir();
+    const files = [path.join(home, ".minimax", "config.yaml")];
+    try {
+        for (const name of fs.readdirSync(home)) {
+            if (name.startsWith(".minimax-")) files.push(path.join(home, name, "config.yaml"));
+        }
+    } catch {}
+    return files;
+}
+
+export function readMcodeConfig(env: NodeJS.ProcessEnv = process.env): McodeConfig {
+    const merged: McodeConfig = { providers: {} };
+    const windows = new Map<string, ModelWindow>();
+    for (const file of mcodeConfigFiles(env)) {
+        let text: string;
+        try {
+            text = fs.readFileSync(file, "utf8");
+        } catch {
+            continue;
+        }
+        const cfg = parseMcodeYaml(text);
+        for (const [name, prov] of Object.entries(cfg.providers)) {
+            if (!prov.baseUrl) continue;
+            merged.providers[name] ??= {};
+            if (!merged.providers[name]!.baseUrl) merged.providers[name]!.baseUrl = prov.baseUrl;
+        }
+        for (const w of cfg.models ?? []) {
+            const prev = windows.get(w.id);
+            if (!prev || w.contextWindow > prev.contextWindow) windows.set(w.id, w);
+            else if (w.maxOutput !== undefined && (prev.maxOutput === undefined || w.maxOutput > prev.maxOutput)) {
+                prev.maxOutput = w.maxOutput;
+            }
+        }
+    }
+    if (windows.size > 0) merged.models = [...windows.values()];
+    return merged;
 }
 
 export function readPiConfig(piHome: string): PiConfig {
@@ -1188,6 +1348,7 @@ export function loadClientConfig(env: NodeJS.ProcessEnv, cwd: string): ClientCon
     config.kimi = readKimiConfig(resolveKimiHome(env), env);
     config.gemini = readGeminiEnvConfig(env);
     config.iflow = readIflowEnvConfig(env);
+    config.mcode = readMcodeConfig(env);
     return config;
 }
 
@@ -1195,7 +1356,7 @@ export function loadClientConfig(env: NodeJS.ProcessEnv, cwd: string): ClientCon
  *  launched client's own declarations are authoritative (#436: launching
  *  `bili omp` with omp's models.yml declaring 131072 must not be overridden by
  *  another client's larger declaration for the same model id). */
-export type ModelWindowScope = "claude" | "codex" | "pi" | "omp" | "opencode" | "hermes" | "dsh" | "codebuddy" | "qoder" | "trae" | "jcode" | "kimi" | "gemini" | "iflow" | "qwen";
+export type ModelWindowScope = "claude" | "codex" | "pi" | "omp" | "opencode" | "hermes" | "dsh" | "codebuddy" | "qoder" | "trae" | "jcode" | "kimi" | "gemini" | "iflow" | "qwen" | "mcode";
 
 /** Collect per-model context windows from client configs the launcher can
  *  read (pi models.json, omp models.yml, opencode opencode.json, codex
@@ -1219,6 +1380,7 @@ export function collectModelWindows(config: ClientConfig, scope?: ModelWindowSco
         else if (scope === "opencode") for (const p of Object.values(config.opencode?.providers ?? {})) add(p.models);
         else if (scope === "codebuddy") add(config.codebuddy?.models);
         else if (scope === "kimi") add(config.kimi?.models);
+        else if (scope === "mcode") add(config.mcode?.models);
         return out;
     }
     for (const p of Object.values(config.pi?.providers ?? {})) add(p.models);
@@ -1227,6 +1389,7 @@ export function collectModelWindows(config: ClientConfig, scope?: ModelWindowSco
     add(config.codex?.modelWindows);
     add(config.codebuddy?.models);
     add(config.kimi?.models);
+    add(config.mcode?.models);
     return out;
 }
 
@@ -1248,6 +1411,7 @@ export function collectModelMaxOutputs(config: ClientConfig, scope?: ModelWindow
         else if (scope === "opencode") for (const p of Object.values(config.opencode?.providers ?? {})) add(p.models);
         else if (scope === "codebuddy") add(config.codebuddy?.models);
         else if (scope === "kimi") add(config.kimi?.models);
+        else if (scope === "mcode") add(config.mcode?.models);
         return out;
     }
     for (const p of Object.values(config.pi?.providers ?? {})) add(p.models);
@@ -1256,5 +1420,6 @@ export function collectModelMaxOutputs(config: ClientConfig, scope?: ModelWindow
     add(config.codex?.modelWindows);
     add(config.codebuddy?.models);
     add(config.kimi?.models);
+    add(config.mcode?.models);
     return out;
 }

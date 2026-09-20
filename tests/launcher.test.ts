@@ -88,6 +88,10 @@ import {
     readKimiConfig,
     resolveKimiHome,
     KIMI_DEFAULT_MODEL_HOSTS,
+    parseMcodeYaml,
+    readMcodeConfig,
+    resolveMcodeInstallDir,
+    MCODE_DEFAULT_MODEL_HOSTS,
     type SpawnChild,
     type SpawnFn,
     runLaunch,
@@ -148,6 +152,7 @@ test("isLaunchClient: pi/claude/codex/omp/opencode/pi-test true, others false", 
     assert.equal(isLaunchClient("qoder"), true);
     assert.equal(isLaunchClient("jcode"), true);
     assert.equal(isLaunchClient("kimi"), true);
+    assert.equal(isLaunchClient("mcode"), true);
     assert.equal(isLaunchClient("pi-test"), true);
     assert.equal(isLaunchClient("start"), false);
     assert.equal(isLaunchClient(""), false);
@@ -4187,6 +4192,195 @@ test("runLaunch kimi: cert-MITM envs (combined CA on SSL_CERT_FILE + NODE_EXTRA_
         assert.ok(!mitm.includes("api.kimi.ai"), "explicit provider present → no managed fallback hosts");
         const windows = String(proxyEnvs[0]!.BILI_LAUNCHER_MODEL_WINDOWS ?? "");
         assert.ok(windows.includes("kimi-for-coding"), `windows: ${windows}`);
+    } finally {
+        process.exit = prevExit;
+        process.env.HOME = prevHome;
+        if (prevUserProfile === undefined) delete process.env.USERPROFILE;
+        else process.env.USERPROFILE = prevUserProfile;
+        if (prevBin === undefined) delete process.env.BILI_CLIENT_BIN;
+        else process.env.BILI_CLIENT_BIN = prevBin;
+        if (prevNoProxy === undefined) delete process.env.NO_PROXY;
+        else process.env.NO_PROXY = prevNoProxy;
+        fs.rmSync(home, { recursive: true, force: true });
+    }
+});
+
+test("parseMcodeYaml: minimax_api.baseURL, custom_provider options.baseURL (reserved keys skipped), model limits → windows (#1050)", () => {
+    const yaml = [
+        "minimax_api:",
+        "  apiKey: sk-mm",
+        "  baseURL: https://agent.minimax.io/mavis/api/v1/llm/v1",
+        "custom_provider:",
+        "  minimax_api:",
+        "    options:",
+        "      baseURL: https://ignored.example.com/",
+        "  relay:",
+        "    name: Relay",
+        '    options:',
+        '      apiKey: "sk-relay"',
+        "      baseURL: https://relay.example.com/anthropic",
+        "    models:",
+        "      MiniMax-M3:",
+        "        limit:",
+        "          context: 200000",
+        "          output: 16384",
+        "      NoLimit:",
+        "        limit:",
+        "          context: 128000",
+        "",
+    ].join("\n");
+    const cfg = parseMcodeYaml(yaml);
+    assert.deepEqual(cfg.providers, {
+        minimax_api: { baseUrl: "https://agent.minimax.io/mavis/api/v1/llm/v1" },
+        relay: { baseUrl: "https://relay.example.com/anthropic" },
+    });
+    assert.deepEqual(cfg.models, [
+        { id: "MiniMax-M3", contextWindow: 200000, maxOutput: 16384 },
+        { id: "NoLimit", contextWindow: 128000 },
+    ]);
+});
+
+test("readMcodeConfig + resolveMcodeInstallDir: union-scan ~/.minimax*/config.yaml, MINIMAX_DATA_DIR override wins (#1050)", () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-mcode-home-"));
+    const prevHome = process.env.HOME;
+    const prevUserProfile = process.env.USERPROFILE;
+    process.env.HOME = home;
+    if (prevUserProfile !== undefined) process.env.USERPROFILE = home;
+    try {
+        assert.ok(resolveMcodeInstallDir({}).endsWith(path.join(".minimax-code")));
+        assert.equal(resolveMcodeInstallDir({ MCODE_INSTALL_DIR: "/tmp/md" }), "/tmp/md");
+        assert.deepEqual(readMcodeConfig({}), { providers: {} });
+        fs.mkdirSync(path.join(home, ".minimax"));
+        fs.writeFileSync(path.join(home, ".minimax", "config.yaml"), "minimax_api:\n  baseURL: https://agent.minimax.cn/mavis/api/v1/llm/v1\n");
+        fs.mkdirSync(path.join(home, ".minimax-work"));
+        fs.writeFileSync(
+            path.join(home, ".minimax-work", "config.yaml"),
+            ["custom_provider:", "  relay:", "    options:", "      baseURL: https://relay.example.com/anthropic", "    models:", "      MiniMax-M3:", "        limit:", "          context: 200000"].join("\n"),
+        );
+        const cfg = readMcodeConfig({});
+        assert.equal(cfg.providers["minimax_api"]?.baseUrl, "https://agent.minimax.cn/mavis/api/v1/llm/v1");
+        assert.equal(cfg.providers["relay"]?.baseUrl, "https://relay.example.com/anthropic");
+        assert.deepEqual(cfg.models, [{ id: "MiniMax-M3", contextWindow: 200000 }]);
+        const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-mcode-data-"));
+        fs.writeFileSync(path.join(dataDir, "config.yaml"), "minimax_api:\n  baseURL: https://override.example.com/\n");
+        const overridden = readMcodeConfig({ MINIMAX_DATA_DIR: dataDir });
+        assert.deepEqual(Object.keys(overridden.providers), ["minimax_api"]);
+        assert.equal(overridden.providers["minimax_api"]?.baseUrl, "https://override.example.com/");
+        fs.rmSync(dataDir, { recursive: true, force: true });
+    } finally {
+        if (prevHome === undefined) delete process.env.HOME;
+        else process.env.HOME = prevHome;
+        if (prevUserProfile === undefined) delete process.env.USERPROFILE;
+        else process.env.USERPROFILE = prevUserProfile;
+        fs.rmSync(home, { recursive: true, force: true });
+    }
+});
+
+test("discoverRoutes: mcode — loopback inventory, https MITM whitelist, http proxy-env, wrapped skip (#1050)", () => {
+    const config: ClientConfig = {
+        mcode: {
+            providers: {
+                local: { baseUrl: "http://127.0.0.1:8199/v1" },
+                remote: { baseUrl: "https://agent.minimax.io/mavis/api/v1/llm/v1" },
+                lan: { baseUrl: "http://10.0.0.5:1234/v1" },
+                wrapped: { baseUrl: "http://127.0.0.1:8787/bili/http://127.0.0.1:9999/v1" },
+            },
+        },
+    };
+    const routes = discoverRoutes("mcode", config);
+    assert.deepEqual(routes.httpRewrites, [{ key: "mcode-1", realUpstream: "http://127.0.0.1:8199/v1" }]);
+    assert.deepEqual(routes.httpsDomains, ["agent.minimax.io"]);
+    assert.deepEqual(routes.httpEnvRoutes, ["http://10.0.0.5:1234/v1"]);
+});
+
+test("discoverRoutes: mcode empty config → official fallback hosts (#1050)", () => {
+    const routes = discoverRoutes("mcode", {});
+    assert.deepEqual(routes.httpsDomains, MCODE_DEFAULT_MODEL_HOSTS);
+    assert.deepEqual(routes.httpRewrites, []);
+    assert.deepEqual(routes.httpEnvRoutes, []);
+});
+
+test("resolveClientCommand: mcode resolves `mcode` on PATH, falls back to <install>/bin/mcode (#1050)", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-mcode-bin-"));
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-mcode-home-"));
+    const prevHome = process.env.HOME;
+    const prevUserProfile = process.env.USERPROFILE;
+    process.env.HOME = home;
+    if (prevUserProfile !== undefined) process.env.USERPROFILE = home;
+    try {
+        const env: NodeJS.ProcessEnv = { PATH: dir };
+        assert.deepEqual(resolveClientCommand("mcode", env), { command: path.join(home, ".minimax-code", "bin", "mcode"), prefixArgs: [] });
+        fs.writeFileSync(path.join(dir, "mcode"), "");
+        assert.deepEqual(resolveClientCommand("mcode", env), { command: path.join(dir, "mcode"), prefixArgs: [] });
+        const emptyDir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-mcode-empty-"));
+        assert.deepEqual(resolveClientCommand("mcode", { PATH: emptyDir, MCODE_INSTALL_DIR: "/tmp/md" }), { command: path.join("/tmp/md", "bin", "mcode"), prefixArgs: [] });
+        fs.rmSync(emptyDir, { recursive: true, force: true });
+    } finally {
+        if (prevHome === undefined) delete process.env.HOME;
+        else process.env.HOME = prevHome;
+        if (prevUserProfile === undefined) delete process.env.USERPROFILE;
+        else process.env.USERPROFILE = prevUserProfile;
+        fs.rmSync(dir, { recursive: true, force: true });
+        fs.rmSync(home, { recursive: true, force: true });
+    }
+});
+
+test("runLaunch mcode: cert-MITM envs (combined CA on SSL_CERT_FILE + NODE_EXTRA_CA_CERTS), discovered host whitelist, model windows (#1050)", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-mcode-launch-"));
+    const prevHome = process.env.HOME;
+    const prevUserProfile = process.env.USERPROFILE;
+    const prevBin = process.env.BILI_CLIENT_BIN;
+    const prevNoProxy = process.env.NO_PROXY;
+    fs.mkdirSync(path.join(home, ".minimax"));
+    fs.writeFileSync(
+        path.join(home, ".minimax", "config.yaml"),
+        ["minimax_api:", "  apiKey: sk-mm", "  baseURL: https://agent.minimax.io/mavis/api/v1/llm/v1", "", "custom_provider:", "  relay:", "    name: Relay", "    options:", "      apiKey: sk-relay", "      baseURL: https://relay.example.com/anthropic", "    models:", "      MiniMax-M3:", "        limit:", "          context: 200000", "          output: 16384"].join("\n"),
+    );
+    process.env.HOME = home;
+    if (prevUserProfile !== undefined) process.env.USERPROFILE = home;
+    const fakeMcode = path.join(home, process.platform === "win32" ? "fake-mcode.exe" : "fake-mcode");
+    fs.writeFileSync(fakeMcode, "");
+    process.env.BILI_CLIENT_BIN = fakeMcode;
+    process.env.NO_PROXY = "localhost,.corp";
+
+    const clientEnvs: (NodeJS.ProcessEnv | undefined)[] = [];
+    const proxyEnvs: (NodeJS.ProcessEnv | undefined)[] = [];
+    const spawnImpl: SpawnFn = (cmd, args, opts) => {
+        const env = (opts as { env?: NodeJS.ProcessEnv } | undefined)?.env;
+        if (cmd === fakeMcode) {
+            clientEnvs.push(env);
+            const child = makeFakeChild(0);
+            const orig = child.on.bind(child);
+            (child as { on: SpawnChild["on"] }).on = (event, listener) => {
+                orig(event, listener);
+                if (event === "exit") setTimeout(() => listener(0, null), 0);
+                return child;
+            };
+            return child;
+        }
+        proxyEnvs.push(env);
+        return makeFakeChild(42425);
+    };
+    const fetchImpl = async () => ({ ok: true });
+    const prevExit = process.exit;
+    process.exit = (() => undefined) as typeof process.exit;
+    try {
+        await runLaunch({ client: "mcode", clientArgs: [], overrides: {} }, { fetchImpl, spawnImpl, sleep: () => Promise.resolve() });
+        assert.equal(clientEnvs.length, 1);
+        const seenEnv = clientEnvs[0]!;
+        const origin = seenEnv.HTTPS_PROXY;
+        assert.ok(/^http:\/\/127\.0\.0\.1:\d+$/.test(String(origin)), `origin: ${origin}`);
+        assert.ok(String(seenEnv.SSL_CERT_FILE).endsWith(path.join("billion-context", "ca", "combined-ca.pem")), String(seenEnv.SSL_CERT_FILE));
+        assert.equal(seenEnv.NODE_EXTRA_CA_CERTS, seenEnv.SSL_CERT_FILE, "combined bundle on both CA vars");
+        assert.equal(seenEnv.HTTP_PROXY, undefined, "no plain-http routes → no HTTP_PROXY");
+        assert.equal(seenEnv.NO_PROXY, undefined, "inherited NO_PROXY stripped");
+        assert.equal(seenEnv.BILLION_CONTEXT_PROXY, undefined, "mcode has no agent-side plugin consumer");
+        assert.ok(proxyEnvs.length > 0, "proxy child spawned");
+        const mitm = String(proxyEnvs[0]!.BILI_MITM_DOMAINS).split(",");
+        assert.ok(mitm.includes("agent.minimax.io"), `whitelist has agent.minimax.io: ${mitm.join(",")}`);
+        assert.ok(mitm.includes("relay.example.com"), `whitelist has relay.example.com: ${mitm.join(",")}`);
+        const windows = String(proxyEnvs[0]!.BILI_LAUNCHER_MODEL_WINDOWS ?? "");
+        assert.ok(windows.includes("MiniMax-M3"), `windows: ${windows}`);
     } finally {
         process.exit = prevExit;
         process.env.HOME = prevHome;
