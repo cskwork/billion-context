@@ -19,6 +19,8 @@
 //    the kernel's cache report — its shape is kernel-owned and variable-length
 //    (LINE ITEMS table up to the sample cap), so we cannot anchor on the
 //    renderer output the way we can for the two panels above.
+import { MARKER_LINE, stripMarkerLines } from "./loop/tag-echo-filter.js";
+
 const PANEL_BOX_TOP = "\u256d";
 const PANEL_BOX_TITLE = "ACP Context Analysis";
 const PANEL_BOX_FOOTER = "Tag visibility: tags injected to LLM only (deep copy), not persisted in session, not shown in terminal.";
@@ -91,6 +93,52 @@ export function stripAcpPanelMessages(messages: unknown): number {
         }
     }
     return stripped;
+}
+
+// #1029: ACP status markers ("❌ [ACP] …", "📦 [ACP] …") are ephemeral proxy
+// status lines streamed into assistant text (#717). Clients that resend full
+// history (e.g. DSH Desktop) carry them back on every turn, where they
+// accumulate in the model context and the reading flow. Strip marker lines
+// from incoming user/assistant text before projection (mirrors
+// stripAcpPanelMessages above; line semantics shared with the outgoing
+// tag-echo filter). Messages are NEVER deleted — a marker-only assistant
+// message may still carry tool_calls whose tool results must not be orphaned;
+// such text degrades to a single space instead.
+export function stripAcpStatusMarkers(messages: unknown): number {
+    if (!Array.isArray(messages)) return 0;
+    let stripped = 0;
+    for (const rec of messages) {
+        if (rec === null || typeof rec !== "object") continue;
+        const m = rec as Record<string, unknown>;
+        if (m.role !== "user" && m.role !== "assistant") continue;
+        const content = m.content;
+        if (typeof content === "string") {
+            const out = stripMarkerLines(content);
+            if (out !== content) {
+                m.content = out.trim().length > 0 ? out : " ";
+                stripped += countMarkerLines(content);
+            }
+        } else if (Array.isArray(content)) {
+            for (const part of content) {
+                if (part === null || typeof part !== "object") continue;
+                const p = part as Record<string, unknown>;
+                const text = p.text;
+                if (typeof text !== "string") continue;
+                const out = stripMarkerLines(text);
+                if (out !== text) {
+                    p.text = out.trim().length > 0 ? out : " ";
+                    stripped += countMarkerLines(text);
+                }
+            }
+        }
+    }
+    return stripped;
+}
+
+function countMarkerLines(text: string): number {
+    let n = 0;
+    for (const _ of text.matchAll(MARKER_LINE)) n++;
+    return n;
 }
 
 // Strip ACP panel user messages from a Responses input array (in place);

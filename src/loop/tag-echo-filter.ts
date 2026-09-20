@@ -160,7 +160,7 @@ const MARKER_HEAD = /^\p{So}(?:[ \t])?\[ACP\]/u;
 // cheap and lossless (flush/content-preservation resolves it); the strict
 // \p{So} decision happens only in MARKER_HEAD, so prose is never stripped.
 const MARKER_HEAD_PREFIX = /^[^\x00-\x7F](?:[ \t])?(?:\[ACP\]|\[ACP|\[AC|\[A|\[)?$/u;
-const MARKER_LINE = /^\p{So}(?:[ \t])?\[ACP\][^\n]*\n?/gmu;
+export const MARKER_LINE = /^\p{So}(?:[ \t])?\[ACP\][^\n]*\n?/gmu;
 // Conservative tail probe for the streaming fast-path gate below: the chunk's
 // last line is still an undecidable marker-head prefix (icon alone, or icon +
 // partial "[ACP"), so the next chunk must flow through the filter. Any

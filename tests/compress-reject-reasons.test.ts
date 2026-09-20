@@ -40,8 +40,10 @@ test("#362: parse-level rejections surface per-entry reasons in the model-facing
     assert.ok(out.startsWith("[Compression FAILED"), `expected failure, got: ${out}`);
     assert.ok(out.includes("kind=no-valid-ranges"), `kind reported, got: ${out}`);
     assert.ok(out.includes("dropped=2"), `dropped count reported, got: ${out}`);
-    assert.ok(out.includes("- entry 0: missing range bounds"), "reason for entry 0 present");
-    assert.ok(out.includes("- entry 1: missing summary"), "reason for entry 1 present");
+    // #1029: reasons are inlined on line 1 (the ❌ visibility marker keeps only
+    // line 1 — the old bullet list reached clients as a dangling header).
+    assert.ok(out.includes("entry 0: missing range bounds"), "reason for entry 0 present (inline)");
+    assert.ok(out.includes("entry 1: missing summary"), "reason for entry 1 present (inline)");
 });
 
 test("#362: shape drift (content vs ranges key) reports kind=missing-content", () => {

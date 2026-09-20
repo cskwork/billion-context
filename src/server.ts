@@ -85,7 +85,7 @@ import { makeContinuationRefetch } from "./degenerate-retry.js";
 import { reasoningGuardEngages, runReasoningGuard } from "./reasoning-guard.js";
 import { sanitizeResponsesInputIds, dropWhitespaceResponsesMessages, normalizeResponsesMessageItems } from "./loop/adapter-responses.js";
 import { CODEX_COMPACT_HEALTH_RATIO, codexCompactMode, isCodexClient, hasCompactionTrigger, stripBiliCompactionItems, replaceBiliCompactionItems, codexCompactGate, codexCompactGatePre, buildTriggerForgeBody, mergeForgedSummaries } from "./codex-compact.js";
-import { stripAcpPanelMessages, stripAcpPanelResponsesInput } from "./acp-panel.js";
+import { stripAcpPanelMessages, stripAcpPanelResponsesInput, stripAcpStatusMarkers } from "./acp-panel.js";
 import { rewriteOpenaiJsonResponse } from "./stream-openai.js";
 import { rewriteGoogleJsonResponse } from "./stream-google.js";
 import { rewriteResponsesJsonResponse } from "./stream-responses.js";
@@ -2093,6 +2093,10 @@ function prepareAnthropic(
     if (strippedPanels > 0) {
         log("info", `[${sessionId}] stripped ${strippedPanels} ACP panel message(s) before projection (UI-only, issue #359)`);
     }
+    const strippedMarkerLines = stripAcpStatusMarkers(parsed.messages);
+    if (strippedMarkerLines > 0) {
+        log("info", `[${sessionId}] stripped ${strippedMarkerLines} ACP status marker line(s) from incoming history (ephemeral proxy status, issue #1029)`);
+    }
 
     try {
         const { msgs, cacheControls } = anthropicToCore(parsed);
@@ -2254,6 +2258,10 @@ function prepareOpenai(
     const strippedPanels = stripAcpPanelMessages(parsed.messages);
     if (strippedPanels > 0) {
         log("info", `[${sessionId}] stripped ${strippedPanels} ACP panel message(s) before projection (UI-only, issue #359)`);
+    }
+    const strippedMarkerLines = stripAcpStatusMarkers(parsed.messages);
+    if (strippedMarkerLines > 0) {
+        log("info", `[${sessionId}] stripped ${strippedMarkerLines} ACP status marker line(s) from incoming history (ephemeral proxy status, issue #1029)`);
     }
 
     try {
@@ -2644,6 +2652,10 @@ function prepareResponses(
     const strippedPanels = stripAcpPanelResponsesInput(parsed.input);
     if (strippedPanels > 0) {
         log("info", `[${sessionId}] stripped ${strippedPanels} ACP panel message(s) before projection (UI-only, issue #359)`);
+    }
+    const strippedMarkerLines = stripAcpStatusMarkers(parsed.input);
+    if (strippedMarkerLines > 0) {
+        log("info", `[${sessionId}] stripped ${strippedMarkerLines} ACP status marker line(s) from incoming history (ephemeral proxy status, issue #1029)`);
     }
 
     const shouldInject = opts.compress.injectTool;
