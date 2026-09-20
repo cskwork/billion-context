@@ -18,6 +18,11 @@
 //   kimi     $KIMI_CODE_HOME/plugins/managed/billion-context/kimi.plugin.json
 //            + installed.json record (stdio MCP + SessionStart hook; config.toml
 //            routing happens per-session, see src/kimi/)
+//   hermes   ~/.hermes/plugins/billion-context/{plugin.yaml,__init__.py,bili.json}
+//            (#958: Python plugin — hermes's CLI agent plugin API is Python-only;
+//            it self-spawns/attaches a proxy and routes traffic via HTTPS_PROXY +
+//            HERMES_CA_BUNDLE, the same wire path as `bili hermes`; enablement is
+//            delegated to `hermes plugins enable`)
 // Installers throw on failure (bad/locked config, missing host CLI); the CLI
 // layer catches, prints `bili plugin: <msg>` and exits 1.
 
@@ -28,7 +33,7 @@ import crypto from "node:crypto";
 import { execFileSync, spawnSync } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { applyEdits, modify as jsoncModify, parse as jsoncParse, type ParseError } from "jsonc-parser";
-import { resolveDshHome, resolveKimiHome, resolvePiHome } from "./client-config.js";
+import { resolveDshHome, resolveHermesHome, resolveKimiHome, resolvePiHome } from "./client-config.js";
 import { clearClaudeNativePort, resolveClaudeNativePort, saveClaudeNativePort } from "./config.js";
 import { isPidAlive, isProxyInstanceFile, readProxyInstanceFile } from "./instance.js";
 import { DSH_PACKAGE, dshBundleInstalled, dshHasLegacyManagedBlock, dshProfileDependsOnBili, dshProfileDirs, refreshDshProfileBundles, runDshPlugin, stripLegacyManagedBlock } from "./dsh-channel.js";
@@ -52,7 +57,7 @@ function proxyOriginForInstall(): string {
     return inst.origin;
 }
 
-export const PLUGIN_AGENTS = ["pi", "omp", "claude", "codex", "opencode", "dsh", "kimi"] as const;
+export const PLUGIN_AGENTS = ["pi", "omp", "claude", "codex", "opencode", "dsh", "kimi", "hermes"] as const;
 export type PluginAgent = (typeof PLUGIN_AGENTS)[number];
 
 export function selfPackageRoot(): string {
@@ -1394,6 +1399,75 @@ function kimiStatus(): string {
     return "not installed";
 }
 
+// — hermes (#958) ——————————————————————————————————————————————————————————————
+// Python plugin: hermes's CLI agent plugin API is Python-only, so the lane copies
+// the shipped source verbatim into the user plugin dir instead of pointing at dist.
+// Enablement is delegated to `hermes plugins enable` — hermes owns config.yaml, we
+// never parse it. The bili.json sidecar points the plugin at THIS install's
+// dist/index.js + node runtime, so a global self-update moves both together.
+
+const HERMES_PLUGIN_ID = "billion-context";
+
+function hermesPluginDir(): string {
+    return path.join(resolveHermesHome(process.env), "plugins", HERMES_PLUGIN_ID);
+}
+
+interface HermesSidecar {
+    proxyScript: string;
+    nodePath: string;
+}
+
+function runHermesCli(args: string[]): { ok: true } | { ok: false; reason: string } {
+    try {
+        execFileSync("hermes", args, { timeout: 15_000, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+        return { ok: true };
+    } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === "ENOENT") return { ok: false, reason: "not-found" };
+        const stderr = (err as { stderr?: Buffer | string }).stderr;
+        const detail = typeof stderr === "string" ? stderr.trim() : stderr?.toString().trim();
+        return { ok: false, reason: detail || (err instanceof Error ? err.message : String(err)) };
+    }
+}
+
+function hermesInstallCore(): void {
+    const root = selfPackageRoot();
+    const initSrc = fs.readFileSync(path.join(root, "hermes-plugin", "__init__.py"), "utf8");
+    const yamlSrc = fs.readFileSync(path.join(root, "hermes-plugin", "plugin.yaml"), "utf8");
+    requireDistFile(path.join(root, "dist", "index.js"));
+    const dir = hermesPluginDir();
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, "__init__.py"), initSrc);
+    fs.writeFileSync(path.join(dir, "plugin.yaml"), yamlSrc.replace(/^version:.*/m, `version: "${selfVersion()}"`));
+    const sidecar: HermesSidecar = { proxyScript: path.join(root, "dist", "index.js"), nodePath: process.execPath };
+    fs.writeFileSync(path.join(dir, "bili.json"), `${JSON.stringify(sidecar, null, 2)}\n`);
+}
+
+function hermesInstall(): string {
+    hermesInstallCore();
+    const dir = hermesPluginDir();
+    const enable = runHermesCli(["plugins", "enable", HERMES_PLUGIN_ID]);
+    if (enable.ok) return `wrote the billion-context plugin into ${dir} and enabled it — start a new hermes session to activate`;
+    const hint = enable.reason === "not-found"
+        ? "the hermes CLI was not found on PATH — enable it manually: hermes plugins enable billion-context"
+        : `enabling via the hermes CLI failed (${enable.reason}) — enable it manually: hermes plugins enable billion-context`;
+    return `wrote the billion-context plugin into ${dir}; ${hint}`;
+}
+
+function hermesRemove(): string {
+    const dir = hermesPluginDir();
+    if (!fs.existsSync(dir)) return "not installed";
+    fs.rmSync(dir, { recursive: true, force: true });
+    const disable = runHermesCli(["plugins", "disable", HERMES_PLUGIN_ID]);
+    return disable.ok
+        ? `removed the billion-context plugin (${dir}) and disabled it — start a new hermes session to finish`
+        : `removed the billion-context plugin (${dir}); if hermes still lists it, disable it manually: hermes plugins disable billion-context`;
+}
+
+function hermesStatus(): string {
+    const dir = hermesPluginDir();
+    return fs.existsSync(path.join(dir, "__init__.py")) && fs.existsSync(path.join(dir, "bili.json")) ? "installed" : "not installed";
+}
+
 // — dispatch ————————————————————————————————————————————————————————————
 
 export function isPluginAgent(value: string): value is PluginAgent {
@@ -1401,11 +1475,11 @@ export function isPluginAgent(value: string): value is PluginAgent {
 }
 
 export function pluginInstall(agent: PluginAgent, opts: { withMcp?: boolean } = {}): string {
-    return agent === "pi" ? piInstall() : agent === "omp" ? ompInstall() : agent === "claude" ? claudeInstall() : agent === "codex" ? codexInstall() : agent === "dsh" ? dshInstall() : agent === "kimi" ? kimiInstall() : opencodeInstall(opts.withMcp === true);
+    return agent === "pi" ? piInstall() : agent === "omp" ? ompInstall() : agent === "claude" ? claudeInstall() : agent === "codex" ? codexInstall() : agent === "dsh" ? dshInstall() : agent === "kimi" ? kimiInstall() : agent === "hermes" ? hermesInstall() : opencodeInstall(opts.withMcp === true);
 }
 
 export function pluginRemove(agent: PluginAgent): string {
-    return agent === "pi" ? piRemove() : agent === "omp" ? ompRemove() : agent === "claude" ? claudeRemove() : agent === "codex" ? codexRemove() : agent === "dsh" ? dshRemove() : agent === "kimi" ? kimiRemove() : opencodeRemove();
+    return agent === "pi" ? piRemove() : agent === "omp" ? ompRemove() : agent === "claude" ? claudeRemove() : agent === "codex" ? codexRemove() : agent === "dsh" ? dshRemove() : agent === "kimi" ? kimiRemove() : agent === "hermes" ? hermesRemove() : opencodeRemove();
 }
 
 export function pluginStatusAll(): Array<{ agent: string; status: string; channel: string }> {
@@ -1417,6 +1491,7 @@ export function pluginStatusAll(): Array<{ agent: string; status: string; channe
         ["opencode", opencodeStatus],
         ["dsh", dshStatus],
         ["kimi", kimiStatus],
+        ["hermes", hermesStatus],
     ];
     return checks.map(([agent, check]) => {
         try {
@@ -1430,7 +1505,8 @@ export function pluginStatusAll(): Array<{ agent: string; status: string; channe
 // #991 single-writer: every lane's update path, user-facing. Host-managed
 // copies (pi's npm entry, opencode's plugin dir) are only ever updated by
 // their host; dsh profile bundles track the global version; reference lanes
-// (omp/claude/codex/kimi) follow the global bili install itself.
+// (omp/claude/codex/kimi/hermes) follow the global bili install itself —
+// hermes additionally re-copies its Python files via `bili plugin update hermes`.
 const UPDATE_CHANNEL: Record<PluginAgent, string> = {
     pi: "pi update (pi owns the npm:billion-context copy)",
     omp: "the global bili install (entry points at it)",
@@ -1439,6 +1515,7 @@ const UPDATE_CHANNEL: Record<PluginAgent, string> = {
     opencode: "opencode's own plugin manager (opencode owns the copy)",
     dsh: "the global bili self-update (profile bundles track it)",
     kimi: "the global bili install (plugin points at its dist)",
+    hermes: "the global bili install (sidecar points at its dist); `bili plugin update hermes` re-copies the plugin",
 };
 
 export interface PluginUpdateOpts {
@@ -1518,6 +1595,11 @@ async function updateLane(agent: PluginAgent, opts: PluginUpdateOpts, log: (leve
         const before = targets.length;
         await refreshDshProfileBundles(latest, log);
         return [`dsh: refreshing ${before} profile bundle(s) to ${latest} through dsh's plugin channel (see log for per-profile results)`];
+    }
+    if (agent === "hermes") {
+        if (hermesStatus() !== "installed") return ["hermes: not installed — nothing to update"];
+        hermesInstallCore();
+        return [`hermes: re-copied the plugin into ${hermesPluginDir()} (bili ${selfVersion()}) — restart hermes to pick it up`];
     }
     const via = UPDATE_CHANNEL[agent];
     return [`${agent}: the plugin entry follows the global bili install — it updates together with it (${via})`];

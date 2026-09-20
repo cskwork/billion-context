@@ -71,7 +71,8 @@
     "LICENSE",
     "README.md",
     "dist",
-    "dsh.bundle.patch.yml"
+    "dsh.bundle.patch.yml",
+    "hermes-plugin"
   ],
   "pi": {
     "image": "https://raw.githubusercontent.com/ranxianglei/billion-context/master/docs/logo.png",
