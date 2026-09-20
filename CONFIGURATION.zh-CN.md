@@ -308,13 +308,6 @@
 - **状态：** ACTIVE
 - **说明：** 启用多层压缩 —— 对旧摘要进行 tier-2 蒸馏，以及 tier-3 凝缩。设为 `false` 可运行在仅 tier-1 模式（每个摘要都是扁平的 tier-1 摘要）。映射到内核字段 `tiers.enabled`。
 
-#### `protectedLatestTools`
-
-- **类型：** `string[]`（工具名模式，如 `["todo_list"]`）
-- **默认值：** `[]`（无 —— 按客户端自行开启，工具名因客户端而异）
-- **状态：** ACTIVE
-- **说明：** 工具名模式列表：匹配工具的**最新**一次 tool-call 及其配对 result 永远不会被压缩（内核 `protectedLatestTools`，需 `acp-kernel` >= 0.0.80）。为累积快照型工具而设 —— 例如 agent 的 todo/任务清单，每条新 result 都取代旧的：只有最新实例是事实源，若用 `protectedTools` 保护**全部**实例会使该工具的历史无限膨胀，而只保护**最新**一条既让活跃快照留在上下文里，又让所有被取代的旧实例照常折叠。这解决了“压缩后 agent 忘掉任务清单”的故障（#639）。保护是硬排除：最新实例不可寻址（其 ref 渲染为 `BLOCKED`），推荐范围与显式范围都无法覆盖它；在两种压缩模式、所有 wire 上一致生效。模式匹配同内核工具模式（精确名或 `*` 通配，如 `"todo_list"`、`"TodoWrite"`、`"todo*"`）。跨层级整体替换（最深层胜出）。示例：`{ "compress": { "protectedLatestTools": ["todo_list", "TodoWrite"] } }`。
-
 #### `prompts`
 
 - **类型：** `object`（`{ compressPhilosophy?, howToCompressRules?, tier2DistillRules?, tier3CondenseRules? }`，均为字符串）

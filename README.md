@@ -71,8 +71,6 @@ An opt-in fifth tool, `absorb` (`compress.absorb.enabled: true` — see [CONFIGU
 
 An opt-in sixth tool, `acp_rule` (`compress.rules: true` — see [CONFIGURATION.md](CONFIGURATION.md)), records **persistent principle-level reminders**: a short rule recorded by the model (user-emphasized lessons, behaviors to remember, major pitfalls hit) is hard-protected from compression — the call and its result stay in context across every fold — and omitting the argument lists the recorded rules ([ranxianglei/billion-context-pi#433](https://github.com/ranxianglei/billion-context-pi/issues/433)).
 
-A sibling protection knob, `compress.protectedLatestTools` (see [CONFIGURATION.md](CONFIGURATION.md)), keeps the **latest** snapshot of a cumulative tool (a client's todo/task list, e.g. `["todo_list", "TodoWrite"]`) un-compressible while older instances fold normally — so the agent never loses its live task list to a fold (#639).
-
 ### Two compression modes — who executes `compress`
 
 The proxy runs in one of two modes, and **the mode decides who executes

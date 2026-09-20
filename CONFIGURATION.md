@@ -310,14 +310,9 @@ For each request, the proxy resolves the settings by longest-URL-prefix match (t
 - **Status:** ACTIVE
 - **Description:** Enable multi-tier compression — tier-2 distillation of old summaries and tier-3 condensation. Set `false` to run in tier-1-only mode (every summary is a flat tier-1 summary). Maps to the kernel field `tiers.enabled`.
 
-#### `protectedLatestTools`
-
-- **Type:** `string[]` (tool-name patterns, e.g. `["todo_list"]`)
-- **Default:** `[]` *(none — opt in per client, tool names are client-specific)*
-- **Status:** ACTIVE
-- **Description:** Tool-name patterns whose **latest** tool-call + paired result are never compressed (kernel `protectedLatestTools`, requires `acp-kernel` >= 0.0.80). Built for cumulative-snapshot tools — e.g. an agent's todo/task list, where every newer result supersedes the older ones: only the newest instance is the source of truth, so protecting **all** instances (via `protectedTools`) would make that tool's history grow unboundedly, while protecting the **latest** keeps the live snapshot in context and lets every superseded instance fold normally. This solves the "agent forgets its task list after compression" failure (#639). Protection is a HARD exclusion: the latest instance is unaddressable (its refs render as `BLOCKED`), so neither suggested nor explicit compress ranges can cover it; it applies identically in both compression modes and on every wire. Patterns match like kernel tool patterns (exact name or `*` glob, e.g. `"todo_list"`, `"TodoWrite"`, `"todo*"`). Whole-array replace at the deepest defined level. Example: `{ "compress": { "protectedLatestTools": ["todo_list", "TodoWrite"] } }`.
-
 #### `prompts`
+
+- **Type:** `object` (`{ compressPhilosophy?, howToCompressRules?, tier2DistillRules?, tier3CondenseRules? }`, all strings)
 - **Default:** *(kernel defaults — see `acp-kernel` `defaultPrompts`)*
 - **Status:** ACTIVE
 - **Description:** Override the compression prompt text injected into the system prompt and nudge messages. Every field is **load-bearing**: the kernel rules were tuned over months of production use, and overriding them can degrade summary quality (lost paths / signatures / decisions → broken retrieval). Overrides only take effect when `acknowledgePromptsRisk` resolves to `true` after the three-level merge — the flag resolves independently at its own deepest defined level and gates **all** `prompts` overrides regardless of which level each piece lives at (a global-level flag activates model-level `prompts`); otherwise they are ignored and a one-time warning is logged. Non-string fields are silently dropped (a malformed partial never clobbers a good default). Useful mainly for non-English or small-model tuning — see issue #156.
