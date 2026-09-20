@@ -984,13 +984,12 @@ export async function pipePluginChatWithStrip(
         log?.(`[marker-echo] stripped model-emitted ACP confirmation marker from plugin passthrough text`);
     };
     // One state machine per (field, block/choice index) — interleaved choices
-    // or content blocks must not share partial-tag state.
+    // or content blocks must not share partial-tag state. Tool-call arguments
+    // never flow through a stream (#1039): they are forwarded verbatim.
     interface PipeStream {
         filter: TagEchoFilter;
         field: string;
         index: number;
-        choice?: number;
-        toolIndex?: number;
     }
     const streams = new Map<string, PipeStream>();
     const filterFor = (field: string, index: number) => {
@@ -1002,15 +1001,6 @@ export async function pipePluginChatWithStrip(
         }
         return s;
     };
-    const toolArgStreamFor = (choice: number, toolIndex: number) => {
-        const key = `tcall:${choice}:${toolIndex}`;
-        let s = streams.get(key);
-        if (!s) {
-            s = { filter: createTagEchoFilter(onTagDrop), field: "arguments", index: toolIndex, choice, toolIndex };
-            streams.set(key, s);
-        }
-        return s;
-    };
     const anyPending = () => {
         for (const s of streams.values()) if (s.filter.pending()) return true;
         return false;
@@ -1018,7 +1008,7 @@ export async function pipePluginChatWithStrip(
     let lastChunkMeta: Record<string, unknown> = {};
     const syntheticTail = (s: PipeStream, tail: string): string => {
         if (protocol === "anthropic") {
-            const deltaType = s.field === "text" ? "text_delta" : s.field === "thinking" ? "thinking_delta" : "input_json_delta";
+            const deltaType = s.field === "thinking" ? "thinking_delta" : "text_delta";
             return `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: s.index, delta: { type: deltaType, [s.field]: tail } })}\n\n`;
         }
         if (protocol === "google") {
@@ -1035,9 +1025,6 @@ export async function pipePluginChatWithStrip(
             };
             const frame = typeof lastChunkMeta["modelVersion"] === "string" ? { modelVersion: lastChunkMeta["modelVersion"], candidates: [candidate] } : { candidates: [candidate] };
             return `data: ${JSON.stringify(frame)}\n\n`;
-        }
-        if (s.toolIndex !== undefined) {
-            return `data: ${JSON.stringify({ ...lastChunkMeta, object: "chat.completion.chunk", choices: [{ index: s.choice ?? 0, delta: { tool_calls: [{ index: s.toolIndex, function: { arguments: tail } }] } }] })}\n\n`;
         }
         return `data: ${JSON.stringify({ ...lastChunkMeta, object: "chat.completion.chunk", choices: [{ index: s.index, delta: { [s.field]: tail } }] })}\n\n`;
     };
@@ -1260,33 +1247,6 @@ export async function pipePluginChatWithStrip(
                     (rebuilt["choices"] as Record<string, unknown>[])[ci]["delta"] = { ...((rebuilt["choices"] as Record<string, unknown>[])[ci]["delta"] as Record<string, unknown>), [field]: clean };
                 }
             }
-            const tcs = dd["tool_calls"];
-            if (Array.isArray(tcs)) {
-                for (let ti = 0; ti < tcs.length; ti++) {
-                    const tc = tcs[ti];
-                    if (!tc || typeof tc !== "object") continue;
-                    const fn = (tc as Record<string, unknown>)["function"];
-                    const av = fn && typeof fn === "object" ? (fn as Record<string, unknown>)["arguments"] : undefined;
-                    if (typeof av !== "string" || av.length === 0) continue;
-                    if (!mayStartRenderTag(av) && !anyPending()) continue;
-                    const choiceIdx = typeof ch?.["index"] === "number" ? ch["index"] : ci;
-                    const tcIdx = typeof (tc as Record<string, unknown>)["index"] === "number" ? ((tc as Record<string, unknown>)["index"] as number) : ti;
-                    const s = toolArgStreamFor(choiceIdx, tcIdx);
-                    const clean = s.filter.push(av);
-                    if (clean === av) continue;
-                    if (!rebuilt) {
-                        rebuilt = { ...ev, choices: choices.map((c) => ({ ...(c as Record<string, unknown>), delta: { ...((c as Record<string, unknown>)["delta"] as Record<string, unknown>) } })) };
-                    }
-                    const rch = (rebuilt["choices"] as Record<string, unknown>[])[ci];
-                    const rdd = rch["delta"] as Record<string, unknown>;
-                    const rtcs = Array.isArray(rdd["tool_calls"]) ? (rdd["tool_calls"] as unknown[]) : [];
-                    const rtc = rtcs[ti] ? { ...(rtcs[ti] as Record<string, unknown>) } : { ...(tc as Record<string, unknown>) };
-                    rtc["function"] = { ...((rtc["function"] ?? {}) as Record<string, unknown>), arguments: clean };
-                    rtcs[ti] = rtc;
-                    rdd["tool_calls"] = rtcs;
-                    rch["delta"] = rdd;
-                }
-            }
         }
         if (rebuilt) {
             // Delta carried no visible text after stripping: drop the whole
@@ -1314,7 +1274,9 @@ export async function pipePluginChatWithStrip(
         }
         const d = ev["delta"] as Record<string, unknown> | undefined;
         const index = typeof ev["index"] === "number" ? ev["index"] : 0;
-        const field = d?.["type"] === "thinking_delta" ? "thinking" : d?.["type"] === "text_delta" ? "text" : d?.["type"] === "input_json_delta" ? "partial_json" : null;
+        // input_json_delta (tool-call arguments) is deliberately unmanaged:
+        // #1039 — argument bytes are user intent, forwarded verbatim.
+        const field = d?.["type"] === "thinking_delta" ? "thinking" : d?.["type"] === "text_delta" ? "text" : null;
         if (field === null || typeof d?.[field] !== "string") {
             return rawEvent + "\n\n";
         }
@@ -1895,10 +1857,16 @@ export async function pipePluginResponsesWithStrip(
                         }
                     }
                     if (retryFraming(type)) continue;
+                    // function_call_arguments.done carries tool arguments, not
+                    // visible text: forwarded verbatim (#1039).
+                    if (type === "response.function_call_arguments.done") {
+                        await write(flushArgTails() + rawEvent + "\n\n");
+                        continue;
+                    }
                     // #933: done-family events also carry full text payloads — strip those too.
-                    // Arg-carrier dones are not visible text: the degenerate-turn retry below
-                    // does not hold on them, so they are stripped and released directly.
-                    if (type === "response.reasoning_summary_part.done" || type === "response.function_call_arguments.done") {
+                    // The done is not visible text to the degenerate-turn retry below, so it
+                    // is stripped and released directly.
+                    if (type === "response.reasoning_summary_part.done") {
                         const hadEcho = containsRenderTagText(jsonStr) || containsMarkerLineText(jsonStr);
                         if (hadEcho) sawStrippedEcho = true;
                         const evOut = hadEcho ? stripResponsesText(ev) : ev;
@@ -1982,9 +1950,10 @@ export async function pipePluginResponsesWithStrip(
                         await write(rebuildEvent(rawEvent, rebuilt));
                         continue;
                     }
-                    // Both delta event types carry the fragment in `delta`;
-                    // only the .done variants carry `arguments`.
-                    const argField = type === "response.function_call_arguments.delta" || type === "response.reasoning_summary_text.delta" ? "delta" : null;
+                    // Reasoning summary deltas carry visible prose; function_call
+                    // argument deltas are user intent and pass through verbatim
+                    // (#1039), falling into the generic rawEvent write below.
+                    const argField = type === "response.reasoning_summary_text.delta" ? "delta" : null;
                     if (argField !== null && typeof type === "string") {
                         const v = ev[argField];
                         if (typeof v !== "string" || v.length === 0) {
