@@ -129,6 +129,15 @@ test("responses wire round-2: lifecycle references stay valid and remapped ids f
         events.some((e) => e.event === "response.output_item.done" && (e.data.item as Record<string, unknown>)?.id === round2Id),
         "round-2 message item closed with output_item.done",
     );
+    const completedItem = events.find(
+        (e) => e.event === "response.output_item.done" && (e.data.item as Record<string, unknown>)?.id === round2Id,
+    )!.data.item as Record<string, unknown>;
+    const replay = structuredClone(completedItem);
+    const expected = structuredClone(completedItem);
+    delete expected.id;
+    sanitizeResponsesInputIds([replay]);
+    assert.deepEqual(replay, expected, "next-turn replay keeps the full message without its proxy id");
+    assert.equal(completedItem.id, round2Id, "stream lifecycle ids remain intact");
 });
 
 test("sanitizeResponsesInputIds rewrites over-long ids deterministically and heals poisoned rollouts (#242)", () => {
