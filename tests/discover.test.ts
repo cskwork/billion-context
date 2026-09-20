@@ -11,6 +11,7 @@ import {
 import {
     parseZcodeConfig,
     TRAE_DEFAULT_MODEL_HOSTS,
+    AIDER_DEFAULT_MODEL_HOSTS,
     readZcodeConfig,
     QODER_DEFAULT_MODEL_HOSTS,
     type ClientConfig,
@@ -147,6 +148,14 @@ test("extractHttpsHosts: qoder → default model hosts; modelServerHost replaces
 test("extractHttpsHosts: trae → default model hosts; modelApiHost replaces them (#655)", () => {
     assert.deepEqual(extractHttpsHosts({ trae: {} }), TRAE_DEFAULT_MODEL_HOSTS);
     assert.deepEqual(extractHttpsHosts({ trae: { modelApiHost: "my-relay.example.com" } }), ["my-relay.example.com"]);
+});
+
+test("extractHttpsHosts: aider → default hosts when undeclared; declared https URLs replace them (#1048)", () => {
+    assert.deepEqual(extractHttpsHosts({ aider: {} }), AIDER_DEFAULT_MODEL_HOSTS);
+    assert.deepEqual(
+        extractHttpsHosts({ aider: { baseUrls: ["https://my-relay.example.com/v1", "http://127.0.0.1:8000/v1"] } }),
+        ["my-relay.example.com"],
+    );
 });
 
 async function withTempHome<T>(fn: (home: string, env: NodeJS.ProcessEnv) => Promise<T>): Promise<T> {

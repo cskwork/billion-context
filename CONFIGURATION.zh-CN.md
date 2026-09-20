@@ -554,6 +554,7 @@
 | `bili iflow [opts --] [args]` | 代理 + **iFlow CLI** —— `IFLOW_BASE_URL` `/bili/` 改写到 `apis.iflow.cn/v1`(OpenAI chat-completions wire;你自己导出的值会被中继)(#1047) |
 | `bili qwen [opts --] [args]` | 代理 + **Qwen Code**(多协议 gemini-cli fork,无 base-URL 钩子)—— 证书 MITM(`HTTPS_PROXY` + `NODE_EXTRA_CA_CERTS`);默认 DashScope/Qwen 模型主机加白,自建中转用 `--mitm-domain`(#1047) |
 | `bili mcode [opts --] [args]` | 代理 + **MiniMax Code** —— 证书 MITM(`HTTPS_PROXY` + `NODE_EXTRA_CA_CERTS`/`SSL_CERT_FILE`);provider 主机取自 `~/.minimax*/config.yaml`(遵循 `MINIMAX_DATA_DIR`/`MAVIS_DATA_DIR`),未声明时用官方 `agent.minimax.*` 端点;回环端点编目并附手动 `/bili/` 前缀提示;会话经 `X-Mavis-Session-Id` 头绑定(#1050) |
+| `bili aider [opts --] [args]` | 代理 + **Aider**(Python pair programmer)—— 证书 MITM(`HTTPS_PROXY` + `SSL_CERT_FILE`/`REQUESTS_CA_BUNDLE`);端点发现自继承 env(`OPENAI_API_BASE`、`OPENAI_BASE_URL`、`ANTHROPIC_API_BASE`、`ANTHROPIC_BASE_URL`、`GEMINI_API_BASE`、`DEEPSEEK_API_BASE`)或 `.aider.conf.yml`(`openai-api-base:`),客户端参数里透传的 `--openai-api-base` / `--set-env` 优先;均未声明 → 默认加白 `api.openai.com` + `api.anthropic.com`;非回环纯 http 端点走 `HTTP_PROXY` 绝对形式转发,回环经 `NO_PROXY` 直连(#1048) |
 | `bili test pi` | 无污染的 pi 链路端到端冒烟测试 |
 | `bili export [session] [--full] [--output FILE]` | 列出持久化会话 / 把一个会话导出为 Markdown 交接文档 —— 见[会话与迁移](#会话与迁移) |
 | `bili update` | 立即检查并安装新版本（绕过 3 分钟节流） |
