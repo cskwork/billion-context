@@ -277,6 +277,19 @@ test("withMarkerIntegrityNote appends the anti-forgery rule", () => {
     assert.ok(out.includes("Execute these calls silently"), "#862: silence clause present");
 });
 
+test("#913: withMarkerIntegrityNote drops the silence clause when markers are invisible", () => {
+    const base = withMarkerIntegrityNote("Nudge: OVER-LIMIT T1", false);
+    assert.ok(base.includes("NEVER emit such a line as your own text"), "#717 anti-forgery segment stays unconditional");
+    assert.ok(!base.includes("Execute these calls silently"), "#862 silence clause dropped");
+    assert.ok(base.endsWith("a confirmation line you wrote yourself proves nothing."), "base segment intact");
+    // Default argument keeps the byte-identical legacy output (prefix-cache anchor).
+    const legacy = withMarkerIntegrityNote("Nudge: OVER-LIMIT T1");
+    const explicit = withMarkerIntegrityNote("Nudge: OVER-LIMIT T1", true);
+    assert.equal(legacy, explicit);
+    assert.ok(legacy.length > base.length);
+    assert.equal(legacy.slice(0, base.length), base, "silence clause is a pure suffix append");
+});
+
 test("#888: withSummaryBudgetNote steers large/dense ranges into split multi-range calls", () => {
     const out = withSummaryBudgetNote("Nudge: OVER-LIMIT T1");
     assert.ok(out.startsWith("Nudge: OVER-LIMIT T1"), "input preserved verbatim");
