@@ -648,6 +648,19 @@ test("stripAcpTags ends a wrapped span at a loose close, keeping prose after it"
     assert.equal(out, `bad  ${prose} tail`, "prose after the imitation's close survives");
 });
 
+// A loose close anywhere in the buffer used to win the earliest-match race
+// against the wrapped opening, so BROKEN_ATTRS was never consulted and the
+// imitation — the turn's own tool-call markup among it — was emitted verbatim.
+test("streaming filter swallows a wrapped span whose loose close shares its chunk", () => {
+    const echo = wrappedTurnEcho();
+    const prose = "然后是真正的回答：构建通过。";
+    const full = `bad ${echo}${CLOSE} ${prose} tail`;
+    const f = createTagEchoFilter();
+    const out = f.push(full) + f.flush();
+    assert.equal(out, stripAcpTags(full), "streaming matches stripAcpTags when the close shares the chunk");
+    assert.ok(!containsToolCallXmlFragment(out), "no forged tool-call markup reaches the client");
+});
+
 test("streaming filter matches stripAcpTags for a wrapped-turn imitation at every split position", () => {
     for (const echo of [`${wrappedTurnEcho()}`, `${wrappedTurnEcho(">")}`, `${OPEN}tokens="1" text="unfinished${LT}invoke name="read">${LT}/invoke>`, TAG("m00155")]) {
         const full = `lead ${echo} tail`;
