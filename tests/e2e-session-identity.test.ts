@@ -244,6 +244,22 @@ test("e2e session identity: anthropic x-claude-code-session-id survives x-api-ke
     }
 });
 
+test("e2e session identity: anthropic x-mavis-session-id survives x-api-key rotation (#1050)", async () => {
+    const h = await startHarness();
+    try {
+        const body = anthropicBody();
+        await post(h, 0, "/v1/messages", body, { "x-api-key": "sk-mm-old", "x-mavis-session-id": "mcode-sess-1" });
+        await post(h, 0, "/v1/messages", body, { "x-api-key": "sk-mm-new", "x-mavis-session-id": "mcode-sess-1" });
+        const sessions = await getSessions(h);
+        assert.equal(sessions.length, 1, `expected 1 session, got ${JSON.stringify(sessions)}`);
+        assert.equal(sessions[0]!.id, "mcode-sess-1");
+        assert.equal(sessions[0]!.protocol, "anthropic");
+        assert.equal(sessions[0]!.requests, 2);
+    } finally {
+        await h.close();
+    }
+});
+
 test("e2e session identity: openai prompt_cache_key survives bearer rotation (#286)", async () => {
     const h = await startHarness();
     try {

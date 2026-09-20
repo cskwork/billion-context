@@ -555,6 +555,7 @@ Full command surface (`bili --help` prints an abridged version). Precedence ever
 | `bili gemini [opts --] [args]` | Proxy + **Gemini CLI** (Google) — `GOOGLE_GEMINI_BASE_URL` `/bili/` rewrite to `generativelanguage.googleapis.com` (Google native wire; your own exported value is relayed instead); no MITM/CA; headless `-p` needs a saved auth selection (#1047) |
 | `bili iflow [opts --] [args]` | Proxy + **iFlow CLI** — `IFLOW_BASE_URL` `/bili/` rewrite to `apis.iflow.cn/v1` (OpenAI chat-completions wire; your own exported value is relayed instead) (#1047) |
 | `bili qwen [opts --] [args]` | Proxy + **Qwen Code** (multi-protocol gemini-cli fork, no base-URL hook) — cert-MITM via `HTTPS_PROXY` + `NODE_EXTRA_CA_CERTS`; default DashScope/Qwen model hosts whitelisted, custom relays via `--mitm-domain` (#1047) |
+| `bili mcode [opts --] [args]` | Proxy + **MiniMax Code** — cert-MITM via `HTTPS_PROXY` + `NODE_EXTRA_CA_CERTS`/`SSL_CERT_FILE`; provider hosts from `~/.minimax*/config.yaml` (`MINIMAX_DATA_DIR`/`MAVIS_DATA_DIR` respected) or the official `agent.minimax.*` endpoints when none declared; loopback endpoints inventoried with a manual `/bili/` prefix hint; session bound via the `X-Mavis-Session-Id` header (#1050) |
 | `bili test pi` | Non-polluting end-to-end smoke test of the pi path |
 | `bili export [session] [--full] [--output FILE]` | List persisted sessions / export one as a Markdown handoff — see [Sessions & Migration](#sessions--migration) |
 | `bili update` | Check for & install a newer version now (bypasses the 3-minute throttle) |
