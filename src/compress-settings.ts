@@ -71,6 +71,7 @@ export function mergeCompress(
         preserveRecentTokens: pick("preserveRecentTokens"),
         minCompressRangeChars: rangeOf(model) ?? rangeOf(provider) ?? rangeOf(global),
         tiers: pick("tiers"),
+        protectedLatestTools: pick("protectedLatestTools"),
         prompts: promptLevels.length > 0 ? Object.assign({}, ...promptLevels) : undefined,
         acknowledgePromptsRisk: pick("acknowledgePromptsRisk"),
         absorb: absorbLevels.length > 0 ? Object.assign({}, ...absorbLevels) : undefined,
@@ -196,6 +197,9 @@ export function hasCompressSettings(s: CompressSettings): boolean {
   *  - `minCompressRangeChars` (deprecated alias: `minCompressRange`) →
   *    `compress.minCompressRange`. The unit is characters.
   *  - `tiers` → `tiers.enabled`.
+ *  - `protectedLatestTools` → top-level Config (kernel hard-excludes the
+ *    latest instance + paired result of matching tools from every compress
+ *    range). Whole-array replace, deepest level wins.
   *  - `absorb` → `absorb` (kernel AbsorbConfig; unset fields inherit the
   *    kernel DEFAULT_ABSORB_CONFIG, so a partial user block still resolves
   *    fully). Absent `s.absorb` leaves `base.absorb` untouched — the feature
@@ -240,6 +244,7 @@ export function applyCompressSettings(base: Config, limit: number, s: CompressSe
             ...base.compress,
             minCompressRange: s.minCompressRangeChars ?? s.minCompressRange ?? base.compress.minCompressRange,
         },
+        protectedLatestTools: s.protectedLatestTools ?? base.protectedLatestTools,
         ...(absorb !== undefined ? { absorb } : {}),
         ...(s.rules !== undefined ? { rules: { enabled: s.rules === true } } : {}),
     };

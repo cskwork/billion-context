@@ -140,6 +140,21 @@ export type CompressSettings = {
     minCompressRange?: number;
     /** Enable multi-tier (T2/T3) distillation (kernel `tiers.enabled`). */
     tiers?: boolean;
+    /** Tool-name patterns whose LATEST tool-call + paired result are never
+     *  compressed (kernel `protectedLatestTools`, acp-kernel >= 0.0.80).
+     *  Built for cumulative-snapshot tools (e.g. a client's todo/task list):
+     *  every newer result supersedes the older ones, so only the newest
+     *  instance is the source of truth — protecting ALL of them (via
+     *  `protectedTools`) would make that tool's history grow unboundedly,
+     *  while protecting the LATEST keeps the live snapshot in context and
+     *  lets every superseded instance fold normally. Patterns match like
+     *  kernel tool patterns (exact name or `*` glob, e.g. `"todo_list"`,
+     *  `"TodoWrite"`, `"todo*"`). Protection is a HARD exclusion: neither
+     *  suggested nor explicit compress ranges can cover the latest instance.
+     *  Deepest level wins (global → provider → model), whole-array replace.
+     *  Default: none — opt in per client/agent, since tool names are
+     *  client-specific. */
+    protectedLatestTools?: string[];
     /** Emit 📦/❌ ACP visibility markers after proxy tool executions
      *  (compress / decompress / search_context / acp_status) — both the marker
      *  line streamed to the client and the marker message re-injected into
@@ -877,6 +892,11 @@ export function parseCompressSettings(v: unknown): (CompressSettings & { injectT
     if ("tiers" in obj) {
         if (typeof obj.tiers !== "boolean") ok = false;
         else out.tiers = obj.tiers;
+    }
+    if ("protectedLatestTools" in obj && obj.protectedLatestTools !== undefined) {
+        const v = obj.protectedLatestTools;
+        if (!Array.isArray(v) || v.length === 0 || v.some((x) => typeof x !== "string" || x.trim().length === 0)) ok = false;
+        else out.protectedLatestTools = (v as string[]).map((x) => x.trim());
     }
     if ("stripImages" in obj) {
         if (typeof obj.stripImages !== "boolean") ok = false;
