@@ -143,6 +143,20 @@ async function withHarness(opts: { mode?: string; firstTurnTokens: number; stric
     }
 }
 
+// A non-intercepted compaction request ends the CLIENT response at its own
+// forward, so asserting h.bodies.length right after the response races a
+// duplicate forward that lands milliseconds later. Wait for the duplicate
+// instead: resolves true as soon as upstream reaches `n` requests, false if it
+// never does within `ms`.
+async function reachesUpstreamRequests(h: Harness, n: number, ms: number): Promise<boolean> {
+    const deadline = Date.now() + ms;
+    while (Date.now() < deadline) {
+        if (h.bodies.length >= n) return true;
+        await new Promise((r) => setTimeout(r, 10));
+    }
+    return h.bodies.length >= n;
+}
+
 // Turn 1: a normal turn where the model compresses the oldest pair, leaving an
 // active block. Returns the upstream-request count after setup.
 async function setupCompressedSession(h: Harness): Promise<number> {
@@ -431,3 +445,37 @@ test("e2e #332 (endpoint form): intercept + gate preconditions fail → raw body
         assert.equal(JSON.stringify(after.state), stateBefore, "processTurn skipped when the gate cannot pass");
     });
 });
+
+// The non-intercepted trigger path returns `prepared: null` and forwards the
+// normalized body itself. The passthrough tail then re-tested `!prepared` —
+// which that path never assigns — and forwarded the RAW body a second time:
+// two ~90%-of-window POSTs billed for one client request, the second carrying
+// the un-normalized fc_bili_* items the first forward had just stripped, written
+// into an already-ended response. Both gate-reject shapes are covered: `pass`
+// mode never calls prepare at all, and `intercept` with an unmet gate rejects
+// before prepare, so neither assigns `prepared`.
+for (const variant of [
+    { label: "pass mode", mode: "pass", firstTurnTokens: 1000 },
+    { label: "intercept + gate preconditions unmet", mode: "intercept", firstTurnTokens: 1000 },
+]) {
+    test(`e2e (trigger form): ${variant.label} → forwarded EXACTLY once, never a second raw forward`, async () => {
+        await withHarness({ mode: variant.mode, firstTurnTokens: variant.firstTurnTokens }, async (h) => {
+            const body = JSON.stringify({
+                model: "gpt-resp",
+                stream: true,
+                session_id: `once-${variant.mode}`,
+                instructions: "You are the test coding agent.",
+                input: [{ type: "message", role: "user", content: "Message 0 of the working session." }, { type: "compaction_trigger" }],
+            });
+            const r = await fetch(h.url, {
+                method: "POST",
+                headers: { "content-type": "application/json", "user-agent": CODEX_UA },
+                body,
+            });
+            assert.equal(r.status, 200);
+            await r.text();
+            assert.equal(await reachesUpstreamRequests(h, 2, 1000), false, "the non-intercepted compaction request reaches upstream exactly once");
+            assert.equal(h.bodies.length, 1, "exactly one upstream request");
+        });
+    });
+}

@@ -1167,6 +1167,11 @@ async function handle(
         }
     }
     let prepared: Prepared | null = null;
+    // Whether this request has already been handed to forward(). `prepared`
+    // cannot answer that: the codex compaction_trigger path deliberately skips
+    // the kernel and forwards its own normalized body with `prepared === null`,
+    // so the passthrough tail below would forward the raw body a second time.
+    let forwarded = false;
     // #661: route-scoped passthrough — the global flag's semantics, limited to
     // requests whose upstream URL matches a provider route with
     // `passthrough: true` (upstreams that fingerprint the request body).
@@ -1813,6 +1818,7 @@ async function handle(
                 return { body: prepared!.body, prepared: prepared! };
             });
             if (pendingForward) {
+                forwarded = true;
                 await forward(req, res, opts, pendingForward.body, pendingForward.prepared, core, reqConfig, log, route, instanceId, affinity);
                 // Remember for ALL modes (not just plugin): wire clients (dsh,
                 // hermes, unplug'd pi) read the same panel via /__bili/plugin/status
@@ -1827,7 +1833,7 @@ async function handle(
             releaseInFlight(session);
         }
     }
-    if (!prepared) {
+    if (!prepared && !forwarded) {
         if (protocol === null && !opts.passthrough && !routePassthrough && !isModelDiscoveryPath(urlPath)) {
             logUnrecognizedPath(log, req.url ?? "");
         }
