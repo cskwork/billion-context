@@ -57,6 +57,13 @@ export function sanitizeResponsesInputIds(input: unknown): void {
     if (!Array.isArray(input)) return;
     for (const item of input) {
         const rec = item as Record<string, unknown>;
+        // Client-visible proxy ids are not upstream item identities; replay the full message instead.
+        if (rec?.type === "message" && rec.role === "assistant"
+            && typeof rec.id === "string" && rec.id.startsWith("msg-proxy-")
+            && (typeof rec.content === "string" || Array.isArray(rec.content))) {
+            delete rec.id;
+            continue;
+        }
         if (typeof rec?.id === "string" && rec.id.length > RESPONSES_ITEM_ID_MAX) {
             rec.id = `msg-fix-${hashId(rec.id)}`;
         }
