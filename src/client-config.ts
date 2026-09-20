@@ -881,8 +881,14 @@ export function readMcodeConfig(env: NodeJS.ProcessEnv = process.env): McodeConf
         }
         for (const w of cfg.models ?? []) {
             const prev = windows.get(w.id);
-            if (!prev || w.contextWindow > prev.contextWindow) windows.set(w.id, w);
-            else if (w.maxOutput !== undefined && (prev.maxOutput === undefined || w.maxOutput > prev.maxOutput)) {
+            if (!prev || w.contextWindow > prev.contextWindow) {
+                // Replacing on a larger window must not drop an already-known
+                // larger maxOutput (file order must not decide the outcome).
+                if (prev && prev.maxOutput !== undefined && (w.maxOutput === undefined || prev.maxOutput > w.maxOutput)) {
+                    w.maxOutput = prev.maxOutput;
+                }
+                windows.set(w.id, w);
+            } else if (w.maxOutput !== undefined && (prev.maxOutput === undefined || w.maxOutput > prev.maxOutput)) {
                 prev.maxOutput = w.maxOutput;
             }
         }

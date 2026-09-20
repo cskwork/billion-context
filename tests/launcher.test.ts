@@ -4240,6 +4240,38 @@ test("parseMcodeYaml: minimax_api.baseURL, custom_provider options.baseURL (rese
     ]);
 });
 
+test("readMcodeConfig: window merge keeps the known maxOutput when a larger context window replaces it (#1060)", () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-mcode-merge-"));
+    const prevHome = process.env.HOME;
+    const prevUserProfile = process.env.USERPROFILE;
+    process.env.HOME = home;
+    if (prevUserProfile !== undefined) process.env.USERPROFILE = home;
+    try {
+        fs.mkdirSync(path.join(home, ".minimax"));
+        fs.writeFileSync(
+            path.join(home, ".minimax", "config.yaml"),
+            ["custom_provider:", "  a:", "    models:", "      m1:", "        limit:", "          context: 200000", "          output: 8192", "      m2:", "        limit:", "          context: 100000", "          output: 4096"].join("\n"),
+        );
+        fs.mkdirSync(path.join(home, ".minimax-work"));
+        fs.writeFileSync(
+            path.join(home, ".minimax-work", "config.yaml"),
+            ["custom_provider:", "  a:", "    models:", "      m1:", "        limit:", "          context: 400000", "      m2:", "        limit:", "          context: 300000", "          output: 2048"].join("\n"),
+        );
+        const cfg = readMcodeConfig({});
+        const byId = new Map((cfg.models ?? []).map((w) => [w.id, w]));
+        assert.equal(byId.get("m1")?.contextWindow, 400000, "larger window from the later file wins");
+        assert.equal(byId.get("m1")?.maxOutput, 8192, "replacement without output keeps the earlier maxOutput");
+        assert.equal(byId.get("m2")?.contextWindow, 300000);
+        assert.equal(byId.get("m2")?.maxOutput, 4096, "replacement with a smaller output keeps the larger maxOutput");
+    } finally {
+        if (prevHome === undefined) delete process.env.HOME;
+        else process.env.HOME = prevHome;
+        if (prevUserProfile === undefined) delete process.env.USERPROFILE;
+        else process.env.USERPROFILE = prevUserProfile;
+        fs.rmSync(home, { recursive: true, force: true });
+    }
+});
+
 test("readMcodeConfig + resolveMcodeInstallDir: union-scan ~/.minimax*/config.yaml, MINIMAX_DATA_DIR override wins (#1050)", () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-mcode-home-"));
     const prevHome = process.env.HOME;
