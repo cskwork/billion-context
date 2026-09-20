@@ -667,9 +667,8 @@ type FileConfig = {
      *  client forks its history mid-conversation (edit / regenerate), the new
      *  session inherits the parent's compression blocks whose source content
      *  is fully present in the forked request, instead of restarting with
-     *  zero compression state. Default false; env BILI_FORK_ADOPTION=1 wins
-     *  over the file only when enabling (the file's explicit false cannot be
-     *  re-enabled by env). */
+     *  zero compression state. Default false; env BILI_FORK_ADOPTION=1/0
+     *  wins over the file. */
     forkAdoption?: boolean;
     /** Global wire-compat block. `roles` maps message roles to the role name
      *  upstreams accept (e.g. `{"developer":"system"}`) — applied to the
