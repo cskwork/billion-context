@@ -97,6 +97,14 @@ import {
     readMcodeConfig,
     resolveMcodeInstallDir,
     MCODE_DEFAULT_MODEL_HOSTS,
+    buildCopilotEnv,
+    buildAmpEnv,
+    COPILOT_DEFAULT_MODEL_HOSTS,
+    AMP_DEFAULT_MODEL_HOSTS,
+    resolveGooseDirs,
+    readGooseConfig,
+    prepareGooseHome,
+    finalizeGooseHome,
     type SpawnChild,
     type SpawnFn,
     runLaunch,
@@ -159,6 +167,9 @@ test("isLaunchClient: pi/claude/codex/omp/opencode/pi-test true, others false", 
     assert.equal(isLaunchClient("kimi"), true);
     assert.equal(isLaunchClient("mcode"), true);
     assert.equal(isLaunchClient("aider"), true);
+    assert.equal(isLaunchClient("copilot"), true);
+    assert.equal(isLaunchClient("amp"), true);
+    assert.equal(isLaunchClient("goose"), true);
     assert.equal(isLaunchClient("pi-test"), true);
     assert.equal(isLaunchClient("start"), false);
     assert.equal(isLaunchClient(""), false);
@@ -3903,6 +3914,142 @@ test("resolveClientCommand: aider resolves the `aider` bin generically (#1048)",
     }
 });
 
+test("buildCopilotEnv: HTTPS_PROXY + SSL_CERT_FILE + BILLION_CONTEXT_PROXY, baseEnv preserved (#1049)", () => {
+    const env = buildCopilotEnv("http://127.0.0.1:8787", "/tmp/ca.pem", { FOO: "bar" });
+    assert.equal(env.HTTPS_PROXY, "http://127.0.0.1:8787");
+    assert.equal(env.SSL_CERT_FILE, "/tmp/ca.pem");
+    assert.equal(env.BILLION_CONTEXT_PROXY, "http://127.0.0.1:8787");
+    assert.equal(env.FOO, "bar");
+});
+
+test("buildAmpEnv: HTTPS_PROXY + SSL_CERT_FILE + BILLION_CONTEXT_PROXY, baseEnv preserved (#1049)", () => {
+    const env = buildAmpEnv("http://127.0.0.1:8787", "/tmp/ca.pem", { FOO: "bar" });
+    assert.equal(env.HTTPS_PROXY, "http://127.0.0.1:8787");
+    assert.equal(env.SSL_CERT_FILE, "/tmp/ca.pem");
+    assert.equal(env.BILLION_CONTEXT_PROXY, "http://127.0.0.1:8787");
+    assert.equal(env.FOO, "bar");
+});
+
+test("discoverRoutes: copilot whitelists api.githubcopilot.com + plan subdomains (#1049)", () => {
+    const routes = discoverRoutes("copilot", {});
+    assert.deepEqual(routes.httpsDomains, [...COPILOT_DEFAULT_MODEL_HOSTS]);
+    assert.deepEqual(routes.httpRewrites, []);
+    assert.deepEqual(routes.httpEnvRoutes, []);
+});
+
+test("discoverRoutes: amp whitelists ampcode.com (#1049)", () => {
+    const routes = discoverRoutes("amp", {});
+    assert.deepEqual(routes.httpsDomains, [...AMP_DEFAULT_MODEL_HOSTS]);
+    assert.deepEqual(routes.httpRewrites, []);
+    assert.deepEqual(routes.httpEnvRoutes, []);
+});
+
+test("discoverRoutes: goose rewrites custom provider base_urls (incl. loopback), no MITM domains (#1049)", () => {
+    const routes = discoverRoutes("goose", {
+        goose: {
+            activeProvider: "mine",
+            customProviders: {
+                mine: "https://api.custom.example/v1",
+                local: "http://127.0.0.1:11434/v1",
+                dup: "https://api.custom.example/v1",
+            },
+        },
+    });
+    assert.deepEqual(routes.httpsDomains, []);
+    assert.deepEqual(routes.httpRewrites, [
+        { key: "mine", realUpstream: "https://api.custom.example/v1" },
+        { key: "local", realUpstream: "http://127.0.0.1:11434/v1" },
+    ]);
+});
+
+test("resolveGooseDirs: GOOSE_PATH_ROOT wins; XDG fallback scatters under Block (#1049)", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "bili-goose-root-"));
+    try {
+        const dirs = resolveGooseDirs({ GOOSE_PATH_ROOT: root });
+        assert.deepEqual(dirs, {
+            configDir: path.join(root, "config"),
+            dataDir: path.join(root, "data"),
+            stateDir: path.join(root, "state"),
+            agentsDir: path.join(root, ".agents"),
+        });
+        const h = os.homedir();
+        const plain = resolveGooseDirs({});
+        assert.equal(plain.configDir, path.join(h, ".config", "goose"));
+        assert.equal(plain.dataDir, path.join(h, ".local", "share", "Block", "goose"));
+        assert.equal(plain.stateDir, plain.dataDir);
+        assert.equal(plain.agentsDir, path.join(plain.dataDir, ".agents"));
+        const xdg = resolveGooseDirs({
+            XDG_CONFIG_HOME: "/x/cfg",
+            XDG_DATA_HOME: "/x/data",
+            XDG_STATE_HOME: "/x/state",
+        });
+        assert.deepEqual(xdg, {
+            configDir: path.join("/x/cfg", "goose"),
+            dataDir: path.join("/x/data", "Block", "goose"),
+            stateDir: path.join("/x/state", "Block", "goose"),
+            agentsDir: path.join("/x/data", "Block", "goose", ".agents"),
+        });
+    } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+    }
+});
+
+test("readGooseConfig: active_provider + custom_providers base_urls; GOOSE_PROVIDER wins (#1049)", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "bili-goose-cfg-"));
+    try {
+        const cfgDir = path.join(root, "config");
+        fs.mkdirSync(path.join(cfgDir, "custom_providers"), { recursive: true });
+        fs.writeFileSync(path.join(cfgDir, "config.toml"), 'active_provider = "mine"\n');
+        fs.writeFileSync(path.join(cfgDir, "custom_providers", "mine.toml"), 'name = "Mine"\nbase_url = "https://api.custom.example/v1"  # comment\n');
+        fs.writeFileSync(path.join(cfgDir, "custom_providers", "nourl.toml"), 'name = "NoUrl"\n');
+        fs.writeFileSync(path.join(cfgDir, "custom_providers", "notes.txt"), "ignored");
+        const dirs = resolveGooseDirs({ GOOSE_PATH_ROOT: root });
+        const cfg = readGooseConfig(dirs, {});
+        assert.equal(cfg.activeProvider, "mine");
+        assert.deepEqual(cfg.customProviders, { mine: "https://api.custom.example/v1" });
+        assert.equal(readGooseConfig(dirs, { GOOSE_PROVIDER: "override" }).activeProvider, "override");
+        assert.deepEqual(readGooseConfig(resolveGooseDirs({ GOOSE_PATH_ROOT: "/nonexistent-bili-test" }), {}).customProviders, {});
+    } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+    }
+});
+
+test("prepareGooseHome/finalizeGooseHome: overlay layout, patched urls, merge-back round-trip (#1049)", () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-goose-home-"));
+    try {
+        const cfgDir = path.join(home, ".config", "goose");
+        fs.mkdirSync(path.join(cfgDir, "custom_providers"), { recursive: true });
+        fs.writeFileSync(path.join(cfgDir, "config.toml"), 'active_provider = "openai"\n');
+        fs.writeFileSync(path.join(cfgDir, "custom_providers", "mine.toml"), 'name = "Mine"\nbase_url = "https://api.custom.example/v1"\n');
+        fs.writeFileSync(path.join(cfgDir, "custom_providers", "other.toml"), 'name = "Other"\nbase_url = "https://keep.example/v1"\n');
+        const origin = "http://127.0.0.1:9999";
+        const env: NodeJS.ProcessEnv = { XDG_CONFIG_HOME: path.join(home, ".config"), XDG_DATA_HOME: path.join(home, ".local", "share"), XDG_STATE_HOME: path.join(home, ".local", "state") };
+        const overlay = prepareGooseHome(env, origin, [{ key: "mine", realUpstream: "https://api.custom.example/v1" }]);
+        assert.ok(overlay, "overlay prepared");
+        const root = overlay!.root;
+        assert.equal(root, path.join(home, ".config", "goose-bili"));
+        assert.ok(fs.lstatSync(path.join(root, "data")).isSymbolicLink());
+        assert.ok(fs.lstatSync(path.join(root, "state")).isSymbolicLink());
+        assert.ok(fs.lstatSync(path.join(root, ".agents")).isSymbolicLink());
+        const patched = fs.readFileSync(path.join(root, "config", "custom_providers", "mine.toml"), "utf8");
+        assert.equal(patched, 'name = "Mine"\nbase_url = "' + wrapUpstream(origin, "https://api.custom.example/v1") + '"\n', "line rewritten in place, nothing else touched");
+        const untouched = fs.readFileSync(path.join(root, "config", "custom_providers", "other.toml"), "utf8");
+        assert.ok(untouched.includes('base_url = "https://keep.example/v1"'), untouched);
+        const realBefore = fs.readFileSync(path.join(cfgDir, "custom_providers", "mine.toml"), "utf8");
+        assert.ok(realBefore.includes("https://api.custom.example/v1"), "real config untouched by prepare");
+        fs.writeFileSync(path.join(root, "config", "config.toml"), 'active_provider = "mine"\n');
+        fs.writeFileSync(path.join(root, "config", "custom_providers", "newprov.toml"), 'name = "New"\nbase_url = "https://new.example/v1"\n');
+        finalizeGooseHome(overlay!);
+        assert.ok(fs.readFileSync(path.join(cfgDir, "config.toml"), "utf8").includes('active_provider = "mine"'), "user edit merged back");
+        assert.ok(fs.existsSync(path.join(cfgDir, "custom_providers", "newprov.toml")), "new file merged back");
+        assert.ok(realBefore === fs.readFileSync(path.join(cfgDir, "custom_providers", "mine.toml"), "utf8"), "patched file did NOT leak into real config");
+        assert.ok(!fs.readFileSync(path.join(cfgDir, "custom_providers", "newprov.toml"), "utf8").includes(origin), "new file content verbatim");
+        assert.equal(prepareGooseHome(env, origin, []), undefined, "no rewrites → no overlay");
+    } finally {
+        fs.rmSync(home, { recursive: true, force: true });
+    }
+});
+
 test("resolveClientCommand: trae resolves `traecli`, falls back to `trae-cli` then `trae`", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-trae-bin-"));
     try {
@@ -4762,4 +4909,117 @@ test("opencodeProjectBypassWarnings: override + project-only warn, routed values
     w = opencodeProjectBypassWarnings({ providers: { "local-lb": { baseURL: "http://127.0.0.1:9/a", file: F }, ghost: { baseURL: "http://127.0.0.1:7/b", file: F } } }, routes);
     assert.equal(w.length, 2);
     assert.deepEqual(opencodeProjectBypassWarnings({ providers: {} }, routes), []);
+});
+
+test("runLaunch copilot: cert-MITM env (HTTPS_PROXY + combined SSL_CERT_FILE), inherited proxy stripped (#1049)", async () => {
+    const seenEnv = await captureLaunchedClientEnv("copilot");
+    const origin = seenEnv.BILLION_CONTEXT_PROXY;
+    assert.ok(/^http:\/\/127\.0\.0\.1:\d+$/.test(String(origin)), `origin: ${origin}`);
+    assert.ok(String(seenEnv.SSL_CERT_FILE).endsWith(path.join("billion-context", "ca", "combined-ca.pem")), String(seenEnv.SSL_CERT_FILE));
+    assert.equal(seenEnv.NODE_EXTRA_CA_CERTS, undefined);
+    assertInheritedProxyStripped(seenEnv, String(origin));
+});
+
+test("runLaunch amp: cert-MITM env (HTTPS_PROXY + combined SSL_CERT_FILE), inherited proxy stripped (#1049)", async () => {
+    const seenEnv = await captureLaunchedClientEnv("amp");
+    const origin = seenEnv.BILLION_CONTEXT_PROXY;
+    assert.ok(/^http:\/\/127\.0\.0\.1:\d+$/.test(String(origin)), `origin: ${origin}`);
+    assert.ok(String(seenEnv.SSL_CERT_FILE).endsWith(path.join("billion-context", "ca", "combined-ca.pem")), String(seenEnv.SSL_CERT_FILE));
+    assert.equal(seenEnv.NODE_EXTRA_CA_CERTS, undefined);
+    assertInheritedProxyStripped(seenEnv, String(origin));
+});
+
+test("runLaunch goose: *_HOST redirects to the proxy, no proxy envs at all (#1049)", async () => {
+    const seenEnv = await captureLaunchedClientEnv("goose");
+    const origin = seenEnv.BILLION_CONTEXT_PROXY;
+    assert.ok(/^http:\/\/127\.0\.0\.1:\d+$/.test(String(origin)), `origin: ${origin}`);
+    assert.equal(seenEnv.OPENAI_HOST, wrapUpstream(String(origin), "https://api.openai.com"));
+    assert.equal(seenEnv.ANTHROPIC_HOST, wrapUpstream(String(origin), "https://api.anthropic.com"));
+    for (const k of INHERITED_PROXY_TEST_VARS) {
+        assert.equal(seenEnv[k], undefined, `${k} must stay unset — rustls distrusts bili's CA`);
+    }
+    assert.equal(seenEnv.GOOSE_PATH_ROOT, undefined, "no custom providers → no overlay");
+    assert.equal(seenEnv.BILI_TEST_MARKER, "keep");
+});
+
+test("runLaunch goose: custom provider rides the regenerated GOOSE_PATH_ROOT overlay, edits merge back (#1049)", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-goose-launch-"));
+    const fakeBin = path.join(home, process.platform === "win32" ? "fake-goose.exe" : "fake-goose");
+    fs.writeFileSync(fakeBin, "");
+    const cfgDir = path.join(home, ".config", "goose");
+    fs.mkdirSync(path.join(cfgDir, "custom_providers"), { recursive: true });
+    fs.writeFileSync(path.join(cfgDir, "config.toml"), 'active_provider = "mine"\n');
+    fs.writeFileSync(path.join(cfgDir, "custom_providers", "mine.toml"), 'name = "Mine"\nbase_url = "https://api.custom.example/v1"\n');
+    const prevHome = process.env.HOME;
+    const prevUserProfile = process.env.USERPROFILE;
+    const prevBin = process.env.BILI_CLIENT_BIN;
+    const prevExit = process.exit;
+    const savedProxyVars: Record<string, string | undefined> = {};
+    for (const k of INHERITED_PROXY_TEST_VARS) savedProxyVars[k] = process.env[k];
+    const prevXdgConfig = process.env.XDG_CONFIG_HOME;
+    const prevXdgData = process.env.XDG_DATA_HOME;
+    const prevXdgState = process.env.XDG_STATE_HOME;
+    process.env.HOME = home;
+    if (prevUserProfile !== undefined) process.env.USERPROFILE = home;
+    process.env.XDG_CONFIG_HOME = path.join(home, ".config");
+    process.env.XDG_DATA_HOME = path.join(home, ".local", "share");
+    process.env.XDG_STATE_HOME = path.join(home, ".local", "state");
+    process.env.BILI_CLIENT_BIN = fakeBin;
+    for (const k of INHERITED_PROXY_TEST_VARS) delete process.env[k];
+    process.exit = (() => undefined) as typeof process.exit;
+    const clientEnvs: (NodeJS.ProcessEnv | undefined)[] = [];
+    const spawnImpl: SpawnFn = (cmd, args, opts) => {
+        const env = (opts as { env?: NodeJS.ProcessEnv } | undefined)?.env;
+        if (cmd === fakeBin) {
+            clientEnvs.push(env);
+            fs.writeFileSync(path.join(String(env!.GOOSE_PATH_ROOT), "config", "config.toml"), 'active_provider = "mine"\nsome_new_key = 1\n');
+            const child = makeFakeChild(0);
+            const orig = child.on.bind(child);
+            (child as { on: SpawnChild["on"] }).on = (event, listener) => {
+                orig(event, listener);
+                if (event === "exit") setTimeout(() => listener(0, null), 0);
+                return child;
+            };
+            return child;
+        }
+        return makeFakeChild(42424);
+    };
+    try {
+        await runLaunch(
+            { client: "goose", clientArgs: [], overrides: {} },
+            { fetchImpl: async () => ({ ok: true }), spawnImpl, sleep: () => Promise.resolve() },
+        );
+        assert.equal(clientEnvs.length, 1, "goose client spawned exactly once");
+        const seenEnv = clientEnvs[0]!;
+        const origin = String(seenEnv.BILLION_CONTEXT_PROXY);
+        assert.ok(/^http:\/\/127\.0\.0\.1:\d+$/.test(origin), `origin: ${origin}`);
+        assert.equal(seenEnv.OPENAI_HOST, wrapUpstream(origin, "https://api.openai.com"));
+        assert.equal(seenEnv.GOOSE_PATH_ROOT, path.join(home, ".config", "goose-bili"));
+        for (const k of INHERITED_PROXY_TEST_VARS) {
+            assert.equal(seenEnv[k], undefined, `${k} must stay unset`);
+        }
+        const patched = fs.readFileSync(path.join(home, ".config", "goose-bili", "config", "custom_providers", "mine.toml"), "utf8");
+        assert.ok(patched.includes(`base_url = "${wrapUpstream(origin, "https://api.custom.example/v1")}"`), patched);
+        const realAfter = fs.readFileSync(path.join(cfgDir, "config.toml"), "utf8");
+        assert.ok(realAfter.includes("some_new_key = 1"), "user edit merged back into the real config via runLaunch cleanup");
+        assert.ok(fs.readFileSync(path.join(cfgDir, "custom_providers", "mine.toml"), "utf8").includes('base_url = "https://api.custom.example/v1"'), "patched url did not leak into the real config");
+    } finally {
+        process.exit = prevExit;
+        process.env.HOME = prevHome;
+        if (prevUserProfile === undefined) delete process.env.USERPROFILE;
+        else process.env.USERPROFILE = prevUserProfile;
+        if (prevBin === undefined) delete process.env.BILI_CLIENT_BIN;
+        else process.env.BILI_CLIENT_BIN = prevBin;
+        if (prevXdgConfig === undefined) delete process.env.XDG_CONFIG_HOME;
+        else process.env.XDG_CONFIG_HOME = prevXdgConfig;
+        if (prevXdgData === undefined) delete process.env.XDG_DATA_HOME;
+        else process.env.XDG_DATA_HOME = prevXdgData;
+        if (prevXdgState === undefined) delete process.env.XDG_STATE_HOME;
+        else process.env.XDG_STATE_HOME = prevXdgState;
+        for (const [k, v] of Object.entries(savedProxyVars)) {
+            if (v === undefined) delete process.env[k];
+            else process.env[k] = v;
+        }
+        fs.rmSync(home, { recursive: true, force: true });
+    }
 });

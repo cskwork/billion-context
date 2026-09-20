@@ -55,7 +55,7 @@ import { selfPackageRoot, isBiliPiEntry, ompPluginLoadedFrom, dshNativeInstalled
 function selfDistFile(name: string): string {
     return path.join(selfPackageRoot(), "dist", name);
 }
-import { nonEmpty, resolvePiHome, resolveOmpHome, resolveDshHome, resolveCodexHome, loadClientConfig, collectModelWindows, collectModelMaxOutputs, type ClientConfig, type CodexConfig, resolveOpencodeConfigFile, readOpencodeConfigRoot, opencodePluginBaseDir, type OpencodeConfig, type OpencodeProvider, type HermesConfig, type HermesProvider, qoderIsCnSite, QODER_DEFAULT_MODEL_HOSTS, resolveTraeHome, readTraeConfig, TRAE_DEFAULT_MODEL_HOSTS, JCODE_DEFAULT_MODEL_HOSTS, type TraeConfig, resolveKimiHome, readKimiConfig, parseKimiToml, KIMI_DEFAULT_MODEL_HOSTS, QWEN_DEFAULT_MODEL_HOSTS, type KimiConfig, type KimiProvider, readOpencodeProjectLayer, type OpencodeProjectLayer, readMcodeConfig, resolveMcodeInstallDir, MCODE_DEFAULT_MODEL_HOSTS, type McodeConfig, discoverAiderArgUrls, AIDER_DEFAULT_MODEL_HOSTS } from "./client-config.js";
+import { nonEmpty, resolvePiHome, resolveOmpHome, resolveDshHome, resolveCodexHome, loadClientConfig, collectModelWindows, collectModelMaxOutputs, type ClientConfig, type CodexConfig, resolveOpencodeConfigFile, readOpencodeConfigRoot, opencodePluginBaseDir, type OpencodeConfig, type OpencodeProvider, type HermesConfig, type HermesProvider, qoderIsCnSite, QODER_DEFAULT_MODEL_HOSTS, resolveTraeHome, readTraeConfig, TRAE_DEFAULT_MODEL_HOSTS, JCODE_DEFAULT_MODEL_HOSTS, type TraeConfig, resolveKimiHome, readKimiConfig, parseKimiToml, KIMI_DEFAULT_MODEL_HOSTS, QWEN_DEFAULT_MODEL_HOSTS, type KimiConfig, type KimiProvider, readOpencodeProjectLayer, type OpencodeProjectLayer, readMcodeConfig, resolveMcodeInstallDir, MCODE_DEFAULT_MODEL_HOSTS, type McodeConfig, discoverAiderArgUrls, AIDER_DEFAULT_MODEL_HOSTS, COPILOT_DEFAULT_MODEL_HOSTS, AMP_DEFAULT_MODEL_HOSTS, resolveGooseDirs, readGooseConfig, type GooseConfig, type GooseDirs } from "./client-config.js";
 import { loadRoutes, resolveConfiguredContextLimit, lookupContextLimit, type ProviderRoutes } from "./config.js";
 import { contextFromRegistry } from "./registry.js";
 
@@ -128,12 +128,18 @@ export {
     AIDER_DEFAULT_MODEL_HOSTS,
     AIDER_BASE_URL_ENVS,
     type AiderConfig,
+    COPILOT_DEFAULT_MODEL_HOSTS,
+    AMP_DEFAULT_MODEL_HOSTS,
+    resolveGooseDirs,
+    readGooseConfig,
+    type GooseConfig,
+    type GooseDirs,
 } from "./client-config.js";
 
 export const LAUNCHER_DEFAULT_HOST = "127.0.0.1";
-export const LAUNCH_CLIENTS = ["pi", "codex", "claude", "omp", "opencode", "hermes", "dsh", "codebuddy", "qoder", "trae", "jcode", "kimi", "gemini", "iflow", "qwen", "mcode", "aider", "pi-test"] as const;
+export const LAUNCH_CLIENTS = ["pi", "codex", "claude", "omp", "opencode", "hermes", "dsh", "codebuddy", "qoder", "trae", "jcode", "kimi", "gemini", "iflow", "qwen", "mcode", "aider", "copilot", "amp", "goose", "pi-test"] as const;
 export type ClientName = (typeof LAUNCH_CLIENTS)[number];
-export type BaseClientName = "claude" | "codex" | "pi" | "omp" | "opencode" | "hermes" | "dsh" | "codebuddy" | "qoder" | "trae" | "jcode" | "kimi" | "gemini" | "iflow" | "qwen" | "mcode" | "aider";
+export type BaseClientName = "claude" | "codex" | "pi" | "omp" | "opencode" | "hermes" | "dsh" | "codebuddy" | "qoder" | "trae" | "jcode" | "kimi" | "gemini" | "iflow" | "qwen" | "mcode" | "aider" | "copilot" | "amp" | "goose";
 
 const HEALTH_PATH = "/__bili/health";
 const HEALTH_POLL_INTERVAL_MS = 200;
@@ -705,6 +711,49 @@ export function discoverRoutes(client: ClientName, config: ClientConfig): Discov
                 }
             }
         }
+    } else if (client === "copilot") {
+        // #1049: closed Go binary, no base-URL override — cert-MITM is the only
+        // route (Go net/http honors HTTPS_PROXY + SSL_CERT_FILE). Whitelist is
+        // GitHub's own CI firewall allowlist for the CLI: api.githubcopilot.com
+        // plus the per-plan subdomains.
+        for (const h of COPILOT_DEFAULT_MODEL_HOSTS) {
+            const host = h.split(":", 2)[0]!.toLowerCase();
+            if (host && !httpsSeen.has(host)) {
+                httpsSeen.add(host);
+                httpsDomains.push(host);
+            }
+        }
+    } else if (client === "amp") {
+        // #1049: closed Go binary like copilot; ampcode.com carries both the
+        // model leg and the control plane, so one entry covers both.
+        for (const h of AMP_DEFAULT_MODEL_HOSTS) {
+            const host = h.split(":", 2)[0]!.toLowerCase();
+            if (host && !httpsSeen.has(host)) {
+                httpsSeen.add(host);
+                httpsDomains.push(host);
+            }
+        }
+    } else if (client === "goose") {
+        // #1049: release builds wire reqwest with rustls (webpki roots), so the
+        // proxy's CA is untrusted and cert-MITM cannot reach goose at all — every
+        // model leg is redirected straight at the proxy as plain HTTP instead.
+        // Custom declarative providers ride httpRewrites (delivered through a
+        // regenerated config overlay in prepareGooseHome; loopback included,
+        // since the rewrite IS the delivery mechanism here, unlike dsh/kimi);
+        // the built-in openai/anthropic legs are covered by *_HOST env overrides
+        // injected in runLaunch. No MITM domains exist for this client.
+        const seen = new Set<string>();
+        for (const [name, raw] of Object.entries(config.goose?.customProviders ?? {})) {
+            const real = unwrapUpstream(raw);
+            try {
+                const url = new URL(real);
+                if (url.protocol !== "http:" && url.protocol !== "https:") continue;
+                if (seen.has(real)) continue;
+                seen.add(real);
+                rewriteKeys.add(name);
+                httpRewrites.push({ key: name, realUpstream: real });
+            } catch {}
+        }
     } else {
         for (const [name, prov] of Object.entries(config.codex?.providers ?? {})) {
             classify(prov.baseUrl, `model_providers.${name}.base_url`);
@@ -792,6 +841,17 @@ export function buildAiderEnv(origin: string, caBundle: string, baseEnv: NodeJS.
         NO_PROXY: "localhost,127.0.0.1,::1",
         no_proxy: "localhost,127.0.0.1,::1",
     };
+}
+
+export function buildCopilotEnv(origin: string, caPath: string, baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+    // #1049: copilot is a Go binary like codex/trae — the CA rides SSL_CERT_FILE
+    // (the combined bundle, since it replaces Go's system trust store).
+    return { ...baseEnv, HTTPS_PROXY: origin, SSL_CERT_FILE: caPath, BILLION_CONTEXT_PROXY: origin };
+}
+
+export function buildAmpEnv(origin: string, caPath: string, baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+    // #1049: amp is a Go binary like copilot — same cert-MITM contract.
+    return { ...baseEnv, HTTPS_PROXY: origin, SSL_CERT_FILE: caPath, BILLION_CONTEXT_PROXY: origin };
 }
 
 export function buildCodexArgs(
@@ -1129,10 +1189,12 @@ function isPrivateIPv4(host: string): boolean {
  *  yet verified against a real build, so v1 runs pure wire mode (the proxy
  *  injects the context tools on the wire). kimi is excluded as well: its
  *  mcp.json path is hardcoded in the binary with no ephemeral-config flag,
- *  so v1 runs pure wire mode (#757). gemini/iflow/qwen (#1047) are excluded
- *  like codebuddy: their MCP-injection flags are unverified, v1 is pure wire. */
+  *  so v1 runs pure wire mode (#757). gemini/iflow/qwen (#1047) are excluded
+  *  like codebuddy: their MCP-injection flags are unverified, v1 is pure wire.
+  *  copilot/amp/goose are excluded likewise: closed or unverified MCP
+  *  surfaces, v1 runs pure wire mode (#1049). */
 export function launcherInjectMcp(env: NodeJS.ProcessEnv, base: string, codexUpstream?: string): boolean {
-    if (base === "pi" || base === "omp" || base === "opencode" || base === "hermes" || base === "dsh" || base === "codebuddy" || base === "qoder" || base === "trae" || base === "jcode" || base === "kimi" || base === "gemini" || base === "iflow" || base === "qwen" || base === "mcode" || base === "aider") return false;
+    if (base === "pi" || base === "omp" || base === "opencode" || base === "hermes" || base === "dsh" || base === "codebuddy" || base === "qoder" || base === "trae" || base === "jcode" || base === "kimi" || base === "gemini" || base === "iflow" || base === "qwen" || base === "mcode" || base === "aider" || base === "copilot" || base === "amp" || base === "goose") return false;
     if (env.BILI_LAUNCHER_PLUGIN === "0") return false;
     if (base === "codex" && env.BILI_LAUNCHER_PLUGIN === undefined && codexUpstream !== undefined && isPrivateUpstreamHost(codexUpstream)) {
         return false;
@@ -1791,6 +1853,175 @@ export function prepareDshHome(
     if (!refreshOverlayHome(dshHome, overlay, "settings.yaml")) return undefined;
     writeOverlayFileAtomic(overlay, "settings.yaml", lines.join(eol));
     return overlay;
+}
+
+export interface GooseOverlay {
+    root: string;
+    realConfigDir: string;
+    patchedFiles: Set<string>;
+    snapshot: Map<string, string>;
+}
+
+/** #1049: synthetic GOOSE_PATH_ROOT for `bili goose`. The overlay's config/ is
+ *  GENERATED every launch (fresh copy of the real config dir with the matched
+ *  custom_providers base_urls re-pointed at the proxy); data/, state/, .agents/
+ *  are SYMLINKS to the real dirs so sessions, auth and agents keep working. It
+ *  deliberately does NOT reuse refreshOverlayHome: that loop unlinks any
+ *  symlink whose target is not an entry of the single real home it was given,
+ *  and goose's home is scattered across XDG dirs unless GOOSE_PATH_ROOT is set.
+ *  Returns undefined when nothing can be prepared (caller warns and launches
+ *  without compression of the custom-provider legs). A non-symlink where a
+ *  symlink belongs means possible user data — abort rather than delete. */
+export function prepareGooseHome(env: NodeJS.ProcessEnv, origin: string, rewrites: HttpRewrite[]): GooseOverlay | undefined {
+    if (rewrites.length === 0) return undefined;
+    const dirs = resolveGooseDirs(env);
+    const root = nonEmpty(env.GOOSE_PATH_ROOT) ? `${env.GOOSE_PATH_ROOT!}-bili` : `${dirs.configDir}-bili`;
+    try {
+        fs.mkdirSync(root, { recursive: true });
+    } catch {
+        return undefined;
+    }
+    for (const [name, target] of [["data", dirs.dataDir], ["state", dirs.stateDir], [".agents", dirs.agentsDir]] as const) {
+        fs.mkdirSync(target, { recursive: true });
+        const link = path.join(root, name);
+        try {
+            const st = fs.lstatSync(link);
+            if (st.isSymbolicLink()) {
+                if (fs.readlinkSync(link) !== target) {
+                    fs.rmSync(link);
+                    fs.symlinkSync(target, link);
+                }
+            } else {
+                return undefined;
+            }
+        } catch {
+            try {
+                fs.symlinkSync(target, link);
+            } catch {
+                return undefined;
+            }
+        }
+    }
+    const cfg = path.join(root, "config");
+    try {
+        fs.rmSync(cfg, { recursive: true, force: true });
+    } catch {}
+    try {
+        fs.mkdirSync(cfg, { recursive: true });
+    } catch {
+        return undefined;
+    }
+    let realEntries: string[] = [];
+    try {
+        realEntries = fs.readdirSync(dirs.configDir);
+    } catch {}
+    for (const name of realEntries) {
+        try {
+            fs.cpSync(path.join(dirs.configDir, name), path.join(cfg, name), { recursive: true });
+        } catch {}
+    }
+    const wrapSet = new Set(rewrites.map((r) => r.realUpstream));
+    const patchedFiles = new Set<string>();
+    let cpEntries: string[] = [];
+    try {
+        cpEntries = fs.readdirSync(path.join(cfg, "custom_providers"));
+    } catch {}
+    for (const name of cpEntries) {
+        if (!name.endsWith(".toml")) continue;
+        const file = path.join(cfg, "custom_providers", name);
+        let txt: string;
+        try {
+            txt = fs.readFileSync(file, "utf8");
+        } catch {
+            continue;
+        }
+        const eol = txt.includes("\r\n") ? "\r\n" : "\n";
+        let changed = false;
+        const lines = txt.split(/\r?\n/).map((line) => {
+            const m = /^(\s*base_url\s*=\s*)(["'])([^"']+)\2(\s*(?:#.*)?)$/.exec(line);
+            if (!m) return line;
+            const rawUrl = m[3];
+            if (!/^https?:\/\//i.test(rawUrl)) return line;
+            const real = unwrapUpstream(rawUrl);
+            if (!wrapSet.has(real)) return line;
+            changed = true;
+            return `${m[1]}${m[2]}${wrapUpstream(origin, real)}${m[2]}${m[4] ?? ""}`;
+        });
+        if (changed) {
+            try {
+                fs.writeFileSync(file, lines.join(eol));
+                patchedFiles.add(path.join("custom_providers", name));
+            } catch {}
+        }
+    }
+    const snapshot = new Map<string, string>();
+    const walk = (dir: string): void => {
+        let entries: string[] = [];
+        try {
+            entries = fs.readdirSync(dir);
+        } catch {
+            return;
+        }
+        for (const name of entries) {
+            const p = path.join(dir, name);
+            const st = fs.lstatSync(p);
+            if (st.isDirectory()) {
+                walk(p);
+            } else if (st.isFile() && !patchedFiles.has(path.relative(cfg, p))) {
+                try {
+                    snapshot.set(path.relative(cfg, p), fs.readFileSync(p, "utf8"));
+                } catch {}
+            }
+        }
+    };
+    walk(cfg);
+    return { root, realConfigDir: dirs.configDir, patchedFiles, snapshot };
+}
+
+/** #1049: merge-back for the goose overlay — user edits made inside the
+ *  generated config tree (new provider files, active_provider switches, ...)
+ *  land in the REAL config dir so the next plain `goose` run sees them. Files
+ *  bili patched itself never round-trip (their wrapped URLs would leak into
+ *  the real config); deletions are not propagated. */
+export function finalizeGooseHome(overlay: GooseOverlay): void {
+    const cfg = path.join(overlay.root, "config");
+    const walk = (dir: string): void => {
+        let entries: string[] = [];
+        try {
+            entries = fs.readdirSync(dir);
+        } catch {
+            return;
+        }
+        for (const name of entries) {
+            const p = path.join(dir, name);
+            let st;
+            try {
+                st = fs.lstatSync(p);
+            } catch {
+                continue;
+            }
+            if (st.isDirectory()) {
+                walk(p);
+                continue;
+            }
+            if (!st.isFile()) continue;
+            const rel = path.relative(cfg, p);
+            if (overlay.patchedFiles.has(rel)) continue;
+            let cur: string;
+            try {
+                cur = fs.readFileSync(p, "utf8");
+            } catch {
+                continue;
+            }
+            if (overlay.snapshot.get(rel) === cur) continue;
+            const dest = path.join(overlay.realConfigDir, rel);
+            try {
+                fs.mkdirSync(path.dirname(dest), { recursive: true });
+                fs.writeFileSync(dest, cur);
+            } catch {}
+        }
+    };
+    walk(cfg);
 }
 
 /** Strip any existing [mcp_servers.bili] block from codex config text so the
@@ -2754,6 +2985,7 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
     let clientArgs = params.clientArgs;
     let opencodeTmpFile: string | undefined;
     let dshOverlayHome: string | undefined;
+    let gooseOverlay: GooseOverlay | undefined;
     const tmpFiles: string[] = [];
     const directUrl = launcherDirectUrl(process.env);
     if (directUrl) {
@@ -3064,6 +3296,41 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
                 `bili: no aider endpoint declared (OPENAI_API_BASE / --openai-api-base / .aider.conf.yml) — assuming ${AIDER_DEFAULT_MODEL_HOSTS.join(" + ")}; pass --mitm-domain <host> for other relays.`,
             );
         }
+    } else if (base === "copilot") {
+        // #1049: cert-MITM like codex/trae (Go net/http honors HTTPS_PROXY; CA
+        // via SSL_CERT_FILE combined bundle). No budget env — the CLI manages
+        // its own context window.
+        env = buildCopilotEnv(origin, resolveCombinedCaPath(process.env), stripInheritedProxy(process.env));
+    } else if (base === "amp") {
+        // #1049: cert-MITM like copilot; ampcode.com carries both the model
+        // leg and the control plane, so the single whitelist entry covers both.
+        env = buildAmpEnv(origin, resolveCombinedCaPath(process.env), stripInheritedProxy(process.env));
+    } else if (base === "goose") {
+        // #1049: rustls release builds won't trust bili's CA, so no proxy envs
+        // at all — every model leg is redirected straight at the proxy as
+        // plain HTTP instead: built-in openai/anthropic via their *_HOST
+        // session-override envs (honored above any persisted config, stable
+        // across mid-session provider switches), custom declarative providers
+        // via a regenerated GOOSE_PATH_ROOT overlay (real config untouched,
+        // user edits merged back in finalizeGooseHome). Inherited proxy vars
+        // are stripped: the plain-HTTP model legs must never detour through a
+        // corporate forward proxy.
+        env = { ...stripInheritedProxy(process.env), BILLION_CONTEXT_PROXY: origin };
+        env.OPENAI_HOST = wrapUpstream(origin, "https://api.openai.com");
+        env.ANTHROPIC_HOST = wrapUpstream(origin, "https://api.anthropic.com");
+        if (routes.httpRewrites.length > 0) {
+            const overlay = prepareGooseHome(process.env, origin, routes.httpRewrites);
+            if (overlay) {
+                gooseOverlay = overlay;
+                env.GOOSE_PATH_ROOT = overlay.root;
+            } else {
+                console.error("bili: goose custom-provider rewrite unavailable (overlay could not be prepared) — those endpoints will NOT go through the proxy");
+            }
+        }
+        const active = config.goose?.activeProvider;
+        if (active && active !== "openai" && active !== "anthropic" && !(active in (config.goose?.customProviders ?? {}))) {
+            console.error(`bili: goose active provider "${active}" has no override seam (not built-in openai/anthropic, not a discovered custom provider) — its model traffic will NOT go through the proxy`);
+        }
     } else if (base === "codex") {
         // Per-spawn conversation id for the MCP shell's headless
         // self-registration (codex provides no session id of its own).
@@ -3164,6 +3431,11 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         code = 1;
     } finally {
         stopProxy(handle);
+        if (gooseOverlay) {
+            try {
+                finalizeGooseHome(gooseOverlay);
+            } catch {}
+        }
         if (opencodeTmpFile) {
             try {
                 fs.rmSync(path.dirname(opencodeTmpFile), { recursive: true, force: true });
