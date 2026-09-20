@@ -555,6 +555,9 @@
 | `bili qwen [opts --] [args]` | 代理 + **Qwen Code**(多协议 gemini-cli fork,无 base-URL 钩子)—— 证书 MITM(`HTTPS_PROXY` + `NODE_EXTRA_CA_CERTS`);默认 DashScope/Qwen 模型主机加白,自建中转用 `--mitm-domain`(#1047) |
 | `bili mcode [opts --] [args]` | 代理 + **MiniMax Code** —— 证书 MITM(`HTTPS_PROXY` + `NODE_EXTRA_CA_CERTS`/`SSL_CERT_FILE`);provider 主机取自 `~/.minimax*/config.yaml`(遵循 `MINIMAX_DATA_DIR`/`MAVIS_DATA_DIR`),未声明时用官方 `agent.minimax.*` 端点;回环端点编目并附手动 `/bili/` 前缀提示;会话经 `X-Mavis-Session-Id` 头绑定(#1050) |
 | `bili aider [opts --] [args]` | 代理 + **Aider**(Python pair programmer)—— 证书 MITM(`HTTPS_PROXY` + `SSL_CERT_FILE`/`REQUESTS_CA_BUNDLE`);端点发现自继承 env(`OPENAI_API_BASE`、`OPENAI_BASE_URL`、`ANTHROPIC_API_BASE`、`ANTHROPIC_BASE_URL`、`GEMINI_API_BASE`、`DEEPSEEK_API_BASE`)或 `.aider.conf.yml`(`openai-api-base:`),客户端参数里透传的 `--openai-api-base` / `--set-env` 优先;均未声明 → 默认加白 `api.openai.com` + `api.anthropic.com`;非回环纯 http 端点走 `HTTP_PROXY` 绝对形式转发,回环经 `NO_PROXY` 直连(#1048) |
+| `bili copilot [opts --] [args]` | 代理 + **Copilot CLI**（GitHub,闭源 Go 二进制）—— 证书 MITM(`HTTPS_PROXY` + `SSL_CERT_FILE`);模型主机(`api.githubcopilot.com` + 各套餐子域)加白(#1049) |
+| `bili amp [opts --] [args]` | 代理 + **Amp CLI**（Sourcegraph,闭源 Go 二进制）—— 证书 MITM(`HTTPS_PROXY` + `SSL_CERT_FILE`);`ampcode.com` 加白(#1049) |
+| `bili goose [opts --] [args]` | 代理 + **Goose**(Block,Rust/reqwest)—— rustls 发布构建不信任任何 CA 文件,故不用代理环境变量:内置 openai/anthropic 腿经 `OPENAI_HOST`/`ANTHROPIC_HOST` 重定向,自定义声明式 provider 经重新生成的 `GOOSE_PATH_ROOT` overlay 做 `base_url` `/bili/` 改写(真实配置不动,用户编辑回并);固定第三方 provider 会警告(#1049) |
 | `bili test pi` | 无污染的 pi 链路端到端冒烟测试 |
 | `bili export [session] [--full] [--output FILE]` | 列出持久化会话 / 把一个会话导出为 Markdown 交接文档 —— 见[会话与迁移](#会话与迁移) |
 | `bili update` | 立即检查并安装新版本（绕过 3 分钟节流） |

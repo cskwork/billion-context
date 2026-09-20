@@ -195,6 +195,19 @@ export interface AiderConfig {
     baseUrls?: string[];
 }
 
+/** goose (Block) model routing surface. Release builds wire reqwest with
+ *  rustls (webpki roots), so bili's CA is untrusted and cert-MITM cannot reach
+ *  the model legs — every leg must be redirected straight at the proxy as
+ *  plain HTTP instead: built-in openai/anthropic via their `*_HOST` env
+ *  overrides, custom declarative providers via a regenerated config overlay. */
+export interface GooseConfig {
+    /** `active_provider` from config.toml (legacy GOOSE_PROVIDER env wins). */
+    activeProvider?: string;
+    /** Custom declarative providers: file name (without .toml) → raw
+     *  `base_url` from `<config_dir>/custom_providers/<name>.toml`. */
+    customProviders: Record<string, string>;
+}
+
 export interface ClientConfig {
     claude?: ClaudeSettings;
     codex?: CodexConfig;
@@ -212,6 +225,7 @@ export interface ClientConfig {
     iflow?: IflowConfig;
     mcode?: McodeConfig;
     aider?: AiderConfig;
+    goose?: GooseConfig;
 }
 
 /** qoder's default model-inference hosts, hardcoded in the binary (no config
@@ -847,6 +861,79 @@ export function parseMcodeYaml(text: string): McodeConfig {
     return result;
 }
 
+/** Copilot CLI (GitHub) model hosts, cert-MITM'd so `bili copilot` compresses
+ *  the model traffic. The binary is closed-source Go (net/http honors
+ *  HTTPS_PROXY + SSL_CERT_FILE); the family is api.githubcopilot.com plus the
+ *  per-plan subdomains from GitHub's own CI firewall allowlist for the CLI. */
+export const COPILOT_DEFAULT_MODEL_HOSTS = [
+    "api.githubcopilot.com",
+    "api.individual.githubcopilot.com",
+    "api.business.githubcopilot.com",
+    "api.enterprise.githubcopilot.com",
+];
+
+/** Amp (Sourcegraph) backend host, cert-MITM'd so `bili amp` compresses the
+ *  model traffic. Closed-source Go like copilot; ampcode.com carries both the
+ *  model leg and the control plane (/api/internal, /api/telemetry). */
+export const AMP_DEFAULT_MODEL_HOSTS = ["ampcode.com"];
+
+/** goose directory layout (mirrors its paths.rs): GOOSE_PATH_ROOT (absolute)
+ *  holds config/, data/, state/, .agents/; without it the home scatters across
+ *  XDG dirs under author "Block" (state falls back to data when
+ *  XDG_STATE_HOME is unset — etcetera's state_dir() returns None then). */
+export interface GooseDirs {
+    configDir: string;
+    dataDir: string;
+    stateDir: string;
+    agentsDir: string;
+}
+
+export function resolveGooseDirs(env: NodeJS.ProcessEnv = process.env): GooseDirs {
+    const root = nonEmpty(env.GOOSE_PATH_ROOT) ? env.GOOSE_PATH_ROOT! : undefined;
+    if (root) {
+        return {
+            configDir: path.join(root, "config"),
+            dataDir: path.join(root, "data"),
+            stateDir: path.join(root, "state"),
+            agentsDir: path.join(root, ".agents"),
+        };
+    }
+    const h = os.homedir();
+    const configDir = path.join(nonEmpty(env.XDG_CONFIG_HOME) ? env.XDG_CONFIG_HOME! : path.join(h, ".config"), "goose");
+    const dataDir = path.join(nonEmpty(env.XDG_DATA_HOME) ? env.XDG_DATA_HOME! : path.join(h, ".local", "share"), "Block", "goose");
+    const stateDir = nonEmpty(env.XDG_STATE_HOME) ? path.join(env.XDG_STATE_HOME!, "Block", "goose") : dataDir;
+    return { configDir, dataDir, stateDir, agentsDir: path.join(dataDir, ".agents") };
+}
+
+export function readGooseConfig(dirs: GooseDirs, env: NodeJS.ProcessEnv = process.env): GooseConfig {
+    const result: GooseConfig = { customProviders: {} };
+    if (nonEmpty(env.GOOSE_PROVIDER)) {
+        result.activeProvider = env.GOOSE_PROVIDER!;
+    } else {
+        try {
+            const text = fs.readFileSync(path.join(dirs.configDir, "config.toml"), "utf8");
+            const m = /^active_provider\s*=\s*["']([^"']+)["']/m.exec(text);
+            if (m?.[1]) result.activeProvider = m[1];
+        } catch {}
+    }
+    let entries: string[] = [];
+    try {
+        entries = fs.readdirSync(path.join(dirs.configDir, "custom_providers"));
+    } catch {}
+    for (const name of entries.sort()) {
+        if (!name.endsWith(".toml")) continue;
+        let txt: string;
+        try {
+            txt = fs.readFileSync(path.join(dirs.configDir, "custom_providers", name), "utf8");
+        } catch {
+            continue;
+        }
+        const m = /^\s*base_url\s*=\s*["']([^"']+)["']/m.exec(txt);
+        if (m?.[1]) result.customProviders[name.replace(/\.toml$/, "")] = m[1];
+    }
+    return result;
+}
+
 /** mcode's install dir (launchers at <dir>/bin/mcode): MCODE_INSTALL_DIR or
  *  ~/.minimax-code (installer default). */
 export function resolveMcodeInstallDir(env: NodeJS.ProcessEnv = process.env): string {
@@ -1366,6 +1453,7 @@ export function loadClientConfig(env: NodeJS.ProcessEnv, cwd: string): ClientCon
     config.iflow = readIflowEnvConfig(env);
     config.mcode = readMcodeConfig(env);
     config.aider = readAiderConfig(env, cwd);
+    config.goose = readGooseConfig(resolveGooseDirs(env), env);
     return config;
 }
 
@@ -1483,7 +1571,7 @@ export function readAiderConfig(env: NodeJS.ProcessEnv = process.env, cwd: strin
  *  launched client's own declarations are authoritative (#436: launching
  *  `bili omp` with omp's models.yml declaring 131072 must not be overridden by
  *  another client's larger declaration for the same model id). */
-export type ModelWindowScope = "claude" | "codex" | "pi" | "omp" | "opencode" | "hermes" | "dsh" | "codebuddy" | "qoder" | "trae" | "jcode" | "kimi" | "gemini" | "iflow" | "qwen" | "mcode" | "aider";
+export type ModelWindowScope = "claude" | "codex" | "pi" | "omp" | "opencode" | "hermes" | "dsh" | "codebuddy" | "qoder" | "trae" | "jcode" | "kimi" | "gemini" | "iflow" | "qwen" | "mcode" | "aider" | "copilot" | "amp" | "goose";
 
 /** Collect per-model context windows from client configs the launcher can
  *  read (pi models.json, omp models.yml, opencode opencode.json, codex
