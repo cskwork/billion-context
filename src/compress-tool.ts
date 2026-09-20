@@ -15,10 +15,12 @@ import {
     ABSORB_TOOL_OPENAI,
     RULE_TOOL_NAME,
     SEARCH_CONTEXT_TOOL,
+    SEARCH_CONTEXT_TOOL_GOOGLE,
     SEARCH_CONTEXT_TOOL_OPENAI,
     SEARCH_CONTEXT_TOOL_RESPONSES,
     SEARCH_CONTEXT_TOOL_NAME,
     ACP_TOOLS_ANTHROPIC,
+    ACP_TOOLS_GOOGLE,
     ACP_TOOLS_OPENAI,
     ACP_TOOLS_RESPONSES,
     ACP_READONLY_TOOLS_RESPONSES,
@@ -42,18 +44,23 @@ export {
     COMPRESS_TOOL,
     COMPRESS_TOOL_OPENAI,
     COMPRESS_TOOL_RESPONSES,
+    COMPRESS_TOOL_GOOGLE,
     DECOMPRESS_TOOL,
     DECOMPRESS_TOOL_OPENAI,
     DECOMPRESS_TOOL_RESPONSES,
+    DECOMPRESS_TOOL_GOOGLE,
     SEARCH_CONTEXT_TOOL,
     SEARCH_CONTEXT_TOOL_OPENAI,
     SEARCH_CONTEXT_TOOL_RESPONSES,
+    SEARCH_CONTEXT_TOOL_GOOGLE,
     ACP_STATUS_TOOL,
     ACP_STATUS_TOOL_OPENAI,
     ACP_STATUS_TOOL_RESPONSES,
+    ACP_STATUS_TOOL_GOOGLE,
     ACP_TOOLS_OPENAI,
     ACP_TOOLS_ANTHROPIC,
     ACP_TOOLS_RESPONSES,
+    ACP_TOOLS_GOOGLE,
     ACP_READONLY_TOOLS_RESPONSES,
     buildCompressSystemPrompt,
     buildCompressTextSystemPrompt,
@@ -61,6 +68,7 @@ export {
     ABSORB_TOOL_NAME,
     ABSORB_TOOL,
     ABSORB_TOOL_OPENAI,
+    ABSORB_TOOL_GOOGLE,
     buildAbsorbSystemPrompt,
     RULE_TOOL_NAME,
 } from "acp-kernel";
@@ -104,9 +112,16 @@ export const BILI_SEARCH_CONTEXT_TOOL_RESPONSES = {
     parameters: withConversationId(SEARCH_CONTEXT_TOOL_RESPONSES.parameters),
 };
 
+export const BILI_SEARCH_CONTEXT_TOOL_GOOGLE = {
+    name: SEARCH_CONTEXT_TOOL_GOOGLE.name,
+    description: SEARCH_CONTEXT_TOOL_GOOGLE.description,
+    parameters: withConversationId(SEARCH_CONTEXT_TOOL_GOOGLE.parameters),
+};
+
 export const BILI_ACP_TOOLS_ANTHROPIC = ACP_TOOLS_ANTHROPIC.map((t) => (t.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL : t));
 export const BILI_ACP_TOOLS_OPENAI = ACP_TOOLS_OPENAI.map((t) => (t.function.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL_OPENAI : t));
 export const BILI_ACP_TOOLS_RESPONSES = ACP_TOOLS_RESPONSES.map((t) => (t.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL_RESPONSES : t));
+export const BILI_ACP_TOOLS_GOOGLE = ACP_TOOLS_GOOGLE.map((t) => (t.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL_GOOGLE : t));
 export const BILI_ACP_READONLY_TOOLS_RESPONSES = ACP_READONLY_TOOLS_RESPONSES.map((t) => (t.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL_RESPONSES : t));
 
 // The kernel ships no Responses-format absorb const (the four ACP tools have
@@ -120,8 +135,8 @@ export const ABSORB_TOOL_RESPONSES = {
 };
 
 // The reconciled kernel (acp-kernel#332) ships RULE_TOOL_NAME + the rule state
-// helpers but no wire tool objects. Synthesize all three shapes here so every
-// injection point (wire helpers, plugin manifest) serves one definition.
+// helpers but no wire tool objects. Synthesize all four wire shapes here so
+// every injection point (wire helpers, plugin manifest) serves one definition.
 const RULE_TOOL_DESCRIPTION = "Record a short, principle-level reminder so it survives context compression — the call and its result are protected and stay in context. Record when: the user calls out or repeatedly emphasizes a lesson; the user asks you to remember or follow a behavior; you personally hit a major pitfall worth remembering long-term. Keep each rule to one short line. Omit the rule argument to list recorded rules.";
 const RULE_PARAM_SCHEMA = {
     type: "object",
@@ -132,6 +147,7 @@ const RULE_PARAM_SCHEMA = {
 export const RULE_TOOL = { name: RULE_TOOL_NAME, description: RULE_TOOL_DESCRIPTION, input_schema: RULE_PARAM_SCHEMA };
 export const RULE_TOOL_OPENAI = { type: "function" as const, function: { name: RULE_TOOL_NAME, description: RULE_TOOL_DESCRIPTION, parameters: RULE_PARAM_SCHEMA } };
 export const RULE_TOOL_RESPONSES = { type: "function" as const, name: RULE_TOOL_NAME, description: RULE_TOOL_DESCRIPTION, parameters: RULE_PARAM_SCHEMA };
+export const RULE_TOOL_GOOGLE = { name: RULE_TOOL_NAME, description: RULE_TOOL_DESCRIPTION, parameters: RULE_PARAM_SCHEMA };
 
 export function parseCompressInput(input: unknown, callId?: string) {
     const parsed = parseCompressArgs(input, { callId });
