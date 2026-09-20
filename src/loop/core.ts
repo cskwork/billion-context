@@ -247,6 +247,11 @@ export async function* runCompressLoop(
     // client can see.
     let continuationRetried = false;
     let degenerateRetried = false;
+    // #1029: a retry storm re-executes the same failing proxy call every round;
+    // re-streaming the identical status marker each time only accumulates noise
+    // in client-stored history (incoming-history stripping removes it next turn,
+    // but one copy per request is enough signal for humans).
+    const seenMarkers = new Set<string>();
 
     const fetchUpstream = (body: Record<string, unknown>) =>
         fetchWithRetry(
@@ -583,7 +588,15 @@ export async function* runCompressLoop(
                     }
                     const result = await withSessionLock(ctx.session, () => executeProxyTool(call.name, parsedArgs, ctx, call.callId));
                     proxyResults.push({ name: call.name, callId: call.callId, result, arguments: call.arguments, signature: call.signature });
-                    if (ctx.visibilityMarkers !== false) yield adapter.emitMarker(call.name, result);
+                    if (ctx.visibilityMarkers !== false) {
+                        const markerKey = `${call.name}\u0000${result}`;
+                        if (seenMarkers.has(markerKey)) {
+                            ctx.log(`[acp-loop] suppressed duplicate ${call.name} status marker (identical failure repeated this request)`);
+                        } else {
+                            seenMarkers.add(markerKey);
+                            yield adapter.emitMarker(call.name, result);
+                        }
+                    }
                 } else {
                     realToolCalls.push(call);
                     realCalls += 1;
