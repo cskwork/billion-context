@@ -60,7 +60,7 @@ import {
     type GoogleSystemInstruction,
     type GoogleTool,
 } from "acp-kernel/wire";
-import { ABSORB_TOOL, ABSORB_TOOL_GOOGLE, ABSORB_TOOL_OPENAI, ABSORB_TOOL_RESPONSES, COMPRESS_TOOL, BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_GOOGLE, BILI_ACP_TOOLS_OPENAI, BILI_ACP_TOOLS_RESPONSES, BILI_ACP_READONLY_TOOLS_RESPONSES, COMPRESS_TOOL_NAME, RULE_TOOL, RULE_TOOL_OPENAI, RULE_TOOL_RESPONSES, buildAbsorbSystemPrompt, buildCompressSystemPrompt, buildCompressHybridSystemPrompt, withConversationIdNote, withMarkerIntegrityNote, withStagedCompressGuidance, withSummaryBudgetNote } from "./compress-tool.js";
+import { ABSORB_TOOL, ABSORB_TOOL_GOOGLE, ABSORB_TOOL_OPENAI, ABSORB_TOOL_RESPONSES, COMPRESS_TOOL, BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_GOOGLE, BILI_ACP_TOOLS_OPENAI, BILI_ACP_TOOLS_RESPONSES, BILI_ACP_READONLY_TOOLS_RESPONSES, COMPRESS_TOOL_NAME, RULE_TOOL, RULE_TOOL_GOOGLE, RULE_TOOL_OPENAI, RULE_TOOL_RESPONSES, buildAbsorbSystemPrompt, buildCompressSystemPrompt, buildCompressHybridSystemPrompt, withConversationIdNote, withMarkerIntegrityNote, withStagedCompressGuidance, withSummaryBudgetNote } from "./compress-tool.js";
 import { applyAbsorbView, absorbEnabled, absorbToolName, storeEffectiveAbsorb } from "./absorb.js";
 import { rulesEnabled, storeEffectiveRules } from "./rules-feature.js";
 import { rewriteJsonResponse, type RewriteCtx } from "./stream.js";
@@ -2463,6 +2463,10 @@ function prepareGoogle(
         const tokenCount = effectiveTokenCount(session, msgs);
         const activeBefore = new Set(session.state.blocks.filter((b) => b.active).map((b) => b.blockId));
         const absorbActive = absorbEnabled(config) && shouldInject;
+        // acp_rule has no processTurn side effect (no markers/instructions are
+        // ever injected into messages), so unlike absorb it needs no loop-
+        // config stripping — only tool availability matters.
+        const rulesActive = rulesEnabled(config) && shouldInject;
         const loopConfig = absorbActive ? config : { ...config, absorb: undefined };
         const turn = core.processTurn({ messages: msgs, state: session.state, config: loopConfig, tokenCount, renderTags: "text-only" });
         session.state = turn.state;
@@ -2503,7 +2507,7 @@ function prepareGoogle(
         const extraSystemParts = sysParts.slice(systemText ? 1 : 0);
         systemInstruction = extraSystemParts.length > 0 ? { parts: sysParts.map((text) => ({ text })) } : parsed.systemInstruction;
         if (injectTools) {
-            toolsOut = injectGoogleTool(parsed.tools, absorbActive ? ABSORB_TOOL_GOOGLE : undefined);
+            toolsOut = injectGoogleTool(parsed.tools, [...(absorbActive ? [ABSORB_TOOL_GOOGLE] : []), ...(rulesActive ? [RULE_TOOL_GOOGLE] : [])], surface?.toolPrompts);
         }
         if (willInjectNudge && turn.nudge) {
             try {
@@ -3096,9 +3100,9 @@ function injectOpenaiTool(tools: OpenAITool[] | undefined, extras?: readonly Ope
  *  nests declarations one level deeper than the OpenAI shape
  *  (`tools[].functionDeclarations[]`), so presence is collected across every
  *  entry and the missing declarations are appended as one new entry. */
-function injectGoogleTool(tools: GoogleTool[] | undefined, extra?: { name: string }, toolPrompts?: ToolPrompts): GoogleTool[] {
+function injectGoogleTool(tools: GoogleTool[] | undefined, extra?: { name: string }[], toolPrompts?: ToolPrompts): GoogleTool[] {
     const acp = applyAcpToolOverrides(BILI_ACP_TOOLS_GOOGLE, toolPrompts) as GoogleFunctionDeclaration[];
-    const wanted: { name: string }[] = extra ? [...acp, extra] : [...acp];
+    const wanted: { name: string }[] = extra ? [...acp, ...extra] : [...acp];
     if (!Array.isArray(tools)) return [{ functionDeclarations: wanted as GoogleFunctionDeclaration[] }];
     const present = new Set<string>();
     for (const tool of tools) {
