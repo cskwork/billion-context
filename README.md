@@ -161,6 +161,9 @@ Pick by your client:
 | **hermes** | `bili plugin install hermes` (self-spawning native plugin, no launcher — Python plugin, #958) or `bili hermes` (launcher, cert-MITM) |
 | **claude** | `bili claude` (launcher) or `bili plugin install claude` (native posture, #964 — managed settings block + session-owned proxy; see the notes below) |
 | **jcode** | [`billion-context`](https://github.com/ranxianglei/billion-context) via `bili jcode` (launcher, cert-MITM) or `/bili/` prefix — no native plugin possible: compiled Rust binary with no plugin seam, and its static per-provider config can't stamp per-request headers ([#962](https://github.com/ranxianglei/billion-context/issues/962)) |
+| **gemini** (Gemini CLI) | `bili gemini` (launcher, `GOOGLE_GEMINI_BASE_URL` `/bili/` rewrite) or `/bili/` prefix — launcher-only: gemini-cli's extension system reaches custom commands only, no in-loop tool seam (#1043) |
+| **iflow** (iFlow CLI) | `bili iflow` (launcher, `IFLOW_BASE_URL` `/bili/` rewrite) or `/bili/` prefix |
+| **qwen** (Qwen Code) | `bili qwen` (launcher, cert-MITM) or `/bili/` prefix |
 | **everything else** (no context hook) | [`billion-context`](https://github.com/ranxianglei/billion-context) — `bili <client>` (launcher, preferred) or `/bili/` prefix |
 
 **Native mode vs standalone extensions.** The host-native plugins (`bili plugin install pi` / `opencode` — they spawn the proxy inside the host process) and the standalone in-process extensions (`billion-context-pi`, `opencode-acp`) are **mutually exclusive**: both active means double compression. The installer makes the switch: `bili plugin install pi` replaces the legacy `npm:billion-context-pi` entry (with a reminder that a project-scope entry in `<project>/.pi/settings.json` from `pi install -l` lives outside the global settings), and `bili plugin install opencode` strips legacy `opencode-acp` entries from the global opencode.json — bare name, `npm:` alias, versioned (`opencode-acp@stable`), or path form, array or object shape; the original config is snapshotted to `.bili-bak` once. A **project-local** install (`opencode plugin opencode-acp` writes `<project>/.opencode/opencode.json`, not the global config) is not touched — remove it by hand; the installer note reminds you. As a runtime safety net for manual installs, the native entries set `BILLION_CONTEXT_NATIVE=<host>` synchronously at load so a standalone extension can stand down at action time — its own load-time `BILLION_CONTEXT_PROXY` check cannot see a proxy that native mode spawns asynchronously, and its `/bili/` baseUrl check never sees the fetch-layer rewrite. On the pi side the marker needs `billion-context-pi` **0.1.72+** (the per-event re-check landed after 0.1.71); the pi-native entry additionally scans both pi settings files once its proxy is up and warns loudly when it spots a co-resident legacy entry the installer never saw — that warning is the only visible signal while an old `billion-context-pi` silently double-compresses.
@@ -304,7 +307,7 @@ Notes:
   runtime-info). Full source-level analysis: [#962](https://github.com/ranxianglei/billion-context/issues/962)
   (closed wontfix). Use `bili jcode`.
 
-### Option 2 — Launcher (`bili pi` / `bili codex` / `bili claude` / `bili omp` / `bili opencode` / `bili hermes` / `bili dsh` / `bili codebuddy` / `bili qoder` / `bili trae` / `bili jcode` / `bili kimi`)
+### Option 2 — Launcher (`bili pi` / `bili codex` / `bili claude` / `bili omp` / `bili opencode` / `bili hermes` / `bili dsh` / `bili codebuddy` / `bili qoder` / `bili trae` / `bili jcode` / `bili kimi` / `bili gemini` / `bili iflow` / `bili qwen`)
 
 The launcher wraps a client in one command: it starts a proxy on an
 independent port (a fresh instance is always spawned — a port is never
@@ -328,6 +331,9 @@ bili qoder                            # qoder: model endpoint is hardcoded https
 bili trae                             # Trae CLI (ByteDance, closed Go binary, no base-URL override) — cert-MITM via HTTPS_PROXY + SSL_CERT_FILE, model host from TRAE_CLI_API_HOST or the default enterprise gateway (#655)
 bili jcode                            # jcode (Rust agent harness) — env-only cert-MITM launch: HTTPS_PROXY + SSL_CERT_FILE, model host api.z.ai whitelisted, local loopback providers stay direct via NO_PROXY
 bili kimi                             # Kimi Code CLI (Moonshot): honors standard proxy envs for all traffic EXCEPT an unconditional loopback bypass — non-loopback https via cert-MITM (HTTPS_PROXY + NODE_EXTRA_CA_CERTS/SSL_CERT_FILE), non-loopback http via absolute-form forward proxy; provider/model hosts from ~/.kimi-code/config.toml (KIMI_CODE_HOME respected) or the managed OAuth endpoints when none declared; loopback endpoints inventoried with a manual /bili/ prefix hint (#757)
+bili gemini                           # Gemini CLI (Google): GOOGLE_GEMINI_BASE_URL /bili/ rewrite to generativelanguage.googleapis.com (Google native wire), real ~/.gemini untouched
+bili iflow                            # iFlow CLI: IFLOW_BASE_URL /bili/ rewrite to apis.iflow.cn/v1 (OpenAI chat-completions wire), real ~/.iflow untouched
+bili qwen                             # Qwen Code (multi-protocol gemini-cli fork, no base-URL hook): cert-MITM via HTTPS_PROXY + NODE_EXTRA_CA_CERTS, default DashScope/Qwen model hosts whitelisted, custom relays via --mitm-domain
 bili pi --mitm-domain api.foo.com     # add a domain to the MITM whitelist
 ```
 
@@ -514,6 +520,40 @@ pure-stdlib Python module shipped inside the npm package:
   that transport exposes headers. Inert when `BILLION_CONTEXT_PROXY` is set
   (the launcher owns the proxy) or `BILI_PROVIDER_REWRITES` is defined.
   Opt-out: `BILI_NATIVE_HERMES=0`.
+
+### Gemini family (Gemini CLI / iFlow CLI / Qwen Code)
+
+Three launchers for the gemini-cli architecture family (#1043 tier 1). Two of
+the three have a base-URL env hook; one doesn't:
+
+- **`bili gemini`** — Gemini CLI (`@google/gemini-cli`). Sets
+  `GOOGLE_GEMINI_BASE_URL=<proxy>/bili/<upstream>` (default upstream
+  `https://generativelanguage.googleapis.com`; if you export your own
+  `GOOGLE_GEMINI_BASE_URL`, that value is relayed through the proxy instead).
+  The client switches to its `gateway` auth mode and sends Google-native-wire
+  requests straight to the loopback proxy — no MITM, no CA install, and
+  `~/.gemini` is never touched. The proxy speaks this wire natively (model
+  name rides in the URL path). Limitations: headless `-p` runs need a saved
+  auth selection (e.g. `security.auth.selectedType = "gemini-api-key"` in
+  settings + `GEMINI_API_KEY`) because gemini-cli rejects purely-env-derived
+  gateway auth in non-interactive mode; users on an OAuth personal login
+  (CodeAssist) are not covered by this route at all — that path ignores the
+  base-URL hook.
+- **`bili iflow`** — iFlow CLI (`@iflow-ai/iflow-cli`). Same pattern via
+  `IFLOW_BASE_URL` (default `https://apis.iflow.cn/v1`, relayed when you set
+  it); OpenAI chat-completions wire.
+- **`bili qwen`** — Qwen Code (`QwenLM/qwen-code`). This fork dropped the
+  base-URL hook (`DASHSCOPE_PROXY_BASE_URL` is a header-tuning knob, not
+  routing), but it honors standard proxy envs, so the launcher uses cert-MITM:
+  `HTTPS_PROXY=<proxy>` + `NODE_EXTRA_CA_CERTS=<bili CA>` with a static
+  whitelist of the default model hosts (DashScope / Qwen gateway / common
+  third-party endpoints). Custom relay hosts: add them with
+  `--mitm-domain <host>`. Best-effort route — a `BLIND TUNNEL WARNING` in the
+  log means a host is missing from the whitelist.
+
+None of the three has a native mode: none exposes an in-loop tool injection
+seam (gemini-cli extensions reach custom commands only; the forks inherit
+that surface). Launcher-only by design.
 
 ### Client uses `http.proxy` (CONNECT) but nothing compresses
 

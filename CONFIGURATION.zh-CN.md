@@ -550,6 +550,9 @@
 | `bili trae [opts --] [args]` | 代理 + **Trae CLI**（字节跳动,闭源 Go 二进制)—— 证书 MITM(`HTTPS_PROXY` + `SSL_CERT_FILE`);模型主机取 `TRAE_CLI_API_HOST` 或默认企业网关(#655) |
 | `bili jcode [opts --] [args]` | 代理 + **jcode**（Rust 终端编码 agent)—— 环境变量式证书 MITM 启动(`HTTPS_PROXY` + `SSL_CERT_FILE`);托管模型主机 `api.z.ai` 默认加白,本地回环 provider 走 `NO_PROXY` 直连 |
 | `bili kimi [opts --] [args]` | 代理 + **Kimi Code**(Moonshot CLI)—— 证书 MITM(`HTTPS_PROXY` + `NODE_EXTRA_CA_CERTS`/`SSL_CERT_FILE`);provider/model 主机取自 `~/.kimi-code/config.toml`(遵循 `KIMI_CODE_HOME`),未声明时用托管 OAuth 端点;回环端点编目并附手动 `/bili/` 前缀提示(#757) |
+| `bili gemini [opts --] [args]` | 代理 + **Gemini CLI**(Google)—— `GOOGLE_GEMINI_BASE_URL` `/bili/` 改写到 `generativelanguage.googleapis.com`(Google 原生 wire;你自己导出的值会被中继);无 MITM/CA;headless `-p` 需要已保存的认证选择(#1047) |
+| `bili iflow [opts --] [args]` | 代理 + **iFlow CLI** —— `IFLOW_BASE_URL` `/bili/` 改写到 `apis.iflow.cn/v1`(OpenAI chat-completions wire;你自己导出的值会被中继)(#1047) |
+| `bili qwen [opts --] [args]` | 代理 + **Qwen Code**(多协议 gemini-cli fork,无 base-URL 钩子)—— 证书 MITM(`HTTPS_PROXY` + `NODE_EXTRA_CA_CERTS`);默认 DashScope/Qwen 模型主机加白,自建中转用 `--mitm-domain`(#1047) |
 | `bili test pi` | 无污染的 pi 链路端到端冒烟测试 |
 | `bili export [session] [--full] [--output FILE]` | 列出持久化会话 / 把一个会话导出为 Markdown 交接文档 —— 见[会话与迁移](#会话与迁移) |
 | `bili update` | 立即检查并安装新版本（绕过 3 分钟节流） |

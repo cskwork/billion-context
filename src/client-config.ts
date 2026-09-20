@@ -157,6 +157,19 @@ export interface KimiConfig {
     defaultModel?: string;
 }
 
+export interface GeminiConfig {
+    /** The user's pre-existing `GOOGLE_GEMINI_BASE_URL` env — when set,
+     *  gemini-cli already routes model traffic to this relay, so the launcher
+     *  wraps IT via /bili/ instead of the stock Google endpoint. */
+    baseUrl?: string;
+}
+
+export interface IflowConfig {
+    /** The user's pre-existing iFlow base-URL env (`IFLOW_BASE_URL` /
+     *  `IFLOW_baseUrl`) — relay-wrap semantics, same as GeminiConfig.baseUrl. */
+    baseUrl?: string;
+}
+
 export interface ClientConfig {
     claude?: ClaudeSettings;
     codex?: CodexConfig;
@@ -170,6 +183,8 @@ export interface ClientConfig {
     qoder?: QoderConfig;
     trae?: TraeConfig;
     kimi?: KimiConfig;
+    gemini?: GeminiConfig;
+    iflow?: IflowConfig;
 }
 
 /** qoder's default model-inference hosts, hardcoded in the binary (no config
@@ -458,6 +473,22 @@ export const JCODE_DEFAULT_MODEL_HOSTS = [
     "api.z.ai",
 ];
 
+/** Qwen Code's stock model gateways, cert-MITM'd so `bili qwen` compresses
+ *  the model traffic: DashScope OpenAI-compatible endpoints (CN/intl/coding),
+ *  the Qwen OAuth gateway, plus the third-party provider hosts qwen-code ships
+ *  support for. Custom relays go through `--mitm-domain`. */
+export const QWEN_DEFAULT_MODEL_HOSTS = [
+    "dashscope.aliyuncs.com",
+    "dashscope-intl.aliyuncs.com",
+    "coding.dashscope.aliyuncs.com",
+    "coding-intl.dashscope.aliyuncs.com",
+    "chat.qwen.ai",
+    "api.openai.com",
+    "api.anthropic.com",
+    "openrouter.ai",
+    "api.deepseek.com",
+];
+
 /** Trae CLI keeps its config under TRAE_CONFIG_DIR (default ~/.trae):
  *  traecli.yaml, skills, session state. */
 export function resolveTraeHome(env: NodeJS.ProcessEnv): string {
@@ -473,6 +504,17 @@ export function readTraeConfig(env: NodeJS.ProcessEnv): TraeConfig {
         : undefined;
     if (host) result.modelApiHost = host;
     return result;
+}
+
+export function readGeminiEnvConfig(env: NodeJS.ProcessEnv): GeminiConfig {
+    return { baseUrl: nonEmpty(env.GOOGLE_GEMINI_BASE_URL) ? env.GOOGLE_GEMINI_BASE_URL : undefined };
+}
+
+export function readIflowEnvConfig(env: NodeJS.ProcessEnv): IflowConfig {
+    // iFlow's docs list case variants of the base-URL env; the SCREAMING form
+    // is the documented primary, the camel form is accepted too.
+    const raw = nonEmpty(env.IFLOW_BASE_URL) ? env.IFLOW_BASE_URL : nonEmpty(env.IFLOW_baseUrl) ? env.IFLOW_baseUrl : undefined;
+    return { baseUrl: raw };
 }
 
 export function readClaudeSettings(homeDir: string, cwd: string, env: NodeJS.ProcessEnv = process.env): ClaudeSettings {
@@ -1144,6 +1186,8 @@ export function loadClientConfig(env: NodeJS.ProcessEnv, cwd: string): ClientCon
     config.qoder = readQoderConfig(resolveQoderHome(env), env);
     config.trae = readTraeConfig(env);
     config.kimi = readKimiConfig(resolveKimiHome(env), env);
+    config.gemini = readGeminiEnvConfig(env);
+    config.iflow = readIflowEnvConfig(env);
     return config;
 }
 
@@ -1151,7 +1195,7 @@ export function loadClientConfig(env: NodeJS.ProcessEnv, cwd: string): ClientCon
  *  launched client's own declarations are authoritative (#436: launching
  *  `bili omp` with omp's models.yml declaring 131072 must not be overridden by
  *  another client's larger declaration for the same model id). */
-export type ModelWindowScope = "claude" | "codex" | "pi" | "omp" | "opencode" | "hermes" | "dsh" | "codebuddy" | "qoder" | "trae" | "jcode" | "kimi";
+export type ModelWindowScope = "claude" | "codex" | "pi" | "omp" | "opencode" | "hermes" | "dsh" | "codebuddy" | "qoder" | "trae" | "jcode" | "kimi" | "gemini" | "iflow" | "qwen";
 
 /** Collect per-model context windows from client configs the launcher can
  *  read (pi models.json, omp models.yml, opencode opencode.json, codex

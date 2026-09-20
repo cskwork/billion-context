@@ -552,6 +552,9 @@ Full command surface (`bili --help` prints an abridged version). Precedence ever
 | `bili trae [opts --] [args]` | Proxy + **Trae CLI** (ByteDance, closed Go binary) — cert-MITM via `HTTPS_PROXY` + `SSL_CERT_FILE`; model host from `TRAE_CLI_API_HOST` or the default enterprise gateway (#655) |
 | `bili jcode [opts --] [args]` | Proxy + **jcode** (Rust agent harness) — env-only cert-MITM launch via `HTTPS_PROXY` + `SSL_CERT_FILE`; hosted model host (`api.z.ai`) whitelisted, local loopback providers stay direct via `NO_PROXY` |
 | `bili kimi [opts --] [args]` | Proxy + **Kimi Code** (Moonshot CLI) — cert-MITM via `HTTPS_PROXY` + `NODE_EXTRA_CA_CERTS`/`SSL_CERT_FILE`; provider/model hosts from `~/.kimi-code/config.toml` (`KIMI_CODE_HOME` respected) or the managed OAuth endpoints when none declared; loopback endpoints inventoried with a manual `/bili/` prefix hint (#757) |
+| `bili gemini [opts --] [args]` | Proxy + **Gemini CLI** (Google) — `GOOGLE_GEMINI_BASE_URL` `/bili/` rewrite to `generativelanguage.googleapis.com` (Google native wire; your own exported value is relayed instead); no MITM/CA; headless `-p` needs a saved auth selection (#1047) |
+| `bili iflow [opts --] [args]` | Proxy + **iFlow CLI** — `IFLOW_BASE_URL` `/bili/` rewrite to `apis.iflow.cn/v1` (OpenAI chat-completions wire; your own exported value is relayed instead) (#1047) |
+| `bili qwen [opts --] [args]` | Proxy + **Qwen Code** (multi-protocol gemini-cli fork, no base-URL hook) — cert-MITM via `HTTPS_PROXY` + `NODE_EXTRA_CA_CERTS`; default DashScope/Qwen model hosts whitelisted, custom relays via `--mitm-domain` (#1047) |
 | `bili test pi` | Non-polluting end-to-end smoke test of the pi path |
 | `bili export [session] [--full] [--output FILE]` | List persisted sessions / export one as a Markdown handoff — see [Sessions & Migration](#sessions--migration) |
 | `bili update` | Check for & install a newer version now (bypasses the 3-minute throttle) |
