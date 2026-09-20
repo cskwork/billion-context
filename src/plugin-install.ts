@@ -1407,6 +1407,9 @@ function kimiStatus(): string {
 // dist/index.js + node runtime, so a global self-update moves both together.
 
 const HERMES_PLUGIN_ID = "billion-context";
+// cmd.exe's canonical "command missing" line (its exit code is not reliably
+// 9009 when spawned via CreateProcess — CI-verified).
+const CMD_NOT_FOUND_RE = /is not recognized as an internal or external command/i;
 
 function hermesPluginDir(): string {
     return path.join(resolveHermesHome(process.env), "plugins", HERMES_PLUGIN_ID);
@@ -1432,7 +1435,7 @@ function runHermesCli(args: string[]): { ok: true } | { ok: false; reason: strin
         });
         if (res.error) return { ok: false, reason: (res.error as NodeJS.ErrnoException).code === "ENOENT" ? "not-found" : String(res.error) };
         if (res.status === 0) return { ok: true };
-        if (process.platform === "win32" && res.status === 9009) return { ok: false, reason: "not-found" };
+        if (process.platform === "win32" && (res.status === 9009 || CMD_NOT_FOUND_RE.test(res.stderr ?? ""))) return { ok: false, reason: "not-found" };
         const detail = (res.stderr ?? "").trim();
         return { ok: false, reason: detail || `exit ${res.status}` };
     } catch (err) {
