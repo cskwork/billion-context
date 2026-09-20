@@ -65,7 +65,7 @@ import { compressLoopResponsesJson } from "./compress-loop-responses.js";
 import { hoistTrappedToolItems } from "./tool-pair-order.js";
 import { runCompressLoop, pickAdapter } from "./loop/index.js";
 import { containsToolCallXmlFragment } from "./loop/tag-echo-filter.js";
-import { isStrictReasoningEcho, normalizeStrictEchoReasoning } from "./strict-echo.js";
+import { isStrictReasoningEcho, modelIdOf, normalizeStrictEchoReasoning } from "./strict-echo.js";
 export { isStrictReasoningEcho, normalizeStrictEchoReasoning };
 import { isFakeCompletion, injectFakeCompletionHint, maxFakeCompletionRetries, fakeBufCap } from "./fake-completion.js";
 import { makeContinuationRefetch } from "./degenerate-retry.js";
@@ -1979,7 +1979,7 @@ function prepareAnthropic(
     const stream = parsed.stream === true;
     ++session.stats.requests;
     const injectTools = opts.compress.injectTool && !pluginMode;
-    const stripReasoning = (msgs: BiliMessage[]): BiliMessage[] => withReasoningDrop(msgs, reasoning, log, sessionId, isStrictReasoningEcho(session, upstreamOrigin));
+    const stripReasoning = (msgs: BiliMessage[]): BiliMessage[] => withReasoningDrop(msgs, reasoning, log, sessionId, isStrictReasoningEcho(session, upstreamOrigin, modelIdOf(parsed)));
 
     if (isAutoModeClassifier(parsed)) {
         log("info", `[${sessionId}] auto-mode classifier passthrough (skipping compress injection)`);
@@ -2133,7 +2133,7 @@ function prepareOpenai(
     const stream = parsed.stream === true;
     ++session.stats.requests;
     let openaiSystemText = "";
-    const stripReasoning = (msgs: BiliMessage[]): BiliMessage[] => withReasoningDrop(msgs, reasoning, log, sessionId, isStrictReasoningEcho(session, upstreamOrigin));
+    const stripReasoning = (msgs: BiliMessage[]): BiliMessage[] => withReasoningDrop(msgs, reasoning, log, sessionId, isStrictReasoningEcho(session, upstreamOrigin, modelIdOf(parsed)));
     let openaiOutboundSystem: string | undefined;
     let processedMessages: CoreMessage[] = [];
     let originalMessages: CoreMessage[] = [];
@@ -2254,7 +2254,7 @@ function prepareOpenai(
 
     // #762: repair the strict-echo rejection class BEFORE the sentinel sees
     // the array — a normalized body must not fire its own canary.
-    rebuiltMessages = normalizeStrictEchoReasoning(rebuiltMessages, isStrictReasoningEcho(session, upstreamOrigin), log, sessionId);
+    rebuiltMessages = normalizeStrictEchoReasoning(rebuiltMessages, isStrictReasoningEcho(session, upstreamOrigin, modelIdOf(parsed)), log, sessionId);
     const rebuilt: OpenAIRequestBody = { ...parsed, messages: rebuiltMessages, tools: toolsOut as OpenAITool[] | undefined };
     warnReasoningPairs(rebuiltMessages, log, sessionId);
     clampOutgoingOutput(rebuilt as Record<string, unknown>, typeof (parsed as Record<string, unknown>).max_completion_tokens === "number" ? "max_completion_tokens" : "max_tokens", { systemText: openaiSystemText, tools: toolsOut, processedMessages, lastInputTokens: session.stats.lastInputTokens, nativeWindow, imageTokens: imageTokensInParsedBody("openai", rebuilt, imageBillingFor(opts, billingUpstream ?? upstreamOrigin)) }, sessionId, log);
@@ -2314,7 +2314,7 @@ function prepareResponses(
     const sessionId = session.id;
     const stream = parsed.stream === true;
     ++session.stats.requests;
-    const stripReasoning = (msgs: BiliMessage[]): BiliMessage[] => withReasoningDrop(msgs, reasoning, log, sessionId, isStrictReasoningEcho(session, upstreamOrigin));
+    const stripReasoning = (msgs: BiliMessage[]): BiliMessage[] => withReasoningDrop(msgs, reasoning, log, sessionId, isStrictReasoningEcho(session, upstreamOrigin, modelIdOf(parsed)));
     if (reconcileNativeCompactionBoundary(session)) {
         log("info", `[${sessionId}] reconciled ACP state after native Responses compact boundary`);
     }
