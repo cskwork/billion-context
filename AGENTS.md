@@ -560,6 +560,19 @@ after that succeeded was the Windows fix shipped in a follow-up release.
   intended injection: preserve tool_call ids/ordering, SSE structure, and
   upstream invariants (e.g. `compaction_trigger` must remain the last input
   item, #283/#209). Reason in BOTH compression modes (§6).
+  - *Tool-call arguments are user intent (#1039).* Any payload a host will
+    EXECUTE or PERSIST — tool-call `arguments` in every wire shape (OpenAI
+    `tool_calls[].function.arguments`, Anthropic `input_json_delta.partial_json`
+    / `tool_use.input`, Responses `function_call_arguments.*`), fragment or
+    whole — is forwarded **byte-exact**. NEVER filter, strip, or "clean" it,
+    not even to remove model-echoed render tags: a shape-based filter cannot
+    distinguish an echo from a literal the user genuinely wants written (bash
+    command strings, write/edit file contents), so any such "fix" silently
+    corrupts executed/persisted data. Echoed tags surfacing in a host TUI is
+    cosmetic noise — the fix for that belongs on the injection side (host
+    renderTags policy, #933), never in the argument path. Tag-echo stripping
+    applies to model PROSE only (content/reasoning/thinking/summary text
+    fields); see the invariant block atop `src/loop/tag-echo-filter.ts`.
   - *Kernel-owned split:* the FORMAT CONTRACT of the kernel-emitted ACP
     artifacts (the compression tags, block refs, `acp_summary` structure — see
     Key Design Decision #2) and the **id-never-reused guarantee** belong to

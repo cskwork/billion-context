@@ -452,6 +452,7 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
                             if (typeof item.arguments === "string" && item.arguments) fc.arguments = item.arguments;
                             pending.delete(itemId);
                             toolCallsEmitted++;
+                            // #1039 invariant: arguments are user intent, verbatim — see tag-echo-filter.ts header.
                             yield {
                                 kind: "tool_call",
                                 name: fc.name,

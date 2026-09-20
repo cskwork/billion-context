@@ -249,6 +249,7 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
                 for (const [, tc] of pending) {
                     if (tc.name.length > 0 || tc.id.length > 0) {
                         toolCallsEmitted++;
+                        // #1039 invariant: arguments are user intent, verbatim — see tag-echo-filter.ts header.
                         yield {
                             kind: "tool_call",
                             name: tc.name,

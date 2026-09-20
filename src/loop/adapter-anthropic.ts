@@ -319,6 +319,7 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                     if (tb) {
                         pending.delete(upstreamIndex);
                         toolCallsEmitted++;
+                        // #1039 invariant: arguments are user intent, verbatim — see tag-echo-filter.ts header.
                         yield {
                             kind: "tool_call",
                             name: tb.name,

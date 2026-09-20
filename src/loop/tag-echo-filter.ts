@@ -21,6 +21,21 @@
 // close), so real words that merely contain the letters (acpi/acpi.h includes,
 // caption, app, uppercase ACPI) never match; a false positive costs at most
 // the same bounded caps as before (swallow ≤ SWALLOW_CAP, hold ≤ HOLD_LIMIT/TAG_OPEN_CAP).
+//
+// ─── INVARIANT (#1039): tool-call arguments are user intent ─────────────────
+// Anything the host will EXECUTE or PERSIST — tool-call arguments in every
+// wire shape (openai tool_calls[].function.arguments fragments, anthropic
+// input_json_delta.partial_json and tool_use.input, responses
+// function_call_arguments.delta/.done and item.arguments) — is forwarded
+// BYTE-EXACT. Never route it through any filter from this file, at fragment
+// or whole-payload granularity, and never "clean" it because it contains a
+// tag-shaped echo. A shape-based filter cannot distinguish a model-echoed
+// render tag from a literal the user genuinely wants written (bash command
+// strings, write/edit file contents): stripping arguments silently corrupts
+// executed/persisted data (#1039). Echoed tags surfacing in a host TUI is
+// cosmetic noise; that fix belongs on the injection side (host renderTags
+// policy, #933), never here. The strippers below apply to model PROSE only
+// (content/reasoning_content/reasoning/thinking/text/summary fields).
 function buildAcplikeName(): string {
     const cores = ["acp", "apc", "cap", "cpa", "pac", "pca"];
     const names = new Set<string>(cores);

@@ -1215,6 +1215,9 @@ export async function pipePluginChatWithStrip(
             if (!d || typeof d !== "object") continue;
             const dd = d as Record<string, unknown>;
             if (dd["tool_calls"] !== undefined) sawToolUse = true;
+            // #1039 invariant: tool_calls fragments in this delta are user
+            // intent and pass through untouched — only the text fields below
+            // are ever stripped (see tag-echo-filter.ts header).
             for (const field of ["content", "reasoning_content", "reasoning"]) {
                 const v = dd[field];
                 if (typeof v !== "string") continue;
