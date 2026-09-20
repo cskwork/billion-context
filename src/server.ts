@@ -93,6 +93,7 @@ import { observeResponsesTerminalState } from "./stream-terminal.js";
 import { emitPreflightError, emitStreamError } from "./stream-error.js";
 import { affinityToken, claudeSubagentAgentId, claudeSubagentSplit, clientConversationHeader, codexTurnIdentity, preferPromptCacheKeyIdentity, type ConversationIdentity } from "./session-id.js";
 import { prefixAffinity, type AnonymousAffinity } from "./prefix-affinity.js";
+import { maybeAdoptForkBlocks } from "./fork-adoption.js";
 import { flushPrefixAffinity, hydratePrefixAffinity, scheduleAffinityPersist } from "./affinity-persist.js";
 import { consumePluginRegisterFor, flushConversations, handlePluginCompact, handlePluginManifest, handlePluginRegister, handlePluginRuntimeInfo, handlePluginStatus, handlePluginTool, loadConversations, pipePluginChatWithStrip, pipePluginJson, pipePluginResponsesWithStrip, pluginAgentHeader, pluginConversationHeader, pluginHeadersMatchModel, pluginReportedContextWindow, pluginReportedMaxOutput, pluginRuntimeInfoFor, recordPluginSession, rememberPluginMessages, takePendingPluginRegister } from "./plugin.js";
 import { setupMitm, readMitmUpstream, getBlindTunnelStats } from "./mitm.js";
@@ -1394,6 +1395,28 @@ async function handle(
                 via: anonAffinity.via,
                 ...(anonAffinity.lineage ? { lineage: anonAffinity.lineage } : {}),
             };
+        }
+        // Fork block-adoption (#629): a fresh anonymous session born from a
+        // mid-history fork inherits the parent's fully-present compression
+        // blocks (copy-on-fork) instead of restarting with zero state. Runs
+        // BEFORE the prepare*/processTurn below so the seeded refs are there
+        // for reconciliation; only on the session's first request so a replay
+        // can never re-adopt. Always safe to call — it logs the adoptable
+        // inventory even when adoption is disabled (the #629 measurement).
+        if (anonAffinity?.via === "new" && anonAffinity.lineage?.reason === "forked" && session.stats.requests === 0) {
+            try {
+                maybeAdoptForkBlocks({
+                    session,
+                    parentId: anonAffinity.lineage.parents[0]!,
+                    protocol,
+                    parsed,
+                    upstreamOrigin,
+                    enabled: opts.forkAdoption === true,
+                    log,
+                });
+            } catch (err) {
+                log("warn", `[fork-adoption] failed (${String(err)}); continuing with fresh state (#629)`);
+            }
         }
         // Launcher-mode binding (#162): prefer identity — claude code sends
         // x-claude-code-session-id on every request, equal to the
