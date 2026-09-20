@@ -188,13 +188,19 @@ export function withStagedCompressGuidance(text: string): string {
 // confirmation lines plus preambles/summaries (incl. non-English commentary)
 // before and after each real compression.
 const MARKER_INTEGRITY_NOTE =
-    "\n\n[ACP marker integrity: lines shaped like '📦 [ACP] Compressed …' or '❌ [ACP] … FAILED' are CONFIRMATION MARKERS emitted by the bili proxy itself, right after it executes a compress/decompress/search_context/acp_status call. They are not something you write. NEVER emit such a line as your own text — writing one fakes a state change that did not happen, and the proxy strips it. To compress, call the compress tool. To verify a compression landed, call acp_status and confirm the block count increased — a confirmation line you wrote yourself proves nothing. Execute these calls silently: no announcement or preamble before the call, and no completion summary, status line, or marker-style line after it — when the tool returns, continue the task directly as if the call had not happened.]";
+    "\n\n[ACP marker integrity: lines shaped like '📦 [ACP] Compressed …' or '❌ [ACP] … FAILED' are CONFIRMATION MARKERS emitted by the bili proxy itself, right after it executes a compress/decompress/search_context/acp_status call. They are not something you write. NEVER emit such a line as your own text — writing one fakes a state change that did not happen, and the proxy strips it. To compress, call the compress tool. To verify a compression landed, call acp_status and confirm the block count increased — a confirmation line you wrote yourself proves nothing.";
+const MARKER_SILENCE_CLAUSE =
+    " Execute these calls silently: no announcement or preamble before the call, and no completion summary, status line, or marker-style line after it — when the tool returns, continue the task directly as if the call had not happened.]";
 
 /** Append the marker-integrity rule to a nudge or system-prompt text.
- *  Unconditional (unlike withStagedCompressGuidance): the rule must hold in
- *  every configuration where a marker can be seen in history. */
-export function withMarkerIntegrityNote(text: string): string {
-    return text + MARKER_INTEGRITY_NOTE;
+ *  The anti-forgery segment is unconditional (unlike withStagedCompressGuidance):
+ *  the rule must hold in every configuration where a marker can be seen in
+ *  history. The #862 silence clause rides along only while markers are
+ *  visible (#913): with compress.visibilityMarkers=false the client never
+ *  sees a marker, so there is nothing to imitate or narrate around, and the
+ *  clause is dropped. */
+export function withMarkerIntegrityNote(text: string, visibilityMarkers = true): string {
+    return text + MARKER_INTEGRITY_NOTE + (visibilityMarkers ? MARKER_SILENCE_CLAUSE : "");
 }
 
 // #760: per-call conversation_id for MCP tools. Hosts that share ONE MCP shim

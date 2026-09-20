@@ -396,6 +396,24 @@ async function waitForPort(port: number, ms: number): Promise<boolean> {
     return false;
 }
 
+// The proxy writes <state>/billion-context/proxy-origin synchronously inside
+// its 'listening' callback — AFTER the kernel already accepts TCP connects on
+// the port. A reader that just saw the port come up can hit a real window
+// where the file is not on disk yet (#1031); poll briefly instead of one
+// immediate read. Still absent past the deadline = hard failure.
+async function waitForInstanceFile(file: string, ms: number): Promise<string> {
+    const deadline = Date.now() + ms;
+    for (;;) {
+        try {
+            return fs.readFileSync(file, "utf8");
+        } catch (e) {
+            if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
+            if (Date.now() >= deadline) throw new Error(`instance file did not appear within ${ms}ms: ${file}`);
+            await new Promise((r) => setTimeout(r, 50));
+        }
+    }
+}
+
 function runHook(distScript: string, port: number, xdg: Record<string, string>): Promise<{ code: number | null; stderr: string }> {
     // Hermetic tmp: the hook's spawned proxy logs to
     // <tmpdir>/bili-proxy-<port>.log. The minimal child env has no platform
@@ -481,7 +499,7 @@ test("hook e2e: a healthy proxy on ANOTHER port is never attached (static URL)",
         const rA = await runHook(distScript, portA, xdg);
         assert.equal(rA.code, 0);
         assert.ok(await waitForPort(portA, 60_000), "proxy A up");
-        pidA = (JSON.parse(fs.readFileSync(instFile, "utf8")) as { pid: number }).pid;
+        pidA = (JSON.parse(await waitForInstanceFile(instFile, 30_000)) as { pid: number }).pid;
 
         // SAME state dir, DIFFERENT port: claude dials a STATIC url pinned to
         // portB — attaching to A's origin would strand every request. The
@@ -490,7 +508,7 @@ test("hook e2e: a healthy proxy on ANOTHER port is never attached (static URL)",
         assert.equal(rB.code, 0);
         assert.match(rB.stderr, /started at/, "spawned — not attached to A");
         assert.ok(await waitForPort(portB, 60_000), "proxy B up on its own port");
-        pidB = (JSON.parse(fs.readFileSync(instFile, "utf8")) as { pid: number }).pid;
+        pidB = (JSON.parse(await waitForInstanceFile(instFile, 30_000)) as { pid: number }).pid;
         assert.notEqual(pidB, pidA, "separate instance, not an attach");
     } finally {
         if (pidA > 0) killPid(pidA);
@@ -551,7 +569,7 @@ test("hook e2e: dist script spawns a proxy on the stable port, second run attach
         assert.equal(r1.code, 0);
         assert.match(r1.stderr, /proxy started|proxy attached/);
         assert.ok(await waitForPort(port, 60_000), "proxy listening on the stable port");
-        const inst = JSON.parse(fs.readFileSync(instanceFile, "utf8")) as { pid: number; origin: string };
+        const inst = JSON.parse(await waitForInstanceFile(instanceFile, 30_000)) as { pid: number; origin: string };
         assert.equal(inst.origin, `http://127.0.0.1:${port}`);
         assert.equal(typeof inst.pid, "number");
         proxyPid = inst.pid;

@@ -78,14 +78,14 @@ import { compressLoopResponsesJson } from "./compress-loop-responses.js";
 import { hoistTrappedToolItems } from "./tool-pair-order.js";
 import { runCompressLoop, pickAdapter } from "./loop/index.js";
 import { containsToolCallXmlFragment } from "./loop/tag-echo-filter.js";
-import { isStrictReasoningEcho, normalizeStrictEchoReasoning } from "./strict-echo.js";
+import { isStrictReasoningEcho, modelIdOf, normalizeStrictEchoReasoning } from "./strict-echo.js";
 export { isStrictReasoningEcho, normalizeStrictEchoReasoning };
 import { isFakeCompletion, injectFakeCompletionHint, maxFakeCompletionRetries, fakeBufCap } from "./fake-completion.js";
 import { makeContinuationRefetch } from "./degenerate-retry.js";
 import { reasoningGuardEngages, runReasoningGuard } from "./reasoning-guard.js";
 import { sanitizeResponsesInputIds, dropWhitespaceResponsesMessages, normalizeResponsesMessageItems } from "./loop/adapter-responses.js";
 import { CODEX_COMPACT_HEALTH_RATIO, codexCompactMode, isCodexClient, hasCompactionTrigger, stripBiliCompactionItems, replaceBiliCompactionItems, codexCompactGate, codexCompactGatePre, buildTriggerForgeBody, mergeForgedSummaries } from "./codex-compact.js";
-import { stripAcpPanelMessages, stripAcpPanelResponsesInput } from "./acp-panel.js";
+import { stripAcpPanelMessages, stripAcpPanelResponsesInput, stripAcpStatusMarkers } from "./acp-panel.js";
 import { rewriteOpenaiJsonResponse } from "./stream-openai.js";
 import { rewriteGoogleJsonResponse } from "./stream-google.js";
 import { rewriteResponsesJsonResponse } from "./stream-responses.js";
@@ -93,6 +93,7 @@ import { observeResponsesTerminalState } from "./stream-terminal.js";
 import { emitPreflightError, emitStreamError } from "./stream-error.js";
 import { affinityToken, claudeSubagentAgentId, claudeSubagentSplit, clientConversationHeader, codexTurnIdentity, preferPromptCacheKeyIdentity, type ConversationIdentity } from "./session-id.js";
 import { prefixAffinity, type AnonymousAffinity } from "./prefix-affinity.js";
+import { maybeAdoptForkBlocks } from "./fork-adoption.js";
 import { flushPrefixAffinity, hydratePrefixAffinity, scheduleAffinityPersist } from "./affinity-persist.js";
 import { consumePluginRegisterFor, flushConversations, handlePluginCompact, handlePluginManifest, handlePluginRegister, handlePluginRuntimeInfo, handlePluginStatus, handlePluginTool, loadConversations, pipePluginChatWithStrip, pipePluginJson, pipePluginResponsesWithStrip, pluginAgentHeader, pluginConversationHeader, pluginHeadersMatchModel, pluginReportedContextWindow, pluginReportedMaxOutput, pluginRuntimeInfoFor, recordPluginSession, rememberPluginMessages, takePendingPluginRegister } from "./plugin.js";
 import { setupMitm, readMitmUpstream, getBlindTunnelStats } from "./mitm.js";
@@ -1395,6 +1396,28 @@ async function handle(
                 ...(anonAffinity.lineage ? { lineage: anonAffinity.lineage } : {}),
             };
         }
+        // Fork block-adoption (#629): a fresh anonymous session born from a
+        // mid-history fork inherits the parent's fully-present compression
+        // blocks (copy-on-fork) instead of restarting with zero state. Runs
+        // BEFORE the prepare*/processTurn below so the seeded refs are there
+        // for reconciliation; only on the session's first request so a replay
+        // can never re-adopt. Always safe to call — it logs the adoptable
+        // inventory even when adoption is disabled (the #629 measurement).
+        if (anonAffinity?.via === "new" && anonAffinity.lineage?.reason === "forked" && session.stats.requests === 0) {
+            try {
+                maybeAdoptForkBlocks({
+                    session,
+                    parentId: anonAffinity.lineage.parents[0]!,
+                    protocol,
+                    parsed,
+                    upstreamOrigin,
+                    enabled: opts.forkAdoption === true,
+                    log,
+                });
+            } catch (err) {
+                log("warn", `[fork-adoption] failed (${String(err)}); continuing with fresh state (#629)`);
+            }
+        }
         // Launcher-mode binding (#162): prefer identity — claude code sends
         // x-claude-code-session-id on every request, equal to the
         // CLAUDE_CODE_SESSION_ID the MCP shell registered, so binding is
@@ -1653,6 +1676,7 @@ async function handle(
                 async (): Promise<{ body: string | Buffer; prepared: Prepared | null } | null> => {
                 const runPrepare = (): Prepared => {
                     const cs = resolveCompress(opts.routes, route?.rewrittenUrl, requestModel, opts.compress);
+                    const visibilityMarkers = cs.visibilityMarkers ?? true;
                     const reasoningCfg = cs.reasoning;
                     const keepRecent = cs.stripImagesKeepRecent ?? DEFAULT_STRIP_IMAGES_KEEP_RECENT;
                     const stripped = cs.stripImages
@@ -1671,19 +1695,19 @@ async function handle(
                         // Both the model and the stream flag live in the URL path
                         // for this wire (the body carries neither), so they are
                         // derived here instead of read off `work`.
-                        return prepareGoogle(work as GoogleRequestBody, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, nativeWindow, googleModel, googlePathKind(urlPath) === "stream-generate");
+                        return prepareGoogle(work as GoogleRequestBody, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, nativeWindow, googleModel, googlePathKind(urlPath) === "stream-generate", visibilityMarkers);
                     }
                     return protocol === "anthropic"
-                        ? prepareAnthropic(work as AnthropicRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, upstreamOrigin, reasoningCfg)
+                        ? prepareAnthropic(work as AnthropicRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, upstreamOrigin, reasoningCfg, visibilityMarkers)
                         : protocol === "openai"
-                          ? prepareOpenai(work as OpenAIRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, upstreamOrigin, nativeWindow, reasoningCfg, route?.rewrittenUrl)
+                          ? prepareOpenai(work as OpenAIRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, upstreamOrigin, nativeWindow, reasoningCfg, visibilityMarkers, route?.rewrittenUrl)
                           : responsesCompact
                             // #618 review nit: when no bili compaction item is present,
                             // prepareResponsesCompact falls back to the raw bodyBuffer — forward
                             // the re-serialized post-strip work instead so dropped images don't
                             // ride along. Unchanged bodies keep the original buffer byte-identical.
                             ? prepareResponsesCompact(stripped.removed > 0 ? Buffer.from(JSON.stringify(work)) : bodyBuffer, work as ResponsesRequestBody, session, req, core, reqConfig, log)
-                            : prepareResponses(work as ResponsesRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, responsesIdentity!, pluginMode, upstreamOrigin, nativeWindow, reasoningCfg, route?.rewrittenUrl);
+                            : prepareResponses(work as ResponsesRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, responsesIdentity!, pluginMode, upstreamOrigin, nativeWindow, reasoningCfg, visibilityMarkers, route?.rewrittenUrl);
                 };
                 // #332: codex's native remote-compaction request (trigger form)
                 // is dispatched BEFORE prepare/preflight. When it is not
@@ -2068,12 +2092,13 @@ function prepareAnthropic(
     pluginMode: boolean,
     upstreamOrigin: string,
     reasoning: CompressReasoningConfig | undefined,
+    visibilityMarkers: boolean,
 ): Prepared {
     const sessionId = session.id;
     const stream = parsed.stream === true;
     ++session.stats.requests;
     const injectTools = opts.compress.injectTool && !pluginMode;
-    const stripReasoning = (msgs: BiliMessage[]): BiliMessage[] => withReasoningDrop(msgs, reasoning, log, sessionId, isStrictReasoningEcho(session, upstreamOrigin));
+    const stripReasoning = (msgs: BiliMessage[]): BiliMessage[] => withReasoningDrop(msgs, reasoning, log, sessionId, isStrictReasoningEcho(session, upstreamOrigin, modelIdOf(parsed)));
 
     if (isAutoModeClassifier(parsed)) {
         log("info", `[${sessionId}] auto-mode classifier passthrough (skipping compress injection)`);
@@ -2092,6 +2117,10 @@ function prepareAnthropic(
     const strippedPanels = stripAcpPanelMessages(parsed.messages);
     if (strippedPanels > 0) {
         log("info", `[${sessionId}] stripped ${strippedPanels} ACP panel message(s) before projection (UI-only, issue #359)`);
+    }
+    const strippedMarkerLines = stripAcpStatusMarkers(parsed.messages);
+    if (strippedMarkerLines > 0) {
+        log("info", `[${sessionId}] stripped ${strippedMarkerLines} ACP status marker line(s) from incoming history (ephemeral proxy status, issue #1029)`);
     }
 
     try {
@@ -2162,7 +2191,7 @@ function prepareAnthropic(
         reapOrphanBlocks(session, msgs, deactivateBlock);
         rebuiltMessages = coreToAnthropic(processedMessages as BiliMessage[], cacheControls);
 
-        systemOut = injectSystem(parsed, opts, prompts, loopConfig, ensureCanonicalId(session), surface);
+        systemOut = injectSystem(parsed, opts, prompts, loopConfig, ensureCanonicalId(session), surface, visibilityMarkers);
         if (injectTools) {
             toolsOut = injectTool(parsed.tools, [...(absorbActive ? [ABSORB_TOOL] : []), ...(rulesActive ? [RULE_TOOL] : [])], surface?.toolPrompts);
         }
@@ -2177,7 +2206,7 @@ function prepareAnthropic(
             try {
                 const rendered = renderNudgeText(turn.nudge, prompts, surface?.nudgeSections);
                 if (rendered.text) {
-                    rebuiltMessages = [...rebuiltMessages, { role: "user", content: withMarkerIntegrityNote(withSummaryBudgetNote(withStagedCompressGuidance(rendered.text))) }];
+                    rebuiltMessages = [...rebuiltMessages, { role: "user", content: withMarkerIntegrityNote(withSummaryBudgetNote(withStagedCompressGuidance(rendered.text)), visibilityMarkers) }];
                 }
             } catch {
             }
@@ -2226,13 +2255,14 @@ function prepareOpenai(
     upstreamOrigin: string,
     nativeWindow: number,
     reasoning: CompressReasoningConfig | undefined,
+    visibilityMarkers: boolean,
     billingUpstream?: string,
 ): Prepared {
     const sessionId = session.id;
     const stream = parsed.stream === true;
     ++session.stats.requests;
     let openaiSystemText = "";
-    const stripReasoning = (msgs: BiliMessage[]): BiliMessage[] => withReasoningDrop(msgs, reasoning, log, sessionId, isStrictReasoningEcho(session, upstreamOrigin));
+    const stripReasoning = (msgs: BiliMessage[]): BiliMessage[] => withReasoningDrop(msgs, reasoning, log, sessionId, isStrictReasoningEcho(session, upstreamOrigin, modelIdOf(parsed)));
     let openaiOutboundSystem: string | undefined;
     let processedMessages: CoreMessage[] = [];
     let originalMessages: CoreMessage[] = [];
@@ -2254,6 +2284,10 @@ function prepareOpenai(
     const strippedPanels = stripAcpPanelMessages(parsed.messages);
     if (strippedPanels > 0) {
         log("info", `[${sessionId}] stripped ${strippedPanels} ACP panel message(s) before projection (UI-only, issue #359)`);
+    }
+    const strippedMarkerLines = stripAcpStatusMarkers(parsed.messages);
+    if (strippedMarkerLines > 0) {
+        log("info", `[${sessionId}] stripped ${strippedMarkerLines} ACP status marker line(s) from incoming history (ephemeral proxy status, issue #1029)`);
     }
 
     try {
@@ -2322,7 +2356,7 @@ function prepareOpenai(
         // would invalidate the cache every turn.
         const sysParts: string[] = [];
         if (systemText) sysParts.push(systemText);
-        if (shouldInject) sysParts.push(withConversationIdNote(withMarkerIntegrityNote(withSummaryBudgetNote(buildCompressSystemPrompt(prompts, surface?.promptSections))), ensureCanonicalId(session)));
+        if (shouldInject) sysParts.push(withConversationIdNote(withMarkerIntegrityNote(withSummaryBudgetNote(buildCompressSystemPrompt(prompts, surface?.promptSections)), visibilityMarkers), ensureCanonicalId(session)));
         if (absorbActive) sysParts.push(buildAbsorbSystemPrompt(absorbToolName(config)));
         rebuiltMessages = injectOpenaiSystem(rebuiltMessages, sysParts);
         // #532: capture what bili injects outside the fold space (client system
@@ -2343,7 +2377,7 @@ function prepareOpenai(
             try {
                 const rendered = renderNudgeText(turn.nudge, prompts, surface?.nudgeSections);
                 if (rendered.text) {
-                    rebuiltMessages = [...rebuiltMessages, { role: "user", content: withMarkerIntegrityNote(withSummaryBudgetNote(withStagedCompressGuidance(rendered.text))) }];
+                    rebuiltMessages = [...rebuiltMessages, { role: "user", content: withMarkerIntegrityNote(withSummaryBudgetNote(withStagedCompressGuidance(rendered.text)), visibilityMarkers) }];
                 }
             } catch {
             }
@@ -2355,7 +2389,7 @@ function prepareOpenai(
 
     // #762: repair the strict-echo rejection class BEFORE the sentinel sees
     // the array — a normalized body must not fire its own canary.
-    rebuiltMessages = normalizeStrictEchoReasoning(rebuiltMessages, isStrictReasoningEcho(session, upstreamOrigin), log, sessionId);
+    rebuiltMessages = normalizeStrictEchoReasoning(rebuiltMessages, isStrictReasoningEcho(session, upstreamOrigin, modelIdOf(parsed)), log, sessionId);
     const rebuilt: OpenAIRequestBody = { ...parsed, messages: rebuiltMessages, tools: toolsOut as OpenAITool[] | undefined };
     warnReasoningPairs(rebuiltMessages, log, sessionId);
     clampOutgoingOutput(rebuilt as Record<string, unknown>, typeof (parsed as Record<string, unknown>).max_completion_tokens === "number" ? "max_completion_tokens" : "max_tokens", { systemText: openaiSystemText, tools: toolsOut, processedMessages, lastInputTokens: session.stats.lastInputTokens, nativeWindow, imageTokens: imageTokensInParsedBody("openai", rebuilt, imageBillingFor(opts, billingUpstream ?? upstreamOrigin)) }, sessionId, log);
@@ -2435,6 +2469,7 @@ function prepareGoogle(
     nativeWindow: number,
     model: string | undefined,
     stream: boolean,
+    visibilityMarkers: boolean,
 ): Prepared {
     const sessionId = session.id;
     ++session.stats.requests;
@@ -2498,7 +2533,7 @@ function prepareGoogle(
         // trailing user content below (see prepareOpenai for the rationale).
         const sysParts: string[] = [];
         if (systemText) sysParts.push(systemText);
-        if (shouldInject) sysParts.push(withMarkerIntegrityNote(buildCompressSystemPrompt(prompts, surface?.promptSections)));
+        if (shouldInject) sysParts.push(withMarkerIntegrityNote(buildCompressSystemPrompt(prompts, surface?.promptSections), visibilityMarkers));
         if (absorbActive) sysParts.push(buildAbsorbSystemPrompt(absorbToolName(config)));
         googleOutboundSystem = sysParts.join("\n\n");
         // Untouched when nothing was added beyond the client's own text: the
@@ -2513,7 +2548,7 @@ function prepareGoogle(
             try {
                 const rendered = renderNudgeText(turn.nudge, prompts, surface?.nudgeSections);
                 if (rendered.text) {
-                    rebuiltContents = appendGoogleNudge(rebuiltContents, withMarkerIntegrityNote(withStagedCompressGuidance(rendered.text)));
+                    rebuiltContents = appendGoogleNudge(rebuiltContents, withMarkerIntegrityNote(withStagedCompressGuidance(rendered.text), visibilityMarkers));
                 }
             } catch {
             }
@@ -2590,12 +2625,13 @@ function prepareResponses(
     upstreamOrigin: string,
     nativeWindow: number,
     reasoning: CompressReasoningConfig | undefined,
+    visibilityMarkers: boolean,
     billingUpstream?: string,
 ): Prepared {
     const sessionId = session.id;
     const stream = parsed.stream === true;
     ++session.stats.requests;
-    const stripReasoning = (msgs: BiliMessage[]): BiliMessage[] => withReasoningDrop(msgs, reasoning, log, sessionId, isStrictReasoningEcho(session, upstreamOrigin));
+    const stripReasoning = (msgs: BiliMessage[]): BiliMessage[] => withReasoningDrop(msgs, reasoning, log, sessionId, isStrictReasoningEcho(session, upstreamOrigin, modelIdOf(parsed)));
     if (reconcileNativeCompactionBoundary(session)) {
         log("info", `[${sessionId}] reconciled ACP state after native Responses compact boundary`);
     }
@@ -2644,6 +2680,10 @@ function prepareResponses(
     const strippedPanels = stripAcpPanelResponsesInput(parsed.input);
     if (strippedPanels > 0) {
         log("info", `[${sessionId}] stripped ${strippedPanels} ACP panel message(s) before projection (UI-only, issue #359)`);
+    }
+    const strippedMarkerLines = stripAcpStatusMarkers(parsed.input);
+    if (strippedMarkerLines > 0) {
+        log("info", `[${sessionId}] stripped ${strippedMarkerLines} ACP status marker line(s) from incoming history (ephemeral proxy status, issue #1029)`);
     }
 
     const shouldInject = opts.compress.injectTool;
@@ -2709,7 +2749,7 @@ function prepareResponses(
             ? []
             : (session.metadata.codexForgedSummaries as string[] | undefined) ?? [];
         if (shouldInject && !isCompactionTrigger && !process.env.ACP_NO_COMPRESS_PROMPT) {
-            const prompt = withConversationIdNote(withMarkerIntegrityNote(withSummaryBudgetNote(responsesTextProtocol ? buildCompressHybridSystemPrompt(prompts, surface?.promptSections) : buildCompressSystemPrompt(prompts, surface?.promptSections))), ensureCanonicalId(session));
+            const prompt = withConversationIdNote(withMarkerIntegrityNote(withSummaryBudgetNote(responsesTextProtocol ? buildCompressHybridSystemPrompt(prompts, surface?.promptSections) : buildCompressSystemPrompt(prompts, surface?.promptSections)), visibilityMarkers), ensureCanonicalId(session));
             const devParts = [...projection.systemParts, ...forgedSummaries, prompt];
             if (absorbActive) devParts.push(buildAbsorbSystemPrompt(absorbToolName(config)));
             const devContent = devParts.join("\n\n---\n\n");
@@ -2740,7 +2780,7 @@ function prepareResponses(
                     const inputItems: ResponseInputItem[] = typeof rebuiltInput === "string"
                         ? [{ type: "message", role: "user", content: rebuiltInput }]
                         : rebuiltInput;
-                    inputItems.push({ type: "message", role: "user", content: withMarkerIntegrityNote(withSummaryBudgetNote(withStagedCompressGuidance(rendered.text))) });
+                    inputItems.push({ type: "message", role: "user", content: withMarkerIntegrityNote(withSummaryBudgetNote(withStagedCompressGuidance(rendered.text)), visibilityMarkers) });
                     rebuiltInput = inputItems;
                 }
             } catch {
@@ -3050,6 +3090,7 @@ function injectSystem(
     config: Config,
     noteId: string,
     surface?: PackSurface,
+    visibilityMarkers = true,
 ): string | AnthropicRequestBody["system"] {
     // ONLY the static compress prompt goes into the system block — it is the
     // prefix-cache anchor and must stay byte-stable across turns. The nudge
@@ -3057,7 +3098,7 @@ function injectSystem(
     // the caller (prepareAnthropic), never merged into system.
     const baseText = extractSystem(parsed.system);
     const parts: string[] = [];
-    if (opts.compress.injectTool) parts.push(withConversationIdNote(withMarkerIntegrityNote(withSummaryBudgetNote(buildCompressSystemPrompt(prompts, surface?.promptSections))), noteId));
+    if (opts.compress.injectTool) parts.push(withConversationIdNote(withMarkerIntegrityNote(withSummaryBudgetNote(buildCompressSystemPrompt(prompts, surface?.promptSections)), visibilityMarkers), noteId));
     if (opts.compress.injectTool && absorbEnabled(config)) parts.push(buildAbsorbSystemPrompt(absorbToolName(config)));
     if (parts.length === 0) return parsed.system;
     const full = baseText ? `${baseText}\n\n---\n\n${parts.join("\n\n")}` : parts.join("\n\n");
@@ -4354,7 +4395,8 @@ async function forward(
             const absorbSection = absorbActive
                 ? `\n\n---\n\n${buildAbsorbSystemPrompt(absorbToolName(loopConfig))}`
                 : "";
-            const systemPrompt = withMarkerIntegrityNote(withSummaryBudgetNote(textProtocol ? buildCompressHybridSystemPrompt(prepared.prompts ?? defaultPrompts, prepared.surface?.promptSections) : buildCompressSystemPrompt(prepared.prompts ?? defaultPrompts, prepared.surface?.promptSections))) + absorbSection;
+            const visibilityMarkers = resolveCompress(opts.routes, route?.rewrittenUrl, (parsedReq as { model?: string }).model, opts.compress).visibilityMarkers ?? true;
+            const systemPrompt = withMarkerIntegrityNote(withSummaryBudgetNote(textProtocol ? buildCompressHybridSystemPrompt(prepared.prompts ?? defaultPrompts, prepared.surface?.promptSections) : buildCompressSystemPrompt(prepared.prompts ?? defaultPrompts, prepared.surface?.promptSections)), visibilityMarkers) + absorbSection;
             const adapter = pickAdapter(prepared.protocol, parsedReq, textProtocol, prepared.responsesProjection, prepared.anthropicSystem, prepared.openaiSystemText, absorbActive ? absorbToolName(loopConfig) : undefined, prepared.google);
             const refreshFolded = async (current: CoreMessage[]): Promise<CoreMessage[]> => {
                 return withSessionLock(prepared.session, () => {
@@ -4375,7 +4417,6 @@ async function forward(
                     return repairResponsesAssistantOrdering(stripKernelSummaries([...viewed, ...records] as BiliMessage[], turn.state), prepared.originalMessages);
                 });
             };
-            const visibilityMarkers = resolveCompress(opts.routes, route?.rewrittenUrl, (parsedReq as { model?: string }).model, opts.compress).visibilityMarkers ?? true;
             const loop = runCompressLoop(
                 streamToRead,
                 { core, config, messages: prepared.processedMessages.length > 0 ? prepared.processedMessages : prepared.originalMessages, compressMessages: prepared.originalMessages, session: prepared.session, log: ctx.log, proxyUrl, protocol: prepared.protocol, textProtocol, debug: opts.debug, refreshFolded, visibilityMarkers },

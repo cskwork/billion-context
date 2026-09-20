@@ -86,6 +86,7 @@ AI 编程助手的<strong>通用上下文压缩代理</strong>
 | **omp** | [`billion-context`](https://github.com/ranxianglei/billion-context)，`bili omp`（内置插件）或 `bili plugin install omp`（自拉起原生插件，免启动器） |
 | **dsh** | [`billion-context`](https://github.com/ranxianglei/billion-context) —— `bili dsh`（启动器，经 `--patch` 注入完整原生插件：工具、会话绑定 `/acp`、fetch 拦截）或 `bili plugin install dsh` ≡ `dsh plugin --profile <name> add billion-context`（统一泳道 —— pnpm 把包装进各 profile、由 dsh 挂载包内 patch 层；bili 形式只是替你按 profile 驱动 dsh 自己的通道，并顺带迁移旧版受管块） |
 | **kimi** | `bili plugin install kimi`（自拉起原生插件，免启动器 —— 需 Kimi Code ≥ 2.0.0；每会话在 `~/.kimi-code/config.toml` 写入路由块）或 `bili kimi`（启动器，证书 MITM）或 `/bili/` 前缀 |
+| **hermes** | `bili plugin install hermes`（自拉起原生插件，免启动器 —— Python 插件，#958）或 `bili hermes`（启动器，证书 MITM） |
 | **claude** | `bili claude`(启动器)或 `bili plugin install claude`(原生姿态,#964 —— 受管 settings 块 + 会话自管代理;见下方"注意") |
 | **jcode** | [`billion-context`](https://github.com/ranxianglei/billion-context)，`bili jcode`（启动器，cert-MITM）或 `/bili/` 前缀 —— 无法做原生插件：编译型 Rust 二进制、无插件接缝，其静态 provider 配置无法按请求打头（[#962](https://github.com/ranxianglei/billion-context/issues/962)） |
 | **gemini**（Gemini CLI） | `bili gemini`（启动器，`GOOGLE_GEMINI_BASE_URL` `/bili/` 改写）或 `/bili/` 前缀 —— 仅启动器模式：gemini-cli 的扩展体系只到自定义命令，没有环内工具注入接缝（#1043） |
@@ -116,9 +117,9 @@ npm install -g billion-context
 
 
 
-### 方式 1 —— 原生插件(native,`bili plugin install pi` / `omp` / `opencode` / `dsh` / `kimi`)
+### 方式 1 —— 原生插件(native,`bili plugin install pi` / `omp` / `opencode` / `dsh` / `kimi` / `hermes`)
 
-代理住进客户端:装一次,之后照常启动客户端 —— 不用启动器命令、不用环境变量、不用固定端口、不用改 URL。目前支持 **pi**、**omp**、**opencode**(1.x 与 2.x)、**dsh** 与 **kimi**:
+代理住进客户端:装一次,之后照常启动客户端 —— 不用启动器命令、不用环境变量、不用固定端口、不用改 URL。目前支持 **pi**、**omp**、**opencode**(1.x 与 2.x)、**dsh**、**kimi** 与 **hermes**:
 
 ```bash
 bili plugin install pi          # 在 pi 的 settings 里注册 billion-context 条目(bili 自身为 npm 安装时写 npm 条目)
@@ -126,6 +127,7 @@ bili plugin install omp         # 在 omp 的 config.yml(~/.omp/agent/config.yml
 bili plugin install opencode    # 在 opencode 真实配置里注册插件 + 关闭原生自动压缩
 bili plugin install dsh         # 对每个已存在的 profile 执行 'dsh plugin --profile <name> add billion-context'
 bili plugin install kimi        # 写 $KIMI_CODE_HOME/plugins/managed/billion-context/kimi.plugin.json(+ installed.json 记录);每会话路由块在首次启动时落到 config.toml(需 Kimi Code >= 2.0.0)
+bili plugin install hermes      # 把 Python 插件拷进 ~/.hermes/plugins/billion-context/(+ 机器自管的 bili.json sidecar),并经 `hermes plugins enable billion-context` 启用
 bili plugin remove <client>     # 卸载(dsh 经同一通道移除;配置快照存 .bili-bak)
 ```
 
@@ -136,7 +138,7 @@ bili plugin remove <client>     # 卸载(dsh 经同一通道移除;配置快照�
 
 pi / omp / kimi / claude 没有客户端侧通道 —— 它们的配置条目由 `bili plugin install <client>` 代写(kimi 的声明式 `kimi.plugin.json` + 注册记录、claude 的受管 settings 块等)。
 
-插件加载时**自拉起自己的代理**(已有健康实例则直接复用;父进程 pid 看门狗在客户端退出时收掉它),把模型流量改写到 `<proxy>/bili/<上游URL>`,注册 `compress` / `decompress` / `acp_status` 为客户端原生工具(plugin 模式),并把客户端**自己的模型配置**上报给代理让压缩预算用真实窗口而不是注册表猜测。退出开关:`BILI_NATIVE_PI=0`、`BILI_NATIVE_OMP=0`、`BILI_NATIVE_OPENCODE=0`、`BILI_NATIVE_DSH=0`、`BILI_NATIVE_KIMI=0`。完整机制:[TECHNICAL-NOTES.zh-CN.md](TECHNICAL-NOTES.zh-CN.md)。
+插件加载时**自拉起自己的代理**(已有健康实例则直接复用;父进程 pid 看门狗在客户端退出时收掉它),把模型流量改写到 `<proxy>/bili/<上游URL>`,注册 `compress` / `decompress` / `acp_status` 为客户端原生工具(plugin 模式),并把客户端**自己的模型配置**上报给代理让压缩预算用真实窗口而不是注册表猜测。退出开关:`BILI_NATIVE_PI=0`、`BILI_NATIVE_OMP=0`、`BILI_NATIVE_OPENCODE=0`、`BILI_NATIVE_DSH=0`、`BILI_NATIVE_KIMI=0`、`BILI_NATIVE_HERMES=0`。完整机制:[TECHNICAL-NOTES.zh-CN.md](TECHNICAL-NOTES.zh-CN.md)。
 
 **Runtime-info 协议(#955)。** 原生插件读取客户端自己将要使用的模型配置并推给代理(逐请求头 + 自举上报);代理解析上下文窗口时优先采用这份真相,而不是 models.dev 注册表/内置表。协议细节、解析顺序与现有实现:[TECHNICAL-NOTES.zh-CN.md](TECHNICAL-NOTES.zh-CN.md)。
 
@@ -145,6 +147,7 @@ pi / omp / kimi / claude 没有客户端侧通道 —— 它们的配置条目�
 - 原生模式与独立进程内扩展(`billion-context-pi`、`opencode-acp`)**互斥** —— 安装器负责换条目并把原配置快照(`.bili-bak`);迁移细节见上方客户端表(pi 需 `billion-context-pi` 0.1.72+ 才能干净退让)。
 - OpenCode:legacy `opencode-acp` 会话、V1/V2 插件形态与全部注意事项已并入 [OpenCode](#opencode) 一节。
 - `kimi` 仅在自举时上报 runtime-info(静态 `custom_headers` 无法承载逐请求的窗口/模型头,否则会在模型切换后过期),子代理会话按每次调用的 `conversation_id` 绑定 —— 完整机制见下文「Kimi Code」小节。
+- `hermes` 的原生插件是 Python 写的(其 CLI agent 的插件 API 只有 Python)—— 不补丁 fetch,而是在健康检查通过后用环境变量把 hermes 的 httpx 栈指向代理,并经 `llm_request` 中间件打逐请求头;完整机制见下文「Hermes」一节。
 - `claude` 有**原生姿态**(#964):`bili plugin install claude` 写入受管 settings 块(静态 `/bili/` URL + `SessionStart` hook)+ 指向稳定端口的 MCP shell —— 代理随会话生灭。`BILI_NATIVE_CLAUDE=0` 退出(passthrough)。机制细节:[TECHNICAL-NOTES.zh-CN.md](TECHNICAL-NOTES.zh-CN.md)。
 - `codex` / `omp` 也有配套安装(MCP shell 与轻量扩展),但它们需要一个在跑的代理 —— 不属于原生模式。
 - `jcode` 则完全没有原生模式:它是编译型 Rust 二进制、无插件/扩展接缝,唯一的 provider 级请求头是静态 TOML 表(对每个请求原样附加),MCP server 又是跨所有会话共享的全局池 —— 既无法在进程内改写模型流量,也无法打上 plugin 模式所需的按请求头(`x-bili-plugin`、会话 id、runtime-info)。完整源码级分析见 [#962](https://github.com/ranxianglei/billion-context/issues/962)(已按 wontfix 关闭)。请用 `bili jcode`(启动器)。
@@ -249,6 +252,14 @@ curl -s http://localhost:8787/__bili/stats
 
 三者都没有 native 模式:均无环内工具注入接缝(gemini-cli 扩展只到自定义命令,
 fork 继承同一面)。按设计保持 launcher-only。
+### Hermes（Nous Research）
+
+三种对齐模式:`bili hermes`(启动器,证书 MITM —— 方式 2)、`/bili/` URL 前缀、原生插件模式(`bili plugin install hermes`,#958)。hermes CLI agent 的插件 API 只有 Python(`desktop/plugin.js` SDK 属于另一个 Desktop app),所以原生插件是随 npm 包分发的一个纯标准库 Python 模块:
+
+- **安装:** `bili plugin install hermes` 把 `plugin.yaml` + `__init__.py` 拷进 `~/.hermes/plugins/billion-context/`,写一个机器自管的 `bili.json` sidecar(指向全局 bili 安装的 `dist/index.js` + node 路径),并经 hermes 自己的通道启用插件(`hermes plugins enable billion-context` —— CLI 不在 PATH 上时改为打印同一条命令)。新开一个 hermes 会话生效。卸载:`bili plugin remove hermes`;全局更新后刷新:`bili plugin update hermes`。
+- **生命周期:** 加载时插件先附着到健康的运行中代理,否则在临时端口自拉起(父进程 pid 看门狗在 hermes 退出时收掉它;并发启动走与启动器相同的 starting-marker 仲裁协议)。只有代理确认健康后,才用 `HTTPS_PROXY` / `https_proxy` + `HERMES_CA_BUNDLE`(bili 根 CA)把 hermes 的 httpx 栈指向它 —— **从不改动** `~/.hermes/config.yaml`。provider 的 https 域名从 hermes 配置读出并加入 MITM 白名单;其余域名与启动器模式一样盲隧道。拉不出健康代理时插件静默退场,流量直连(不压缩、无死端口)。
+- **Plugin 模式盖章:** `llm_request` 中间件打 `x-bili-plugin: hermes` + 会话 id(= hermes session id,gateway 多会话安全)+ 模型,已知后再加 `x-bili-plugin-max-output` —— 且只在 ACP 工具已对着存活代理清单注册完之后;第一轮走 wire 模式。`pre_api_request` hook 捕获生效的 `max_tokens`,把 runtime-info(模型 + 最大输出)推给代理。`compress` / `decompress` / `acp_status` 注册为真正的 hermes 工具,由代理既有的插件端点提供。
+- **已知局限:** 走 hermes Codex-wire 传输发出的请求可能丢掉逐请求头面,这类配置在该传输暴露头之前停留在 wire 模式。`BILLION_CONTEXT_PROXY` 已设置(启动器管着代理)或定义了 `BILI_PROVIDER_REWRITES` 时插件整体退场。退出开关:`BILI_NATIVE_HERMES=0`。
 
 ### 客户端用 `http.proxy`(CONNECT)接入但从不压缩
 

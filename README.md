@@ -158,6 +158,7 @@ Pick by your client:
 | **omp** | [`billion-context`](https://github.com/ranxianglei/billion-context) via `bili omp` (built-in plugin) or `bili plugin install omp` (self-spawning native plugin, no launcher) |
 | **dsh** | `bili dsh` (launcher — full native plugin via `--patch`: tools, session-bound `/acp`, fetch intercept) or `bili plugin install dsh` ≡ `dsh plugin --profile <name> add billion-context` (one unified lane — pnpm-installs the package into each profile so dsh mounts the bundled patch layer; the bili form just drives dsh's own channel per profile and migrates legacy managed blocks) |
 | **kimi** | `bili plugin install kimi` (self-spawning native plugin, no launcher — Kimi Code ≥ 2.0.0; per-session routing block in `~/.kimi-code/config.toml`) or `bili kimi` (launcher, cert-MITM) or `/bili/` prefix |
+| **hermes** | `bili plugin install hermes` (self-spawning native plugin, no launcher — Python plugin, #958) or `bili hermes` (launcher, cert-MITM) |
 | **claude** | `bili claude` (launcher) or `bili plugin install claude` (native posture, #964 — managed settings block + session-owned proxy; see the notes below) |
 | **jcode** | [`billion-context`](https://github.com/ranxianglei/billion-context) via `bili jcode` (launcher, cert-MITM) or `/bili/` prefix — no native plugin possible: compiled Rust binary with no plugin seam, and its static per-provider config can't stamp per-request headers ([#962](https://github.com/ranxianglei/billion-context/issues/962)) |
 | **gemini** (Gemini CLI) | `bili gemini` (launcher, `GOOGLE_GEMINI_BASE_URL` `/bili/` rewrite) or `/bili/` prefix — launcher-only: gemini-cli's extension system reaches custom commands only, no in-loop tool seam (#1043) |
@@ -190,12 +191,12 @@ Three ways to use it — pick one:
 Mechanism details behind these three options (plugin lifecycle, runtime-info
 protocol, injection priority) live in [TECHNICAL-NOTES.md](TECHNICAL-NOTES.md).
 
-### Option 1 — Native plugin (`bili plugin install pi` / `omp` / `opencode` / `dsh` / `kimi`)
+### Option 1 — Native plugin (`bili plugin install pi` / `omp` / `opencode` / `dsh` / `kimi` / `hermes`)
 
 The proxy lives inside the client: install once, then start the client
 exactly as you always do — no launcher command, no env vars, no fixed port,
 no URL edits. Supported today for **pi**, **omp**, **opencode** (1.x and
-2.x), **dsh** and **kimi**:
+2.x), **dsh**, **kimi** and **hermes**:
 
 ```bash
 bili plugin install pi          # registers a "billion-context" entry in pi's settings (npm form when bili itself was npm-installed)
@@ -203,6 +204,7 @@ bili plugin install omp         # registers an extensions entry in omp's config.
 bili plugin install opencode    # registers the plugin in opencode's real config + disables native auto-compaction
 bili plugin install dsh         # runs 'dsh plugin --profile <name> add billion-context' for every existing profile
 bili plugin install kimi        # writes $KIMI_CODE_HOME/plugins/managed/billion-context/kimi.plugin.json (+ installed.json record); per-session routing block lands in config.toml on first start (Kimi Code >= 2.0.0)
+bili plugin install hermes      # copies the Python plugin into ~/.hermes/plugins/billion-context/ (+ machine-owned bili.json sidecar) and enables it via `hermes plugins enable billion-context`
 bili plugin remove <client>     # undo (dsh removes through the same channel; config snapshots go to .bili-bak)
 bili plugin update [client]     # bring every lane's bili presence up to date, each through its own owner (see below)
 ```
@@ -241,6 +243,7 @@ overwrites that copy in place:
 | **opencode** | opencode's plugin dir | **opencode's plugin manager** — bili never overwrites it |
 | **dsh** | each profile's pnpm store | global bili self-update re-runs dsh's plugin channel per profile (or `dsh plugin add billion-context@latest`); pnpm's hardlinked store must never be copied over in place |
 | omp / claude / codex / kimi | no copy — entries point at the global bili install | they update together with the global copy |
+| **hermes** | `~/.hermes/plugins/billion-context/` (copied files + `bili.json` sidecar pointing at the global dist) | **`bili plugin update hermes`** re-copies the files; the sidecar tracks the global install |
 
 This is enforced in code, not just convention: the self-updater
 (`src/update.ts` → `hostManagedInstall`) detects install dirs under a pnpm
@@ -259,7 +262,8 @@ rewrites model traffic to `<proxy>/bili/<upstream-url>`, registers
 mode), and reports the client's **own model config** to the proxy so
 compression budgets use the real window instead of a registry guess.
 Opt-out envs: `BILI_NATIVE_PI=0`, `BILI_NATIVE_OMP=0`,
-`BILI_NATIVE_OPENCODE=0`, `BILI_NATIVE_DSH=0`, `BILI_NATIVE_KIMI=0`. Full
+`BILI_NATIVE_OPENCODE=0`, `BILI_NATIVE_DSH=0`, `BILI_NATIVE_KIMI=0`,
+`BILI_NATIVE_HERMES=0`. Full
 mechanics: [TECHNICAL-NOTES.md](TECHNICAL-NOTES.md).
 
 **Runtime-info protocol (#955).** A native plugin reads the model config
@@ -281,6 +285,11 @@ Notes:
   carry per-request window/model headers without going stale on model switch)
   and binds subagent conversations by per-call `conversation_id` — full
   mechanics in the "Kimi Code" section below.
+- `hermes`'s native plugin is Python (its CLI agent's plugin API is
+  Python-only) — instead of patching fetch it points hermes' httpx stack at
+  the proxy via env vars after a health check, and stamps per-request headers
+  through an `llm_request` middleware; full mechanics in the "Hermes" section
+  below.
 - `codex` has a companion install too (an MCP shell), but it needs a running
   proxy — it is not native mode.
 - `claude` also has a **native posture** (#964): `bili plugin install
@@ -470,7 +479,47 @@ small node scripts that do the work around the client:
   sessions (kimi exposes no stable session id; tool calls bind via the
   per-call `conversation_id` argument), and kimi's native auto-compaction is
   NOT pushed out — ACP compression simply fires first, as in launcher mode.
-  Opt-out: `BILI_NATIVE_KIMI=0`.
+   Opt-out: `BILI_NATIVE_KIMI=0`.
+
+### Hermes (Nous Research)
+
+Three aligned modes: `bili hermes` (launcher, cert-MITM — Option 2), `/bili/`
+URL prefix, and native plugin mode (`bili plugin install hermes`, #958). The
+hermes CLI agent's plugin API is Python-only (the `desktop/plugin.js` SDK
+belongs to the separate Desktop app), so the native plugin is a small
+pure-stdlib Python module shipped inside the npm package:
+
+- **Install:** `bili plugin install hermes` copies `plugin.yaml` +
+  `__init__.py` into `~/.hermes/plugins/billion-context/`, writes a
+  machine-owned `bili.json` sidecar pointing at the global bili install
+  (`dist/index.js` + node path), and enables the plugin through hermes' own
+  channel (`hermes plugins enable billion-context` — if the CLI isn't on PATH
+  the same command is printed instead). Start a new hermes session to
+  activate. Remove with `bili plugin remove hermes`; refresh with
+  `bili plugin update hermes` after a global update.
+- **Lifecycle:** at load the plugin attaches to a healthy running proxy or
+  spawns its own on an ephemeral port (parent-pid watchdog tears it down when
+  hermes exits; concurrent starts arbitrate through the same starting-marker
+  protocol the launcher uses). Only once the proxy is verified healthy does it
+  point hermes' httpx stack at it via `HTTPS_PROXY` / `https_proxy` +
+  `HERMES_CA_BUNDLE` (bili's root CA) — `~/.hermes/config.yaml` is never
+  touched. Provider https hosts are read from hermes' config and whitelisted
+  for MITM; everything else blind-tunnels exactly like launcher mode. If no
+  proxy can be made healthy, the plugin stands down silently and traffic goes
+  direct (no compression, no dead port).
+- **Plugin-mode stamping:** an `llm_request` middleware stamps
+  `x-bili-plugin: hermes` + conversation id (= the hermes session id, so
+  gateway multi-session stays safe) + model, and `x-bili-plugin-max-output`
+  once known — ONLY after the ACP tools are registered against the live proxy
+  manifest; round 1 rides wire mode. A `pre_api_request` hook captures the
+  effective `max_tokens` and pushes runtime-info (model + max output) to the
+  proxy. `compress` / `decompress` / `acp_status` are registered as real
+  hermes tools served by the proxy's existing plugin endpoints.
+- **Known limitations:** requests going out hermes' Codex-wire transport may
+  drop the per-request header surface, so such setups stay in wire mode until
+  that transport exposes headers. Inert when `BILLION_CONTEXT_PROXY` is set
+  (the launcher owns the proxy) or `BILI_PROVIDER_REWRITES` is defined.
+  Opt-out: `BILI_NATIVE_HERMES=0`.
 
 ### Gemini family (Gemini CLI / iFlow CLI / Qwen Code)
 

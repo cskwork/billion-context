@@ -1,7 +1,7 @@
 import type { CoreMessage } from "acp-kernel";
 import { coreToAnthropic, extractSystem, buildSystem, type AnthropicRequestBody } from "acp-kernel/wire";
 import { buildVisibilityMarker } from "../compress-loop.js";
-import { composeStreamFilters, createMarkerLineFilter, createTagEchoFilter, stripAcpTags } from "./tag-echo-filter.js";
+import { composeStreamFilters, createMarkerLineFilter, createTagEchoFilter } from "./tag-echo-filter.js";
 import { degenerateTurnWarning } from "../degenerate-turn.js";
 import { log as loggerLog } from "../logger.js";
 import type {
@@ -319,11 +319,12 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                     if (tb) {
                         pending.delete(upstreamIndex);
                         toolCallsEmitted++;
+                        // #1039 invariant: arguments are user intent, verbatim — see tag-echo-filter.ts header.
                         yield {
                             kind: "tool_call",
                             name: tb.name,
                             callId: tb.id,
-                            arguments: stripAcpTags(tb.json),
+                            arguments: tb.json,
                         } as ParsedStreamEvent;
                     } else if (thinkingIndexes.delete(upstreamIndex)) {
                         // Seal the current thinking segment so interleaved thinking

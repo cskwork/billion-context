@@ -4,7 +4,7 @@ import { coreToResponsesWithToolImages as coreToResponses, patchResponsesInputWi
 import { buildVisibilityMarker } from "../compress-loop.js";
 import { hoistTrappedToolItems } from "../tool-pair-order.js";
 import { hashId } from "../util.js";
-import { composeStreamFilters, createMarkerLineFilter, createTagEchoFilter, stripResponsesText, stripAcpTags, containsMarkerLineText, containsRenderTagText, ACP_NAME_ALT } from "./tag-echo-filter.js";
+import { composeStreamFilters, createMarkerLineFilter, createTagEchoFilter, stripResponsesText, containsMarkerLineText, containsRenderTagText, ACP_NAME_ALT } from "./tag-echo-filter.js";
 import { degenerateTurnWarning } from "../degenerate-turn.js";
 import { log as loggerLog } from "../logger.js";
 import { ACP_TEXT_OPEN, ACP_TEXT_CLOSE, ACP_STATUS_OPEN, ACP_STATUS_CLOSE, ACP_SEARCH_OPEN, ACP_SEARCH_CLOSE, ACP_DECOMPRESS_OPEN, ACP_DECOMPRESS_CLOSE, COMPRESS_TOOL_NAME, PROXY_TOOL_NAMES } from "../compress-tool.js";
@@ -57,6 +57,13 @@ export function sanitizeResponsesInputIds(input: unknown): void {
     if (!Array.isArray(input)) return;
     for (const item of input) {
         const rec = item as Record<string, unknown>;
+        // Client-visible proxy ids are not upstream item identities; replay the full message instead.
+        if (rec?.type === "message" && rec.role === "assistant"
+            && typeof rec.id === "string" && rec.id.startsWith("msg-proxy-")
+            && (typeof rec.content === "string" || Array.isArray(rec.content))) {
+            delete rec.id;
+            continue;
+        }
         if (typeof rec?.id === "string" && rec.id.length > RESPONSES_ITEM_ID_MAX) {
             rec.id = `msg-fix-${hashId(rec.id)}`;
         }
@@ -215,7 +222,7 @@ function buildMessageItemSequence(itemId: string, outputIndex: number, text: str
 }
 
 function buildFunctionCallEvents(fc: ToolCallEmit, itemId: string, outputIndex: number): Buffer {
-    const args = stripAcpTags(fc.arguments);
+    const args = fc.arguments;
     return Buffer.from(
         [
             `event: response.output_item.added\ndata: ${JSON.stringify({
@@ -381,20 +388,17 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
                                 arguments: "",
                             });
                         } else {
-                            const chunk = (containsRenderTagText(eventStr) || containsMarkerLineText(eventStr)) ? rebuildResponsesEvent(type, stripResponsesText(obj)) : rawBuf;
-                            yield { kind: "meta", chunk, firstRoundOnly: false } as ParsedStreamEvent;
+                            yield { kind: "meta", chunk: rawBuf, firstRoundOnly: false } as ParsedStreamEvent;
                         }
                     } else if (item?.type === "custom_tool_call") {
-                        const chunk = (containsRenderTagText(eventStr) || containsMarkerLineText(eventStr)) ? rebuildResponsesEvent(type, stripResponsesText(obj)) : rawBuf;
-                        yield { kind: "meta", chunk, firstRoundOnly: false } as ParsedStreamEvent;
+                        yield { kind: "meta", chunk: rawBuf, firstRoundOnly: false } as ParsedStreamEvent;
                     } else if (item?.type === "message" && round > 1 && !suppressTextLifecycle) {
                         const origId = typeof item.id === "string" ? item.id : "";
                         const mapped = { id: `msg-proxy-${round}-${hashId(origId || String(outputIndex))}`, index: outputIndex++ };
                         if (origId) remapped.set(origId, mapped);
                         yield { kind: "meta", chunk: rewriteItemEvent(type, obj, mapped), firstRoundOnly: false } as ParsedStreamEvent;
                     } else if (item?.type !== "message" || !suppressTextLifecycle) {
-                        const chunk = (containsRenderTagText(eventStr) || containsMarkerLineText(eventStr)) ? rebuildResponsesEvent(type, stripResponsesText(obj)) : rawBuf;
-                        yield { kind: "meta", chunk, firstRoundOnly: true } as ParsedStreamEvent;
+                        yield { kind: "meta", chunk: rawBuf, firstRoundOnly: true } as ParsedStreamEvent;
                     }
                 } else if (
                     type === "response.content_part.added" ||
@@ -432,19 +436,13 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
                     const delta = typeof obj.delta === "string" ? obj.delta : "";
                     const fc = pending.get(itemId);
                     if (fc) fc.arguments += delta;
-                    else {
-                        const chunk = (containsRenderTagText(eventStr) || containsMarkerLineText(eventStr)) ? rebuildResponsesEvent(type, stripResponsesText(obj)) : rawBuf;
-                        yield { kind: "meta", chunk, firstRoundOnly: false } as ParsedStreamEvent;
-                    }
+                    else yield { kind: "meta", chunk: rawBuf, firstRoundOnly: false } as ParsedStreamEvent;
                 } else if (type === "response.function_call_arguments.done") {
                     const itemId = typeof obj.item_id === "string" ? obj.item_id : "";
                     const args = typeof obj.arguments === "string" ? obj.arguments : "";
                     const fc = pending.get(itemId);
                     if (fc && args) fc.arguments = args;
-                    else {
-                        const chunk = (containsRenderTagText(eventStr) || containsMarkerLineText(eventStr)) ? rebuildResponsesEvent(type, stripResponsesText(obj)) : rawBuf;
-                        yield { kind: "meta", chunk, firstRoundOnly: false } as ParsedStreamEvent;
-                    }
+                    else yield { kind: "meta", chunk: rawBuf, firstRoundOnly: false } as ParsedStreamEvent;
                 } else if (type === "response.output_item.done") {
                     const item = obj.item as Record<string, unknown> | undefined;
                     if (item?.type === "function_call") {
@@ -454,27 +452,26 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
                             if (typeof item.arguments === "string" && item.arguments) fc.arguments = item.arguments;
                             pending.delete(itemId);
                             toolCallsEmitted++;
+                            // #1039 invariant: arguments are user intent, verbatim — see tag-echo-filter.ts header.
                             yield {
                                 kind: "tool_call",
                                 name: fc.name,
                                 callId: fc.callId,
-                                arguments: stripAcpTags(fc.arguments),
+                                arguments: fc.arguments,
                             } as ParsedStreamEvent;
                         } else {
-                            const chunk = (containsRenderTagText(eventStr) || containsMarkerLineText(eventStr)) ? rebuildResponsesEvent(type, stripResponsesText(obj)) : rawBuf;
-                            yield { kind: "meta", chunk, firstRoundOnly: false } as ParsedStreamEvent;
+                            yield { kind: "meta", chunk: rawBuf, firstRoundOnly: false } as ParsedStreamEvent;
                             toolCallsEmitted++;
                             yield {
                                 kind: "tool_call",
                                 name: typeof item.name === "string" ? item.name : "",
                                 callId: typeof item.call_id === "string" ? item.call_id : "",
-                                arguments: typeof item.arguments === "string" ? stripAcpTags(item.arguments) : "",
+                                arguments: typeof item.arguments === "string" ? item.arguments : "",
                                 passthrough: true,
                             } as ParsedStreamEvent;
                         }
                     } else if (item?.type === "custom_tool_call") {
-                        const chunk = (containsRenderTagText(eventStr) || containsMarkerLineText(eventStr)) ? rebuildResponsesEvent(type, stripResponsesText(obj)) : rawBuf;
-                        yield { kind: "meta", chunk, firstRoundOnly: false } as ParsedStreamEvent;
+                        yield { kind: "meta", chunk: rawBuf, firstRoundOnly: false } as ParsedStreamEvent;
                     } else if (item?.type === "message") {
                         const origId = typeof item.id === "string" ? item.id : "";
                         const mapped = remapped.get(origId);
@@ -486,8 +483,7 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
                             yield { kind: "meta", chunk, firstRoundOnly: true } as ParsedStreamEvent;
                         }
                     } else if (item?.type !== "message" || !suppressTextLifecycle) {
-                        const chunk = (containsRenderTagText(eventStr) || containsMarkerLineText(eventStr)) ? rebuildResponsesEvent(type, stripResponsesText(obj)) : rawBuf;
-                        yield { kind: "meta", chunk, firstRoundOnly: true } as ParsedStreamEvent;
+                        yield { kind: "meta", chunk: rawBuf, firstRoundOnly: true } as ParsedStreamEvent;
                     }
                 } else if (type === "response.completed") {
                     yield* flushFilter();

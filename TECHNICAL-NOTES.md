@@ -36,8 +36,10 @@ of its own. Implementations: `src/agent/pi.ts` (covers pi and omp),
 `src/agent/opencode-native.ts` (v1), `src/agent/opencode-v2.ts`,
 `src/agent/dsh-native.ts`, `src/kimi/native-mcp.ts` (bootstrap-time report
 only — kimi's provider `custom_headers` are static, so per-request headers
-would go stale on model switch) — other client integrations should follow
-the same protocol.
+would go stale on model switch), `hermes-plugin/__init__.py` (Python plugin:
+per-request headers via an `llm_request` middleware, max output captured by a
+`pre_api_request` hook) — other client integrations should follow the same
+protocol.
 
 The launcher env tier covers pure-proxy clients (no in-process plugin):
 `bili <client>` reads the client's own model config at launch

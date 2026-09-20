@@ -39,14 +39,38 @@ export function bufferToStream(buf: Buffer): ReadableStream<Uint8Array> {
     });
 }
 
+/** Minimal writable surface {@link awaitDrain} needs — satisfied by
+ *  http.ServerResponse and by test recording sinks alike. */
+export interface DrainableResponse {
+    destroyed?: boolean;
+    writableEnded?: boolean;
+    once(event: string, cb: () => void): unknown;
+}
+
+// Backpressure wait that also resolves when the CLIENT goes away (#100). A
+// drain-only wait hangs forever once the client stops reading mid-stream:
+// 'drain' never fires again, while 'close'/'error' do. If the response is
+// already dead, resolve immediately — a fresh listener registered after
+// 'close' has fired could never fire, so a second backpressure write after
+// the disconnect would hang again.
+export function awaitDrain(res: DrainableResponse): Promise<void> {
+    if (res.destroyed || res.writableEnded) return Promise.resolve();
+    return new Promise((resolve) => {
+        res.once("drain", resolve);
+        res.once("close", resolve);
+        res.once("error", resolve);
+    });
+}
+
 export async function pipeThrough(stream: ReadableStream<Uint8Array>, res: http.ServerResponse): Promise<void> {
     const reader = stream.getReader();
     try {
         for (;;) {
             const { done, value } = await reader.read();
             if (done) break;
+            if (res.destroyed || res.writableEnded) break;
             if (!res.write(Buffer.from(value))) {
-                await new Promise<void>((r) => res.once("drain", () => r()));
+                await awaitDrain(res);
             }
         }
     } finally {

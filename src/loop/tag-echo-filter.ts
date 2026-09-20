@@ -21,6 +21,21 @@
 // close), so real words that merely contain the letters (acpi/acpi.h includes,
 // caption, app, uppercase ACPI) never match; a false positive costs at most
 // the same bounded caps as before (swallow ≤ SWALLOW_CAP, hold ≤ HOLD_LIMIT/TAG_OPEN_CAP).
+//
+// ─── INVARIANT (#1039): tool-call arguments are user intent ─────────────────
+// Anything the host will EXECUTE or PERSIST — tool-call arguments in every
+// wire shape (openai tool_calls[].function.arguments fragments, anthropic
+// input_json_delta.partial_json and tool_use.input, responses
+// function_call_arguments.delta/.done and item.arguments) — is forwarded
+// BYTE-EXACT. Never route it through any filter from this file, at fragment
+// or whole-payload granularity, and never "clean" it because it contains a
+// tag-shaped echo. A shape-based filter cannot distinguish a model-echoed
+// render tag from a literal the user genuinely wants written (bash command
+// strings, write/edit file contents): stripping arguments silently corrupts
+// executed/persisted data (#1039). Echoed tags surfacing in a host TUI is
+// cosmetic noise; that fix belongs on the injection side (host renderTags
+// policy, #933), never here. The strippers below apply to model PROSE only
+// (content/reasoning_content/reasoning/thinking/text/summary fields).
 function buildAcplikeName(): string {
     const cores = ["acp", "apc", "cap", "cpa", "pac", "pca"];
     const names = new Set<string>(cores);
@@ -160,7 +175,7 @@ const MARKER_HEAD = /^\p{So}(?:[ \t])?\[ACP\]/u;
 // cheap and lossless (flush/content-preservation resolves it); the strict
 // \p{So} decision happens only in MARKER_HEAD, so prose is never stripped.
 const MARKER_HEAD_PREFIX = /^[^\x00-\x7F](?:[ \t])?(?:\[ACP\]|\[ACP|\[AC|\[A|\[)?$/u;
-const MARKER_LINE = /^\p{So}(?:[ \t])?\[ACP\][^\n]*\n?/gmu;
+export const MARKER_LINE = /^\p{So}(?:[ \t])?\[ACP\][^\n]*\n?/gmu;
 // Conservative tail probe for the streaming fast-path gate below: the chunk's
 // last line is still an undecidable marker-head prefix (icon alone, or icon +
 // partial "[ACP"), so the next chunk must flow through the filter. Any
@@ -432,7 +447,6 @@ function stripItemContent(it: unknown): unknown {
         out[k] = v;
     };
     if (Array.isArray(io.content)) set("content", stripParts(io.content));
-    if (typeof io.arguments === "string") set("arguments", stripAcpTags(io.arguments));
     if (Array.isArray(io.summary)) {
         set(
             "summary",
@@ -450,81 +464,15 @@ function stripIfString(v: unknown): unknown {
     return typeof v === "string" ? stripAcpTags(v) : v;
 }
 
-// #933: whole-object invariant — field-enumerated stripping kept missing new
-// carriers (tool-call arguments); these walk every string leaf instead.
-export function stripAcpTagsDeep(v: unknown): unknown {
-    if (typeof v === "string") return stripAcpTags(v);
-    if (Array.isArray(v)) {
-        let changed = false;
-        const out = v.map((x) => {
-            const r = stripAcpTagsDeep(x);
-            if (r !== x) changed = true;
-            return r;
-        });
-        return changed ? out : v;
-    }
-    if (v && typeof v === "object") {
-        let changed = false;
-        const out: Record<string, unknown> = {};
-        for (const [k, x] of Object.entries(v as Record<string, unknown>)) {
-            const r = stripAcpTagsDeep(x);
-            if (r !== x) changed = true;
-            out[k] = r;
-        }
-        return changed ? out : v;
-    }
-    return v;
-}
-
-export function findAcpLikeTagSnippetsDeep(v: unknown, path = "$"): string[] {
-    const hits: string[] = [];
-    const visit = (x: unknown, p: string): void => {
-        if (typeof x === "string") {
-            const pairedSpans: Array<[number, number]> = [];
-            for (const m of x.matchAll(new RegExp(PAIRED.source, "g"))) {
-                hits.push(`${p}: ${m[0].slice(0, 60)}`);
-                pairedSpans.push([m.index, m.index + m[0].length]);
-            }
-            for (const re of [new RegExp(LONE_OPEN.source, "g"), new RegExp(LONE_CLOSE.source, "g")]) {
-                for (const m of x.matchAll(re)) {
-                    if (pairedSpans.some(([s, e]) => m.index! >= s && m.index! < e)) continue;
-                    hits.push(`${p}: ${m[0].slice(0, 60)}`);
-                }
-            }
-            for (const m of x.matchAll(MARKER_LINE)) hits.push(`${p}: ${m[0].slice(0, 60)}`);
-            return;
-        }
-        if (Array.isArray(x)) {
-            x.forEach((it, i) => visit(it, `${p}[${i}]`));
-            return;
-        }
-        if (x && typeof x === "object") {
-            for (const [k, it] of Object.entries(x as Record<string, unknown>)) visit(it, `${p}.${k}`);
-        }
-    };
-    visit(v, path);
-    return hits;
-}
-
-function stripToolCallArgs(tcs: unknown): unknown {
-    if (!Array.isArray(tcs)) return tcs;
-    return tcs.map((tc) => {
-        if (!tc || typeof tc !== "object") return tc;
-        const tco = tc as Record<string, unknown>;
-        const fn = tco["function"];
-        if (fn && typeof fn === "object" && typeof (fn as Record<string, unknown>)["arguments"] === "string") {
-            return { ...tco, function: { ...(fn as Record<string, unknown>), arguments: stripAcpTags((fn as Record<string, unknown>)["arguments"] as string) } };
-        }
-        return tc;
-    });
-}
-
 // Plugin-passthrough parity for the OpenAI chat-completions wire (issue #14:
 // pi + qwen echoed render tags through the verbatim plugin stream): strip the
-// text fields and tool-call arguments a chat chunk / completion carries —
-// `choices[].delta.{content,reasoning_content,reasoning}` +
-// `tool_calls[].function.arguments` on streams, `choices[].message.*` on
-// non-streaming bodies. Mutates in place, mirroring stripResponsesText.
+// text fields a chat chunk / completion carries —
+// `choices[].delta.{content,reasoning_content,reasoning}` on streams,
+// `choices[].message.*` on non-streaming bodies. Tool-call arguments are
+// deliberately left untouched (#1039): they carry user intent that hosts
+// execute/persist, so a shape-based false positive would silently corrupt
+// data — only model prose is stripped. Mutates in place, mirroring
+// stripResponsesText.
 export function stripOpenaiChatText<T>(obj: T): T {
     if (!obj || typeof obj !== "object") return obj;
     const o = obj as Record<string, unknown>;
@@ -539,7 +487,6 @@ export function stripOpenaiChatText<T>(obj: T): T {
                 hh["content"] = stripIfString(hh["content"]);
                 hh["reasoning_content"] = stripIfString(hh["reasoning_content"]);
                 hh["reasoning"] = stripIfString(hh["reasoning"]);
-                hh["tool_calls"] = stripToolCallArgs(hh["tool_calls"]);
                 ch[holder] = hh;
             }
         }
@@ -559,22 +506,14 @@ export function stripAnthropicText<T>(obj: T): T {
         const dd = { ...(d as Record<string, unknown>) };
         dd["text"] = stripIfString(dd["text"]);
         dd["thinking"] = stripIfString(dd["thinking"]);
-        dd["partial_json"] = stripIfString(dd["partial_json"]);
         o["delta"] = dd;
     }
     if (Array.isArray(o["content"])) {
         o["content"] = (o["content"] as unknown[]).map((c) => {
             if (!c || typeof c !== "object") return c;
             const cc = c as Record<string, unknown>;
-            const hasText = typeof cc["text"] === "string" || typeof cc["thinking"] === "string";
-            const input = cc["type"] === "tool_use" ? cc["input"] : undefined;
-            const hasInput = input != null && typeof input === "object";
-            if (!hasText && !hasInput) return c;
-            return {
-                ...cc,
-                ...(hasText ? { text: stripIfString(cc["text"]), thinking: stripIfString(cc["thinking"]) } : {}),
-                ...(hasInput ? { input: stripAcpTagsDeep(input) } : {}),
-            };
+            if (typeof cc["text"] !== "string" && typeof cc["thinking"] !== "string") return c;
+            return { ...cc, text: stripIfString(cc["text"]), thinking: stripIfString(cc["thinking"]) };
         });
     }
     return obj;
@@ -584,13 +523,14 @@ export function stripAnthropicText<T>(obj: T): T {
 // object (mutates in place). Handles the shapes that carry literal text:
 // output_text.done `.text`, content_part.done `.part.text`,
 // output_item.done `.item.content[].text`, and `.response.output[].content[]`
-// on response.completed.
+// on response.completed. Tool-call arguments (`.arguments`, the `.delta`
+// fragment carriers) are deliberately untouched (#1039): they carry user
+// intent that hosts execute/persist, so a shape-based false positive would
+// silently corrupt data — only model prose is stripped.
 export function stripResponsesText<T>(obj: T): T {
     if (!obj || typeof obj !== "object") return obj;
     const o = obj as Record<string, unknown>;
     if (typeof o.text === "string") o.text = stripAcpTags(o.text);
-    if (typeof o.arguments === "string") o.arguments = stripAcpTags(o.arguments);
-    if (typeof o.delta === "string") o.delta = stripAcpTags(o.delta);
     if (o.part && typeof o.part === "object" && typeof (o.part as Record<string, unknown>).text === "string") {
         o.part = { ...(o.part as Record<string, unknown>), text: stripAcpTags((o.part as Record<string, unknown>).text as string) };
     }

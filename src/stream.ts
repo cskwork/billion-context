@@ -122,7 +122,7 @@ function normalizedSpecKey(ranges: ParsedRange[]): string {
         .sort()
         .join(",");
 }
-function recordCompressFailure(session: Session, key: string): string {
+function recordCompressFailure(session: Session, key: string, repeatAdvice?: string): string {
     if (!key) return "";
     const prev = session.metadata[FAIL_STREAK_KEY];
     const keys = Array.isArray(prev) ? prev.filter((k): k is string => typeof k === "string") : [];
@@ -132,7 +132,8 @@ function recordCompressFailure(session: Session, key: string): string {
     session.metadata[FAIL_STREAK_KEY] = keys;
     markDirty(session);
     if (occurrences < 2) return "";
-    return ` [Repeat-failure guard: you have now requested this exact range set ${occurrences} time(s) in this session and it keeps failing with the same error. Repeating it deterministically fails the same way until the visible context changes — do NOT re-issue it. Call acp_status first and pick from its CURRENT compressible ranges, or extend your range(s) to cover more adjacent messages.]`;
+    const advice = repeatAdvice ?? "Call acp_status first and pick from its CURRENT compressible ranges, or extend your range(s) to cover more adjacent messages.";
+    return ` [Repeat-failure guard: you have now requested this exact spec ${occurrences} time(s) in this session and it keeps failing with the same error. Repeating it deterministically fails the same way until the visible context changes — do NOT re-issue it. ${advice}]`;
 }
 function clearCompressFailures(session: Session): void {
     if (session.metadata[FAIL_STREAK_KEY] !== undefined) {
@@ -141,13 +142,49 @@ function clearCompressFailures(session: Session): void {
     }
 }
 
+// #1029: after a session-generation change (client restart/fork starts a fresh
+// session instance whose refs restart at m00001), stale refs from the previous
+// generation fail resolution. The kernel gate points at acp_status; inline the
+// current span here so the model can re-issue immediately without the round-trip.
+function currentRefsSnapshot(ctx: RewriteCtx): string {
+    // Refs live in state.messageRefs (mNNNNN namespace); message ids are raw
+    // client ids and carry no ref numbers.
+    let loId = "";
+    let hiId = "";
+    let loN = Infinity;
+    let hiN = -1;
+    for (const ref of Object.keys(ctx.session.state.messageRefs?.byRef ?? {})) {
+        const m = M_REF_NUM_RE.exec(ref);
+        if (!m) continue;
+        const n = Number(m[1]);
+        if (n < loN) { loN = n; loId = ref; }
+        if (n > hiN) { hiN = n; hiId = ref; }
+    }
+    if (!loId || !hiId) return "";
+    const activeBlocks = ctx.session.state.blocks.filter((b) => b.active).length;
+    return ` [Current context: ${ctx.messages.length} visible message(s), refs ${loId}–${hiId}, ${activeBlocks} active block(s). Refs restart at m00001 after a session-generation change — request only refs inside this span, or call acp_status for exact compressible ranges.]`;
+}
+
 export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: RewriteCtx): string {
     const { ranges, diagnostics } = parsed;
     if (ranges.length === 0) {
         ctx.log("[acp-proxy: compress call had no valid ranges; nothing compressed.]");
-        const reasons = diagnostics.invalidReasons?.slice(0, 8).map((r) => (r.length > 200 ? r.slice(0, 200) + "..." : r)) ?? [];
-        const why = reasons.length > 0 ? ` Rejected entries:\n${reasons.map((r) => `- ${r}`).join("\n")}` : "";
-        return `[Compression FAILED: no valid ranges parsed (kind=${diagnostics.kind}, dropped=${diagnostics.invalidItems}).${why}\n compress requires a non-empty 'content' array where each element is EITHER an object {startId, endId, summary} OR one line-form string whose first line is 'mNNNNN–mNNNNN optional topic' with the summary markdown on the following lines (a separate summary-only element right after a bare header line is also accepted). startId/endId are mNNNNN message refs from the conversation.${compressibleSpanHint(ctx.session.state)} Re-issue the compress call with a valid content array.]`;
+        const rawReasons = diagnostics.invalidReasons ?? [];
+        for (const reason of rawReasons) ctx.log(`[acp-proxy: rejected entry: ${reason}]`);
+        // #1029: keep the ENTIRE failure on ONE line. buildVisibilityMarker
+        // (the ❌ status line streamed to the client) keeps only line 1, so the
+        // old multi-line "Rejected entries:" list reached clients as a dangling
+        // header with no entries — stored in client history and re-sent forever,
+        // and useless for self-correction. Inline the reasons instead (full
+        // list stays logged above).
+        const reasons = rawReasons.slice(0, 3).map((r) => (r.length > 160 ? r.slice(0, 160) + "..." : r));
+        const why = reasons.length > 0 ? ` Rejected entries: ${reasons.join(" | ")}.` : "";
+        const guard = recordCompressFailure(
+            ctx.session,
+            `parse:${diagnostics.kind}:${diagnostics.invalidItems}:${rawReasons.slice(0, 3).join("|")}`,
+            "Fix the argument shape against the format below instead of re-issuing the same malformed call.",
+        );
+        return `[Compression FAILED: no valid ranges parsed (kind=${diagnostics.kind}, dropped=${diagnostics.invalidItems}).${why} compress requires a non-empty 'content' array where each element is EITHER an object {startId, endId, summary} OR one line-form string whose first line is 'mNNNNN–mNNNNN optional topic' with the summary markdown on the following lines (a separate summary-only element right after a bare header line is also accepted). startId/endId are mNNNNN message refs from the conversation (call acp_status to see current refs).${compressibleSpanHint(ctx.session.state)} Re-issue the compress call with a valid content array.${guard}]`;
     }
     // #847: detect reversed refs as SUBMITTED, before #1001 normalization
     // rewrites them (order matters — normalizeRangeOrder mutates in place).
@@ -204,7 +241,11 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
                 ? ` Note: startId > endId in range(s) ${revs.map((rg) => `${rg.startRef}→${rg.endRef}`).join(", ")} — your refs were reversed; they were normalized to ascending order before evaluation, so check your ref order.`
                 : "";
             ctx.log(`[acp-proxy: compress FAILED ${detail} → 0 blocks. ${errs}${revs.length > 0 ? " [reversed refs]" : ""}]`);
-            return `[Compression FAILED: ${errs}${revNote}${recordCompressFailure(ctx.session, normalizedSpecKey(ranges))}${compressibleSpanHint(ctx.session.state)}]`;
+            // #1036 span hint names boundary+1..highest ("still raw") — it
+            // duplicates the snapshot's lo–hi exactly when no fold covers
+            // anything, so only append it when active blocks exist.
+            const spanHint = ctx.session.state.blocks.some((b) => b.active) ? compressibleSpanHint(ctx.session.state) : "";
+            return `[Compression FAILED: ${errs}${revNote}${currentRefsSnapshot(ctx)}${recordCompressFailure(ctx.session, normalizedSpecKey(ranges))}${spanHint}]`;
         }
         clearCompressFailures(ctx.session);
 
