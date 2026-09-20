@@ -3,7 +3,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { loadClientConfig, resolvePiHome, resolveCodebuddyHome, resolveQoderHome, resolveTraeHome, nonEmpty, QODER_DEFAULT_MODEL_HOSTS, TRAE_DEFAULT_MODEL_HOSTS, type ClientConfig } from "./client-config.js";
+import { loadClientConfig, resolvePiHome, resolveCodebuddyHome, resolveQoderHome, resolveTraeHome, nonEmpty, QODER_DEFAULT_MODEL_HOSTS, TRAE_DEFAULT_MODEL_HOSTS, AIDER_DEFAULT_MODEL_HOSTS, type ClientConfig } from "./client-config.js";
 
 const TTL_MS = 2000;
 
@@ -57,6 +57,17 @@ export function extractHttpsHosts(config: ClientConfig): string[] {
     if (config.trae) {
         const hosts = nonEmpty(config.trae.modelApiHost) ? [config.trae.modelApiHost] : TRAE_DEFAULT_MODEL_HOSTS;
         for (const h of hosts) push(`https://${h}`);
+    }
+    if (config.aider) {
+        // #1048: aider's endpoints come from runtime env / .aider.conf.yml /
+        // CLI args (no persistent store). Declared URLs are full URLs (push
+        // keeps the https ones); nothing declared → the common defaults.
+        const urls = config.aider.baseUrls ?? [];
+        if (urls.length > 0) {
+            for (const u of urls) push(u);
+        } else {
+            for (const h of AIDER_DEFAULT_MODEL_HOSTS) push(`https://${h}`);
+        }
     }
     return out;
 }

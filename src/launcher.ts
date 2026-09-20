@@ -13,6 +13,7 @@
  *   bili codex  [-- client args...]   HTTPS_PROXY + SSL_CERT_FILE
  *   bili claude [-- client args...]   HTTPS_PROXY + NODE_EXTRA_CA_CERTS
  *   bili kimi   [-- client args...]   HTTPS_PROXY + NODE_EXTRA_CA_CERTS (cert-MITM)
+ *   bili aider  [-- client args...]   HTTPS_PROXY + SSL_CERT_FILE/REQUESTS_CA_BUNDLE (cert-MITM)
  *   bili test pi                      non-polluting pi smoke test
  *
  * The real upstream hosts are DISCOVERED by reading (never editing) the
@@ -54,7 +55,7 @@ import { selfPackageRoot, isBiliPiEntry, ompPluginLoadedFrom, dshNativeInstalled
 function selfDistFile(name: string): string {
     return path.join(selfPackageRoot(), "dist", name);
 }
-import { nonEmpty, resolvePiHome, resolveOmpHome, resolveDshHome, resolveCodexHome, loadClientConfig, collectModelWindows, collectModelMaxOutputs, type ClientConfig, type CodexConfig, resolveOpencodeConfigFile, readOpencodeConfigRoot, opencodePluginBaseDir, type OpencodeConfig, type OpencodeProvider, type HermesConfig, type HermesProvider, qoderIsCnSite, QODER_DEFAULT_MODEL_HOSTS, resolveTraeHome, readTraeConfig, TRAE_DEFAULT_MODEL_HOSTS, JCODE_DEFAULT_MODEL_HOSTS, type TraeConfig, resolveKimiHome, readKimiConfig, parseKimiToml, KIMI_DEFAULT_MODEL_HOSTS, QWEN_DEFAULT_MODEL_HOSTS, type KimiConfig, type KimiProvider, readOpencodeProjectLayer, type OpencodeProjectLayer, readMcodeConfig, resolveMcodeInstallDir, MCODE_DEFAULT_MODEL_HOSTS, type McodeConfig } from "./client-config.js";
+import { nonEmpty, resolvePiHome, resolveOmpHome, resolveDshHome, resolveCodexHome, loadClientConfig, collectModelWindows, collectModelMaxOutputs, type ClientConfig, type CodexConfig, resolveOpencodeConfigFile, readOpencodeConfigRoot, opencodePluginBaseDir, type OpencodeConfig, type OpencodeProvider, type HermesConfig, type HermesProvider, qoderIsCnSite, QODER_DEFAULT_MODEL_HOSTS, resolveTraeHome, readTraeConfig, TRAE_DEFAULT_MODEL_HOSTS, JCODE_DEFAULT_MODEL_HOSTS, type TraeConfig, resolveKimiHome, readKimiConfig, parseKimiToml, KIMI_DEFAULT_MODEL_HOSTS, QWEN_DEFAULT_MODEL_HOSTS, type KimiConfig, type KimiProvider, readOpencodeProjectLayer, type OpencodeProjectLayer, readMcodeConfig, resolveMcodeInstallDir, MCODE_DEFAULT_MODEL_HOSTS, type McodeConfig, discoverAiderArgUrls, AIDER_DEFAULT_MODEL_HOSTS } from "./client-config.js";
 import { loadRoutes, resolveConfiguredContextLimit, lookupContextLimit, type ProviderRoutes } from "./config.js";
 import { contextFromRegistry } from "./registry.js";
 
@@ -121,12 +122,18 @@ export {
     mcodeConfigFiles,
     MCODE_DEFAULT_MODEL_HOSTS,
     type McodeConfig,
+    readAiderConfig,
+    readAiderConfUrls,
+    discoverAiderArgUrls,
+    AIDER_DEFAULT_MODEL_HOSTS,
+    AIDER_BASE_URL_ENVS,
+    type AiderConfig,
 } from "./client-config.js";
 
 export const LAUNCHER_DEFAULT_HOST = "127.0.0.1";
-export const LAUNCH_CLIENTS = ["pi", "codex", "claude", "omp", "opencode", "hermes", "dsh", "codebuddy", "qoder", "trae", "jcode", "kimi", "gemini", "iflow", "qwen", "mcode", "pi-test"] as const;
+export const LAUNCH_CLIENTS = ["pi", "codex", "claude", "omp", "opencode", "hermes", "dsh", "codebuddy", "qoder", "trae", "jcode", "kimi", "gemini", "iflow", "qwen", "mcode", "aider", "pi-test"] as const;
 export type ClientName = (typeof LAUNCH_CLIENTS)[number];
-export type BaseClientName = "claude" | "codex" | "pi" | "omp" | "opencode" | "hermes" | "dsh" | "codebuddy" | "qoder" | "trae" | "jcode" | "kimi" | "gemini" | "iflow" | "qwen" | "mcode";
+export type BaseClientName = "claude" | "codex" | "pi" | "omp" | "opencode" | "hermes" | "dsh" | "codebuddy" | "qoder" | "trae" | "jcode" | "kimi" | "gemini" | "iflow" | "qwen" | "mcode" | "aider";
 
 const HEALTH_PATH = "/__bili/health";
 const HEALTH_POLL_INTERVAL_MS = 200;
@@ -653,6 +660,51 @@ export function discoverRoutes(client: ClientName, config: ClientConfig): Discov
                 httpsDomains.push(host);
             }
         }
+    } else if (client === "aider") {
+        // #1048: aider's Python stack (litellm → httpx, plus requests) honors
+        // standard proxy envs for all outbound traffic, so no URL rewriting
+        // exists or is needed — only destination routing: https upstreams get
+        // cert MITM (host whitelisted below), non-loopback plain-http ride
+        // absolute-form forward-proxy requests (httpEnvRoutes). Loopback
+        // destinations stay direct via NO_PROXY and are inventory-only
+        // (compressing them would require editing .aider.conf.yml, which the
+        // zero-config-change contract forbids). Endpoints come from runtime
+        // env + .aider.conf.yml + CLI args (merged by runLaunch); nothing
+        // declared → the common defaults.
+        const aiderSeen = new Set<string>();
+        let anon = 0;
+        for (const raw of config.aider?.baseUrls ?? []) {
+            const real = unwrapUpstream(raw);
+            try {
+                const url = new URL(real);
+                if (url.protocol !== "http:" && url.protocol !== "https:") continue;
+                if (aiderSeen.has(real)) continue;
+                aiderSeen.add(real);
+                if (isLoopbackHost(url.hostname)) {
+                    anon += 1;
+                    rewriteKeys.add(`aider-${anon}`);
+                    httpRewrites.push({ key: `aider-${anon}`, realUpstream: real });
+                } else if (url.protocol === "https:") {
+                    const host = url.hostname.toLowerCase();
+                    if (host && !httpsSeen.has(host)) {
+                        httpsSeen.add(host);
+                        httpsDomains.push(host);
+                    }
+                } else if (!httpEnvRoutes.includes(real)) {
+                    httpEnvRoutes.push(real);
+                }
+            } catch {
+                // Unparseable endpoint: skip.
+            }
+        }
+        if ((config.aider?.baseUrls ?? []).length === 0) {
+            for (const h of AIDER_DEFAULT_MODEL_HOSTS) {
+                if (!httpsSeen.has(h)) {
+                    httpsSeen.add(h);
+                    httpsDomains.push(h);
+                }
+            }
+        }
     } else {
         for (const [name, prov] of Object.entries(config.codex?.providers ?? {})) {
             classify(prov.baseUrl, `model_providers.${name}.base_url`);
@@ -716,6 +768,26 @@ export function buildJcodeEnv(origin: string, caPath: string, baseEnv: NodeJS.Pr
         ...baseEnv,
         HTTPS_PROXY: origin,
         SSL_CERT_FILE: caPath,
+        BILLION_CONTEXT_PROXY: origin,
+        NO_PROXY: "localhost,127.0.0.1,::1",
+        no_proxy: "localhost,127.0.0.1,::1",
+    };
+}
+
+export function buildAiderEnv(origin: string, caBundle: string, baseEnv: NodeJS.ProcessEnv, routeHttp: boolean): NodeJS.ProcessEnv {
+    // #1048: aider's Python stack trusts the CA through two different readers
+    // — httpx (litellm's HTTP layer) honors SSL_CERT_FILE with REPLACE
+    // semantics (hence the combined bundle carrying system roots so
+    // blind-tunneled hosts still validate), and requests honors
+    // REQUESTS_CA_BUNDLE. HTTP_PROXY is only set when a plaintext-http
+    // upstream actually routes through it (absolute-form forward-proxy).
+    // NO_PROXY keeps loopback legs (local ollama/vllm servers) direct.
+    return {
+        ...baseEnv,
+        HTTPS_PROXY: origin,
+        ...(routeHttp ? { HTTP_PROXY: origin } : {}),
+        SSL_CERT_FILE: caBundle,
+        REQUESTS_CA_BUNDLE: caBundle,
         BILLION_CONTEXT_PROXY: origin,
         NO_PROXY: "localhost,127.0.0.1,::1",
         no_proxy: "localhost,127.0.0.1,::1",
@@ -1060,7 +1132,7 @@ function isPrivateIPv4(host: string): boolean {
  *  so v1 runs pure wire mode (#757). gemini/iflow/qwen (#1047) are excluded
  *  like codebuddy: their MCP-injection flags are unverified, v1 is pure wire. */
 export function launcherInjectMcp(env: NodeJS.ProcessEnv, base: string, codexUpstream?: string): boolean {
-    if (base === "pi" || base === "omp" || base === "opencode" || base === "hermes" || base === "dsh" || base === "codebuddy" || base === "qoder" || base === "trae" || base === "jcode" || base === "kimi" || base === "gemini" || base === "iflow" || base === "qwen" || base === "mcode") return false;
+    if (base === "pi" || base === "omp" || base === "opencode" || base === "hermes" || base === "dsh" || base === "codebuddy" || base === "qoder" || base === "trae" || base === "jcode" || base === "kimi" || base === "gemini" || base === "iflow" || base === "qwen" || base === "mcode" || base === "aider") return false;
     if (env.BILI_LAUNCHER_PLUGIN === "0") return false;
     if (base === "codex" && env.BILI_LAUNCHER_PLUGIN === undefined && codexUpstream !== undefined && isPrivateUpstreamHost(codexUpstream)) {
         return false;
@@ -2617,7 +2689,18 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
     const discoveryEnv =
         base === "pi" || base === "omp" ? { ...process.env, PI_CODING_AGENT_DIR: undefined } : process.env;
     const config = loadClientConfig(discoveryEnv, process.cwd());
-    const routes = discoverRoutes(base, config);
+    let routes = discoverRoutes(base, config);
+    if (base === "aider") {
+        // #1048: the CLI channel (--openai-api-base / --set-env) outranks env
+        // and conf files in aider's own resolution order; merge it into the
+        // discovered set before routing so it lands in the MITM whitelist.
+        const argUrls = discoverAiderArgUrls(params.clientArgs);
+        if (argUrls.length > 0) {
+            config.aider = { baseUrls: dedupeInOrder([...(config.aider?.baseUrls ?? []), ...argUrls]) };
+            routes = discoverRoutes(base, config);
+        }
+    }
+    const aiderDeclared = base === "aider" && ((config.aider?.baseUrls ?? []).length > 0 || (params.mitmDomains ?? []).length > 0);
     // #535: pi's REAL home — resolvePiHome honors a possibly-stale inherited
     // PI_CODING_AGENT_DIR (e.g. launching `bili pi` from inside a shell that
     // a legacy bili overlay launch exported it into); the new file-free
@@ -2657,7 +2740,7 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
     const handle = await ensureProxyRunning({ host, port, passthrough, debug, mitmDomains: domains, modelWindows: collectModelWindows(config, base), modelMaxOutputs: collectModelMaxOutputs(config, base) }, deps);
     console.error(
         `bili: started proxy at ${handle.origin} (MITM domains: ${domains.length ? domains.join(", ") : "defaults"})` +
-            ((base !== "kimi" && base !== "mcode" && routes.httpRewrites.length > 0) ? ` (HTTP /bili/ rewrites: ${routes.httpRewrites.length})` : "") +
+            ((base !== "kimi" && base !== "mcode" && base !== "aider" && routes.httpRewrites.length > 0) ? ` (HTTP /bili/ rewrites: ${routes.httpRewrites.length})` : "") +
             (routes.httpsRewrites.length > 0 ? ` (HTTPS cert rewrites: ${routes.httpsRewrites.length})` : "") +
             (routes.httpEnvRoutes.length > 0 ? ` (HTTP proxy-env routes: ${routes.httpEnvRoutes.length})` : "") +
             (params.client === "pi-test" ? " (no extensions)" : ""),
@@ -2955,6 +3038,32 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         // whitelisted for the proxy's CA. NODE_EXTRA_CA_CERTS is additive, so
         // the plain root CA suffices.
         env = buildQwenEnv(origin, resolveCaCertPath(process.env), stripInheritedProxy(process.env));
+    } else if (base === "aider") {
+        // #1048: cert-MITM like jcode/kimi — aider's Python stack (litellm →
+        // httpx, plus requests) honors standard proxy envs for all outbound
+        // traffic; the combined bundle goes to BOTH SSL_CERT_FILE (httpx /
+        // OpenSSL replace semantics) and REQUESTS_CA_BUNDLE (requests).
+        // NO_PROXY keeps loopback legs (local ollama/vllm servers) direct.
+        // No budget env and no native mode: aider has no tool-injection seam
+        // (its hook surface is shell commands around edits/notifications, not
+        // conversation tools), so the proxy owns compression in wire mode.
+        const usesProxyEnv = routes.httpsDomains.length > 0 || routes.httpEnvRoutes.length > 0;
+        env = usesProxyEnv
+            ? buildAiderEnv(origin, resolveCombinedCaPath(process.env), stripInheritedProxy(process.env), routes.httpEnvRoutes.length > 0)
+            : { ...process.env };
+        if (routes.httpRewrites.length > 0) {
+            console.error(
+                `bili: ${routes.httpRewrites.length} loopback endpoint(s) declared for aider bypass NO_PROXY and will NOT go through the proxy — point their base URL at ${origin}/bili/<url> manually (e.g. via --openai-api-base) to compress them.`,
+            );
+        } else if (!usesProxyEnv) {
+            console.error(
+                "bili: no routable aider endpoint found — traffic will NOT go through the proxy.",
+            );
+        } else if (!aiderDeclared) {
+            console.error(
+                `bili: no aider endpoint declared (OPENAI_API_BASE / --openai-api-base / .aider.conf.yml) — assuming ${AIDER_DEFAULT_MODEL_HOSTS.join(" + ")}; pass --mitm-domain <host> for other relays.`,
+            );
+        }
     } else if (base === "codex") {
         // Per-spawn conversation id for the MCP shell's headless
         // self-registration (codex provides no session id of its own).

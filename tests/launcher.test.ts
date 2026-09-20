@@ -53,6 +53,11 @@ import {
     TRAE_DEFAULT_MODEL_HOSTS,
     buildJcodeEnv,
     JCODE_DEFAULT_MODEL_HOSTS,
+    buildAiderEnv,
+    readAiderConfig,
+    readAiderConfUrls,
+    discoverAiderArgUrls,
+    AIDER_DEFAULT_MODEL_HOSTS,
     resolveDshHome,
     prepareDshHome,
     writeDshAcpPatch,
@@ -153,6 +158,7 @@ test("isLaunchClient: pi/claude/codex/omp/opencode/pi-test true, others false", 
     assert.equal(isLaunchClient("jcode"), true);
     assert.equal(isLaunchClient("kimi"), true);
     assert.equal(isLaunchClient("mcode"), true);
+    assert.equal(isLaunchClient("aider"), true);
     assert.equal(isLaunchClient("pi-test"), true);
     assert.equal(isLaunchClient("start"), false);
     assert.equal(isLaunchClient(""), false);
@@ -3783,6 +3789,120 @@ test("discoverRoutes: jcode whitelists the default zai host for cert-MITM", () =
     assert.deepEqual(routes.httpsDomains, [...JCODE_DEFAULT_MODEL_HOSTS]);
 });
 
+test("readAiderConfig: env channels, order + dedupe (#1048)", () => {
+    assert.deepEqual(readAiderConfig({}, "/nonexistent"), { baseUrls: [] });
+    const env: NodeJS.ProcessEnv = {
+        OPENAI_API_BASE: "https://a.example.com/v1",
+        OPENAI_BASE_URL: "https://a.example.com/v1",
+        ANTHROPIC_BASE_URL: "https://b.example.com",
+        GEMINI_API_BASE: "   ",
+    };
+    assert.deepEqual(readAiderConfig(env, "/nonexistent"), { baseUrls: ["https://a.example.com/v1", "https://b.example.com"] });
+});
+
+test("readAiderConfUrls: home > git root > cwd precedence, quoted values (#1048)", () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-aider-home-"));
+    const repo = fs.mkdtempSync(path.join(os.tmpdir(), "bili-aider-repo-"));
+    const work = path.join(repo, "work");
+    try {
+        fs.mkdirSync(path.join(repo, ".git"));
+        fs.mkdirSync(work);
+        const homeConf = path.join(home, ".aider.conf.yml");
+        const gitConf = path.join(repo, ".aider.conf.yml");
+        const cwdConf = path.join(work, ".aider.conf.yml");
+        fs.writeFileSync(homeConf, "openai-api-base: https://home.example.com/v1\n");
+        fs.writeFileSync(gitConf, 'openai-api-base: "https://git.example.com/v1"\n');
+        fs.writeFileSync(cwdConf, "openai-api-base: https://cwd.example.com/v1\n");
+        const confEnv: NodeJS.ProcessEnv = { HOME: home };
+        assert.deepEqual(readAiderConfUrls(work, confEnv), ["https://home.example.com/v1"]);
+        fs.rmSync(homeConf);
+        assert.deepEqual(readAiderConfUrls(work, confEnv), ["https://git.example.com/v1"]);
+        fs.rmSync(gitConf);
+        assert.deepEqual(readAiderConfUrls(work, confEnv), ["https://cwd.example.com/v1"]);
+    } finally {
+        fs.rmSync(home, { recursive: true, force: true });
+        fs.rmSync(repo, { recursive: true, force: true });
+    }
+});
+
+test("discoverAiderArgUrls: --openai-api-base space/equal forms + --set-env filtering (#1048)", () => {
+    assert.deepEqual(discoverAiderArgUrls([]), []);
+    assert.deepEqual(discoverAiderArgUrls(["-m", "gpt-4o"]), []);
+    assert.deepEqual(
+        discoverAiderArgUrls(["--openai-api-base", "https://x.example.com/v1", "-m", "gpt-4o"]),
+        ["https://x.example.com/v1"],
+    );
+    assert.deepEqual(
+        discoverAiderArgUrls(["--openai-api-base=https://y.example.com/v1"]),
+        ["https://y.example.com/v1"],
+    );
+    assert.deepEqual(
+        discoverAiderArgUrls(["--set-env", "ANTHROPIC_API_BASE=https://z.example.com"]),
+        ["https://z.example.com"],
+    );
+    assert.deepEqual(
+        discoverAiderArgUrls(["--set-env=OPENAI_BASE_URL=https://w.example.com"]),
+        ["https://w.example.com"],
+    );
+    assert.deepEqual(discoverAiderArgUrls(["--set-env", "UNRELATED=1", "--set-env", "OPENAI_API_BASE"]), []);
+});
+
+test("discoverRoutes: aider → default hosts when nothing declared (#1048)", () => {
+    const routes = discoverRoutes("aider", {});
+    assert.deepEqual(routes.httpsDomains, AIDER_DEFAULT_MODEL_HOSTS);
+    assert.deepEqual(routes.httpRewrites, []);
+    assert.deepEqual(routes.httpsRewrites, []);
+    assert.deepEqual(routes.httpEnvRoutes, []);
+});
+
+test("discoverRoutes: aider classifies declared URLs — https MITM, http LAN forward-proxy, loopback inventory (#1048)", () => {
+    const config: ClientConfig = { aider: { baseUrls: [
+        "https://relay.example.com/v1",
+        "http://lan-gw.example:8080/v1",
+        "http://127.0.0.1:11434/v1",
+        "https://relay.example.com/v1",
+    ] } };
+    const routes = discoverRoutes("aider", config);
+    assert.deepEqual(routes.httpsDomains, ["relay.example.com"]);
+    assert.deepEqual(routes.httpEnvRoutes, ["http://lan-gw.example:8080/v1"]);
+    assert.deepEqual(routes.httpRewrites, [{ key: "aider-1", realUpstream: "http://127.0.0.1:11434/v1" }]);
+    assert.deepEqual(routes.httpsRewrites, []);
+});
+
+test("discoverRoutes: aider with only a loopback endpoint → no defaults, inventory only (#1048)", () => {
+    const config: ClientConfig = { aider: { baseUrls: ["http://127.0.0.1:11434/v1"] } };
+    const routes = discoverRoutes("aider", config);
+    assert.deepEqual(routes.httpsDomains, []);
+    assert.deepEqual(routes.httpEnvRoutes, []);
+    assert.equal(routes.httpRewrites.length, 1);
+});
+
+test("buildAiderEnv: dual CA vars + NO_PROXY loopback + conditional HTTP_PROXY (#1048)", () => {
+    const noHttp = buildAiderEnv("http://127.0.0.1:8787", "/tmp/combined-ca.pem", { FOO: "bar" }, false);
+    assert.equal(noHttp.HTTPS_PROXY, "http://127.0.0.1:8787");
+    assert.equal(noHttp.HTTP_PROXY, undefined);
+    assert.equal(noHttp.SSL_CERT_FILE, "/tmp/combined-ca.pem");
+    assert.equal(noHttp.REQUESTS_CA_BUNDLE, "/tmp/combined-ca.pem");
+    assert.equal(noHttp.BILLION_CONTEXT_PROXY, "http://127.0.0.1:8787");
+    assert.equal(noHttp.NO_PROXY, "localhost,127.0.0.1,::1");
+    assert.equal(noHttp.no_proxy, "localhost,127.0.0.1,::1");
+    assert.equal(noHttp.FOO, "bar");
+    const withHttp = buildAiderEnv("http://127.0.0.1:8787", "/tmp/combined-ca.pem", {}, true);
+    assert.equal(withHttp.HTTP_PROXY, "http://127.0.0.1:8787");
+});
+
+test("resolveClientCommand: aider resolves the `aider` bin generically (#1048)", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-aider-bin-"));
+    try {
+        const env: NodeJS.ProcessEnv = { PATH: dir };
+        assert.deepEqual(resolveClientCommand("aider", env), { command: "aider", prefixArgs: [] });
+        fs.writeFileSync(path.join(dir, "aider"), "");
+        assert.deepEqual(resolveClientCommand("aider", env), { command: path.join(dir, "aider"), prefixArgs: [] });
+    } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
 test("resolveClientCommand: trae resolves `traecli`, falls back to `trae-cli` then `trae`", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-trae-bin-"));
     try {
@@ -3999,6 +4119,118 @@ test("runLaunch codebuddy: inherited proxy vars stripped so loopback traffic can
     assert.ok(/^http:\/\/127\.0\.0\.1:\d+$/.test(String(origin)), `origin: ${origin}`);
     assert.ok(String(seenEnv.NODE_EXTRA_CA_CERTS).endsWith(path.join("billion-context", "ca", "root-ca.pem")), String(seenEnv.NODE_EXTRA_CA_CERTS));
     assertInheritedProxyStripped(seenEnv, String(origin));
+});
+
+async function runAiderLaunch(
+    clientArgs: string[],
+    envOverrides: NodeJS.ProcessEnv = {},
+): Promise<{ client: NodeJS.ProcessEnv; proxy: NodeJS.ProcessEnv }> {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-aider-launch-"));
+    const prevHome = process.env.HOME;
+    const prevUserProfile = process.env.USERPROFILE;
+    const prevBin = process.env.BILI_CLIENT_BIN;
+    const savedProxyVars: Record<string, string | undefined> = {};
+    for (const k of INHERITED_PROXY_TEST_VARS) {
+        savedProxyVars[k] = process.env[k];
+        delete process.env[k];
+    }
+    const savedOverrides: [string, string | undefined][] = [];
+    for (const [k, v] of Object.entries(envOverrides)) {
+        savedOverrides.push([k, process.env[k]]);
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+    }
+    process.env.HOME = home;
+    if (prevUserProfile !== undefined) process.env.USERPROFILE = home;
+    const fakeAider = path.join(home, process.platform === "win32" ? "fake-aider.exe" : "fake-aider");
+    fs.writeFileSync(fakeAider, "");
+    process.env.BILI_CLIENT_BIN = fakeAider;
+    let clientEnv: NodeJS.ProcessEnv | undefined;
+    let proxyEnv: NodeJS.ProcessEnv | undefined;
+    const spawnImpl: SpawnFn = (cmd, args, opts) => {
+        const env = (opts as { env?: NodeJS.ProcessEnv } | undefined)?.env;
+        if (cmd === fakeAider) {
+            clientEnv = env;
+            const child = makeFakeChild(0);
+            const orig = child.on.bind(child);
+            (child as { on: SpawnChild["on"] }).on = (event, listener) => {
+                orig(event, listener);
+                if (event === "exit") setTimeout(() => listener(0, null), 0);
+                return child;
+            };
+            return child;
+        }
+        proxyEnv = env;
+        return makeFakeChild(42424);
+    };
+    const fetchImpl = async () => ({ ok: true });
+    const prevExit = process.exit;
+    process.exit = (() => undefined) as typeof process.exit;
+    try {
+        await runLaunch(
+            { client: "aider", clientArgs, overrides: {} },
+            { fetchImpl, spawnImpl, sleep: () => Promise.resolve() },
+        );
+    } finally {
+        process.exit = prevExit;
+        process.env.HOME = prevHome;
+        if (prevUserProfile === undefined) delete process.env.USERPROFILE;
+        else process.env.USERPROFILE = prevUserProfile;
+        if (prevBin === undefined) delete process.env.BILI_CLIENT_BIN;
+        else process.env.BILI_CLIENT_BIN = prevBin;
+        for (const [k, v] of Object.entries(savedProxyVars)) {
+            if (v === undefined) delete process.env[k];
+            else process.env[k] = v;
+        }
+        for (const [k, v] of savedOverrides) {
+            if (v === undefined) delete process.env[k];
+            else process.env[k] = v;
+        }
+        fs.rmSync(home, { recursive: true, force: true });
+    }
+    assert.ok(clientEnv, "aider client spawned");
+    assert.ok(proxyEnv, "proxy child spawned");
+    return { client: clientEnv!, proxy: proxyEnv! };
+}
+
+test("runLaunch aider: nothing declared → default hosts whitelisted for cert-MITM (#1048)", async () => {
+    const { client, proxy } = await runAiderLaunch([]);
+    const origin = String(client.BILLION_CONTEXT_PROXY);
+    assert.ok(/^http:\/\/127\.0\.0\.1:\d+$/.test(origin), `origin: ${origin}`);
+    assert.equal(client.HTTPS_PROXY, origin);
+    assert.ok(String(client.SSL_CERT_FILE).endsWith(path.join("billion-context", "ca", "combined-ca.pem")), String(client.SSL_CERT_FILE));
+    assert.equal(client.REQUESTS_CA_BUNDLE, client.SSL_CERT_FILE, "requests reads REQUESTS_CA_BUNDLE");
+    assert.equal(client.HTTP_PROXY, undefined, "no plaintext-http route → HTTP_PROXY unset");
+    assert.equal(client.NO_PROXY, "localhost,127.0.0.1,::1");
+    assert.equal(client.no_proxy, "localhost,127.0.0.1,::1");
+    const mitm = String(proxy.BILI_MITM_DOMAINS).split(",");
+    for (const h of AIDER_DEFAULT_MODEL_HOSTS) {
+        assert.ok(mitm.includes(h), `whitelist has ${h}: ${mitm.join(",")}`);
+    }
+});
+
+test("runLaunch aider: env endpoints discovered — https MITM-whitelisted, http LAN forward-proxied, inherited proxy stripped (#1048)", async () => {
+    const { client, proxy } = await runAiderLaunch([], {
+        OPENAI_API_BASE: "https://my-relay.example.com/v1",
+        ANTHROPIC_BASE_URL: "http://lan-gw.example:8080/v1",
+        http_proxy: "http://evil.example:3128",
+    });
+    const origin = String(client.BILLION_CONTEXT_PROXY);
+    assert.ok(/^http:\/\/127\.0\.0\.1:\d+$/.test(origin), `origin: ${origin}`);
+    assert.equal(client.HTTPS_PROXY, origin);
+    assert.ok(String(client.SSL_CERT_FILE).endsWith(path.join("billion-context", "ca", "combined-ca.pem")), String(client.SSL_CERT_FILE));
+    assert.equal(client.REQUESTS_CA_BUNDLE, client.SSL_CERT_FILE);
+    assert.equal(client.HTTP_PROXY, origin, "plaintext-http route present → HTTP_PROXY set");
+    assert.equal(client.http_proxy, undefined, "inherited http_proxy stripped");
+    const mitm = String(proxy.BILI_MITM_DOMAINS).split(",");
+    assert.ok(mitm.includes("my-relay.example.com"), `whitelist has my-relay.example.com: ${mitm.join(",")}`);
+    assert.ok(!mitm.includes("lan-gw.example"), "plaintext-http host rides the forward proxy, not MITM");
+});
+
+test("runLaunch aider: --openai-api-base passed through the launcher updates the whitelist (#1048)", async () => {
+    const { proxy } = await runAiderLaunch(["--openai-api-base", "https://arg-relay.example.com/v1"]);
+    const mitm = String(proxy.BILI_MITM_DOMAINS).split(",");
+    assert.ok(mitm.includes("arg-relay.example.com"), `whitelist has arg-relay.example.com: ${mitm.join(",")}`);
 });
 
 test("parseKimiToml: providers/models/env channels (quoted names, overrides win, per-model base_url)", () => {

@@ -93,6 +93,7 @@ AI 编程助手的<strong>通用上下文压缩代理</strong>
 | **iflow**（iFlow CLI） | `bili iflow`（启动器，`IFLOW_BASE_URL` `/bili/` 改写）或 `/bili/` 前缀 |
 | **qwen**（Qwen Code） | `bili qwen`（启动器，cert-MITM）或 `/bili/` 前缀 |
 | **mcode**（MiniMax Code） | [`billion-context`](https://github.com/ranxianglei/billion-context)，`bili mcode`（启动器，cert-MITM）或 `/bili/` 前缀 —— 无法做原生插件：其插件体系是纯声明式事件钩子（无模型请求/历史改写接缝），压缩走代理（[#1050](https://github.com/ranxianglei/billion-context/issues/1050)） |
+| **aider** | [`billion-context`](https://github.com/ranxianglei/billion-context)，`bili aider`（启动器，cert-MITM）或 `/bili/` 前缀 —— 无法做原生插件：Python 脚本结构，hook 面仅限编辑/通知前后的 shell 命令，无工具注入接缝（[#1048](https://github.com/ranxianglei/billion-context/issues/1048)） |
 | **其余所有**（没有上下文 hook） | [`billion-context`](https://github.com/ranxianglei/billion-context) —— `bili <client>`（启动器，优先）或 `/bili/` 前缀 |
 
 **原生模式 vs 独立扩展。** 宿主原生插件(`bili plugin install pi` / `opencode` —— 代理在宿主进程内拉起)与独立进程内扩展(`billion-context-pi`、`opencode-acp`)**互斥**:两者同时生效意味着双重压缩。安装器负责切换:`bili plugin install pi` 会替换旧的 `npm:billion-context-pi` 条目;`bili plugin install opencode` 会从全局 opencode.json 里剔除旧的 `opencode-acp` 条目 —— 裸名、`npm:` 别名、带版本号(`opencode-acp@stable`)、路径形式都认,数组/对象两种形态都处理;原配置会快照到 `opencode.json.bili-bak`。**项目级**安装(`opencode plugin opencode-acp` 写的是 `<project>/.opencode/opencode.json`,不是全局配置)不会被碰 —— 需手动移除,安装器输出里会提醒。作为手动安装的运行期安全网,原生入口在加载时同步设置 `BILLION_CONTEXT_NATIVE=<host>`,让独立扩展在动作时自动退出 —— 它自己的加载期 `BILLION_CONTEXT_PROXY` 检查看不见原生模式异步拉起的代理,`/bili/` baseURL 检查也看不见 fetch 层改写。
@@ -152,8 +153,9 @@ pi / omp / kimi / claude 没有客户端侧通道 —— 它们的配置条目�
 - `claude` 有**原生姿态**(#964):`bili plugin install claude` 写入受管 settings 块(静态 `/bili/` URL + `SessionStart` hook)+ 指向稳定端口的 MCP shell —— 代理随会话生灭。`BILI_NATIVE_CLAUDE=0` 退出(passthrough)。机制细节:[TECHNICAL-NOTES.zh-CN.md](TECHNICAL-NOTES.zh-CN.md)。
 - `codex` / `omp` 也有配套安装(MCP shell 与轻量扩展),但它们需要一个在跑的代理 —— 不属于原生模式。
 - `jcode` 则完全没有原生模式:它是编译型 Rust 二进制、无插件/扩展接缝,唯一的 provider 级请求头是静态 TOML 表(对每个请求原样附加),MCP server 又是跨所有会话共享的全局池 —— 既无法在进程内改写模型流量,也无法打上 plugin 模式所需的按请求头(`x-bili-plugin`、会话 id、runtime-info)。完整源码级分析见 [#962](https://github.com/ranxianglei/billion-context/issues/962)(已按 wontfix 关闭)。请用 `bili jcode`(启动器)。
+- `aider` 同样没有原生模式:它是 Python 脚本结构,hook 面仅限于文件编辑与空闲通知前后的 shell 命令(`--git-commit-verify`、`--notifications-command`)—— 无插件/扩展 API,也没有 MCP client,因此不存在 plugin 模式所需的工具注入接缝。请用 `bili aider`([#1048](https://github.com/ranxianglei/billion-context/issues/1048))。
 
-### 方式 2 —— 启动器(`bili pi` / `bili codex` / `bili claude` / `bili omp` / `bili opencode` / `bili hermes` / `bili dsh` / `bili codebuddy` / `bili qoder` / `bili trae` / `bili jcode` / `bili kimi` / `bili gemini` / `bili iflow` / `bili qwen` / `bili mcode`)
+### 方式 2 —— 启动器(`bili pi` / `bili codex` / `bili claude` / `bili omp` / `bili opencode` / `bili hermes` / `bili dsh` / `bili codebuddy` / `bili qoder` / `bili trae` / `bili jcode` / `bili kimi` / `bili gemini` / `bili iflow` / `bili qwen` / `bili mcode` / `bili aider`)
 
 启动器把客户端包进一条命令:在独立端口拉起一个代理(总是全新实例,绝不复用端口),再按客户端支持的机制把它指向代理 —— 能吃代理/CA 环境变量的走**证书 MITM**,不吃的走隔离的**`/bili/` 配置重写**。真实配置文件从不被修改;客户端自己的配置只被**读取**,用来发现它实际连接的 HTTPS 上游主机,把这些主机加入 MITM 白名单 —— 代理只 TLS 终结它们,其余流量盲透传。
 
@@ -174,6 +176,7 @@ bili gemini                           # Gemini CLI(Google):GOOGLE_GEMINI_BASE_UR
 bili iflow                            # iFlow CLI:IFLOW_BASE_URL /bili/ 改写到 apis.iflow.cn/v1(OpenAI chat-completions wire),真实 ~/.iflow 零改动
 bili qwen                             # Qwen Code(多协议 gemini-cli fork,无 base-URL 钩子):HTTPS_PROXY + NODE_EXTRA_CA_CERTS 证书 MITM,默认 DashScope/Qwen 模型主机加白,自建中转用 --mitm-domain 追加
 bili mcode                            # MiniMax Code CLI:除无条件回环绕过外,所有流量遵循标准代理环境变量——非回环 https 走证书 MITM(HTTPS_PROXY + NODE_EXTRA_CA_CERTS/SSL_CERT_FILE),非回环 http 走绝对形式转发;provider 主机取 ~/.minimax*/config.yaml(遵循 MINIMAX_DATA_DIR/MAVIS_DATA_DIR)或未声明时的官方 agent.minimax.* 端点;回环端点编目并附手动 /bili/ 前缀提示;会话经 X-Mavis-Session-Id 头绑定(#1050)
+bili aider                            # Aider(Python pair programmer):HTTPS_PROXY + SSL_CERT_FILE/REQUESTS_CA_BUNDLE 证书 MITM;端点取自继承 env(OPENAI_API_BASE / ANTHROPIC_BASE_URL 等)、--openai-api-base 或 .aider.conf.yml——未声明时默认 api.openai.com + api.anthropic.com;回环端点经 NO_PROXY 直连(#1048)
 bili pi --mitm-domain api.foo.com     # 向 MITM 白名单追加域名
 ```
 

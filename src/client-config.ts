@@ -186,6 +186,15 @@ export interface McodeConfig {
     models?: ModelWindow[];
 }
 
+export interface AiderConfig {
+    /** Model endpoint base URLs discovered from aider's runtime channels:
+     *  inherited env (OPENAI_API_BASE etc.), `.aider.conf.yml` files, and the
+     *  `--openai-api-base` / `--set-env` CLI args (merged by the launcher).
+     *  Read-only discovery — aider has no persistent credential store of its
+     *  own (#1048). */
+    baseUrls?: string[];
+}
+
 export interface ClientConfig {
     claude?: ClaudeSettings;
     codex?: CodexConfig;
@@ -202,6 +211,7 @@ export interface ClientConfig {
     gemini?: GeminiConfig;
     iflow?: IflowConfig;
     mcode?: McodeConfig;
+    aider?: AiderConfig;
 }
 
 /** qoder's default model-inference hosts, hardcoded in the binary (no config
@@ -1355,14 +1365,125 @@ export function loadClientConfig(env: NodeJS.ProcessEnv, cwd: string): ClientCon
     config.gemini = readGeminiEnvConfig(env);
     config.iflow = readIflowEnvConfig(env);
     config.mcode = readMcodeConfig(env);
+    config.aider = readAiderConfig(env, cwd);
     return config;
+}
+
+/** Base-URL env vars honored by aider's provider stack (litellm), verified
+ *  against litellm sources (#1048): OPENAI_BASE_URL/OPENAI_API_BASE (openai
+ *  family), ANTHROPIC_API_BASE/ANTHROPIC_BASE_URL (anthropic), GEMINI_API_BASE
+ *  (gemini), DEEPSEEK_API_BASE (deepseek), plus AIDER_OPENAI_API_BASE —
+ *  aider's configargparse auto_env_var_prefix form of --openai-api-base. */
+export const AIDER_BASE_URL_ENVS = [
+    "OPENAI_API_BASE",
+    "OPENAI_BASE_URL",
+    "AIDER_OPENAI_API_BASE",
+    "ANTHROPIC_API_BASE",
+    "ANTHROPIC_BASE_URL",
+    "GEMINI_API_BASE",
+    "DEEPSEEK_API_BASE",
+];
+
+/** Fallback MITM whitelist when no endpoint is declared anywhere (#1048):
+ *  the two most common aider targets. */
+export const AIDER_DEFAULT_MODEL_HOSTS = [
+    "api.openai.com",
+    "api.anthropic.com",
+];
+
+/** Read-only scan of `.aider.conf.yml` files for the `openai-api-base` key —
+ *  aider's only base-URL setting in conf files (mirrors its CLI flag name).
+ *  Precedence follows aider's own resolution (configargparse applies later
+ *  default_config_files entries over earlier ones; aider lists them
+ *  cwd → git root → home): home > git root > cwd. Only top-level scalar
+ *  values are parsed; anything else is ignored. */
+export function readAiderConfUrls(cwd: string, env: NodeJS.ProcessEnv = process.env): string[] {
+    const home = nonEmpty(env.HOME) ? env.HOME! : os.homedir();
+    const candidates = [path.join(home, ".aider.conf.yml")];
+    let dir = cwd;
+    while (true) {
+        if (fs.existsSync(path.join(dir, ".git"))) {
+            candidates.push(path.join(dir, ".aider.conf.yml"));
+            break;
+        }
+        const parent = path.dirname(dir);
+        if (parent === dir) break;
+        dir = parent;
+    }
+    candidates.push(path.join(cwd, ".aider.conf.yml"));
+    for (const file of candidates) {
+        let text: string;
+        try {
+            text = fs.readFileSync(file, "utf8");
+        } catch {
+            continue;
+        }
+        for (const line of text.split(/\r?\n/)) {
+            const m = /^openai-api-base:\s*(.+?)\s*$/.exec(line);
+            if (!m) continue;
+            let value = m[1]!;
+            if (value.length >= 2 &&
+                ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'")))) {
+                value = value.slice(1, -1);
+            }
+            if (value.trim().length > 0) return [value.trim()];
+        }
+    }
+    return [];
+}
+
+/** Scan aider CLI args for endpoint declarations: `--openai-api-base <url>`
+ *  (also `--openai-api-base=<url>`) and `--set-env NAME=value` where NAME is
+ *  one of AIDER_BASE_URL_ENVS (aider exports --set-env values into the child
+ *  env at startup, so they redirect model traffic like the env channel). */
+export function discoverAiderArgUrls(clientArgs: string[]): string[] {
+    const out: string[] = [];
+    for (let i = 0; i < clientArgs.length; i++) {
+        const a = clientArgs[i]!;
+        if (a === "--openai-api-base" && i + 1 < clientArgs.length) {
+            out.push(clientArgs[i + 1]!);
+            i++;
+        } else if (a.startsWith("--openai-api-base=")) {
+            out.push(a.slice("--openai-api-base=".length));
+        } else if (a === "--set-env" && i + 1 < clientArgs.length) {
+            const kv = clientArgs[i + 1]!;
+            const eq = kv.indexOf("=");
+            if (eq > 0 && AIDER_BASE_URL_ENVS.includes(kv.slice(0, eq))) out.push(kv.slice(eq + 1));
+            i++;
+        } else if (a.startsWith("--set-env=")) {
+            const kv = a.slice("--set-env=".length);
+            const eq = kv.indexOf("=");
+            if (eq > 0 && AIDER_BASE_URL_ENVS.includes(kv.slice(0, eq))) out.push(kv.slice(eq + 1));
+        }
+    }
+    return out;
+}
+
+/** Discover aider's model endpoints from its runtime channels: inherited env
+ *  (the launcher inherits the caller's shell, and aider/litellm read these at
+ *  startup) plus `.aider.conf.yml` files. The CLI channel (--openai-api-base /
+ *  --set-env) is merged by the launcher via discoverAiderArgUrls. Nothing is
+ *  written — env-only, per #1048. */
+export function readAiderConfig(env: NodeJS.ProcessEnv = process.env, cwd: string = process.cwd()): AiderConfig {
+    const urls: string[] = [];
+    const seen = new Set<string>();
+    const add = (raw: string | undefined): void => {
+        if (!nonEmpty(raw)) return;
+        const v = raw!.trim();
+        if (seen.has(v)) return;
+        seen.add(v);
+        urls.push(v);
+    };
+    for (const name of AIDER_BASE_URL_ENVS) add(env[name]);
+    for (const u of readAiderConfUrls(cwd, env)) add(u);
+    return { baseUrls: urls };
 }
 
 /** The client a launcher run targets. Scopes model-window collection so a
  *  launched client's own declarations are authoritative (#436: launching
  *  `bili omp` with omp's models.yml declaring 131072 must not be overridden by
  *  another client's larger declaration for the same model id). */
-export type ModelWindowScope = "claude" | "codex" | "pi" | "omp" | "opencode" | "hermes" | "dsh" | "codebuddy" | "qoder" | "trae" | "jcode" | "kimi" | "gemini" | "iflow" | "qwen" | "mcode";
+export type ModelWindowScope = "claude" | "codex" | "pi" | "omp" | "opencode" | "hermes" | "dsh" | "codebuddy" | "qoder" | "trae" | "jcode" | "kimi" | "gemini" | "iflow" | "qwen" | "mcode" | "aider";
 
 /** Collect per-model context windows from client configs the launcher can
  *  read (pi models.json, omp models.yml, opencode opencode.json, codex
