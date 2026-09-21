@@ -346,6 +346,26 @@ export function peekSession(id: string): Session | undefined {
     return sessions.get(id);
 }
 
+// #1086: does THIS instance hold processed compression state for the given
+// conversation? Memory first, then the persisted record (covers the
+// auto-update restart: memory is gone, disk state survives). A bili instance
+// only ever creates a session record when it PROCESSED the request, so
+// "record exists" ⇒ "the ACP artifacts this client re-sends are ours" — the
+// exemption the chain-detection content fallback needs before passing a
+// request through verbatim. Read-only: never mutates the session map.
+export function hasProcessedState(id: string, meta?: { protocol?: string }): boolean {
+    const mem = sessions.get(id);
+    if (mem) return processedEvidence(mem);
+    const store = getStore();
+    if (!store.enabled) return false;
+    const reloaded = store.loadSync(id, meta);
+    return reloaded !== null && processedEvidence(reloaded);
+}
+
+function processedEvidence(s: Session): boolean {
+    return s.stats.requests > 0 || s.state.nextBlockId > 1 || s.blockContents.size > 0;
+}
+
 // #760b: unified canonical session id. Every session exposes a stable pfa-* id
 // that MCP tools route by, independent of what the client calls itself.
 // Anonymous sessions already ARE pfa-* (PFA-minted session.id), so their
