@@ -488,15 +488,18 @@ export class SessionStore {
      *  (mtime pre-filter) and only decodes age-eligible candidates. */
     async readRawFile(file: string): Promise<unknown | null> {
         try {
-            if (!this.codec) {
-                return JSON.parse(await readFile(file, "utf8"));
-            }
-            const head = await readFileHead(file);
             const raw = await readFile(file);
-            const text = head.length === ENCRYPT_MAGIC.length && head.equals(ENCRYPT_MAGIC)
-                ? this.codec.decode(raw)
-                : raw.toString("utf8");
-            return JSON.parse(text);
+            // Format-agnostic (GC #1082 review): try plain JSON first, then any
+            // codec framing (encryption today; zstd-on-disk once #1083 lands).
+            // Enumerating magic bytes here would re-create the cross-PR drift
+            // this method exists to avoid — every new on-disk frame would
+            // silently no-op the sweep. Framed files fail the utf8 parse on
+            // the magic prefix, so the fallback order is exact.
+            try {
+                return JSON.parse(raw.toString("utf8"));
+            } catch {
+                return this.codec ? JSON.parse(this.codec.decode(raw)) : null;
+            }
         } catch {
             return null;
         }

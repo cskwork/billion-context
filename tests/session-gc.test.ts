@@ -8,6 +8,8 @@ import path from "node:path";
 import { defaultConfig } from "acp-kernel";
 import { startServer } from "../src/server.js";
 import { SessionStore, _setStoreForTest } from "../src/persist.js";
+import { imageTokensInParsedBody } from "../src/image-tokens.js";
+import { estimateRawBodyTokens } from "../src/preflight.js";
 import type { ProxyOptions } from "../src/config.js";
 import { _setForTest as setRegistryForTest } from "../src/registry.js";
 import { createSessionCodec, parseEncryptionKey } from "../src/encrypt.js";
@@ -222,6 +224,33 @@ test("gcSessionFiles: decodes encrypted (BILIENC1) files before judging eligibil
     });
 });
 
+test("readRawFile: format-agnostic — plain JSON parses, codec frames decode, garbage is null (GC keeps)", async () => {
+    const keyHex = "cd".repeat(32);
+    await withEnv({ BILI_ENCRYPTION_KEY: keyHex }, async () => {
+        const dir = tmpDir("bili-gc-raw-");
+        const store = new SessionStore({ dir, debounceMs: 500 });
+        const codec = createSessionCodec(parseEncryptionKey(keyHex));
+
+        const plain = writeFile(dir, "anthropic/host_plain.json", JSON.stringify(envelope("gc-raw-plain", 1, {})), 10);
+        const framed = writeFile(dir, "anthropic/host_framed.json", codec.encode(JSON.stringify(envelope("gc-raw-framed", 1, {}))), 10);
+        const garbage = writeFile(dir, "anthropic/host_garbage.json", "BILIZSTD1\u0000not-really-zstd", 10);
+
+        const a = await store.readRawFile(plain);
+        assert.ok(a && typeof a === "object", "plain JSON reads without codec framing");
+        const b = await store.readRawFile(framed);
+        assert.ok(b && typeof b === "object", "codec-framed file decodes via fallback (any future frame, not just BILIENC1)");
+        const c = await store.readRawFile(garbage);
+        assert.equal(c, null, "unknown frame that the codec cannot decode → null, never a wrong parse");
+
+        // GC side: the garbage file must be counted unreadable and left in place.
+        utimesSync(garbage, new Date(Date.now() - 10 * DAY), new Date(Date.now() - 10 * DAY));
+        const res = await gcSessionFiles({ dir, store, now: Date.now() });
+        assert.equal(res.removed, 2, JSON.stringify(res));
+        assert.ok(!existsSync(plain) && !existsSync(framed));
+        assert.ok(existsSync(garbage), "unreadable unknown-frame file never deleted");
+    });
+});
+
 test("gcSessionFiles: resident fresh sessions are kept; idle residents are dropped and deleted", async () => {
     const dir = tmpDir("bili-gc-res-");
     const store = new SessionStore({ dir, debounceMs: 500 });
@@ -315,11 +344,27 @@ test("records rawInputTokens per turn and persists it (#1082)", async () => {
             assert.ok(sess, "session present after request");
             const raw = sess!.metadata.rawInputTokens;
             assert.ok(typeof raw === "number" && raw > 1000, `rawInputTokens recorded, got ${String(raw)}`);
+
+            // Image-bearing turn: the GC signal must include image tokens —
+            // image bytes ride every re-send, so an image-heavy idle session
+            // must not look cheap to the sweep.
+            const png = "iVBORw0KGgo=" + "A".repeat(4000);
+            const imgBody = { model: "gpt-test", messages: [{ role: "user", content: [{ type: "text", text: "look" }, { type: "image_url", image_url: { url: "data:image/png;base64," + png } }] }] };
+            const resp2 = await fetch(`http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/chat/completions`, {
+                method: "POST",
+                headers: { "content-type": "application/json", "x-acp-session": "gc-rec-integration" },
+                body: JSON.stringify(imgBody),
+            });
+            assert.equal(resp2.status, 200);
+            await resp2.arrayBuffer();
+            const expected = estimateRawBodyTokens(imgBody) + imageTokensInParsedBody("openai", imgBody);
+            const raw2 = sess!.metadata.rawInputTokens;
+            assert.ok(typeof raw2 === "number" && raw2 >= expected, `image turn records text+image (want >= ${expected}, got ${String(raw2)})`);
             assert.ok(store.flushSync(sess as Session), "flush lands the session file");
             const file = findSessionFile(dir, "gc-rec-integration");
             assert.ok(file, "session file written to disk");
             const parsed = JSON.parse(readFileSync(file, "utf8")) as { payload?: { metadata?: Record<string, unknown> } };
-            assert.equal(parsed.payload?.metadata?.rawInputTokens, raw, "recorded value survives persistence round-trip");
+            assert.equal(parsed.payload?.metadata?.rawInputTokens, raw2, "recorded value survives persistence round-trip");
         } finally {
             await closeServer(proxy);
             await closeServer(upstream);

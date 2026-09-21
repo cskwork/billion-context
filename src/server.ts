@@ -1438,11 +1438,14 @@ async function handle(
         session.meta.activePack = reqSurfacePack;
         // #1082: rebuild-cost signal for the session-file GC — token estimate
         // of the RAW wire payload (full history as received, pre-fold/injection).
-        // Text-only (binary fields excluded by design). Latest wins: history
-        // grows monotonically within a session and shrinks after native
-        // compaction boundaries, which is when the re-send really gets cheaper.
+        // Text + images: image bytes are skipped by estimateRawBodyTokens but
+        // they DO ride every re-send, so an image-heavy idle session must not
+        // look cheap to the sweep (review: 400K image + 50K text was recorded
+        // as 50K). Latest wins: history grows monotonically within a session
+        // and shrinks after native compaction boundaries, which is when the
+        // re-send really gets cheaper.
         if (parsed !== null && typeof parsed === "object") {
-            session.metadata.rawInputTokens = estimateRawBodyTokens(parsed);
+            session.metadata.rawInputTokens = estimateRawBodyTokens(parsed) + imageTokensInParsedBody(protocol, parsed);
         }
         if (anonAffinity) {
             prefixAffinity.note(sessionId, anonAffinity.incomingDepth, anonAffinity.tailHash, anonAffinity.itemHashes);
