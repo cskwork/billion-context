@@ -1,4 +1,5 @@
 import type { WireProtocol } from "./util.js";
+import { log as loggerLog } from "./logger.js";
 
 /**
  * Output-side compression (#1093): verbosity steering + effort routing.
@@ -84,8 +85,9 @@ export const DEFAULT_OUTPUT_STEERING: OutputSteeringConfig = {
     effortRouting: true,
 };
 
-function clampVerbosityLevel(v: unknown): number {
+function clampVerbosityLevel(v: unknown, warn: (msg: string) => void): number {
     if (typeof v === "number" && Number.isInteger(v) && v >= 0 && v <= 4) return v;
+    warn(`[config] outputSteering.verbosityLevel must be an integer 0-4; got ${JSON.stringify(v)} — falling back to 2`);
     return 2;
 }
 
@@ -95,11 +97,14 @@ function clampVerbosityLevel(v: unknown): number {
 export function parseOutputSteering(v: unknown): OutputSteeringConfig | undefined {
     if (!v || typeof v !== "object" || Array.isArray(v)) return undefined;
     const obj = v as Record<string, unknown>;
-    return {
+    const warnings: string[] = [];
+    const cfg = {
         enabled: obj.enabled === true,
-        verbosityLevel: clampVerbosityLevel(obj.verbosityLevel),
+        verbosityLevel: clampVerbosityLevel(obj.verbosityLevel, (m) => warnings.push(m)),
         effortRouting: obj.effortRouting !== false,
     };
+    for (const w of warnings) loggerLog("warn", w);
+    return cfg;
 }
 
 // ---- Turn classification (pure structural, no content pattern-matching) ----
@@ -378,7 +383,10 @@ function lowerEffort(obj: Record<string, unknown>, protocol: WireProtocol): bool
     switch (protocol) {
         case "openai": {
             const e = obj.reasoning_effort;
-            if (typeof e === "string" && e !== "low") {
+            // "minimal" sits below "low" on the OpenAI scale — a client that
+            // explicitly asked for it is already at/below our floor; raising it
+            // would override client intent (clamp-only invariant).
+            if (typeof e === "string" && e !== "low" && e !== "minimal") {
                 obj.reasoning_effort = "low";
                 return true;
             }
@@ -388,7 +396,8 @@ function lowerEffort(obj: Record<string, unknown>, protocol: WireProtocol): bool
             const r = asRecord(obj.reasoning);
             if (!r) return false;
             const e = r.effort;
-            if (typeof e === "string" && e !== "low") {
+            // Same scale as OpenAI: "minimal" is already at/below the floor.
+            if (typeof e === "string" && e !== "low" && e !== "minimal") {
                 r.effort = "low";
                 return true;
             }
@@ -464,12 +473,21 @@ export function applyOutputSteering(body: string, protocol: WireProtocol | null,
 
 /** Object-level variant shared by the forward boundary and the compress-retry
  *  re-send paths. Mutates `parsed` in place; returns the applied labels. */
-export function applyOutputSteeringJson(parsed: Record<string, unknown>, protocol: WireProtocol | null, cfg: OutputSteeringConfig): string[] {
+export interface ApplySteeringOptions {
+    /** Skip the verbosity directive while keeping effort routing. Used by the
+     *  kernel's compress rounds: the L2/L3 directive ("never restate code, file
+     *  contents, diffs, or tool output …") directly contradicts the compress
+     *  prompt's own contract — summaries must preserve exact paths, values and
+     *  commands verbatim because they are the primary carrier on decompress. */
+    verbosity?: boolean;
+}
+
+export function applyOutputSteeringJson(parsed: Record<string, unknown>, protocol: WireProtocol | null, cfg: OutputSteeringConfig, opts: ApplySteeringOptions = {}): string[] {
     if (!cfg.enabled) return [];
     const proto = protocol ?? detectProtocolFromBody(parsed);
     if (!proto) return [];
     const labels: string[] = [];
-    if (cfg.verbosityLevel > 0 && steerSystemPrompt(parsed, proto, cfg.verbosityLevel)) {
+    if (opts.verbosity !== false && cfg.verbosityLevel > 0 && steerSystemPrompt(parsed, proto, cfg.verbosityLevel)) {
         labels.push(`steering:L${cfg.verbosityLevel}`);
     }
     if (cfg.effortRouting && classifyTurn(proto, parsed) === "mechanical_continuation" && lowerEffort(parsed, proto)) {

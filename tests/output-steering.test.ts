@@ -326,3 +326,26 @@ test("google: unrecognized part composition is not classified mechanical", () =>
     };
     assert.equal(applyOutputSteering(JSON.stringify(body), "google", EFFORT_ONLY).changed, false);
 });
+
+test("openai: explicit minimal effort is never raised to low", () => {
+    const mech = { model: "m", messages: [{ role: "assistant", content: "", tool_calls: [{ id: "c", type: "function", function: { name: "f", arguments: "{}" } }] }, { role: "tool", tool_call_id: "c", content: "result" }], reasoning_effort: "minimal" };
+    const out = applyOutputSteering(JSON.stringify(mech), "openai", EFFORT_ONLY);
+    assert.equal(out.changed, false, "minimal sits below the low floor — clamp must not raise it");
+    assert.equal(JSON.parse(out.body).reasoning_effort, "minimal");
+});
+
+test("responses: explicit minimal effort is never raised to low", () => {
+    const mech = { model: "m", input: [{ type: "function_call_output", call_id: "c", output: "{}" }], reasoning: { effort: "minimal" } };
+    const out = applyOutputSteering(JSON.stringify(mech), "responses", EFFORT_ONLY);
+    assert.equal(out.changed, false, "minimal sits below the low floor — clamp must not raise it");
+    assert.equal((JSON.parse(out.body).reasoning as { effort: string }).effort, "minimal");
+});
+
+test("applyOutputSteeringJson opts.verbosity=false skips the directive but keeps effort routing", () => {
+    const obj = { model: "m", messages: [{ role: "assistant", content: "", tool_calls: [{ id: "c", type: "function", function: { name: "f", arguments: "{}" } }] }, { role: "tool", tool_call_id: "c", content: "result" }], reasoning_effort: "high" };
+    const labels = applyOutputSteeringJson(obj, "openai", { enabled: true, verbosityLevel: 2, effortRouting: true }, { verbosity: false });
+    assert.deepEqual(labels, ["effort:low"]);
+    assert.equal(obj.reasoning_effort, "low");
+    const sys = obj.messages.find((m) => m.role === "system" || m.role === "developer");
+    assert.equal(sys, undefined, "no steering block appended on compress rounds");
+});
