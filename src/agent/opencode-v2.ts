@@ -167,6 +167,10 @@ export function createOpencodeV2Setup(options: OpencodeV2SetupOptions = {}): (ct
             if (!headers || typeof headers.set !== "function" || !sid || !state.proxyBase) return;
             headers.set("x-bili-plugin-conversation", sid);
             headers.set("x-bili-plugin", "opencode");
+            // #1102: one session id per persona (subagents get child ids) —
+            // instruction drift (AGENTS.md reconcile) must not fork the
+            // compression session.
+            headers.set("x-bili-plugin-instructions-mutable", "1");
             const model = e.model;
             if (model && typeof model.providerID === "string" && typeof model.id === "string") {
                 const key = `${model.providerID}/${model.id}`;
