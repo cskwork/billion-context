@@ -1,6 +1,7 @@
 import { test, beforeEach, after } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
+import os from "node:os";
 import { once } from "node:events";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import path from "node:path";
@@ -17,8 +18,7 @@ import { gcConfigFromEnv, gcSessionFiles, isGcEligible, viewFromParsed } from ".
 const DAY = 86_400_000;
 
 function tmpDir(prefix: string): string {
-    const base = process.env.TMPDIR && process.env.TMPDIR.length > 0 ? process.env.TMPDIR : path.join(process.cwd(), ".tmp");
-    return mkdtempSync(path.join(base, prefix));
+    return mkdtempSync(path.join(os.tmpdir(), prefix));
 }
 
 async function withEnv(vars: Record<string, string | undefined>, fn: () => Promise<void>): Promise<void> {
