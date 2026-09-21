@@ -1030,8 +1030,13 @@ async function handle(
     // session THIS instance processed are self-produced and must run through
     // the kernel (v0.1.133 judged them chains before binding, which stopped
     // compression permanently on single-instance setups).
+    // #1100: "no local state ⇒ foreign" is only sound when persistence proves
+    // ownership across a restart. With BILI_PERSIST=0 an instance can't recover
+    // ownership, so "no state" is ambiguous with our own replayed session — a
+    // decisive passthrough would re-brick compression (#1086). Skip the fallback
+    // entirely when the store is disabled; the hop marker above still catches chains.
     const artifactSeed = hopMarker === undefined && bodyBuffer.length > 0
-        && opts.chainContentDetection !== false && artifactSeedHit(bodyBuffer);
+        && opts.chainContentDetection !== false && getStore().enabled && artifactSeedHit(bodyBuffer);
     // #920: legacy opencode-acp sessions bypass the whole pipeline. The thin
     // plugin stamps this header per request for sessions with acp state on
     // disk; acp owns their context in-process, so binding/injecting/compressing

@@ -3,6 +3,9 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import { once } from "node:events";
 import { createHash } from "node:crypto";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { defaultConfig } from "acp-kernel";
 import { startServer, _resetChainWarningsForTest } from "../src/server.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
@@ -254,7 +257,12 @@ test("#1086 T2: fresh plugin-mode session (declarations only) is processed, not 
 });
 
 test("#1086 T3: foreign artifacts without local state pass through byte-identical, one warn, no state", async () => {
-    _setStoreForTest(new SessionStore({ enabled: false }));
+    // #1100: "no local state ⇒ foreign" holds only when persistence proves ownership
+    // across a restart, so T3 runs an ENABLED store over an empty temp dir (truly
+    // foreign). Disabled-store variant is ambiguous (own session after restart) → T6.
+    const dir = mkdtempSync(join(tmpdir(), "bili-chain-t3-"));
+    const store = new SessionStore({ dir, debounceMs: 5, enabled: true });
+    _setStoreForTest(store);
     _resetSessionsForTest();
     _resetChainWarningsForTest();
     setRegistryForTest({});
@@ -290,6 +298,8 @@ test("#1086 T3: foreign artifacts without local state pass through byte-identica
         await close(proxy);
         upstream.closeAllConnections?.();
         await close(upstream);
+        store.cancelAll();
+        rmSync(dir, { recursive: true, force: true });
     }
 });
 
@@ -319,6 +329,44 @@ test("#1086 T4: chainContentDetection=false disables the content fallback entire
         assert.notEqual(sha(captured[0]!.body), sha(raw), "valve off ⇒ artifacts ignored, kernel processes");
         assert.equal(chainWarns(logs).length, 0);
         assert.ok(peekSession("valve-1")?.stats.requests === 1);
+    } finally {
+        setLogCapture(null);
+        proxy.closeAllConnections?.();
+        await close(proxy);
+        upstream.closeAllConnections?.();
+        await close(upstream);
+    }
+});
+
+test("#1100 T6: BILI_PERSIST=0 + restart ⇒ replayed own session is processed, not permanently passed through", async () => {
+    // Post-restart shape: store disabled (BILI_PERSIST=0) and memory cleared, so this
+    // instance cannot prove ownership of the ACP artifacts the client re-sends. Pre-#1100
+    // that read as "chain" → passthrough forever (#1086 symptom); it must be processed.
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    _resetSessionsForTest();
+    _resetChainWarningsForTest();
+    setRegistryForTest({});
+    const logs: LogRec[] = [];
+    setLogCapture((level, msg) => logs.push({ level, msg }));
+    const captured: Captured[] = [];
+    const upstream = makeUpstream(captured);
+    upstream.listen(0, "127.0.0.1");
+    await listen(upstream);
+    const proxy = await startServer(makeOpts(`http://127.0.0.1:${(upstream.address() as { port: number }).port}`));
+    await listen(proxy);
+    try {
+        const raw = incidentBody();
+        const resp = await fetch(`http://127.0.0.1:${(proxy.address() as { port: number }).port}/v1/chat/completions`, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-acp-session": "own-restart-1" },
+            body: raw,
+        });
+        assert.equal(resp.status, 200);
+        await resp.text();
+        assert.equal(captured.length, 1);
+        assert.notEqual(sha(captured[0]!.body), sha(raw), "#1100: persist-off own session must be rebuilt by the kernel, NOT passed through verbatim");
+        assert.equal(chainWarns(logs, "own-restart-1").length, 0, "ownership is unprovable (not confirmed-foreign), so no chain warning may fire");
+        assert.equal(peekSession("own-restart-1")?.stats.requests, 1, "kernel must have processed the request (session created, stats advanced)");
     } finally {
         setLogCapture(null);
         proxy.closeAllConnections?.();
