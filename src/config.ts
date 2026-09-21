@@ -7,6 +7,7 @@ import { validateHttpProxy, type ProxyFallbackOptions } from "./upstream-proxy.j
 import { resolveOutputHeadroomCap } from "./util.js";
 
 import { parseCompatRoles } from "./compat-roles.js";
+import { parseOutputSteering, DEFAULT_OUTPUT_STEERING, type OutputSteeringConfig } from "./output-steering.js";
 import type { ImageBillingMode } from "./image-tokens.js";
 import type { ReasoningGuardConfig } from "./reasoning-guard.js";
 
@@ -65,6 +66,8 @@ export type ProviderRoute = {
      *  "auto" (default) classifies known first-party pixel hosts. Wins over
      *  the global `imageBilling`; env BILI_IMAGE_BILLING wins over both. */
     imageBilling?: ImageBillingMode;
+    /** Output-side compression override (#1093); wins over the global block. */
+    outputSteering?: OutputSteeringConfig;
 };
 export type ProviderRoutes = Record<string, ProviderRoute>; // key = upstream URL prefix (the /bili/<this> string)
 
@@ -411,6 +414,9 @@ export type ProxyOptions = {
      *  forwarded body for upstreams without the developer role (#552). Empty =
      *  byte-for-byte transparent. */
     compat: { roles: Record<string, string> };
+    /** Output-side compression (#1093), resolved global default. A per-provider
+     *  route `outputSteering` overlays it per request. Default OFF. */
+    outputSteering: OutputSteeringConfig;
     /** Global-level image billing mode (#767); per-provider route entries
      *  override it, env BILI_IMAGE_BILLING overrides both. undefined = auto. */
     imageBilling?: ImageBillingMode;
@@ -597,6 +603,7 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
             routing: parsePromptCacheRouting(env.ACP_PROMPT_CACHE_ROUTING ?? fileConfig.promptCache?.routing),
         },
         compat: { roles: parseCompatRoles(fileConfig.compat?.roles) ?? {} },
+        outputSteering: parseOutputSteering(fileConfig.outputSteering) ?? DEFAULT_OUTPUT_STEERING,
         imageBilling: parseImageBilling(fileConfig.imageBilling),
         sessionHeader: env.ACP_SESSION_HEADER ?? fileConfig.sessionHeader ?? "x-acp-session",
         log: env.ACP_LOG !== "0" && fileConfig.log !== false,
@@ -683,6 +690,9 @@ type FileConfig = {
      *  brings a proxy up on. Default CLAUDE_NATIVE_DEFAULT_PORT; env
      *  BILI_CLAUDE_NATIVE_PORT wins over both. */
     claude?: { nativePort?: number };
+    /** Output-side compression (#1093): verbosity steering + effort routing at
+     *  the forward boundary. Default OFF; a per-provider route overlays it. */
+    outputSteering?: { enabled?: boolean; verbosityLevel?: number; effortRouting?: boolean };
 };
 
 function nonEmpty(value: string | undefined): string | undefined {
@@ -844,7 +854,7 @@ export function parseRouteEntry(v: unknown): ProviderRoute | undefined {
     // is the KEY in the providers map (identical to the /bili/<url> string),
     // so it is NOT repeated inside the value.
     if (v && typeof v === "object" && !Array.isArray(v)) {
-        const obj = v as { models?: Record<string, ModelEntry>; proxy?: string; compressProtocol?: string; compress?: CompressSettings; compat?: { roles?: unknown }; passthrough?: boolean; imageBilling?: unknown };
+        const obj = v as { models?: Record<string, ModelEntry>; proxy?: string; compressProtocol?: string; compress?: CompressSettings; compat?: { roles?: unknown }; passthrough?: boolean; imageBilling?: unknown; outputSteering?: unknown };
         const route: ProviderRoute = { models: obj.models };
         if (typeof obj.proxy === "string") route.proxy = obj.proxy;
         if (obj.compressProtocol === "marker" || obj.compressProtocol === "tools") route.compressProtocol = obj.compressProtocol;
@@ -854,6 +864,8 @@ export function parseRouteEntry(v: unknown): ProviderRoute | undefined {
         if (typeof obj.passthrough === "boolean") route.passthrough = obj.passthrough;
         const imageBilling = parseImageBilling(obj.imageBilling);
         if (imageBilling) route.imageBilling = imageBilling;
+        const outputSteering = parseOutputSteering(obj.outputSteering);
+        if (outputSteering) route.outputSteering = outputSteering;
         return route;
     }
     // A bare value (e.g. null) means "this upstream exists, no overrides".

@@ -105,6 +105,7 @@ import { dumpRejectedBody } from "./error-dump.js";
 
 import { decodeRequestBody, DecompressedTooLargeError } from "./content-encoding.js";
 import { applyCompatRoles, applyCompatRolesJson, detectRoleRejection, detectSystemPlacementError, resolveCompatRoles, type CompatRoles } from "./compat-roles.js";
+import { applyOutputSteering, applyOutputSteeringJson, DEFAULT_OUTPUT_STEERING } from "./output-steering.js";
 import { bodyDumpEnabled, isModelDiscoveryPath, logDumpFailure, logUnrecognizedPath } from "./server/observability.js";
 import { BILI_HOP_HEADER, anthropicBetaContextWindow, LAUNCHER_MODEL_WINDOWS, LAUNCHER_MODEL_MAX_OUTPUTS, launcherContextWindow, launcherMaxOutput, parseLauncherModelWindows, windowSourceLogged } from "./server/context-window.js";
 import { buildForwardHeaders, connectionNamedHeaders, NO_IDENTITY_MESSAGE, RESPONSE_ONLY_STRIP_HEADERS, safeSessionId, UPSTREAM_HOP_HEADERS } from "./server/headers.js";
@@ -3752,6 +3753,12 @@ async function forward(
     let compatRoles: CompatRoles | null = null;
     let compatProtocol: "openai" | "responses" | null = null;
     const { upstreamUrl, headers, proxyUrl } = buildForwardTarget(req, opts, route, affinity, prepared !== null ? instanceId : undefined);
+    const wireProtocol = prepared?.protocol ?? route?.explicitProtocol ?? inferWireProtocol(req.url ?? "");
+    // #1093: resolve output-side compression once here so the initial forward
+    // and every compress-retry re-send apply the SAME steering/effort config;
+    // a per-provider route entry wins over the global default.
+    const steerCfg = findRoute(opts.routes, upstreamUrl)?.outputSteering ?? opts.outputSteering ?? DEFAULT_OUTPUT_STEERING;
+    const steerEnabled = steerCfg.enabled;
     if (typeof body === "string") {
         // upstreamUrl (the real destination) — not route?.rewrittenUrl, which
         // is undefined for zero-config requests and would skip provider compat.
@@ -3762,29 +3769,41 @@ async function forward(
         // config stays user-owned.
         const learned = (prepared?.session.metadata.learnedCompatRoles as CompatRoles | undefined) ?? {};
         const roles = { ...configured, ...learned };
-        const protocol = prepared?.protocol ?? route?.explicitProtocol ?? inferWireProtocol(req.url ?? "");
         // compatProtocol is armed even with zero roles: the learn-on-failure
         // retry below needs it, and roles may be learned mid-request.
-        if (protocol === "openai" || protocol === "responses") {
-            compatProtocol = protocol;
+        if (wireProtocol === "openai" || wireProtocol === "responses") {
+            compatProtocol = wireProtocol;
             if (Object.keys(roles).length > 0) {
                 compatRoles = roles;
-                const applied = applyCompatRoles(body, protocol, roles);
+                const applied = applyCompatRoles(body, wireProtocol, roles);
                 if (applied.rewritten > 0) {
                     wireBody = applied.body;
                     log("info", `[${prepared?.session.id ?? "passthrough"}] [compat] rewrote ${applied.rewritten} message role(s) per compat.roles (${Object.entries(roles).map(([f, t]) => `${f}→${t}`).join(",")})`);
                 }
             }
         }
+        // #1093: verbosity steering + effort routing run LAST, after compat.roles,
+        // so the turn classifier sees the final message list. Idempotent and
+        // byte-identical when disabled or when nothing matches.
+        if (steerEnabled && typeof wireBody === "string") {
+            const applied = applyOutputSteering(wireBody, wireProtocol, steerCfg);
+            if (applied.changed) {
+                wireBody = applied.body;
+                log("info", `[${prepared?.session.id ?? "passthrough"}] [output-steering] ${applied.labels.join(", ")}`);
+            }
+        }
     }
-    // #552: wire transform shared by ALL re-send paths (compress-retry loops
-    // below) so re-sent bodies carry the same rewrite as the initial forward —
-    // otherwise a developer-role 400 would hit mid-stream on the first retry.
-    // Reads compatRoles at CALL time: a role learned mid-request (retry below)
-    // applies to later re-sends within the same request.
-    const wireTransform = compatProtocol
+    // #552/#1093: wire transform shared by ALL re-send paths (compress-retry
+    // loops below) so re-sent bodies carry the same rewrite AND steering as the
+    // initial forward — otherwise a developer-role 400 would hit mid-stream on
+    // the first retry, or a retry would drop the directive/effort change. Both
+    // are read at CALL time (a role learned / config resolved mid-request applies
+    // to later re-sends within the same request). Steering is idempotent, so a
+    // re-send neither accumulates the directive nor re-lowers an already-low field.
+    const wireTransform = compatProtocol || steerEnabled
         ? (b: Record<string, unknown>): Record<string, unknown> => {
-            if (compatRoles) applyCompatRolesJson(b, compatProtocol, compatRoles);
+            if (compatProtocol && compatRoles) applyCompatRolesJson(b, compatProtocol, compatRoles);
+            if (steerEnabled) applyOutputSteeringJson(b, wireProtocol, steerCfg);
             return b;
         }
         : undefined;
