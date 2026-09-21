@@ -111,7 +111,7 @@ export interface StorageCodecOptions {
  *  encryption nor compression applies (plain JSON on disk). decode()
  *  dispatches on magic — BILIENC1 → AES-256-GCM, BILIZSTD1 → zstd/raw,
  *  anything else passes through untouched (legacy plaintext) — so mixed
- *  trees load fine and boot migration can peek the magic before rewriting.
+ *  trees load fine under any codec configuration.
  *  A decode failure throws and the kernel store treats the file as corrupt
  *  (warn + skip). */
 export function createStorageCodec(opts: StorageCodecOptions = {}): StateStoreCodec | undefined {
