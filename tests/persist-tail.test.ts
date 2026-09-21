@@ -8,6 +8,10 @@ import { Session, cacheBlockContent, snapshotMessages } from "../src/session.ts"
 import { renderHandoff } from "../src/export.ts";
 import { createInitialState, defaultCountTokens } from "acp-kernel";
 
+// readRecord() inspects raw on-disk session files directly (bypassing the
+// store codec), so pin the plain-JSON format: #1080 made BILIZSTD1 the default.
+process.env.BILI_PERSIST_ZSTD = "0";
+
 // #401: the persisted record stores a BOUNDED FOLDED-VIEW snapshot —
 // prune() renders summaries in place of folded ranges, then the oldest
 // messages are dropped until the view fits BILI_PERSIST_TAIL_TOKENS. The raw

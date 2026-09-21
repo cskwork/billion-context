@@ -5,7 +5,7 @@ import * as path from "node:path";
 import { StateStore, flatFileNameFor, type PersistedEnvelope, type StateStoreCodec } from "acp-kernel/persist";
 import { sessionsDir } from "./paths.js";
 import { log as loggerLog } from "./logger.js";
-import { createSessionCodec, ENCRYPT_MAGIC, parseEncryptionKey } from "./encrypt.js";
+import { createStorageCodec, ENCRYPT_MAGIC, ZSTD_MAGIC, parseEncryptionKey } from "./encrypt.js";
 import { PersistEpermAlert } from "./persist-eperm.js";
 import { createInitialState, defaultCountTokens, prune, type CompressionState, type CoreMessage } from "acp-kernel";
 import type { Session, BlockContent, BlockView } from "./session.js";
@@ -35,11 +35,14 @@ import type { WireProtocol } from "./util.js";
  *  - Forward-compat: `mergeState` fills any fields missing on a file written
  *    by an older version, so a schema change never breaks old files.
  *  - Disable with BILI_PERSIST=0 for ephemeral/test runs.
- *  - Encryption at rest (#708): BILI_ENCRYPTION_KEY (hex/base64, exactly 32
- *    bytes) wraps every file as BILIENC1 AES-256-GCM(zstd(JSON)) via the
- *    kernel store's codec hook. Legacy plaintext files are re-encoded in
- *    place once at boot (migrateLegacyFiles); key material never touches
- *    disk or logs.
+ *  - Storage encoding at rest: via the kernel store's codec hook, every file
+ *    is zstd-compressed BY DEFAULT (#1080, BILIZSTD1 envelope; opt out with
+ *    BILI_PERSIST_ZSTD=0) and, independently, AES-256-GCM-encrypted when
+ *    BILI_ENCRYPTION_KEY (hex/base64, exactly 32 bytes) is set (#708,
+ *    BILIENC1 envelope) — the body-mode byte records compression even inside
+ *    BILIENC1, so the two stay separately configurable. Legacy plaintext
+ *    files are re-encoded in place once at boot (migrateLegacyFiles); key
+ *    material never touches disk or logs.
  *
  * MECHANISM lives in `acp-kernel/persist` (StateStore: atomic write, rename
  * retries, debounce, per-id serialization, corrupt-tolerant load, recursive
@@ -203,13 +206,19 @@ export class SessionStore {
         this.dir = opts?.dir ?? defaultDir();
         const baseLog = opts?.log ?? defaultLogger;
         this.log = baseLog;
-        // #708: env-only key (a key file next to the data sits on the same
-        // untrusted filesystem). Invalid values throw here — fail fast at
-        // startup instead of running silently unencrypted.
+        // #708/#1080: env-only storage policy (a key file next to the data
+        // sits on the same untrusted filesystem). Compression is ON by
+        // default (#1080); BILI_PERSIST_ZSTD=0 keeps plain JSON. Invalid key
+        // values throw here — fail fast at startup instead of running
+        // silently unencrypted.
         const keyEnv = process.env.BILI_ENCRYPTION_KEY;
-        if (keyEnv) {
-            this.codec = createSessionCodec(parseEncryptionKey(keyEnv));
+        let key: Buffer | null = null;
+        if (keyEnv) key = parseEncryptionKey(keyEnv);
+        this.codec = createStorageCodec({ key, compress: persistZstdEnabled() });
+        if (key) {
             baseLog("info", "[persist] session-file encryption enabled (AES-256-GCM)");
+        } else if (this.codec) {
+            baseLog("info", "[persist] session-file compression enabled (zstd, BILIZSTD1)");
         }
         const epermAlert = new PersistEpermAlert({
             dir: this.dir,
@@ -277,14 +286,14 @@ export class SessionStore {
         return out;
     }
 
-    /** #708: when encryption is enabled, take over legacy plaintext files:
-     * every .json under the sessions dir lacking the BILIENC1 magic is
-     * re-encoded in place — temp write + rename onto the SAME path, so the
-     * atomic replace IS the old-file deletion (no window where both, or
-     *  neither, copy exists). A crash mid-run leaves each file either old or
-     *  new; the next boot finishes the job and sweeps the crashed run's
-     *  orphaned temps. Self-terminating: the 8-byte magic peek decides per
-     *  file, so later boots cost O(files × 8 bytes). */
+    /** #708/#1080: when a storage codec is active, take over legacy
+     * plaintext files: every .json under the sessions dir lacking both the
+     * BILIENC1 and the BILIZSTD1 magic is re-encoded in place — temp write
+     * + rename onto the SAME path, so the atomic replace IS the old-file
+     * deletion (no window where both, or neither, copy exists). A crash
+     * mid-run leaves each file either old or new; the next boot finishes the
+     * job and sweeps the crashed run's orphaned temps. Self-terminating: the
+     * magic peek decides per file, so later boots cost O(files × magic). */
     private async migrateLegacyFiles(): Promise<void> {
         if (!this.codec) return;
         let files: string[];
@@ -306,13 +315,13 @@ export class SessionStore {
             } catch {
                 continue;
             }
-            if (head.equals(ENCRYPT_MAGIC)) continue;
+            if (startsWithMagic(head, ENCRYPT_MAGIC) || startsWithMagic(head, ZSTD_MAGIC)) continue;
             let parsed: unknown;
             try {
                 parsed = JSON.parse(await readFile(file, "utf8"));
             } catch {
                 failed++;
-                this.log("warn", `[persist] encryption migration (#708): leaving unreadable file in place: ${file}`);
+                this.log("warn", `[persist] storage migration (#708/#1080): leaving unreadable file in place: ${file}`);
                 continue;
             }
             const tmp = `${file}.tmp-enc-${process.pid}-${Date.now()}`;
@@ -322,14 +331,14 @@ export class SessionStore {
                 migrated++;
             } catch {
                 failed++;
-                this.log("warn", `[persist] encryption migration (#708): failed to re-encode: ${file}`);
+                this.log("warn", `[persist] storage migration (#708/#1080): failed to re-encode: ${file}`);
                 await rm(tmp, { force: true }).catch(() => {});
             }
         }
         if (migrated > 0 || failed > 0) {
             this.log(
                 failed > 0 ? "warn" : "info",
-                `[persist] encryption migration (#708): re-encoded ${migrated} legacy session file(s)${failed > 0 ? `, ${failed} failed` : ""}`,
+                `[persist] storage migration (#708/#1080): re-encoded ${migrated} legacy session file(s)${failed > 0 ? `, ${failed} failed` : ""}`,
             );
         }
     }
@@ -685,6 +694,15 @@ function persistEnabled(): boolean {
     return true;
 }
 
+/** #1080: zstd-compress session files by default — reversible and invisible
+ *  to clients, storage cost is the driver; BILI_PERSIST_ZSTD=0/false keeps
+ *  them as plain JSON. */
+function persistZstdEnabled(): boolean {
+    const env = process.env.BILI_PERSIST_ZSTD;
+    if (env === "0" || env === "false") return false;
+    return true;
+}
+
 /** Temp name used by migrateLegacyFiles: `<file>.tmp-enc-<pid>-<ts>`. A
  *  process death between write and rename orphans it; any such name present
  *  at boot is stale by definition (the walk runs before this boot writes
@@ -705,7 +723,7 @@ async function walkJsonFiles(dir: string): Promise<string[]> {
     return out;
 }
 
-async function readFileHead(file: string, len: number = ENCRYPT_MAGIC.length): Promise<Buffer> {
+async function readFileHead(file: string, len: number = Math.max(ENCRYPT_MAGIC.length, ZSTD_MAGIC.length)): Promise<Buffer> {
     const fh = await open(file, "r");
     try {
         const buf = Buffer.alloc(len);
@@ -714,6 +732,12 @@ async function readFileHead(file: string, len: number = ENCRYPT_MAGIC.length): P
     } finally {
         await fh.close();
     }
+}
+
+/** Prefix match: the head buffer can be longer (it spans both magics) or
+ *  shorter (truncated file) than the magic being tested. */
+function startsWithMagic(buf: Buffer, magic: Buffer): boolean {
+    return buf.length >= magic.length && buf.subarray(0, magic.length).equals(magic);
 }
 
 /** Token budget for the persisted folded-view snapshot (#401). The raw full

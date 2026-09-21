@@ -5,7 +5,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { SessionStore } from "../src/persist.ts";
-import { createSessionCodec, ENCRYPT_MAGIC, parseEncryptionKey } from "../src/encrypt.ts";
+import { createStorageCodec, ENCRYPT_MAGIC, parseEncryptionKey } from "../src/encrypt.ts";
 import type { Session } from "../src/session.ts";
 import { createInitialState } from "acp-kernel";
 
@@ -43,6 +43,7 @@ async function withTempDir(name: string, fn: (h: Harness) => Promise<void>): Pro
             await fn(h);
         } finally {
             delete process.env.BILI_ENCRYPTION_KEY;
+            delete process.env.BILI_PERSIST_ZSTD;
             rmSync(dir, { recursive: true, force: true });
         }
     });
@@ -68,8 +69,8 @@ test("parseEncryptionKey accepts hex and base64, rejects everything else", () =>
 });
 
 test("codec: roundtrip, magic prefix, per-write nonce, tamper and wrong-key rejection", () => {
-    const codec = createSessionCodec(Buffer.from(KEY, "hex"));
-    const other = createSessionCodec(Buffer.from(KEY_OTHER, "hex"));
+    const codec = createStorageCodec({ key: Buffer.from(KEY, "hex") })!;
+    const other = createStorageCodec({ key: Buffer.from(KEY_OTHER, "hex") })!;
     const json = JSON.stringify({ hello: "world", n: [1, 2, 3] });
 
     const enc = Buffer.isBuffer(codec.encode(json)) ? codec.encode(json) : Buffer.from(codec.encode(json));
@@ -87,9 +88,9 @@ test("codec: roundtrip, magic prefix, per-write nonce, tamper and wrong-key reje
 });
 
 test("codec passes legacy plaintext through untouched", () => {
-    const codec = createSessionCodec(Buffer.from(KEY, "hex"));
-    const json = '{"version":3,"id":"x"}';
-    assert.equal(codec.decode(Buffer.from(json, "utf8")), json);
+    const codec = createStorageCodec({ key: Buffer.from(KEY, "hex") })!;
+    const plain = JSON.stringify({ version: 3, savedAt: 1, id: "s", payload: { protocol: "openai" } });
+    assert.equal(codec.decode(Buffer.from(plain, "utf8")), plain);
 });
 
 await withTempDir("writes are encrypted on disk when the key is set", async (h) => {
@@ -109,11 +110,13 @@ await withTempDir("writes are encrypted on disk when the key is set", async (h) 
 });
 
 await withTempDir("boot migrates legacy plaintext files to encrypted in place", async (h) => {
-    // Phase 1: legacy plaintext tree written by an unencrypted store.
+    // Phase 1: pre-#1080 plaintext tree (zstd opt-out = what older bili wrote).
+    process.env.BILI_PERSIST_ZSTD = "0";
     const legacy = newStore(h);
     await legacy.writeNow(makeSession("s-1"));
     await legacy.writeNow(makeSession("s-2"));
     legacy.cancelAll();
+    delete process.env.BILI_PERSIST_ZSTD;
 
     // Phase 2: boot with the key — every unencoded file must be taken over.
     process.env.BILI_ENCRYPTION_KEY = KEY;
@@ -166,9 +169,12 @@ await withTempDir("migration covers spill-style .fb.json files and leaves corrup
 });
 
 await withTempDir("boot sweeps orphaned .tmp-enc-* temps left by a crashed migration", async (h) => {
+    // Pre-#1080 plaintext file (zstd opt-out), same as what older bili wrote.
+    process.env.BILI_PERSIST_ZSTD = "0";
     const legacy = newStore(h);
     await legacy.writeNow(makeSession("s-crash"));
     legacy.cancelAll();
+    delete process.env.BILI_PERSIST_ZSTD;
 
     // Simulate a process death between the temp write and the rename: a
     // stale temp sits next to an unencoded legacy file.
@@ -209,7 +215,8 @@ await withTempDir("invalid key fails fast at construction", async (h) => {
     assert.throws(() => newStore(h), /BILI_ENCRYPTION_KEY.*exactly 32 bytes/);
 });
 
-await withTempDir("without a key, files stay plaintext (zero behavior change)", async (h) => {
+await withTempDir("without a key and zstd opted out, files stay plaintext", async (h) => {
+    process.env.BILI_PERSIST_ZSTD = "0";
     const store = newStore(h);
     try {
         await store.writeNow(makeSession("s-plain"));

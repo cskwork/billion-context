@@ -1,38 +1,55 @@
 import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
 import * as zlib from "node:zlib";
+import { Decompress as ZstdWasmDecompress } from "fzstd";
 import type { StateStoreCodec } from "acp-kernel/persist";
 
 /**
- * Session-file encryption at rest (#708): AES-256-GCM over an optionally
- * zstd-compressed JSON envelope, applied around every StateStore write/read.
+ * Session-file storage encoding at rest: AES-256-GCM encryption (#708) and
+ * zstd compression (#1080), applied around every StateStore write/read and
+ * configured INDEPENDENTLY of each other.
  *
- * THREAT MODEL: the proxy may run on untrusted nodes; session files hold
- * block summaries plus up to ~16k tokens of folded conversation per session
- * — effectively full conversation content (code, pasted credentials). The
- * key comes ONLY from the BILI_ENCRYPTION_KEY environment variable: a key
- * file next to the data sits on the same untrusted filesystem and defeats
- * the purpose.
+ * THREAT MODEL (#708): the proxy may run on untrusted nodes; session files
+ * hold block summaries plus up to ~16k tokens of folded conversation per
+ * session — effectively full conversation content (code, pasted credentials).
+ * The key comes ONLY from the BILI_ENCRYPTION_KEY environment variable: a key
+ * file next to the data sits on the same untrusted filesystem and defeats the
+ * purpose.
  *
- * FORMAT (v1):
- *   offset 0..7    magic "BILIENC1"
- *   offset 8       format version (0x01)
- *   offset 9       body mode (0x00 raw, 0x01 zstd)
- *   offset 10..21  GCM nonce (random per write)
- *   offset 22..    AES-256-GCM ciphertext, final 16 bytes = auth tag
+ * COMPRESSION (#1080): session JSON is large and fully reversible, so it is
+ * zstd-compressed BY DEFAULT for storage cost; BILI_PERSIST_ZSTD=0 keeps plain
+ * JSON. Clients and tools never see the on-disk format — the store decodes
+ * transparently and `bili export` renders plaintext.
  *
- * Compression runs BEFORE encryption (GCM ciphertext is incompressible).
- * node:zlib gained zstd in Node 22.15; on older runtimes the mode byte
- * records a raw body so every supported version can still decrypt it.
+ * FORMATS (v1):
+ *   encrypted (BILIENC1):
+ *     offset 0..7    magic "BILIENC1"
+ *     offset 8       format version (0x01)
+ *     offset 9       body mode (0x00 raw, 0x01 zstd)
+ *     offset 10..21  GCM nonce (random per write)
+ *     offset 22..    AES-256-GCM ciphertext, final 16 bytes = auth tag
+ *   compressed (BILIZSTD1):
+ *     offset 0..8    magic "BILIZSTD1"
+ *     offset 9       format version (0x01)
+ *     offset 10      body mode (0x00 raw, 0x01 zstd)
+ *     offset 11..    body (JSON or zstd stream)
+ *
+ * Compression runs BEFORE encryption (GCM ciphertext is incompressible); the
+ * mode byte records which, so each concern stays independently configurable.
+ * node:zlib gained zstd in Node 22.15; on older runtimes the writer falls
+ * back to a raw body and the reader uses the bundled fzstd WASM decoder, so a
+ * file written by any supported version reads back on every supported one.
  */
 
 export const ENCRYPT_MAGIC = Buffer.from("BILIENC1", "utf8");
+export const ZSTD_MAGIC = Buffer.from("BILIZSTD1", "utf8");
 const FORMAT_VERSION = 0x01;
 const MODE_RAW = 0x00;
 const MODE_ZSTD = 0x01;
 const NONCE_LEN = 12;
 const TAG_LEN = 16;
-const HEADER_LEN = ENCRYPT_MAGIC.length + 2 + NONCE_LEN;
-const MIN_ENCRYPTED_LEN = HEADER_LEN + TAG_LEN;
+const ENCRYPT_HEADER_LEN = ENCRYPT_MAGIC.length + 2 + NONCE_LEN;
+const MIN_ENCRYPTED_LEN = ENCRYPT_HEADER_LEN + TAG_LEN;
+const PLAIN_HEADER_LEN = ZSTD_MAGIC.length + 2;
 
 /** Parse the BILI_ENCRYPTION_KEY value: hex or base64, must decode to
  *  exactly 32 bytes. Hex wins when both parse (a base64 string made only of
@@ -56,48 +73,101 @@ export function parseEncryptionKey(value: string): Buffer {
     return buf;
 }
 
+let zstdOverride: false | null = null;
+
+/** Test hook: simulate runtimes without native zstd (pre-Node-22.15). Can
+ *  only claim ABSENCE, never presence — encoding then falls back to a raw
+ *  body and decoding uses the WASM path. */
+export function _setZstdAvailableForTest(v: false | null): void {
+    zstdOverride = v;
+}
+
 function zstdAvailable(): boolean {
+    if (zstdOverride === false) return false;
     return typeof zlib.zstdCompressSync === "function" && typeof zlib.zstdDecompressSync === "function";
 }
 
-/** Build the StateStore codec for encrypted session files. decode() passes
- *  buffers without the magic through untouched (legacy plaintext), so mixed
- *  plaintext+encrypted trees load fine and the boot-time migration can peek
- *  the magic before rewriting. A decode failure (wrong key, corruption)
- *  throws and the kernel store treats the file as corrupt (warn + skip). */
-export function createSessionCodec(key: Buffer): StateStoreCodec {
+/** Decompress a zstd-mode body: native node:zlib when present, otherwise the
+ *  bundled fzstd WASM decoder — keeps newer-runtime files readable on older
+ *  ones (#1080). */
+function inflateZstd(body: Buffer): Buffer {
+    if (zstdAvailable()) return zlib.zstdDecompressSync(body);
+    const chunks: Buffer[] = [];
+    new ZstdWasmDecompress((chunk) => chunks.push(Buffer.from(chunk))).push(body, true);
+    return Buffer.concat(chunks);
+}
+
+export interface StorageCodecOptions {
+    /** AES-256-GCM key (#708). Without one, BILIENC1 files cannot be read —
+     *  they surface as an actionable corrupt-file error instead of garbage. */
+    key?: Buffer | null;
+    /** zstd-compress bodies (#1080, default true) — applies to BOTH formats;
+     *  the mode byte records it, so compression stays independent of
+     *  encryption. */
+    compress?: boolean;
+}
+
+/** Build the StateStore codec for session files, or undefined when neither
+ *  encryption nor compression applies (plain JSON on disk). decode()
+ *  dispatches on magic — BILIENC1 → AES-256-GCM, BILIZSTD1 → zstd/raw,
+ *  anything else passes through untouched (legacy plaintext) — so mixed
+ *  trees load fine and boot migration can peek the magic before rewriting.
+ *  A decode failure throws and the kernel store treats the file as corrupt
+ *  (warn + skip). */
+export function createStorageCodec(opts: StorageCodecOptions = {}): StateStoreCodec | undefined {
+    const key = opts.key ?? null;
+    const compress = opts.compress ?? true;
+    if (!key && !compress) return undefined;
     return {
         encode(data: string): Buffer {
             const plain = Buffer.from(data, "utf8");
-            const useZstd = zstdAvailable();
+            const useZstd = compress && zstdAvailable();
             const body = useZstd ? zlib.zstdCompressSync(plain) : plain;
+            const header = Buffer.from([FORMAT_VERSION, useZstd ? MODE_ZSTD : MODE_RAW]);
+            if (!key) {
+                return Buffer.concat([ZSTD_MAGIC, header, body]);
+            }
             const nonce = randomBytes(NONCE_LEN);
             const cipher = createCipheriv("aes-256-gcm", key, nonce);
             const ct = Buffer.concat([cipher.update(body), cipher.final()]);
-            return Buffer.concat([
-                ENCRYPT_MAGIC,
-                Buffer.from([FORMAT_VERSION, useZstd ? MODE_ZSTD : MODE_RAW]),
-                nonce,
-                ct,
-                cipher.getAuthTag(),
-            ]);
+            return Buffer.concat([ENCRYPT_MAGIC, header, nonce, ct, cipher.getAuthTag()]);
         },
         decode(buf: Buffer): string {
-            if (buf.length < ENCRYPT_MAGIC.length || !buf.subarray(0, ENCRYPT_MAGIC.length).equals(ENCRYPT_MAGIC)) {
-                return buf.toString("utf8");
+            if (buf.length >= ENCRYPT_MAGIC.length && buf.subarray(0, ENCRYPT_MAGIC.length).equals(ENCRYPT_MAGIC)) {
+                return decryptEnvelope(buf, key);
             }
-            if (buf.length < MIN_ENCRYPTED_LEN || buf[ENCRYPT_MAGIC.length] !== FORMAT_VERSION) {
-                throw new Error(`[encrypt] unsupported session file format version ${buf[ENCRYPT_MAGIC.length]}`);
+            if (buf.length >= ZSTD_MAGIC.length && buf.subarray(0, ZSTD_MAGIC.length).equals(ZSTD_MAGIC)) {
+                return decompressEnvelope(buf);
             }
-            const mode = buf[ENCRYPT_MAGIC.length + 1];
-            const nonce = buf.subarray(HEADER_LEN - NONCE_LEN, HEADER_LEN);
-            const tag = buf.subarray(buf.length - TAG_LEN);
-            const ct = buf.subarray(HEADER_LEN, buf.length - TAG_LEN);
-            const decipher = createDecipheriv("aes-256-gcm", key, nonce);
-            decipher.setAuthTag(tag);
-            const body = Buffer.concat([decipher.update(ct), decipher.final()]);
-            const plain = mode === MODE_ZSTD ? zlib.zstdDecompressSync(body) : body;
-            return plain.toString("utf8");
+            return buf.toString("utf8");
         },
     };
+}
+
+function decryptEnvelope(buf: Buffer, key: Buffer | null): string {
+    if (!key) {
+        throw new Error("[storage] session file is BILIENC1-encrypted but no BILI_ENCRYPTION_KEY is set — cannot read it");
+    }
+    if (buf.length < MIN_ENCRYPTED_LEN || buf[ENCRYPT_MAGIC.length] !== FORMAT_VERSION) {
+        throw new Error(`[encrypt] unsupported session file format version ${buf[ENCRYPT_MAGIC.length]}`);
+    }
+    const mode = buf[ENCRYPT_MAGIC.length + 1];
+    const nonce = buf.subarray(ENCRYPT_HEADER_LEN - NONCE_LEN, ENCRYPT_HEADER_LEN);
+    const tag = buf.subarray(buf.length - TAG_LEN);
+    const ct = buf.subarray(ENCRYPT_HEADER_LEN, buf.length - TAG_LEN);
+    const decipher = createDecipheriv("aes-256-gcm", key, nonce);
+    decipher.setAuthTag(tag);
+    const body = Buffer.concat([decipher.update(ct), decipher.final()]);
+    const plain = mode === MODE_ZSTD ? inflateZstd(body) : body;
+    return plain.toString("utf8");
+}
+
+function decompressEnvelope(buf: Buffer): string {
+    if (buf.length < PLAIN_HEADER_LEN || buf[ZSTD_MAGIC.length] !== FORMAT_VERSION) {
+        throw new Error(`[storage] unsupported session file format version ${buf[ZSTD_MAGIC.length]}`);
+    }
+    const mode = buf[ZSTD_MAGIC.length + 1];
+    const body = buf.subarray(PLAIN_HEADER_LEN);
+    const plain = mode === MODE_ZSTD ? inflateZstd(body) : body;
+    return plain.toString("utf8");
 }

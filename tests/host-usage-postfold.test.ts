@@ -16,6 +16,10 @@ import { startServer } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 
+// Some tests inspect raw on-disk session files directly (bypassing the store
+// codec), so pin the plain-JSON format: #1080 made BILIZSTD1 the default.
+process.env.BILI_PERSIST_ZSTD = "0";
+
 function makeSession(id: string): Session {
     return {
         id,

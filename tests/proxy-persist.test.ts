@@ -8,6 +8,11 @@ import { setLogCapture } from "../src/logger.ts";
 import { dirname, join, relative, sep } from "node:path";
 import type { Session, BlockContent } from "../src/session.ts";
 import { createInitialState } from "acp-kernel";
+
+// These tests inspect raw on-disk session files directly (bypassing the store
+// codec), so pin the plain-JSON format: #1080 made BILIZSTD1 the default.
+process.env.BILI_PERSIST_ZSTD = "0";
+
 /** Recursively collect *.json files under dir (sessions are namespaced into
  *  protocol/ subdirs). */
 function jsonFilesUnder(dir: string): string[] {
