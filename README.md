@@ -810,30 +810,6 @@ The file auto-rotates at 10 MB (renamed to `bili.log.old`). Cache-hit stats
 per request are logged as `[acp-usage] round N input=X cached=Y (cache hit Z%)`
 so you can measure prefix-cache health directly from the log.
 
-### Chaining bili instances (bili → bili)
-
-When one bili's upstream is another bili (`client → A → B → LLM`), only the
-instance closest to the client should run the compression pipeline — a second
-pass would double-compress and corrupt session state. Any of three signals on
-the inbound request makes the downstream instance pass it through **verbatim**
-(no tool/tag injection, no acp-loop, no session state):
-
-- `x-bili-hop` — stamped with the processing instance's id on every processed
-  emission (#300). Clients never send this header, so its presence always means
-  "came from a bili".
-- `x-bili-sig` — sha256 digest of the exact emitted body bytes (#1078). Proves
-  no middlebox rewrote the request in transit; on mismatch the downstream
-  instance passes through anyway, because it must not process content it did
-  not produce.
-- ACP artifacts in the body (render tags / context-management tool names) —
-  fallback for relays that strip bili's headers.
-
-Every detection logs a prominent `[chain]` line (to `bili.log` and stderr)
-naming the signal that fired. Older versions that stamp only `x-bili-hop` keep
-working unchanged. If a third-party relay in your chain rewrites or strips
-request bodies/headers, a `[chain]` warning on the downstream instance is the
-safety mechanism working, not an error.
-
 ### Self-update
 
 The proxy checks npm for a newer version on startup and every 3 minutes. When a

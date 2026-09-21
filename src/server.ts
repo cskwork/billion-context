@@ -107,7 +107,6 @@ import { decodeRequestBody, DecompressedTooLargeError } from "./content-encoding
 import { applyCompatRoles, applyCompatRolesJson, detectRoleRejection, detectSystemPlacementError, resolveCompatRoles, type CompatRoles } from "./compat-roles.js";
 import { bodyDumpEnabled, isModelDiscoveryPath, logDumpFailure, logUnrecognizedPath } from "./server/observability.js";
 import { BILI_HOP_HEADER, anthropicBetaContextWindow, LAUNCHER_MODEL_WINDOWS, LAUNCHER_MODEL_MAX_OUTPUTS, launcherContextWindow, launcherMaxOutput, parseLauncherModelWindows, windowSourceLogged } from "./server/context-window.js";
-import { BILI_SIG_HEADER, detectAcpArtifacts, stampChainSig, verifyChainSig } from "./server/chain-sig.js";
 import { buildForwardHeaders, connectionNamedHeaders, NO_IDENTITY_MESSAGE, RESPONSE_ONLY_STRIP_HEADERS, safeSessionId, UPSTREAM_HOP_HEADERS } from "./server/headers.js";
 import { isSideRequest, outputBudgetField, restoreOutputBudget, SIDE_REQUEST_MAX_TOKENS, sideRequestGuard } from "./server/side-request.js";
 import { clampOutgoingOutput, countSystemAndToolsTokens, emergencyNudge, estimateInputTokens, estimateWireOverhead } from "./server/budget.js";
@@ -1002,27 +1001,6 @@ async function handle(
             ? `[chain] inbound request carries THIS instance's ${BILI_HOP_HEADER} marker (${hopMarker}) — self-loop detected. Passing through without processing; check your upstream config (it may point back to this instance).`
             : `[chain] inbound request carries ${BILI_HOP_HEADER} from another bili instance (${hopMarker}) — bili→bili chain detected. Passing through without processing to avoid double compression; keep only one bili instance in the chain.`);
     }
-    // #1078: two signals beyond the explicit marker, for chains where a
-    // third-party relay sits between the bilis. (S3) x-bili-sig digests the
-    // exact bytes the processing instance emitted — a mismatch means a
-    // middlebox rewrote the request in transit. (S2) ACP artifacts in the
-    // body prove some bili already processed this conversation even when the
-    // relay stripped bili's headers. Every signal forces the same outcome as
-    // the marker: skip ALL processing, forward verbatim, warn loudly.
-    const chainSig = headerValue(req, BILI_SIG_HEADER);
-    const hasAcpArtifacts = hopMarker === undefined && chainSig === undefined && bodyBuffer.length > 0 && detectAcpArtifacts(bodyBuffer);
-    if (hopMarker !== undefined && chainSig !== undefined) {
-        if (verifyChainSig(chainSig, bodyBuffer) === "mismatch") {
-            log("warn", `[chain] ${BILI_HOP_HEADER} (${hopMarker}) present but ${BILI_SIG_HEADER} does not match the received body — a middlebox rewrote the request in transit. Passing through without processing.`);
-        } else {
-            log("debug", `[chain] ${BILI_SIG_HEADER} verified for ${BILI_HOP_HEADER}=${hopMarker}`);
-        }
-    } else if (hopMarker === undefined && chainSig !== undefined) {
-        log("warn", `[chain] inbound request carries ${BILI_SIG_HEADER} but no ${BILI_HOP_HEADER} — a middlebox likely stripped the hop header. Passing through without processing.`);
-    } else if (hasAcpArtifacts) {
-        log("warn", `[chain] inbound request carries ACP compression artifacts but neither ${BILI_HOP_HEADER} nor ${BILI_SIG_HEADER} — a middlebox likely stripped bili's headers. Passing through without processing.`);
-    }
-    const chainDetected = hopMarker !== undefined || chainSig !== undefined || hasAcpArtifacts;
     // #920: legacy opencode-acp sessions bypass the whole pipeline. The thin
     // plugin stamps this header per request for sessions with acp state on
     // disk; acp owns their context in-process, so binding/injecting/compressing
@@ -1231,14 +1209,13 @@ async function handle(
     // requests whose upstream URL matches a provider route with
     // `passthrough: true` (upstreams that fingerprint the request body).
     const routePassthrough = !opts.passthrough && findRoute(opts.routes, route?.rewrittenUrl)?.passthrough === true;
-    if (routePassthrough && !chainDetected && protocol && parsed) {
+    if (routePassthrough && hopMarker === undefined && protocol && parsed) {
         log("info", `[route-passthrough] ${maskUrlsInText(route?.rewrittenUrl ?? "")} matches a passthrough route — forwarding verbatim, kernel bypassed`);
     }
-    // #300/#1078: `chainDetected` (hop marker, chain signature, or ACP
-    // artifacts in the body) means an upstream bili already processed this
-    // request — skip the whole pipeline (prepared stays null) so the
+    // #300: `hopMarker !== undefined` means an upstream bili already processed
+    // this request — skip the whole pipeline (prepared stays null) so the
     // passthrough path below forwards it verbatim.
-    if (!opts.passthrough && !routePassthrough && !chainDetected && protocol && parsed && typeof parsed === "object") {
+    if (!opts.passthrough && !routePassthrough && hopMarker === undefined && protocol && parsed && typeof parsed === "object") {
         const sessionHeader = headerValue(req, opts.sessionHeader);
         // Plugin mode (issue #1, "内外呼应"): a cooperative agent-side plugin
         // announces itself with x-bili-plugin. The proxy then treats the
@@ -3800,14 +3777,6 @@ async function forward(
             }
         }
     }
-    // #1078 S3: stamp the chain-integrity digest over the EXACT bytes about to
-    // be sent — after every mutation above (tags, tools, roles-compat,
-    // serialization). Only when this instance actually processed (prepared !==
-    // null): a passthrough keeps the inbound signature intact so downstream
-    // verification still attributes the bytes to the original processor.
-    if (prepared !== null && req.method !== "GET" && req.method !== "HEAD") {
-        stampChainSig(headers, wireBody);
-    }
     // #552: wire transform shared by ALL re-send paths (compress-retry loops
     // below) so re-sent bodies carry the same rewrite as the initial forward —
     // otherwise a developer-role 400 would hit mid-stream on the first retry.
@@ -3999,12 +3968,7 @@ async function forward(
                     if (fixed.rewritten === 0) return "other";
                     let r: Awaited<ReturnType<typeof fetchWithTimeout>>;
                     try {
-                        // #1078 S3: this emission has different bytes than the
-                        // initial forward — re-stamp over its own body or a
-                        // downstream bili would report a false rewrite.
-                        const retryHeaders = prepared !== null ? { ...headers } : headers;
-                        if (prepared !== null) stampChainSig(retryHeaders, fixed.body);
-                        r = await fetchWithTimeout(upstreamUrl, { ...init, headers: retryHeaders, body: fixed.body }, undefined, clientAbort.signal);
+                        r = await fetchWithTimeout(upstreamUrl, { ...init, body: fixed.body }, undefined, clientAbort.signal);
                     } catch {
                         return "other"; // transport failure — keep the original 400
                     }
@@ -4669,16 +4633,11 @@ async function resolveFakeCompletion(
             opts.log("warn", `[${sid}] fake completion (tool-call XML, no tool block); retry ${attempt}/${max} with corrective hint`);
             let r: Awaited<ReturnType<typeof fetchWithTimeout>>;
             try {
-                // #1078 S3: the hint changed the bytes — re-stamp (this function
-                // only runs for processed requests) so a downstream bili does
-                // not report a false mid-chain rewrite.
-                const retryHeaders = { ...opts.reqHeaders };
-                stampChainSig(retryHeaders, hinted);
                 r = await fetchWithTimeout(
                     opts.upstreamUrl,
                     {
                         method: "POST",
-                        headers: retryHeaders,
+                        headers: opts.reqHeaders,
                         body: hinted,
                         ...(opts.proxyUrl ? { dispatcher: proxyDispatcher(opts.proxyUrl) } : {}),
                     },
@@ -4867,6 +4826,5 @@ function logMsg(opts: ProxyOptions, level: string, msg: string): void {
 
 export { logDumpFailure, logUnrecognizedPath } from "./server/observability.js";
 export { BILI_HOP_HEADER, parseLauncherModelWindows, anthropicBetaContextWindow } from "./server/context-window.js";
-export { BILI_SIG_HEADER } from "./server/chain-sig.js";
 export { isSideRequest, outputBudgetField, restoreOutputBudget, sideRequestGuard, type OutputBudgetField } from "./server/side-request.js";
 export { countSystemAndToolsTokens, estimateInputTokens, estimateWireOverhead, clampOutputBudget, emergencyNudge } from "./server/budget.js";
