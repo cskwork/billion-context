@@ -120,13 +120,16 @@ export function ensureStored(session: Session, ref: string, text: string, tool?:
 
 /** Render the deterministic wire placeholder for a stored ref. Carries enough
  *  signal (tool, size, a head preview) for the model to judge relevance without
- *  fetching, plus the exact acp_retrieve call to make. Byte-stable for a given
- *  ref+original, so the upstream prefix cache stays warm across turns. */
+ *  fetching, plus the exact acp_retrieve call to make. It also states that
+ *  summarizing is REVERSIBLE — the original persists under this ref — so the
+ *  model can freely pick gist (absorb) or full (retrieve); both fidelities
+ *  coexist under the same id. Byte-stable for a given ref+original, so the
+ *  upstream prefix cache stays warm across turns. */
 export function renderPlaceholder(ref: string, entry: StoredEntry, original: string): string {
     const label = entry.tool ?? "tool";
     const head = original.replace(/\s+/g, " ").trim().slice(0, 60);
     const headPart = head ? ` ${JSON.stringify(head)}` : "";
-    return `\u{1F4E6} [stored #${ref} \u00B7 ${label} \u00B7 ${entry.tokens} tok]${headPart} \u2192 ${RETRIEVE_TOOL_NAME}("${ref}")`;
+    return `\u{1F4E6} [stored #${ref} \u00B7 ${label} \u00B7 ${entry.tokens} tok]${headPart} \u2192 ${RETRIEVE_TOOL_NAME}("${ref}") restores full text; safe to summarize \u2014 the original stays retrievable by this ref`;
 }
 
 /** ID-reference view: replace oversized tool-result content with a deterministic
