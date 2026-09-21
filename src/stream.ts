@@ -2,9 +2,10 @@ import { collectBlockContent, type CompressionCore, type Config, type CoreMessag
 import { handleAcpStatus } from "./acp-status.js";
 import { handleAcpCache, recordCacheFoldsFromBlocks } from "./cache-ledger.js";
 import { type Session, cacheBlockContent, markDirty } from "./session.js";
-import { COMPRESS_TOOL_NAME, parseCompressInput, ABSORB_TOOL_NAME, type ParsedRange } from "./compress-tool.js";
+import { COMPRESS_TOOL_NAME, parseCompressInput, ABSORB_TOOL_NAME, RETRIEVE_TOOL_NAME, type ParsedRange } from "./compress-tool.js";
 import { effectiveAbsorbConfig, executeAbsorb, isProxyToolFor } from "./absorb.js";
 import { executeSearchContextTarget, resolveDecompress } from "./decompress-shared.js";
+import { effectiveStoreConfig, executeRetrieve } from "./store.js";
 import { containsMarkerLineText, containsRenderTagText, stripAcpTags } from "./loop/tag-echo-filter.js";
 import { maxShrinkPerCompress } from "./fetch-util.js";
 
@@ -44,6 +45,9 @@ function executeAnthropicProxyTool(toolName: string, args: Record<string, unknow
     const absorb = effectiveAbsorbConfig(ctx.session, ctx.config);
     if (absorb?.enabled === true && toolName === (absorb.toolName ?? ABSORB_TOOL_NAME)) {
         return executeAbsorb(args, undefined, absorb, ctx);
+    }
+    if (effectiveStoreConfig(ctx.session)?.enabled === true && toolName === RETRIEVE_TOOL_NAME) {
+        return executeRetrieve(args, ctx.session);
     }
     return `[Unknown proxy tool: ${toolName}]`;
 }

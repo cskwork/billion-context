@@ -59,6 +59,7 @@ export function mergeCompress(
     // like `prompts`: a model-level minToolTokens must not discard a
     // provider-level excludeTools.
     const absorbLevels = [global?.absorb, provider?.absorb, model?.absorb].filter(Boolean) as NonNullable<CompressSettings["absorb"]>[];
+    const storeLevels = [global?.store, provider?.store, model?.store].filter(Boolean) as NonNullable<CompressSettings["store"]>[];
     const reasoningLevels = [global?.reasoning, provider?.reasoning, model?.reasoning].filter(Boolean) as NonNullable<CompressSettings["reasoning"]>[];
     const reasoningGuardLevels = [global?.reasoningGuard, provider?.reasoningGuard, model?.reasoningGuard].filter(Boolean) as NonNullable<CompressSettings["reasoningGuard"]>[];
     return {
@@ -75,6 +76,7 @@ export function mergeCompress(
         prompts: promptLevels.length > 0 ? Object.assign({}, ...promptLevels) : undefined,
         acknowledgePromptsRisk: pick("acknowledgePromptsRisk"),
         absorb: absorbLevels.length > 0 ? Object.assign({}, ...absorbLevels) : undefined,
+        store: storeLevels.length > 0 ? Object.assign({}, ...storeLevels) : undefined,
         rules: pick("rules"),
 
 stripImages: pick("stripImages"),

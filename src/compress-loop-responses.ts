@@ -6,10 +6,11 @@ import {
 import { handleAcpStatus } from "./acp-status.js";
 import { handleAcpCache } from "./cache-ledger.js";
 import { lastCompressSuffix, withSessionLock, type Session } from "./session.js";
-import { parseCompressInput, PROXY_TOOL_NAMES, MUTATING_PROXY_TOOLS, COMPRESS_TOOL_NAME, ACP_TEXT_OPEN, ACP_TEXT_CLOSE } from "./compress-tool.js";
+import { parseCompressInput, PROXY_TOOL_NAMES, MUTATING_PROXY_TOOLS, COMPRESS_TOOL_NAME, ACP_TEXT_OPEN, ACP_TEXT_CLOSE, RETRIEVE_TOOL_NAME } from "./compress-tool.js";
 import { log as loggerLog } from "./logger.js";
 import { applyRanges } from "./stream.js";
 import { executeSearchContextTarget, resolveDecompress } from "./decompress-shared.js";
+import { effectiveStoreConfig, executeRetrieve } from "./store.js";
 import { buildVisibilityMarker } from "./compress-loop.js";
 import { hoistTrappedToolItems, type ToolPairItem } from "./tool-pair-order.js";
 import { MAX_LOOP_ROUNDS } from "./loop/index.js";
@@ -103,6 +104,9 @@ function executeProxyTool(
     }
     if (toolName === "acp_cache") {
         return handleAcpCache(ctx.session, args);
+    }
+    if (effectiveStoreConfig(ctx.session)?.enabled === true && toolName === RETRIEVE_TOOL_NAME) {
+        return executeRetrieve(args, ctx.session);
     }
     return `[Unknown proxy tool: ${toolName}]`;
 }

@@ -11,8 +11,9 @@ import {
     type Config,
     type CoreMessage,
 } from "acp-kernel";
-import { PROXY_TOOL_NAMES, RULE_TOOL_NAME } from "./compress-tool.js";
+import { PROXY_TOOL_NAMES, RETRIEVE_TOOL_NAME, RULE_TOOL_NAME } from "./compress-tool.js";
 import { effectiveRulesConfig } from "./rules-feature.js";
+import { effectiveStoreConfig } from "./store.js";
 import { log as loggerLog } from "./logger.js";
 import type { Session } from "./session.js";
 
@@ -48,6 +49,7 @@ export function isProxyToolFor(name: string, session: Session | undefined, confi
     if (PROXY_TOOL_NAMES.has(name)) return true;
     const absorb = effectiveAbsorbConfig(session, config);
     if (absorb?.enabled === true && name === (absorb.toolName ?? ABSORB_TOOL_NAME)) return true;
+    if (effectiveStoreConfig(session)?.enabled === true && name === RETRIEVE_TOOL_NAME) return true;
     return effectiveRulesConfig(session, config)?.enabled === true && name === RULE_TOOL_NAME;
 }
 
