@@ -6,6 +6,10 @@
 // Also covers the interop contract: a third-party client that already implements
 // its own version (constant system + in-history update messages) must pass
 // through with ZERO bili-side injection.
+// Session D (anthropic wire): client-sent cache_control breakpoints must ride
+// on the SAME logical blocks across turns and never land on an injected note
+// (opencode#43507 class of regression: a breakpoint on a message that can
+// never prefix-match silently disables caching for everything after it).
 import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
@@ -29,6 +33,18 @@ function close(server: http.Server): Promise<void> {
 
 function sseBlock(type: string, data: Record<string, unknown>): string {
     return `event: ${type}\ndata: ${JSON.stringify({ type, ...data })}\n\n`;
+}
+
+function anthropicSse(res: http.ServerResponse): void {
+    res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
+    const ev = (t: string, d: Record<string, unknown>): void => res.write(sseBlock(t, { type: t, ...d }));
+    ev("message_start", { message: { id: "msg_d", usage: { input_tokens: 10 } } });
+    ev("content_block_start", { index: 0, content_block: { type: "text", text: "" } });
+    ev("content_block_delta", { index: 0, delta: { type: "text_delta", text: "ok" } });
+    ev("content_block_stop", { index: 0 });
+    ev("message_delta", { delta: { stop_reason: "end_turn" }, usage: { output_tokens: 5 } });
+    ev("message_stop", {});
+    res.end();
 }
 
 function responsesSse(res: http.ServerResponse): void {
@@ -70,6 +86,10 @@ test("e2e #1085: changed head system stays anchored; updates ride as trailing no
             captured.push(body);
             if ((req.url ?? "").includes("/responses")) {
                 responsesSse(res);
+                return;
+            }
+            if ((req.url ?? "").endsWith("/v1/messages")) {
+                anthropicSse(res);
                 return;
             }
             res.writeHead(200, { "content-type": "application/json" });
@@ -212,6 +232,71 @@ test("e2e #1085: changed head system stays anchored; updates ride as trailing no
         assert.ok(cnotes[0]!.includes(INST_V2), "responses note must carry the full replacement text");
         assert.equal(devOf(c3!), devOf(c1!), "responses developer message must remain byte-identical on steady turns");
         assert.equal(markerItems(c3!).length, 1, "steady responses turns must not duplicate the note");
+
+        // --- Session D: Anthropic wire — client-sent cache_control breakpoints ---
+        const SYS_D1 = "ANTHROPIC-AMBIENT-V1";
+        const SYS_D2 = "ANTHROPIC-AMBIENT-V2";
+        const antUrl = `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/messages`;
+        const CC = { type: "ephemeral" };
+        let histD: Array<Record<string, unknown>> = [];
+        for (const [sysText, userText] of [[SYS_D1, "d-hello-1"], [SYS_D2, "d-hello-2"], [SYS_D2, "d-hello-3"]] as Array<[string, string]>) {
+            const newMsg = { role: "user", content: [{ type: "text", text: userText, ...(histD.length === 0 ? { cache_control: CC } : {}) }] };
+            const res = await fetch(antUrl, {
+                method: "POST",
+                headers: { "content-type": "application/json", "anthropic-version": "2023-06-01", "x-acp-session": "anthropic-anchor-e2e" },
+                body: JSON.stringify({ model: "gpt-test", max_tokens: 1024, stream: true, system: [{ type: "text", text: sysText, cache_control: CC }], messages: [...histD, newMsg] }),
+            });
+            if (!res.ok) throw new Error(`anthropic turn failed: HTTP ${res.status}`);
+            await res.text();
+            histD.push(newMsg, { role: "assistant", content: [{ type: "text", text: "ok" }] });
+        }
+
+        type AntBlock = { type?: string; text?: string; cache_control?: unknown };
+        type AntMsg = { role: string; content: string | AntBlock[] };
+        const antBody = (body: string): { system: string | AntBlock[]; messages: AntMsg[] } => JSON.parse(body) as { system: string | AntBlock[]; messages: AntMsg[] };
+        // String-content messages (how injected notes ride the wire) count as one implicit block.
+        const msgBlocks = (m: AntMsg): AntBlock[] => (typeof m.content === "string" ? [{ text: m.content }] : m.content);
+        const ccBlocks = (body: string): AntBlock[] => {
+            const sent = antBody(body);
+            const out: AntBlock[] = [];
+            for (const b of Array.isArray(sent.system) ? sent.system : []) if (b.cache_control) out.push(b);
+            for (const m of sent.messages) for (const b of msgBlocks(m)) if (b.cache_control) out.push(b);
+            return out;
+        };
+        const antNotes = (body: string): string[] => {
+            const sent = antBody(body);
+            const out: string[] = [];
+            for (const m of sent.messages) for (const b of msgBlocks(m)) if ((b.text ?? "").startsWith(MARKER)) out.push(b.text ?? "");
+            return out;
+        };
+        const sysCc = (body: string): AntBlock | undefined => ccBlocks(body).find((b) => (b.text ?? "").startsWith(SYS_D1));
+
+        const [d1, d2, d3] = captured.slice(9, 12);
+        assert.ok(d1 && d2 && d3, "expected 3 captured Anthropic requests");
+        // Turn 1: both client breakpoints forwarded as sent.
+        assert.equal(ccBlocks(d1!).length, 2, "turn 1: exactly the two client breakpoints");
+        assert.ok(sysCc(d1!)!.text!.includes(SYS_D1), "turn 1: system breakpoint rides the original head");
+        // ACP tag rendering prefixes stored text with an \x3cacp...\x3e marker; match by containment.
+        const hasCcOn = (body: string, needle: string): boolean => ccBlocks(body).some((b) => (b.text ?? "").includes(needle));
+        assert.ok(hasCcOn(d1!, "d-hello-1"), "turn 1: history-block breakpoint preserved");
+        // Turn 2: head changed — breakpoints stay on the SAME logical blocks
+        // (identity-keyed carry-over, not index-based), none on the injected note.
+        assert.equal(ccBlocks(d2!).length, 2, "turn 2: breakpoint count unchanged after a head change");
+        assert.ok(sysCc(d2!)!.text!.includes(SYS_D1), "turn 2: system breakpoint follows the anchored head");
+        assert.ok(!sysCc(d2!)!.text!.includes(SYS_D2), "turn 2: anchored system must not contain the replacement text");
+        assert.ok(hasCcOn(d2!, "d-hello-1"), "turn 2: history-block breakpoint still on the same block");
+        assert.ok(!ccBlocks(d2!).some((b) => (b.text ?? "").startsWith(MARKER)), "turn 2: no breakpoint may land on an update note");
+        const dnotes = antNotes(d2!);
+        assert.equal(dnotes.length, 1, "exactly one anthropic update note after a single change");
+        assert.ok(dnotes[0]!.includes(SYS_D2), "anthropic note must carry the full replacement text");
+        const lastD2 = antBody(d2!).messages[antBody(d2!).messages.length - 1];
+        assert.equal(lastD2.role, "user", "anthropic note must trail the conversation");
+        // Turn 3: steady — same breakpoint signature, note not duplicated.
+        assert.equal(ccBlocks(d3!).length, 2, "turn 3: breakpoint count unchanged on steady turns");
+        assert.ok(sysCc(d3!)!.text!.includes(SYS_D1), "turn 3: system breakpoint still on the anchored head");
+        assert.ok(hasCcOn(d3!, "d-hello-1"), "turn 3: history-block breakpoint preserved");
+        assert.ok(!ccBlocks(d3!).some((b) => (b.text ?? "").startsWith(MARKER)), "turn 3: no breakpoint on a note");
+        assert.equal(antNotes(d3!).length, 1, "steady anthropic turns must not duplicate the note");
     } finally {
         await close(proxy);
         await close(upstream);
