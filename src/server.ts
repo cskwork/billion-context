@@ -99,7 +99,7 @@ import { setupMitm, readMitmUpstream, getBlindTunnelStats } from "./mitm.js";
 import type { BiliMessage } from "acp-kernel/wire";
 import { BILI_PLUGIN_BYPASS_HEADER, hardenOpenaiAssistantContent, isLoopbackAddress, inspectContextOverflow, reserveOutputHeadroom, resolveOutputHeadroomCap, shouldReserveOutputHeadroom, systemToUser, usageOutputTotal, usageTotals, type WireProtocol } from "./util.js";
 
-import { BILI_TUNNEL_HEADER, checkTunnelDestination, tunnelAllowlistFromEnv } from "./tunnel-guard.js";
+import { BILI_TUNNEL_HEADER, checkTunnelDestination, classifyIp, localMachineIps, normalizeIpLiteral, parseIpLiteral, tunnelAllowlistFromEnv } from "./tunnel-guard.js";
 import { dumpRejectedBody } from "./error-dump.js";
 
 import { decodeRequestBody, DecompressedTooLargeError } from "./content-encoding.js";
@@ -110,6 +110,33 @@ import { buildForwardHeaders, connectionNamedHeaders, NO_IDENTITY_MESSAGE, RESPO
 import { isSideRequest, outputBudgetField, restoreOutputBudget, SIDE_REQUEST_MAX_TOKENS, sideRequestGuard } from "./server/side-request.js";
 import { clampOutgoingOutput, countSystemAndToolsTokens, emergencyNudge, estimateInputTokens, estimateWireOverhead } from "./server/budget.js";
 import { bufferToStream, dumpStreamToFile, pipeThrough, readStreamToBuffer } from "./server/stream-io.js";
+
+// #1073: a forward-proxy-style (absolute-form) request whose authority IS this
+// instance's own listening endpoint — e.g. a health prober configured with our
+// port as its http_proxy asking for http://127.0.0.1:<self-port>/__bili/health.
+// Fetching that URL means serving it locally; routing it through the tunnel
+// path would only trip bili's own self-layer / admin gate with a 403 instead of
+// returning real health state. Returns the stripped origin-form path when the
+// request qualifies, else undefined. Management prefixes only — model-style
+// paths keep the loud self-layer 403 (#562). Hostname destinations other than
+// the literal loopback names stay conservative (tunnel classification decides).
+export function selfAdminProbePath(reqUrl: string, localPort: number | undefined): string | undefined {
+    if (!reqUrl.startsWith("http://") && !reqUrl.startsWith("https://")) return undefined;
+    if (localPort === undefined) return undefined;
+    try {
+        const u = new URL(reqUrl);
+        const port = u.port !== "" ? Number(u.port) : u.protocol === "https:" ? 443 : 80;
+        if (port !== localPort) return undefined;
+        const host = u.hostname.replace(/^\[|\]$/g, "").toLowerCase();
+        const mine = host === "0.0.0.0" || host === "::" || host === "localhost" || localMachineIps().has(normalizeIpLiteral(host));
+        if (!mine) return undefined;
+        const p = u.pathname;
+        if (p === "/__bili/" || p.startsWith("/__bili/") || p === "/__acp/" || p.startsWith("/__acp/")) return p + u.search;
+    } catch {
+        // malformed absolute URL — not a probe
+    }
+    return undefined;
+}
 
 export function resolveUpstream(_opts: ProxyOptions, reqUrl: string, req?: http.IncomingMessage): { upstream: string; rewrittenUrl: string; explicitProtocol?: WireProtocol; tunnel?: boolean } | undefined {
     // MITM mode: the request arrived over a CONNECT tunnel we terminated
@@ -670,6 +697,12 @@ async function handle(
     // only), but a user can set --host 0.0.0.0 to share the proxy on a LAN —
     // in that case we still must NOT expose management to the LAN. Only the
     // proxy /bili/ and CONNECT (model traffic) endpoints remain open to all.
+    // #1073: an absolute-form request addressed to THIS instance's own endpoint
+    // is a fetch of us, not a tunnel — strip the authority so the admin gate
+    // below sees a normal origin-form request and answers with real health
+    // state instead of 403ing via the tunnel path.
+    const selfProbePath = selfAdminProbePath(req.url ?? "", req.socket.localPort);
+    if (selfProbePath !== undefined) req.url = selfProbePath;
     const isAdminPath = req.url === "/__bili/" || req.url?.startsWith("/__bili/") || req.url === "/__acp/" || req.url?.startsWith("/__acp/");
     // #409: management must never be reachable THROUGH the bili tunnel, not
     // even from a loopback client: the tunnel's inner connection originates
@@ -3221,7 +3254,26 @@ function buildForwardTarget(
     // #409: mark every /bili/ absolute-URL forward so a management plane
     // reached through this tunnel (self, NAT hairpin, chained bili) can
     // recognize and reject it — see the admin gate in handle().
-    if (route?.tunnel) headers[BILI_TUNNEL_HEADER] = "1";
+    // #1073: exception — loopback peer → loopback IP-literal destination on a
+    // management path: any same-machine process can already connect straight
+    // to that destination's port, so the marker adds no protection there while
+    // it 403s legitimate inter-instance probes (health checks between sibling
+    // instances). Remote peers and non-literal hostnames keep the marker
+    // unconditionally (NAT-hairpin / DNS-rebinding protection intact).
+    if (route?.tunnel) {
+        let destLoopback = false;
+        let destAdminPath = false;
+        try {
+            const du = new URL(upstreamUrl);
+            const lit = parseIpLiteral(du.hostname.replace(/^\[|\]$/g, ""));
+            destLoopback = lit !== null && classifyIp(lit) === "loopback";
+            const dp = du.pathname;
+            destAdminPath = dp === "/__bili/" || dp.startsWith("/__bili/") || dp === "/__acp/" || dp.startsWith("/__acp/");
+        } catch {
+            // unparseable upstream URL — stamp defensively
+        }
+        if (!(isLoopbackAddress(req.socket.remoteAddress) && destLoopback && destAdminPath)) headers[BILI_TUNNEL_HEADER] = "1";
+    }
     headers["host"] = new URL(upstreamUrl).host;
     // codex advertises its own server-side context compaction via this beta
     // feature. It conflicts with bili's client-side compress (bili IS the

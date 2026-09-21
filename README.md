@@ -662,10 +662,17 @@ bili --host 0.0.0.0           # all interfaces (or use your LAN IP)
   loopback/private destinations are allowed for local clients (self-hosted
   upstreams) and **denied for remote clients** unless listed in
   `BILI_TUNNEL_ALLOWED_HOSTS` (`host` or `host:port`, comma-separated) — a
-  remote peer must not use the proxy as an SSRF pivot into your LAN, and the
-  management plane is unreachable through the tunnel even via NAT hairpin
-  (tunneled requests carry an internal `x-bili-tunnel` marker that `/__bili/`
-  rejects).
+   remote peer must not use the proxy as an SSRF pivot into your LAN, and the
+   management plane is unreachable through the tunnel even via NAT hairpin
+   (tunneled requests carry an internal `x-bili-tunnel` marker that `/__bili/`
+   rejects). One exception (#1073): a **local** client relaying a management
+   path (`/__bili/*`, `/__acp/*`) to a **loopback IP-literal** destination is
+   forwarded unmarked — any same-machine process can already reach that port
+   directly, so the marker would add no protection while breaking legitimate
+   inter-instance health probes. Remote peers and hostname destinations keep
+   the marker unconditionally. An absolute-form request addressed to the
+   instance's **own** endpoint on a management path is served locally instead
+   of tunneled (a forward-proxy-style health probe gets a real answer).
 - There is **no authentication**: only do this on a trusted LAN or behind a
   firewall. The `/__bili/` management endpoints remain loopback-only.
 - A startup `[security]` warning reminds you of the above.
