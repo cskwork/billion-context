@@ -127,7 +127,7 @@ function openaiCachedTokens(u: Record<string, unknown>): number | undefined {
     return undefined;
 }
 
-export function createOpenaiAdapter(requestBody: Record<string, unknown>, clientSystem?: string, absorbName?: string): CompressLoopAdapter {
+export function createOpenaiAdapter(requestBody: Record<string, unknown>, clientSystem?: string, absorbName?: string, notes?: string[]): CompressLoopAdapter {
     const model = (requestBody.model as string) ?? "unknown";
     let responseId = `chatcmpl-proxy-${Date.now()}`;
     let toolIndex = 0;
@@ -204,7 +204,10 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
             // mirroring the anthropic adapter's anthropicSystem path.
             const messages = systemToUser(hardenOpenaiAssistantContent(coreToOpenai(coreMessages)));
             const withSys = injectOpenaiSystem(messages, [clientSystem, systemPrompt].filter((p): p is string => typeof p === "string" && p.length > 0));
-            return { ...body, messages: withSys };
+            const withNotes = notes && notes.length > 0
+                ? [...withSys, ...notes.map((text) => ({ role: "user" as const, content: text }))]
+                : withSys;
+            return { ...body, messages: withNotes };
         },
 
         async *parseStream(upstream, _round) {
