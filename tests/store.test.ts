@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { existsSync, mkdtempSync, readdirSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { createCore, createInitialState, defaultConfig, type CoreMessage } from "acp-kernel";
+import { applyAbsorb, createCore, createInitialState, defaultConfig, type CoreMessage } from "acp-kernel";
 import {
     applyStoreView,
     effectiveStoreConfig,
@@ -109,4 +109,23 @@ test("sidecar is written to disk under storeDir and the index lands in session.m
     const idx = session.metadata.storeIndex as Record<string, { hash: string }>;
     assert.equal(idx[ref].hash, e.hash);
     assert.ok(!JSON.stringify(idx).includes(BIG_TEXT.slice(0, 40)), "index holds metadata only, never payload bytes");
+});
+
+test("absorbing a stored item keeps its original retrievable", () => {
+    const { session, ref } = makeSession(true);
+    const substituted = applyStoreView(toolResult(), session);
+    assert.match(substituted.find((m) => m.id === "t-res")!.text!, new RegExp(`stored #${ref}`));
+    const outcome = applyAbsorb({
+        ref,
+        summary: "build succeeded in 3s",
+        absorbCallId: undefined,
+        messages: toolResult(),
+        state: session.state,
+        config: { ...defaultConfig(200000), absorb: { enabled: true } },
+    });
+    session.state = outcome.state;
+    assert.equal(outcome.ok, true, `absorb should succeed: ${outcome.resultText}`);
+    const got = executeRetrieve({ ref }, session);
+    assert.ok(got.includes(BIG_TEXT.slice(0, 80)), "retrieve returns the full original");
+    assert.ok(!got.includes("build succeeded in 3s"), "retrieve returns the original, not the digest");
 });
