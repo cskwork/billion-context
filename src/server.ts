@@ -1197,9 +1197,9 @@ async function handle(
             } else if (operatorWindowTuned && native !== undefined && reqConfig.modelContextLimit < native) {
                 windowShrinkReason = "operator";
             }
-        const compressCfg = resolveCompress(opts.routes, embeddedUrl, model, opts.compress);
-        resolvedStoreCfg = compressCfg.store;
-        reqPrompts = resolveCompressPrompts(compressCfg);
+            const compressCfg = resolveCompress(opts.routes, embeddedUrl, model, opts.compress);
+            resolvedStoreCfg = compressCfg.store;
+            reqPrompts = resolveCompressPrompts(compressCfg);
             const surfaceRes = resolveCompressSurfaceDetailed(compressCfg);
             reqSurface = surfaceRes.surface;
             reqSurfacePack = surfaceRes.packName;
@@ -1535,7 +1535,13 @@ async function handle(
         // on — we must never emit a placeholder the model cannot retrieve (silent
         // loss). Plugin mode is out of scope for v1: the agent would need
         // acp_retrieve advertised in the plugin manifest to avoid that same trap.
-        storeEffectiveStore(session, opts.compress.injectTool && !pluginMode ? resolvedStoreCfg : undefined);
+        // The responses text/marker protocol has no native tool channel either
+        // (absorb/rules strip themselves there for the same reason), and
+        // ACP_NO_INJECT_TOOL disables all injection on that wire — both would
+        // leave placeholders unretrievable.
+        const storeChannelOk = protocol !== "responses" ||
+            (!process.env.ACP_NO_INJECT_TOOL && !FORCE_TEXT_PROTOCOL && resolveCompressProtocol(opts.routes, upstreamOrigin) !== "marker");
+        storeEffectiveStore(session, opts.compress.injectTool && !pluginMode && storeChannelOk ? resolvedStoreCfg : undefined);
         // #546: restore a client-shrunk output budget BEFORE the side gate so a
         // tool-carrying main request re-enters the pipeline at full budget (see
         // restoreOutputBudget for the starvation mechanism).

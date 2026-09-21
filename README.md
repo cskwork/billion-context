@@ -71,6 +71,8 @@ An opt-in fifth tool, `absorb` (`compress.absorb.enabled: true` — see [CONFIGU
 
 An opt-in sixth tool, `acp_rule` (`compress.rules: true` — see [CONFIGURATION.md](CONFIGURATION.md)), records **persistent principle-level reminders**: a short rule recorded by the model (user-emphasized lessons, behaviors to remember, major pitfalls hit) is hard-protected from compression — the call and its result stay in context across every fold — and omitting the argument lists the recorded rules ([ranxianglei/billion-context-pi#433](https://github.com/ranxianglei/billion-context-pi/issues/433)).
 
+An opt-in seventh tool, `acp_retrieve` (`compress.store.enabled: true` — see [CONFIGURATION.md](CONFIGURATION.md)), backs the **content-addressed message store** (built-in CCR, #1097): oversized tool results are **ID-referenced at arrival instead of force-distilled** — the wire keeps a byte-stable placeholder and the original goes into a per-session, hash-deduped sidecar store, retrievable on demand via one cheap tool call. Lossless by default: a retrieve not made costs nothing but the call; a detail distilled away by absorb is gone for good. Proxy mode and native-tools wires only in v1 (the marker/text protocol has no channel to execute the retrieve, so the store disarms itself there rather than silently losing content).
+
 A sibling protection knob, `compress.protectedLatestTools` (see [CONFIGURATION.md](CONFIGURATION.md)), keeps the **latest** snapshot of a cumulative tool (a client's todo/task list, e.g. `["todo_list", "TodoWrite"]`) un-compressible while older instances fold normally — so the agent never loses its live task list to a fold (#639).
 
 ### Two compression modes — who executes `compress`

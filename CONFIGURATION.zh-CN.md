@@ -349,6 +349,17 @@
   - `toolName: string` — 重命名注入工具（默认 `"absorb"`）；模式、系统提示段与按会话裁决都跟随名称。
   注入跟随线上原生工具面：代理模式在 anthropic/openai/responses 原生工具线上注入工具 + 静态系统提示段，插件模式在插件清单中广告它（MCP shell 自动拾取）。Responses **marker/文本协议**路由不支持（无原生工具面 — 强制的 absorb 指令不可满足），标题生成请求（`max_tokens ≤ 200`）跳过注入如压缩提示一样。吸收配对在重启后保持隐藏（在会话状态持久化）。
 
+#### `store`
+
+- **类型：** `object`（`{ enabled?, minTokens?, maxStoreBytes? }`）
+- **默认值：** *（禁用 — 除非显式设置 `enabled: true`，该特性完全关闭）*
+- **状态：** ACTIVE（v1 — 仅代理模式、仅原生工具线）
+- **说明：** 可选开启的**内容寻址消息存储**/内置 CCR（issue #1097）。超大工具结果不再被强制蒸馏（如 `absorb`）或永远挂在线上：原文在到达时写入按会话的内容存储，线上保留一个确定性、字节稳定的占位符（`📦 [stored #m00423 · shell · 4213 tok] "头部预览" → acp_retrieve("m00423")`）。模型通过注入的 `acp_retrieve` 工具按需取回完整原文；retrieve 是临时的（走请求内工具结果通道，不进入折叠空间，不占用消息 ref）。默认无损：未执行的 retrieve 只花一次廉价工具调用；而被 absorb 蒸馏掉的细节则永久丢失。子字段（按字段最深层级胜出，与其他 CompressSettings 字段一致）：
+  - `enabled: boolean` — 主开关；任何值不为 `true` 时特性完全关闭（无占位符、无工具）。
+  - `minTokens: number` — 仅达到此 token 数的工具结果被 ID 引用（默认 `500`）；更小的结果保持原样。
+  - `maxStoreBytes: number` — 按会话的存储字节上限，按 ref 逻辑累加（默认 `2 MiB`）；超出上限的内容保持原样，而不是发出不可检索的占位符。
+  索引是纯元数据，随会话 JSON 与 `blockContents` 一同持久化；载荷存放在 `storeDir()`（环境变量 `BILI_STORE_DIR`，默认 `<stateDir>/store`）下的哈希键边车文件（`<sha256(sessionId)>/<sha1(text)>.txt`），按内容哈希去重，retrieve 时懒加载。设置 `BILI_ENCRYPTION_KEY` 时，边车文件使用与会话文件相同的静态加密编解码器。只有 `tool` 结果*内部的内容*缩小——与 assistant `tool_calls` 的配对不受影响。v1 范围门控：**仅代理模式**（插件 agent 需要在其插件清单中声明 `acp_retrieve`，否则占位符会造成静默丢失）；且**仅限原生工具线**：responses marker/文本协议路由与 `ACP_NO_INJECT_TOOL` 没有执行 retrieve 的通道，因此存储在这些场景下自动解除武装，而不是丢失内容。按会话统计（已存字节、当前线上节省字节、retrieve 率）在 `acp_status` 中展示；每次 retrieve 记录一条 `[store] retrieve …` 日志。
+
 #### `rules`
 
 - **类型：** `boolean`
@@ -519,6 +530,7 @@
 | `BILI_PERSIST_EPERM_ALERT_REPEAT_MS` | persist EPERM 告警的重复窗口（毫秒）。`0`（默认）= 只告警一次后静默；`>0` = 失败持续期间最多每这么久重复告警一次。 |
 | `BILI_MAX_SESSIONS` | 内存中最多保留的会话数（默认 `256`；LRU 淘汰 —— 磁盘是事实源）。 |
 | `BILI_SESSIONS_DIR` | 会话持久化目录（默认 XDG data 目录）。 |
+| `BILI_STORE_DIR` | 内容存储边车载荷目录（`compress.store`，#1097）：`<sha256(sessionId)>/<sha1(text)>.txt` 哈希键文件，`acp_retrieve` 时懒读取。默认 `<stateDir>/store`。设置 `BILI_ENCRYPTION_KEY` 时使用会话文件的静态加密编解码器。 |
 | `BILI_ENCRYPTION_KEY` | 会话文件静态加密（#708），适用于部署在不可信节点的场景。密钥必须恰好 32 字节，hex（64 字符）或 base64；不设置 = 明文 JSON 文件（默认，行为不变）。设置后：每个会话文件以 `BILIENC1` AES-256-GCM 加密 zstd 压缩后的 JSON 写入（Node ≥ 22.15 启用 zstd，旧版本写原始数据）——压缩同时可使文件缩小约 5–10 倍。已有的未编码文件在启动时一次性接管：逐个重新编码并原子替换到原路径（rename 即旧文件的删除；迁移中途崩溃会在下次启动自愈）。密钥只从该环境变量读取——永不落盘、永不进日志——请确保它不受同一文件系统上的其他进程触及。非法值会导致启动中止（快速失败，绝不静默明文运行）。用错误的密钥启动时，受影响的会话按损坏文件跳过（有日志，不崩溃）。丢失密钥将使已加密的会话永久不可读。对称加密为刻意设计（同一进程既加密又解密）。威胁模型（#708，owner 确认）：防的是**离线/机械性**的文件获取——云厂商换盘、节点镜像漂移后的离线磁盘快照、磁盘镜像失窃、备份泄露、被云同步的状态目录——离线第三方拿不到密钥即无法读取内容。不防御对活节点有访问权的定向攻击者；那一档应把信任根移出 proxy（KMS / TEE / 机密虚拟机 + 强化权限体系），而不是在 proxy 本身想办法——到了那个程度暴露的远不止密钥，proxy 层不是该守的边界（`BILI_PERSIST=0` 可彻底关闭持久化）。用同一进程/环境中的第二把密钥对密钥做二次加密不增加任何安全性：所有离线失窃场景里攻击者缺的始终只有一个工件——你的非落盘秘密——无论它叫数据密钥还是包裹密钥；只有把包裹密钥放进不同信任域（KMS/TPM/TEE）才能提高门槛，而那属于上面的场景 2。 |
 | `BILLION_CONTEXT_PROXY` | launcher 会导出它；客户端侧 bili 插件/扩展检测到后自禁用自身压缩（避免双重压缩）。 |
 | `BILLION_CONTEXT_PLUGIN` | 设 `0` 彻底关闭插件模式（恢复 wire 层工具注入）。 |
