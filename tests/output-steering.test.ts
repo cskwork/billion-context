@@ -5,6 +5,7 @@ import {
     applyOutputSteering,
     applyOutputSteeringJson,
     parseOutputSteering,
+    resolveVerbosityLevel,
     steeringText,
     type OutputSteeringConfig,
 } from "../src/output-steering.ts";
@@ -348,4 +349,20 @@ test("applyOutputSteeringJson opts.verbosity=false skips the directive but keeps
     assert.equal(obj.reasoning_effort, "low");
     const sys = obj.messages.find((m) => m.role === "system" || m.role === "developer");
     assert.equal(sys, undefined, "no steering block appended on compress rounds");
+});
+
+test("resolveVerbosityLevel: omitted field takes default WITHOUT warning", () => {
+    assert.deepEqual(resolveVerbosityLevel(undefined), { level: DEFAULT_OUTPUT_STEERING.verbosityLevel });
+});
+
+test("resolveVerbosityLevel: valid levels 0-4 pass through untouched", () => {
+    for (const n of [0, 1, 2, 3, 4]) assert.deepEqual(resolveVerbosityLevel(n), { level: n });
+});
+
+test("resolveVerbosityLevel: present-but-invalid values warn and fall back", () => {
+    for (const bad of [9, -1, 2.5, "high", null]) {
+        const r = resolveVerbosityLevel(bad);
+        assert.equal(r.level, DEFAULT_OUTPUT_STEERING.verbosityLevel);
+        assert.ok(r.warning?.includes("must be an integer 0-4"), `expected warning for ${JSON.stringify(bad)}, got ${r.warning}`);
+    }
 });

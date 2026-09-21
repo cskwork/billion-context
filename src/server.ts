@@ -3794,12 +3794,12 @@ async function forward(
         }
     }
     // #552/#1093: wire transform shared by ALL re-send paths (compress-retry
-    // loops below) so re-sent bodies carry the same rewrite AND steering as the
-    // initial forward — otherwise a developer-role 400 would hit mid-stream on
-    // the first retry, or a retry would drop the directive/effort change. Both
-    // are read at CALL time (a role learned / config resolved mid-request applies
-    // to later re-sends within the same request). Steering is idempotent, so a
-    // re-send neither accumulates the directive nor re-lowers an already-low field.
+    // loops below) so re-sent bodies carry the same compat rewrite and effort
+    // routing as the initial forward — otherwise a developer-role 400 would hit
+    // mid-stream on the first retry, or a retry would drop the effort change.
+    // Both are read at CALL time (a role learned / config resolved mid-request
+    // applies to later re-sends within the same request). The transform is
+    // idempotent, so a re-send never double-applies.
     const makeWireTransform = (withVerbosity: boolean) =>
         compatProtocol || steerEnabled
             ? (b: Record<string, unknown>): Record<string, unknown> => {
@@ -3808,7 +3808,6 @@ async function forward(
                 return b;
             }
             : undefined;
-    const wireTransform = makeWireTransform(true);
     // Compress rounds re-send WITHOUT the verbosity directive (summary
     // fidelity: the directive's "never restate paths/code" clause contradicts
     // the compress prompt's verbatim-preservation contract) — compat rewrite

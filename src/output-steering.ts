@@ -85,10 +85,14 @@ export const DEFAULT_OUTPUT_STEERING: OutputSteeringConfig = {
     effortRouting: true,
 };
 
-function clampVerbosityLevel(v: unknown, warn: (msg: string) => void): number {
-    if (typeof v === "number" && Number.isInteger(v) && v >= 0 && v <= 4) return v;
-    warn(`[config] outputSteering.verbosityLevel must be an integer 0-4; got ${JSON.stringify(v)} — falling back to 2`);
-    return 2;
+/** Resolve verbosityLevel. An OMITTED field silently takes the default; a
+ *  PRESENT but out-of-range value falls back WITH a warning (honest output —
+ *  a valid partial config must not be accused of being malformed). */
+export function resolveVerbosityLevel(v: unknown): { level: number; warning?: string } {
+    if (typeof v === "number" && Number.isInteger(v) && v >= 0 && v <= 4) return { level: v };
+    const level = DEFAULT_OUTPUT_STEERING.verbosityLevel;
+    if (v === undefined) return { level };
+    return { level, warning: `[config] outputSteering.verbosityLevel must be an integer 0-4; got ${JSON.stringify(v)} — falling back to ${level}` };
 }
 
 /** Validate an `outputSteering`-shaped value. Malformed fields fall back to
@@ -97,14 +101,13 @@ function clampVerbosityLevel(v: unknown, warn: (msg: string) => void): number {
 export function parseOutputSteering(v: unknown): OutputSteeringConfig | undefined {
     if (!v || typeof v !== "object" || Array.isArray(v)) return undefined;
     const obj = v as Record<string, unknown>;
-    const warnings: string[] = [];
-    const cfg = {
+    const lvl = resolveVerbosityLevel(obj.verbosityLevel);
+    if (lvl.warning) loggerLog("warn", lvl.warning);
+    return {
         enabled: obj.enabled === true,
-        verbosityLevel: clampVerbosityLevel(obj.verbosityLevel, (m) => warnings.push(m)),
+        verbosityLevel: lvl.level,
         effortRouting: obj.effortRouting !== false,
     };
-    for (const w of warnings) loggerLog("warn", w);
-    return cfg;
 }
 
 // ---- Turn classification (pure structural, no content pattern-matching) ----
