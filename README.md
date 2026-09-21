@@ -1001,6 +1001,20 @@ protection → Manage settings → Exclusions → Add an exclusion → Folder) a
 make sure no sync tool (OneDrive / Dropbox / …) is syncing that path. Full
 steps in [CONFIGURATION.md](CONFIGURATION.md#windows-exclude-the-sessions-dir-from-antivirus-362).
 
+### Session file cleanup (#1082)
+
+Short-lived sessions leave small state files behind that are never resumed.
+With persistence enabled, bili sweeps the sessions dir at boot and hourly:
+files older than `BILI_SESSION_GC_MAX_AGE_DAYS` (default 7 days) whose newest
+request body was ≤ `BILI_SESSION_GC_MAX_TOKENS` tokens (default 1M) are
+deleted — resuming the conversation rebuilds the context from the client's
+own history, so the cost is one cold rebuild. Older files without a recorded
+size need no active compression blocks and `contextTokens` under the same
+ceiling. Live sessions, unreadable files, and encrypted files are handled
+conservatively (decoded via `BILI_ENCRYPTION_KEY` before judging). Set
+`BILI_SESSION_GC=0` to disable. Details in
+[CONFIGURATION.md](CONFIGURATION.md#environment-variables).
+
 ## Status
 
 Early. Protocol handling and compression work against mock tests (500+ passing). Real-model integration testing is the next milestone. Expect rough edges.

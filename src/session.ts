@@ -327,6 +327,17 @@ export function peekSession(id: string): Session | undefined {
     return sessions.get(id);
 }
 
+/** #1082 GC: remove a session from the in-memory map so its debounced writer
+ *  cannot resurrect the file GC just deleted. Caller must have verified the
+ *  session is idle (no in-flight requests, no pending save, lastSeen not newer
+ *  than the on-disk record). Returns false when absent or busy. */
+export function dropSessionForGc(id: string): boolean {
+    const s = sessions.get(id);
+    if (!s || s.inFlight > 0) return false;
+    sessions.delete(id);
+    return true;
+}
+
 // #760b: unified canonical session id. Every session exposes a stable pfa-* id
 // that MCP tools route by, independent of what the client calls itself.
 // Anonymous sessions already ARE pfa-* (PFA-minted session.id), so their

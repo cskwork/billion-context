@@ -481,6 +481,27 @@ export class SessionStore {
         return mergeState(envelope.payload.state);
     }
 
+    /** #1082 GC: read+decode a single session file by PATH (not session id),
+     *  returning the parsed record (envelope or legacy flat) or null when the
+     *  file is missing, undecodable, or not JSON. The codec-aware twin of the
+     *  kernel store's id-keyed loaders: the GC walks the directory itself
+     *  (mtime pre-filter) and only decodes age-eligible candidates. */
+    async readRawFile(file: string): Promise<unknown | null> {
+        try {
+            if (!this.codec) {
+                return JSON.parse(await readFile(file, "utf8"));
+            }
+            const head = await readFileHead(file);
+            const raw = await readFile(file);
+            const text = head.length === ENCRYPT_MAGIC.length && head.equals(ENCRYPT_MAGIC)
+                ? this.codec.decode(raw)
+                : raw.toString("utf8");
+            return JSON.parse(text);
+        } catch {
+            return null;
+        }
+    }
+
     /** #405 fix #4: dual-instance rollback guard. When two proxy processes
      *  share BILI_SESSIONS_DIR, whoever saves last used to win — an instance
      *  holding a STALE in-memory copy would roll counters back (requests:3 →
