@@ -115,6 +115,16 @@ Top-level keys that control how the proxy listens and behaves globally.
 - **Description:** Global wire-compat role map. `roles` maps message roles to the role name your upstream accepts, e.g. `{"compat":{"roles":{"developer":"system"}}}` rewrites `developer` → `system` on the final forwarded body for upstreams that reject the `developer` role (#552, newer codex clients). Applies to `openai` chat-completions and `responses` requests; exact-match roles only, everything else in the body is untouched; re-sent compress-retry bodies carry the same rewrite. Per-provider `compat.roles` entries (see [Providers](#providers)) win per key. Default `{}` forwards bodies byte-for-byte unchanged.
 - **Learn-on-failure:** with no compat configured, an upstream `400 Invalid role: …` is auto-fixed — bili rewrites the offending role to `system`, retries once, and remembers the mapping **session-scoped** (in-memory on the session; never written to config). Later requests in that session skip the 400 round-trip. The info log emitted when the fix fires carries the permanent per-provider snippet.
 
+### `outputSteering`
+
+- **Type:** `{ enabled?: boolean; verbosityLevel?: number; effortRouting?: boolean }`
+- **Default:** `{ enabled: false, verbosityLevel: 2, effortRouting: true }` (OFF — zero behavior change until enabled)
+- **Status:** ACTIVE
+- **Description:** Output-side compression (#1093). Output tokens cost ~5× input and are billed the instant they stream out, so both levers act at request time. They run at the forward boundary **after** every other body mutation (last, after `compat.roles`), so the turn classifier sees the final wire list; compress-retry re-sends carry the same idempotent transform. All launcher / native-plugin / `/bili/` lanes inherit it automatically.
+  - **Verbosity steering** — appends a byte-stable conciseness directive at the **tail** of the system prompt (`verbosityLevel` L0–L4, default L2; L0 = no directive). Never prepends (that busts the prefix cache), and is **skip-if-absent** — it never fabricates a system carrier the client didn't send (a newly injected system can itself be rejected by placement-strict backends, #377 class). Idempotent: re-applying the same level is a byte-stable no-op, a level change replaces the sentinel-wrapped block in place, so retries never accumulate it. Covers all four wires: Anthropic `system` (string or block array — `cache_control` breakpoints preserved), OpenAI `system`/`developer` message, Responses `instructions`, Google `systemInstruction.parts`.
+  - **Effort routing** — classifies the final turn **structurally** (block composition only, no content pattern-matching). On a mechanical continuation turn (clean tool result, no error) it lowers an **already-present** effort field toward its floor: OpenAI `reasoning_effort` → `low`; Responses `reasoning.effort` → `low`; Anthropic `output_config.effort` → `low` + `thinking.budget_tokens` → 1024 (documented API floor); Google `generationConfig.thinkingConfig.thinkingBudget` → 128 (**assumed** floor — verify per-model before relying on it). Clamp-only: it never injects an effort field the client didn't send (models without effort support 400 on it), never toggles `thinking.type` (disabling thinking over a history that carries thinking blocks 400s and busts the cache tier), and leaves dynamic budgets (`-1`) and non-mechanical turns untouched. Unrecognized structural shapes are not classified (conservative — the request goes out unchanged).
+- A per-provider `providers.<url>.outputSteering` replaces this global block for that route (see [Providers](#providers)).
+
 ### `proxy`
 
 - **Type:** `string`
@@ -194,6 +204,13 @@ A shallow key (`https://open.bigmodel.cn`) matches every path on that host. A de
 - **Default:** `{}` (disabled)
 - **Status:** ACTIVE
 - **Description:** Per-provider wire-compat overrides. `roles` maps message roles to the role name this upstream accepts, e.g. `{"developer": "system"}` for upstreams that reject the `developer` role newer codex clients send (#552). Applied to the final forwarded `openai`/`responses` body — client-sent roles and bili's own injected prompt alike — and to every body the compress-retry loops re-send. Wins per key over the global `compat` block (see [Server Settings](#server-settings)). Default `{}` forwards byte-for-byte unchanged.
+
+### `outputSteering`
+
+- **Type:** `{ enabled?: boolean; verbosityLevel?: number; effortRouting?: boolean }`
+- **Default:** *(inherits the global [`outputSteering`](#outputsteering) block)*
+- **Status:** ACTIVE
+- **Description:** Per-provider override of output-side compression (#1093) — verbosity steering + effort routing, see [Server Settings](#server-settings) for the two levers and their safety rules. Replaces the global block for this route rather than merging field-by-field: e.g. enable steering globally but keep one route untouched with `{"enabled": false}`, or run a different level on a specific upstream. Fields omitted inside a route entry fall back to the built-in defaults (`verbosityLevel: 2`, `effortRouting: true`), not to the global values.
 
 ### `passthrough`
 

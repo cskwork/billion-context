@@ -250,3 +250,79 @@ test("applyOutputSteeringJson mutates in place and is idempotent", () => {
     assert.deepEqual(applyOutputSteeringJson(obj, "responses", STEER_ONLY), [], "second pass finds the block already present");
     assert.ok(String(obj.instructions).includes(SENTINEL));
 });
+
+test("responses: full-history re-send (original ask + call + output) IS a mechanical continuation", () => {
+    const body = {
+        model: "m",
+        instructions: "You are Codex.",
+        input: [
+            { type: "message", role: "user", content: [{ type: "input_text", text: "fix the bug in src/a.ts" }] },
+            { type: "function_call", name: "shell", arguments: '{"cmd":"ls"}', call_id: "call_1" },
+            { type: "function_call_output", call_id: "call_1", output: "file listing" },
+        ],
+        reasoning: { effort: "high" },
+    };
+    const out = applyOutputSteering(JSON.stringify(body), "responses", EFFORT_ONLY);
+    assert.deepEqual(out.labels, ["effort:low"]);
+    assert.equal((JSON.parse(out.body).reasoning as { effort: string }).effort, "low");
+});
+
+test("responses: codex custom_tool_call / apply_patch shapes stay mechanical", () => {
+    const body = {
+        model: "m",
+        input: [
+            { type: "message", role: "user", content: [{ type: "input_text", text: "run the tests" }] },
+            { type: "custom_tool_call", name: "shell", input: '{"cmd":"npm test"}', call_id: "c1" },
+            { type: "custom_tool_call_output", call_id: "c1", output: "all pass" },
+            { type: "apply_patch_call", input: "*** Begin Patch\n*** End Patch", call_id: "c2" },
+            { type: "apply_patch_call_output", call_id: "c2", output: "Success." },
+        ],
+        reasoning: { effort: "medium" },
+    };
+    const out = applyOutputSteering(JSON.stringify(body), "responses", EFFORT_ONLY);
+    assert.deepEqual(out.labels, ["effort:low"]);
+});
+
+test("responses: a fresh user signal at the tail blocks lowering even after outputs", () => {
+    const body = {
+        model: "m",
+        input: [
+            { type: "message", role: "user", content: [{ type: "input_text", text: "do X" }] },
+            { type: "function_call", name: "f", arguments: "{}", call_id: "c1" },
+            { type: "function_call_output", call_id: "c1", output: "ok" },
+            { type: "message", role: "user", content: [{ type: "input_text", text: "now do Y" }] },
+        ],
+        reasoning: { effort: "high" },
+    };
+    assert.equal(applyOutputSteering(JSON.stringify(body), "responses", EFFORT_ONLY).changed, false);
+});
+
+test("responses: a pending call with no output yet is not a continuation", () => {
+    const body = {
+        model: "m",
+        input: [
+            { type: "message", role: "user", content: [{ type: "input_text", text: "do X" }] },
+            { type: "function_call", name: "f", arguments: "{}", call_id: "c1" },
+        ],
+        reasoning: { effort: "high" },
+    };
+    assert.equal(applyOutputSteering(JSON.stringify(body), "responses", EFFORT_ONLY).changed, false);
+});
+
+test("anthropic: unrecognized block composition is not classified mechanical", () => {
+    const body = {
+        model: "m",
+        messages: [{ role: "user", content: [{ type: "tool_result", tool_use_id: "t", content: "x" }, { type: "mystery_block" }] }],
+        output_config: { effort: "high" },
+    };
+    assert.equal(applyOutputSteering(JSON.stringify(body), "anthropic", EFFORT_ONLY).changed, false);
+});
+
+test("google: unrecognized part composition is not classified mechanical", () => {
+    const body = {
+        model: "m",
+        contents: [{ role: "user", parts: [{ functionResponse: { name: "f", response: {} } }, { mystery: true }] }],
+        generationConfig: { thinkingConfig: { thinkingBudget: 8000 } },
+    };
+    assert.equal(applyOutputSteering(JSON.stringify(body), "google", EFFORT_ONLY).changed, false);
+});

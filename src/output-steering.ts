@@ -134,6 +134,10 @@ function classifyAnthropicTurn(messages: unknown): TurnKind {
             if (b.is_error === true) sawError = true;
         } else if (t === "text" || t === "image" || t === "document") {
             return "new_user_ask";
+        } else {
+            // Unrecognized block composition: do not classify (conservative —
+            // an unknown block may carry user intent we cannot see).
+            return "unknown";
         }
     }
     if (sawError) return "error_continuation";
@@ -189,27 +193,37 @@ function responsesUserSignal(item: Record<string, unknown>): boolean {
     return false;
 }
 
-/** Responses API: the whole `input` is a flat list of items. Mechanical means
- *  it carries tool-output items, no fresh user signal, and nothing unrecognized. */
+/** Responses API: the whole `input` is a flat list of items re-sent in full on
+ *  every request. Mechanical means the FINAL turn (everything after the last
+ *  user signal) carries tool-output items and nothing unrecognized. */
+/** Item types that may sit between the last user signal and the trailing tool
+ *  outputs without breaking a mechanical continuation (assistant-side items:
+ *  prose, tool calls, thinking). */
+const RESPONSES_NEUTRAL_TYPES = new Set(["message", "function_call", "custom_tool_call", "local_shell_call", "apply_patch_call", "reasoning"]);
+
 function classifyResponsesTurn(input: unknown): TurnKind {
     if (typeof input === "string") return input.trim() ? "new_user_ask" : "unknown";
     if (!Array.isArray(input) || input.length === 0) return "unknown";
+    // Walk BACKWARD from the end: the final turn is everything after the LAST
+    // user signal. Clients re-send full history on every request (codex does),
+    // so scanning forward would hit the original ask on every turn and could
+    // never classify a continuation.
     let sawToolOutput = false;
-    let sawUnknown = false;
-    for (const raw of input) {
-        const item = asRecord(raw);
-        if (!item) {
-            sawUnknown = true;
+    for (let i = input.length - 1; i >= 0; i--) {
+        const item = asRecord(input[i]);
+        if (!item) return "unknown";
+        const it = item.type;
+        if (typeof it === "string" && RESPONSES_OUTPUT_TYPES.has(it)) {
+            sawToolOutput = true;
             continue;
         }
-        const it = item.type;
-        if (typeof it === "string" && RESPONSES_OUTPUT_TYPES.has(it)) sawToolOutput = true;
-        else if (responsesUserSignal(item)) return "new_user_ask";
-        else if (it === "message" || it === "function_call" || it === "reasoning") continue;
-        else sawUnknown = true;
+        // Hitting the last user signal: tool outputs AFTER it mean the final
+        // turn is a continuation; none means the user just asked something.
+        if (responsesUserSignal(item)) return sawToolOutput ? "mechanical_continuation" : "new_user_ask";
+        if (typeof it === "string" && RESPONSES_NEUTRAL_TYPES.has(it)) continue;
+        return "unknown";
     }
-    if (sawToolOutput && !sawUnknown) return "mechanical_continuation";
-    return "unknown";
+    return sawToolOutput ? "mechanical_continuation" : "unknown";
 }
 
 /** Google native: the conversation is `contents`; a mechanical continuation is a
@@ -228,8 +242,12 @@ function classifyGoogleTurn(contents: unknown): TurnKind {
             sawFunctionResponse = true;
             continue;
         }
-        if (typeof p.text === "string" && p.text.trim()) return "new_user_ask";
+        if (typeof p.text === "string") {
+            if (p.text.trim()) return "new_user_ask";
+            continue; // empty text part: neutral
+        }
         if (p.inlineData || p.fileData || p.videoMetadata) return "new_user_ask";
+        return "unknown"; // unrecognized part composition: do not classify
     }
     if (sawFunctionResponse) return "mechanical_continuation";
     return "unknown";

@@ -115,6 +115,16 @@
 - **说明：** 全局线上兼容角色映射。`roles` 把消息角色映射为上游接受的角色名，例如 `{"compat":{"roles":{"developer":"system"}}}` 把 `developer` → `system`，用于拒绝 `developer` 角色的上游（#552，新版 codex 客户端会发送）。作用于 `openai` chat-completions 与 `responses` 请求；仅精确匹配角色，体内其它内容不动；压缩重试重发的请求体同样携带。按 provider 的 `compat.roles`（见 [Providers](#providers)）按键优先。默认 `{}` 逐字节透明转发。
 - **失败自学习：** 未配置 compat 时，上游返回 `400 Invalid role: …` 会被自动修复 —— bili 把被拒角色改写为 `system`，重试一次，并把学到的映射记在**会话上**（仅内存，绝不写入配置）。该会话后续请求免 400 往返。修复生效时打印的 info 日志附带可永久化的 per-provider 片段。
 
+### `outputSteering`
+
+- **类型：** `{ enabled?: boolean; verbosityLevel?: number; effortRouting?: boolean }`
+- **默认值：** `{ enabled: false, verbosityLevel: 2, effortRouting: true }`（关闭 —— 启用前零行为变化）
+- **状态：** ACTIVE
+- **说明：** 输出侧压缩（#1093）。输出 token 价格约为输入 token 的 5 倍，且一经流出即计费，所以两个杠杆都只能在请求时生效。二者在转发边界执行，位于所有其它 body 变更**之后**（最后，在 `compat.roles` 之后），保证轮次分类器看到的是最终 wire 列表；压缩重试重发的请求体携带同一幂等变换。launcher / native-plugin / `/bili/` 各通道自动继承。
+  - **Verbosity steering（详略引导）** —— 在 system prompt **尾部**追加一段字节稳定的简洁指令（`verbosityLevel` L0–L4，默认 L2；L0 = 不加指令）。绝不前置（会破坏 prefix cache），且**缺席即跳过** —— 从不伪造客户端没发送的 system 载体（新注入的 system 本身就可能被放置严格的上游拒绝，#377 一类）。幂等：重复应用同一级别是字节级 no-op，级别变化就地替换 sentinel 包裹的块，重试不会累积。覆盖全部四种 wire：Anthropic `system`（字符串或块数组 —— `cache_control` 断点保留）、OpenAI `system`/`developer` 消息、Responses `instructions`、Google `systemInstruction.parts`。
+  - **Effort routing（努力度路由）** —— 对最后一轮做**结构性**分类（只看块组成，不做内容模式匹配）。机械续轮（干净的 tool 结果、无错误）上把**已存在**的 effort 字段向地板值压低：OpenAI `reasoning_effort` → `low`；Responses `reasoning.effort` → `low`；Anthropic `output_config.effort` → `low` + `thinking.budget_tokens` → 1024（文档化 API 下限）；Google `generationConfig.thinkingConfig.thinkingBudget` → 128（**假定**下限 —— 依赖前请按模型核实）。只降不注：从不注入客户端没发送的 effort 字段（不支持 effort 的模型会 400），从不切换 `thinking.type`（在携带 thinking 块的历史上禁用 thinking 会 400 并击穿缓存层），动态预算（`-1`）与非机械轮一律不动。无法识别的结构形状不做分类（保守 —— 请求原样发出）。
+- 按 provider 的 `providers.<url>.outputSteering` 对该路由整体替换此全局块（见 [Providers](#providers)）。
+
 ### `proxy`
 
 - **类型：** `string`
@@ -192,6 +202,13 @@
 - **默认值：** `{}`（禁用）
 - **状态：** ACTIVE
 - **说明：** 按 provider 的线上兼容覆盖。`roles` 把消息角色映射为该上游接受的角色名，例如 `{"developer": "system"}` —— 用于拒绝 `developer` 角色的上游（#552，新版 codex 客户端会发这个角色）。作用于最终转发的 `openai`/`responses` 请求体 —— 客户端发送的角色和 bili 自己注入的提示一视同仁 —— 压缩重试循环重发的请求体同样携带该改写。按键覆盖全局 `compat` 块（见[服务端设置](#服务端设置)）。默认 `{}` 逐字节透明转发。
+
+### `outputSteering`
+
+- **类型：** `{ enabled?: boolean; verbosityLevel?: number; effortRouting?: boolean }`
+- **默认值：** *（继承全局 [`outputSteering`](#outputsteering) 块）*
+- **状态：** ACTIVE
+- **说明：** 输出侧压缩（#1093）的按 provider 覆盖 —— verbosity steering + effort routing，两个杠杆及其安全规则见[服务端设置](#server-settings)。对该路由**整体替换**全局块，而不是逐字段合并：例如全局开启 steering、用 `{"enabled": false}` 保持某个路由不受影响，或在特定上游使用不同级别。route 条目内省略的字段回落到内置默认值（`verbosityLevel: 2`、`effortRouting: true`），而非全局块的取值。
 
 ### `passthrough`
 
