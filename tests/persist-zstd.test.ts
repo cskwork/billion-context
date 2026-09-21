@@ -21,12 +21,12 @@ const NATIVE_ZSTD = typeof zlib.zstdCompressSync === "function" && typeof zlib.z
 
 type LogLine = { level: string; msg: string };
 
-function makeSession(id: string): Session {
+function makeSession(id: string, fill = 0, fillRandom = false): Session {
     return {
         id,
         meta: { protocol: "openai", upstreamOrigin: "http://upstream" },
         stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, contextTokens: 0 },
-        metadata: {},
+        metadata: fill > 0 ? { fill: fillRandom ? randomBytes(fill).toString("hex") : "x".repeat(fill) } : {},
         state: createInitialState(),
         createdAt: Date.now(),
         lastSeen: Date.now(),
@@ -72,7 +72,9 @@ function filePath(dir: string, id: string): string {
 
 test("codec: plain roundtrip is deterministic and carries the BILIZSTD1 header", () => {
     const codec = createStorageCodec()!;
-    const json = JSON.stringify({ hello: "world", n: [1, 2, 3] });
+    // Compressible payload large enough that framing strictly shrinks it (the
+    // size guard frames only when compression actually wins).
+    const json = JSON.stringify({ hello: "world ".repeat(400) });
     const enc = Buffer.from(codec.encode(json));
     assert.ok(enc.subarray(0, ZSTD_MAGIC.length).equals(ZSTD_MAGIC), "magic prefix");
     assert.equal(enc[9], 0x01, "format version byte");
@@ -103,11 +105,12 @@ test("codec: legacy plaintext passthrough + magic dispatch across trees", () => 
 test("codec: key + default compression keeps BILIENC1 in zstd mode (#708 behavior)", () => {
     if (!NATIVE_ZSTD) return;
     const keyed = createStorageCodec({ key: Buffer.from(KEY, "hex") })!;
-    const enc = Buffer.from(keyed.encode(JSON.stringify({ a: 1 })));
+    const json = JSON.stringify({ a: "value ".repeat(500) });
+    const enc = Buffer.from(keyed.encode(json));
     assert.ok(enc.subarray(0, ENCRYPT_MAGIC.length).equals(ENCRYPT_MAGIC));
     assert.equal(enc[8], 0x01, "format version");
     assert.equal(enc[9], 0x01, "mode byte stays zstd by default");
-    assert.equal(keyed.decode(enc), JSON.stringify({ a: 1 }));
+    assert.equal(keyed.decode(enc), json);
 });
 
 test("fzstd fallback decodes node:zlib frames (static fixture)", () => {
@@ -135,7 +138,7 @@ withTempDir("store: no-key tree writes BILIZSTD1 by default and loads it back", 
 
 withTempDir("store: large session shrinks vs the opt-out baseline", async (h) => {
     if (!NATIVE_ZSTD) return;
-    const big = makeSession("s-big");
+    const big = makeSession("s-big", 20_000);
     big.blockContents.set("b1", "acp-block-summary-content ".repeat(20_000));
     const first = newStore(h);
     await first.writeNow(big);
@@ -161,17 +164,16 @@ withTempDir("store: BILI_PERSIST_ZSTD=0 keeps files as plain JSON", async (h) =>
     assert.ok(!h.logs.some((l) => l.msg.includes("compression enabled")));
 });
 
-withTempDir("store: runtimes without native zstd fall back to the raw body", async (h) => {
+withTempDir("store: runtimes without native zstd write unframed plain JSON (no key, no framing)", async (h) => {
     _setZstdAvailableForTest(false);
     const store = newStore(h);
     await store.writeNow(makeSession("s-oldrt"));
     store.cancelAll();
     const buf = readFileSync(filePath(h.dir, "s-oldrt"));
-    assert.ok(buf.subarray(0, 9).equals(ZSTD_MAGIC));
-    assert.equal(buf[9], 0x01, "format version");
-    assert.equal(buf[10], 0x00, "mode byte records the raw fallback");
+    assert.equal(buf[0], 0x7b, `bare JSON, got head ${buf.subarray(0, 9).toString("utf8")}`);
+    assert.ok(JSON.parse(buf.toString("utf8")), "parses as plain JSON");
     const loaded = await newStore(h).boot();
-    assert.equal(loaded.size, 1, "raw-mode file roundtrips");
+    assert.equal(loaded.size, 1, "plain file roundtrips");
 });
 
 withTempDir("store: old runtime reads files written by a newer one (fzstd path)", async (h) => {
@@ -186,27 +188,29 @@ withTempDir("store: old runtime reads files written by a newer one (fzstd path)"
     assert.equal(loaded.size, 1, "fallback decoder handles the zstd body");
 });
 
-withTempDir("boot migrates legacy plaintext files to BILIZSTD1, once", async (h) => {
+withTempDir("boot NEVER rewrites legacy plaintext files (downgrade safety, #1080 review)", async (h) => {
     process.env.BILI_PERSIST_ZSTD = "0";
     const legacy = newStore(h);
     await legacy.writeNow(makeSession("s-1"));
     await legacy.writeNow(makeSession("s-2"));
     legacy.cancelAll();
     delete process.env.BILI_PERSIST_ZSTD;
+    const before = h.logs.length;
     const store = newStore(h);
     const loaded = await store.boot();
-    assert.equal(loaded.size, 2, "both legacy sessions load");
+    assert.equal(loaded.size, 2, "both legacy sessions load under the zstd-default codec");
     for (const id of ["s-1", "s-2"]) {
-        assert.ok(readFileSync(filePath(h.dir, id)).subarray(0, 9).equals(ZSTD_MAGIC), `${id} rewritten`);
+        const raw = readFileSync(filePath(h.dir, id));
+        assert.ok(raw[0] === 0x7b /* '{' */, `${id} still plain JSON on disk after boot`);
+        JSON.parse(raw.toString("utf8"));
     }
-    assert.ok(h.logs.some((l) => l.msg.includes("re-encoded 2 legacy session file(s)")), h.logs.map((l) => l.msg).join("\n"));
+    assert.ok(!h.logs.slice(before).some((l) => l.msg.includes("re-encoded")), "no mass rewrite logged");
     store.cancelAll();
-    const before = h.logs.length;
-    const again = newStore(h);
-    const loaded2 = await again.boot();
-    assert.equal(loaded2.size, 2);
-    assert.ok(!h.logs.slice(before).some((l) => l.msg.includes("re-encoded")), "second boot is a no-op");
-    again.cancelAll();
+    // Organic conversion: the next real save re-encodes that one file.
+    await store.writeNow(makeSession("s-1", 8_000));
+    store.cancelAll();
+    assert.ok(readFileSync(filePath(h.dir, "s-1")).subarray(0, 9).equals(ZSTD_MAGIC), "next save converts organically");
+    assert.ok(readFileSync(filePath(h.dir, "s-2"))[0] === 0x7b, "untouched file stays plaintext");
 });
 
 withTempDir("mixed tree: legacy plaintext and BILIZSTD1 coexist until boot", async (h) => {
@@ -220,7 +224,7 @@ withTempDir("mixed tree: legacy plaintext and BILIZSTD1 coexist until boot", asy
     store.cancelAll();
     const loaded = await newStore(h).boot();
     assert.ok(loaded.has("s-old") && loaded.has("s-new"), "both formats readable in one tree");
-    assert.ok(readFileSync(filePath(h.dir, "s-old")).subarray(0, 9).equals(ZSTD_MAGIC), "legacy side migrated");
+    assert.ok(readFileSync(filePath(h.dir, "s-old"))[0] === 0x7b, "legacy side stays plaintext (no boot rewrite)");
     assert.ok(readFileSync(filePath(h.dir, "s-new")).subarray(0, 9).equals(ZSTD_MAGIC));
 });
 
@@ -263,4 +267,18 @@ withTempDir("decoupling: key + BILI_PERSIST_ZSTD=0 keeps BILIENC1 with a raw bod
     assert.equal(buf[9], 0x00, "mode byte records the raw body");
     const reloaded = newStore(h).loadSync("s-rawenc", { protocol: "openai", upstreamOrigin: "http://upstream" });
     assert.ok(reloaded, "raw-body encrypted file roundtrips");
+});
+
+test("codec: payloads that do not shrink stay unframed plain JSON (size guard)", () => {
+    const codec = createStorageCodec()!;
+    // Small enough that zstd framing (magic + header + frame overhead)
+    // cannot beat the bare payload — the guard must return it verbatim.
+    const tiny = JSON.stringify({ hello: "world", n: [1, 2, 3] });
+    const enc = Buffer.from(codec.encode(tiny));
+    assert.equal(enc[0], 0x7b, `bare JSON head, got ${enc.subarray(0, 9).toString("utf8")}`);
+    assert.equal(enc.toString("utf8"), tiny, "byte-identical plaintext (no framing)");
+    assert.equal(codec.decode(enc), tiny, "decode accepts unframed plaintext");
+    // And the store still round-trips such a file (loadAll -> decode -> JSON).
+    const big = "x".repeat(20_000);
+    assert.notEqual(Buffer.from(codec.encode(big)).subarray(0, 9).toString("utf8"), big.slice(0, 9), "compressible payload still frames");
 });

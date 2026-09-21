@@ -1,11 +1,11 @@
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, renameSync, writeFileSync } from "node:fs";
-import { open, readdir, readFile, rm } from "node:fs/promises";
+import { readdir, readFile, rm } from "node:fs/promises";
 import * as path from "node:path";
 import { StateStore, flatFileNameFor, type PersistedEnvelope, type StateStoreCodec } from "acp-kernel/persist";
 import { sessionsDir } from "./paths.js";
 import { log as loggerLog } from "./logger.js";
-import { createStorageCodec, ENCRYPT_MAGIC, ZSTD_MAGIC, parseEncryptionKey } from "./encrypt.js";
+import { createStorageCodec, parseEncryptionKey } from "./encrypt.js";
 import { PersistEpermAlert } from "./persist-eperm.js";
 import { createInitialState, defaultCountTokens, prune, type CompressionState, type CoreMessage } from "acp-kernel";
 import type { Session, BlockContent, BlockView } from "./session.js";
@@ -41,7 +41,8 @@ import type { WireProtocol } from "./util.js";
  *    BILI_ENCRYPTION_KEY (hex/base64, exactly 32 bytes) is set (#708,
  *    BILIENC1 envelope) — the body-mode byte records compression even inside
  *    BILIENC1, so the two stay separately configurable. Legacy plaintext
- *    files are re-encoded in place once at boot (migrateLegacyFiles); key
+ *    files are NEVER rewritten at boot (downgrade safety — see
+ *    sweepStaleTemps); they convert organically on their next save. Key
  *    material never touches disk or logs.
  *
  * MECHANISM lives in `acp-kernel/persist` (StateStore: atomic write, rename
@@ -276,7 +277,7 @@ export class SessionStore {
      *  tree twice per start. */
     async boot(): Promise<Map<string, Session>> {
         if (!this.enabled) return new Map();
-        await this.migrateLegacyFiles();
+        await this.sweepStaleTemps();
         const loaded = await this.store.loadAll();
         await this.applyLegacyMigration(loaded);
         const out = new Map<string, Session>();
@@ -286,60 +287,25 @@ export class SessionStore {
         return out;
     }
 
-    /** #708/#1080: when a storage codec is active, take over legacy
-     * plaintext files: every .json under the sessions dir lacking both the
-     * BILIENC1 and the BILIZSTD1 magic is re-encoded in place — temp write
-     * + rename onto the SAME path, so the atomic replace IS the old-file
-     * deletion (no window where both, or neither, copy exists). A crash
-     * mid-run leaves each file either old or new; the next boot finishes the
-     * job and sweeps the crashed run's orphaned temps. Self-terminating: the
-     * magic peek decides per file, so later boots cost O(files × magic). */
-    private async migrateLegacyFiles(): Promise<void> {
-        if (!this.codec) return;
+    /** #708/#1080 review: boot NEVER rewrites session file CONTENT. The first
+     *  draft re-encoded every legacy plaintext file in place at boot — a mass
+     *  format flip that a downgrade (rollback during incident triage) would
+     *  meet with "skipping corrupt file" + empty-session resume + overwrite,
+     *  silently destroying history. Legacy plaintext files keep loading via
+     *  the codec's magic dispatch and convert organically on their next save;
+     *  the only thing boot touches is orphaned `.tmp-enc-*` temps from crashed
+     *  writes of previous runs (pure deletion of garbage, never content). */
+    private async sweepStaleTemps(): Promise<void> {
         let files: string[];
         try {
             files = await walkJsonFiles(this.dir);
         } catch {
             return;
         }
-        let migrated = 0;
-        let failed = 0;
         for (const file of files) {
             if (STALE_ENC_TEMP_RE.test(path.basename(file))) {
                 await rm(file, { force: true }).catch(() => {});
-                continue;
             }
-            let head: Buffer;
-            try {
-                head = await readFileHead(file);
-            } catch {
-                continue;
-            }
-            if (startsWithMagic(head, ENCRYPT_MAGIC) || startsWithMagic(head, ZSTD_MAGIC)) continue;
-            let parsed: unknown;
-            try {
-                parsed = JSON.parse(await readFile(file, "utf8"));
-            } catch {
-                failed++;
-                this.log("warn", `[persist] storage migration (#708/#1080): leaving unreadable file in place: ${file}`);
-                continue;
-            }
-            const tmp = `${file}.tmp-enc-${process.pid}-${Date.now()}`;
-            try {
-                writeFileSync(tmp, this.codec.encode(JSON.stringify(parsed)));
-                renameSync(tmp, file);
-                migrated++;
-            } catch {
-                failed++;
-                this.log("warn", `[persist] storage migration (#708/#1080): failed to re-encode: ${file}`);
-                await rm(tmp, { force: true }).catch(() => {});
-            }
-        }
-        if (migrated > 0 || failed > 0) {
-            this.log(
-                failed > 0 ? "warn" : "info",
-                `[persist] storage migration (#708/#1080): re-encoded ${migrated} legacy session file(s)${failed > 0 ? `, ${failed} failed` : ""}`,
-            );
         }
     }
 
@@ -703,7 +669,7 @@ function persistZstdEnabled(): boolean {
     return true;
 }
 
-/** Temp name used by migrateLegacyFiles: `<file>.tmp-enc-<pid>-<ts>`. A
+/** Temp name used by atomic codec writes: `<file>.tmp-enc-<pid>-<ts>`. A
  *  process death between write and rename orphans it; any such name present
  *  at boot is stale by definition (the walk runs before this boot writes
  *  anything) and gets swept. */
@@ -721,23 +687,6 @@ async function walkJsonFiles(dir: string): Promise<string[]> {
         }
     }
     return out;
-}
-
-async function readFileHead(file: string, len: number = Math.max(ENCRYPT_MAGIC.length, ZSTD_MAGIC.length)): Promise<Buffer> {
-    const fh = await open(file, "r");
-    try {
-        const buf = Buffer.alloc(len);
-        const { bytesRead } = await fh.read(buf, 0, len, 0);
-        return buf.subarray(0, bytesRead);
-    } finally {
-        await fh.close();
-    }
-}
-
-/** Prefix match: the head buffer can be longer (it spans both magics) or
- *  shorter (truncated file) than the magic being tested. */
-function startsWithMagic(buf: Buffer, magic: Buffer): boolean {
-    return buf.length >= magic.length && buf.subarray(0, magic.length).equals(magic);
 }
 
 /** Token budget for the persisted folded-view snapshot (#401). The raw full

@@ -121,9 +121,24 @@ export function createStorageCodec(opts: StorageCodecOptions = {}): StateStoreCo
     return {
         encode(data: string): Buffer {
             const plain = Buffer.from(data, "utf8");
+            // Size guard (#1080 review): only frame-and-compress when it
+            // actually shrinks the payload. Tiny sessions would otherwise
+            // grow by the magic+header overhead, and — more important — an
+            // uncompressed MODE_RAW body has no reason to be framed at all
+            // when no key is set: unframed plain JSON maximizes backward
+            // compatibility (a downgrade reads it natively).
             const useZstd = compress && zstdAvailable();
-            const body = useZstd ? zlib.zstdCompressSync(plain) : plain;
-            const header = Buffer.from([FORMAT_VERSION, useZstd ? MODE_ZSTD : MODE_RAW]);
+            let body = plain;
+            let mode = MODE_RAW;
+            if (useZstd) {
+                const z = zlib.zstdCompressSync(plain);
+                if (z.length < plain.length) {
+                    body = z;
+                    mode = MODE_ZSTD;
+                }
+            }
+            if (!key && mode === MODE_RAW) return plain;
+            const header = Buffer.from([FORMAT_VERSION, mode]);
             if (!key) {
                 return Buffer.concat([ZSTD_MAGIC, header, body]);
             }
