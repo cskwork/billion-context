@@ -117,9 +117,12 @@ import { artifactSeedHit, detectAcpArtifacts } from "./server/chain-artifacts.js
 // one warn per session instead of one per request (a chained session can run
 // thousands of turns). Bounded FIFO: evict the oldest once past the cap.
 const warnedChainSessions = new Set<string>();
-const WARNED_CHAIN_SESSION_CAP = 4096;
+export const WARNED_CHAIN_SESSION_CAP = 4096;
 export function _resetChainWarningsForTest(): void {
     warnedChainSessions.clear();
+}
+export function _chainWarnSetForTest(): Set<string> {
+    return warnedChainSessions;
 }
 
 // #1073: a forward-proxy-style (absolute-form) request whose authority IS this

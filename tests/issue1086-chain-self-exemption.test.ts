@@ -3,14 +3,14 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import { once } from "node:events";
 import { createHash } from "node:crypto";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import path, { join } from "node:path";
 import { defaultConfig } from "acp-kernel";
-import { startServer, _resetChainWarningsForTest } from "../src/server.ts";
+import { startServer, _resetChainWarningsForTest, _chainWarnSetForTest, WARNED_CHAIN_SESSION_CAP } from "../src/server.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
-import { getSession, peekSession, _resetSessionsForTest } from "../src/session.ts";
-import type { ProxyOptions } from "../src/config.ts";
+import { getSession, peekSession, _resetSessionsForTest, flushAllSessions } from "../src/session.ts";
+import { loadOptions, type ProxyOptions } from "../src/config.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { setLogCapture } from "../src/logger.ts";
 import { artifactSeedHit, detectAcpArtifacts } from "../src/server/chain-artifacts.ts";
@@ -515,3 +515,139 @@ test("#1086 T5 liveness: plain-client chat session keeps compressing as it grows
         await close(relay);
     }
 }, { timeout: 120_000 });
+
+// #1101 (F2 of the #1090 deep review): three real paths were never exercised
+// by the tests above — the disk branch of hasProcessedState
+// (src/session.ts:342-343, "covers the auto-update restart"), the
+// BILI_CHAIN_CONTENT env parse (src/config.ts), and the warn-set FIFO
+// eviction (src/server.ts). These close those gaps.
+
+test("#1101 T7: persisted own state survives a simulated restart — disk branch of hasProcessedState", async () => {
+    const root = path.join(tmpdir(), `bili-chain-restart-${process.pid}-${Date.now()}`);
+    mkdirSync(root, { recursive: true });
+    const storeA = new SessionStore({ dir: root, enabled: true, debounceMs: 0 });
+    const stores: SessionStore[] = [storeA];
+    _setStoreForTest(storeA);
+    _resetSessionsForTest();
+    _resetChainWarningsForTest();
+    setRegistryForTest({});
+    const logs: LogRec[] = [];
+    setLogCapture((level, msg) => logs.push({ level, msg }));
+    const captured: Captured[] = [];
+    const upstream = makeUpstream(captured);
+    upstream.listen(0, "127.0.0.1");
+    await listen(upstream);
+    const proxy = await startServer(makeOpts(`http://127.0.0.1:${(upstream.address() as { port: number }).port}`));
+    await listen(proxy);
+    try {
+        // Phase A (old process): build processed state through a REAL enabled store.
+        // The warmup turn is artifact-free (a fresh client's first turn carries no
+        // ACP artifacts); the artifacts enter the history later, as in #1086.
+        const raw = incidentBody();
+        const resp1 = await fetch(`http://127.0.0.1:${(proxy.address() as { port: number }).port}/v1/chat/completions`, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-acp-session": "restart-1" },
+            body: JSON.stringify({ model: MODEL, stream: false, messages: [{ role: "system", content: "You are a test assistant." }, { role: "user", content: "hello world, please help me with a task" }] }),
+        });
+        assert.equal(resp1.status, 200);
+        await resp1.text();
+        assert.equal(peekSession("restart-1")?.stats.requests, 1, "kernel must have processed the warmup turn");
+        await flushAllSessions();
+        // Simulated auto-update restart: a new process is a fresh store instance over the
+        // same dir whose boot() walked the tree (initSessions runs inside startServer and
+        // cannot re-run in-process, so boot() is called directly), with an EMPTY memory map —
+        // the >MAX_SESSIONS/evicted shape that forces the disk branch of hasProcessedState.
+        const storeB = new SessionStore({ dir: root, enabled: true, debounceMs: 0 });
+        stores.push(storeB);
+        _setStoreForTest(storeB);
+        await storeB.boot();
+        _resetSessionsForTest();
+        _resetChainWarningsForTest();
+        assert.equal(peekSession("restart-1"), undefined, "memory must be empty before the replay");
+        // Phase B (new process): replay the SAME artifact body — it must be processed,
+        // not judged foreign and passed through (#1086's auto-update scenario).
+        const resp2 = await fetch(`http://127.0.0.1:${(proxy.address() as { port: number }).port}/v1/chat/completions`, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-acp-session": "restart-1" },
+            body: raw,
+        });
+        assert.equal(resp2.status, 200);
+        await resp2.text();
+        assert.equal(captured.length, 2);
+        assert.notEqual(sha(captured[1]!.body), sha(raw), "persisted own session must be PROCESSED after restart, not passed through");
+        assert.equal(chainWarns(logs, "restart-1").length, 0, "no chain warning may fire for own persisted state");
+        assert.equal(peekSession("restart-1")?.stats.requests, 2, "session must have been RELOADED from disk (requests 1→2), not freshly created");
+    } finally {
+        setLogCapture(null);
+        proxy.closeAllConnections?.();
+        await close(proxy);
+        upstream.closeAllConnections?.();
+        await close(upstream);
+        for (const s of stores) s.cancelAll();
+        rmSync(root, { recursive: true, force: true });
+    }
+});
+
+test("#1101 T8: warn-set FIFO evicts the oldest session once past the cap", async () => {
+    // ENABLED store over an empty temp dir: with persistence disabled the content
+    // fallback is skipped entirely (#1100), so "foreign" can only be judged here.
+    const dir = mkdtempSync(join(tmpdir(), "bili-chain-fifo-"));
+    const store = new SessionStore({ dir, debounceMs: 5, enabled: true });
+    _setStoreForTest(store);
+    _resetSessionsForTest();
+    _resetChainWarningsForTest();
+    setRegistryForTest({});
+    const logs: LogRec[] = [];
+    setLogCapture((level, msg) => logs.push({ level, msg }));
+    const captured: Captured[] = [];
+    const upstream = makeUpstream(captured);
+    upstream.listen(0, "127.0.0.1");
+    await listen(upstream);
+    const proxy = await startServer(makeOpts(`http://127.0.0.1:${(upstream.address() as { port: number }).port}`));
+    await listen(proxy);
+    try {
+        const warnSet = _chainWarnSetForTest();
+        for (let i = 0; i < WARNED_CHAIN_SESSION_CAP; i++) warnSet.add(`pad-${i}`);
+        const raw = incidentBody();
+        const resp = await fetch(`http://127.0.0.1:${(proxy.address() as { port: number }).port}/v1/chat/completions`, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-acp-session": "fifo-evict" },
+            body: raw,
+        });
+        assert.equal(resp.status, 200);
+        await resp.text();
+        assert.equal(captured[0]!.body, raw, "foreign payload still passes through byte-identical");
+        assert.ok(warnSet.has("fifo-evict"), "newly warned session must be tracked");
+        assert.ok(!warnSet.has("pad-0"), "oldest entry must be FIFO-evicted once past the cap");
+        assert.ok(warnSet.has("pad-1"), "only the single oldest entry is evicted per add");
+        assert.equal(warnSet.size, WARNED_CHAIN_SESSION_CAP, "set stays bounded at the cap");
+        assert.equal(chainWarns(logs, "fifo-evict").length, 1, "exactly one warn for the new session");
+    } finally {
+        setLogCapture(null);
+        proxy.closeAllConnections?.();
+        await close(proxy);
+        upstream.closeAllConnections?.();
+        await close(upstream);
+        store.cancelAll();
+        rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("#1101 T9: BILI_CHAIN_CONTENT env parse — default ON, 0 disables, env wins over file", async () => {
+    const root = path.join(tmpdir(), `bili-chain-env-${process.pid}-${Date.now()}`);
+    mkdirSync(root, { recursive: true });
+    const cfgFile = path.join(root, "billion-context.json");
+    const prevFile = process.env.BILI_CONFIG_FILE;
+    try {
+        process.env.BILI_CONFIG_FILE = cfgFile;
+        assert.equal(loadOptions({}).chainContentDetection, true, "default ON when nothing is configured");
+        assert.equal(loadOptions({ BILI_CHAIN_CONTENT: "0" }).chainContentDetection, false, "BILI_CHAIN_CONTENT=0 disables the fallback");
+        assert.equal(loadOptions({ BILI_CHAIN_CONTENT: "1" }).chainContentDetection, true, "BILI_CHAIN_CONTENT=1 enables it");
+        writeFileSync(cfgFile, JSON.stringify({ chainContentDetection: false }), "utf8");
+        assert.equal(loadOptions({}).chainContentDetection, false, "file chainContentDetection=false disables the fallback");
+        assert.equal(loadOptions({ BILI_CHAIN_CONTENT: "1" }).chainContentDetection, true, "env =1 wins over file false");
+    } finally {
+        if (prevFile === undefined) delete process.env.BILI_CONFIG_FILE; else process.env.BILI_CONFIG_FILE = prevFile;
+        rmSync(root, { recursive: true, force: true });
+    }
+});
