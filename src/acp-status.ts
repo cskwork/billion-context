@@ -8,6 +8,7 @@ import {
     type CoreMessage,
 } from "acp-kernel";
 import { getBlindTunnelStats } from "./mitm.js";
+import { effectiveStoreConfig } from "./store.js";
 import { preCompactionArchiveOf, type Session } from "./session.js";
 import { VERSION } from "./version.js";
 
@@ -23,7 +24,13 @@ export interface AcpStatusCtx {
 // compress mutates state mid-turn without re-running prepare, so the snapshot
 // goes stale and lists already-compressed refs as compressible (#389).
 // processTurn is pure (nodes return new objects), so the returned state is
-// intentionally NOT adopted — this is a read-only recompute.
+    // intentionally NOT adopted — this is a read-only recompute.
+function fmtBytes(n: number): string {
+    if (n < 1024) return `${n}B`;
+    if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)}KiB`;
+    return `${(n / (1024 * 1024)).toFixed(1)}MiB`;
+}
+
 export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx): string {
     const scope = typeof args.scope === "string" ? (args.scope as "compressed" | "uncompressed") : undefined;
     const view = typeof args.view === "string" ? (args.view as "ranges" | "messages") : undefined;
@@ -68,6 +75,16 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
         }
     } catch {
         // Base-only report; never fall back to a stale snapshot.
+    }
+    const storeIdx = ctx.session.metadata.storeIndex as Record<string, unknown> | undefined;
+    const storeCount = storeIdx ? Object.keys(storeIdx).length : 0;
+    if (effectiveStoreConfig(ctx.session)?.enabled === true && (storeCount > 0 || (ctx.session.stats.retrieveCalls ?? 0) > 0)) {
+        const st = ctx.session.stats;
+        const calls = st.retrieveCalls ?? 0;
+        const hits = st.retrieveHits ?? 0;
+        const rate = calls > 0 ? Math.round((hits / calls) * 100) : 0;
+        extra.push("");
+        extra.push(`STORE (CCR) — ${storeCount} item(s) · ${fmtBytes(st.storedBytes ?? 0)} stored · ${fmtBytes(st.storeBytesSaved ?? 0)} saved on wire · retrieved ${hits}/${calls}${calls > 0 ? ` (${rate}%)` : ""}`);
     }
     const archive = preCompactionArchiveOf(ctx.session);
     const archivedIds = Object.keys(archive);

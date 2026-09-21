@@ -207,6 +207,25 @@ export type CompressSettings = {
          *  the client's own tool names or the agent will call its own tool. */
         toolName?: string;
     };
+    /** [#1097] Content-addressed message store (host-only; no kernel Config
+     *  equivalent). When `enabled`, oversized tool results (>= minTokens) are
+     *  ID-referenced at arrival: the wire keeps a deterministic placeholder and
+     *  the original goes into the per-session content store (persisted alongside
+     *  blockContents), retrievable via the injected `acp_retrieve` tool. Lossless
+     *  by default — a retrieve not made costs one cheap tool call, whereas a
+     *  distilled-away detail is gone for good. Takes precedence over absorb /
+     *  pre-crush for the same result. Off unless explicitly enabled at some level
+     *  (default off for v1). Merged sub-field-wise across the three levels like
+     *  `absorb`. */
+    store?: {
+        /** Enable ID-reference + acp_retrieve for this scope. Absent/false = off. */
+        enabled?: boolean;
+        /** Tool results smaller than this many tokens stay verbatim (default 500). */
+        minTokens?: number;
+        /** Per-session cap on unique stored bytes (default 2 MiB). New content
+         *  beyond the cap is left verbatim rather than substituted. */
+        maxStoreBytes?: number;
+    };
     /** Persistent rule reminders (kernel `Config.rules`, acp-kernel >= 0.0.70).
      *  When `enabled`, an `acp_rule` tool is injected (or advertised in the
      *  plugin manifest): passing a short `rule` records a principle-level
@@ -966,6 +985,26 @@ export function parseCompressSettings(v: unknown): (CompressSettings & { injectT
                 }
             }
             if (ok) out.absorb = cleaned;
+        }
+    }
+    if ("store" in obj && obj.store !== undefined) {
+        const st = obj.store;
+        if (!st || typeof st !== "object" || Array.isArray(st)) {
+            ok = false;
+        } else {
+            const sto = st as Record<string, unknown>;
+            const cleaned: NonNullable<CompressSettings["store"]> = {};
+            if ("enabled" in sto) {
+                if (typeof sto.enabled !== "boolean") { ok = false; }
+                else cleaned.enabled = sto.enabled;
+            }
+            for (const key of ["minTokens", "maxStoreBytes"] as const) {
+                if (!(key in sto)) continue;
+                const v = sto[key];
+                if (typeof v !== "number" || !Number.isFinite(v)) { ok = false; continue; }
+                cleaned[key] = v;
+            }
+            if (ok) out.store = cleaned;
         }
     }
     if ("prompts" in obj && obj.prompts !== undefined) {

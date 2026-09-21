@@ -12,9 +12,11 @@ import {
     parseCompressInput,
     ABSORB_TOOL_NAME,
     RULE_TOOL_NAME,
+    RETRIEVE_TOOL_NAME,
 } from "../compress-tool.js";
 import { effectiveAbsorbConfig, executeAbsorb, isProxyToolFor } from "../absorb.js";
 import { effectiveRulesConfig, executeRule } from "../rules-feature.js";
+import { effectiveStoreConfig, executeRetrieve } from "../store.js";
 import { applyRanges } from "../stream.js";
 import { executeSearchContextTarget, resolveDecompress } from "../decompress-shared.js";
 import { buildVisibilityMarker } from "../compress-loop.js";
@@ -184,6 +186,9 @@ export function executeProxyTool(
     }
     if (effectiveRulesConfig(ctx.session, ctx.config)?.enabled === true && toolName === RULE_TOOL_NAME) {
         return executeRule(args, ctx);
+    }
+    if (effectiveStoreConfig(ctx.session)?.enabled === true && toolName === RETRIEVE_TOOL_NAME) {
+        return executeRetrieve(args, ctx.session);
     }
     return `[Unknown proxy tool: ${toolName}]`;
 }

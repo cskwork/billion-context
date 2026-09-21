@@ -118,6 +118,16 @@ export type Session = {
          *  Cleared by resetSessionCompression (native-compaction boundary).
          *  Persisted (survives restart like the rest of stats). */
         localInputEstimate?: number;
+        /** #1097 content store: total acp_retrieve calls issued this session. */
+        retrieveCalls: number;
+        /** #1097: acp_retrieve calls that resolved to stored content. */
+        retrieveHits: number;
+        /** #1097: acp_retrieve calls that missed (unknown/hallucinated ref). */
+        retrieveMisses: number;
+        /** #1097: cumulative bytes of unique originals held in the store. */
+        storedBytes: number;
+        /** #1097: cumulative wire bytes saved by placeholder substitution. */
+        storeBytesSaved: number;
     };
     /** Free-form escape hatch for future fields not yet promoted to typed
      *  members. Persisted as-is (must be JSON-serializable). Use sparingly —
@@ -264,7 +274,7 @@ export function getSession(id: string, meta?: { protocol?: Session["meta"]["prot
     const session: Session = {
         id,
         meta: { protocol: meta?.protocol, upstreamOrigin: meta?.upstreamOrigin, label: meta?.label },
-        stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, compressCreditTokens: 0, contextTokens: 0 },
+        stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, compressCreditTokens: 0, contextTokens: 0, retrieveCalls: 0, retrieveHits: 0, retrieveMisses: 0, storedBytes: 0, storeBytesSaved: 0 },
         metadata: {},
         state: createInitialState(),
         createdAt: Date.now(),

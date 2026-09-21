@@ -47,6 +47,15 @@ export function sessionsDir(): string {
     return path.join(dataDir(), "sessions");
 }
 
+/** Content-store dir (#1097): hash-keyed sidecar originals, kept OUTSIDE the
+ *  per-session JSON so whole-file encryption and .json discovery never touch
+ *  payloads. Overridable via BILI_STORE_DIR (test isolation / custom layout). */
+export function storeDir(): string {
+    const env = process.env.BILI_STORE_DIR;
+    if (env && env.length > 0) return path.resolve(env);
+    return path.join(dataDir(), "store");
+}
+
 /** Root cache dir: transient/ephemeral data (update-check throttle, etc.). */
 export function cacheDir(): string {
     return path.join(xdg("XDG_CACHE_HOME", ".cache"), "billion-context");
