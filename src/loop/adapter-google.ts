@@ -234,6 +234,7 @@ export function createGoogleAdapter(
     clientSystem?: string,
     absorbName?: string,
     model?: string,
+    notes?: string[],
 ): CompressLoopAdapter {
     // Gemini carries the model in the URL path, not the body, so the server
     // hands it in; the body lookup only covers hand-built requests.
@@ -262,7 +263,11 @@ export function createGoogleAdapter(
 
     return {
         buildRequest(coreMessages, systemPrompt, body) {
-            const rebuilt: Record<string, unknown> = { ...body, contents: coreToGoogle(coreMessages) };
+            const contents = coreToGoogle(coreMessages);
+            if (notes && notes.length > 0) {
+                for (const text of notes) contents.push({ role: "user", parts: [{ text }] });
+            }
+            const rebuilt: Record<string, unknown> = { ...body, contents };
             // The model lives in the URL path, `alt=sse` in the query, and the
             // output cap in generationConfig.maxOutputTokens — a body carrying
             // any of these keys is rejected upstream.

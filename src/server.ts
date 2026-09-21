@@ -77,6 +77,7 @@ import { atomicWriteInstanceFile, clearProxyInstanceFile, isPidAlive, registerIn
 import { compressLoopResponsesJson } from "./compress-loop-responses.js";
 import { hoistTrappedToolItems } from "./tool-pair-order.js";
 import { runCompressLoop, pickAdapter } from "./loop/index.js";
+import { reconcileSystemAnchor } from "./system-anchor.js";
 import { containsToolCallXmlFragment } from "./loop/tag-echo-filter.js";
 import { isStrictReasoningEcho, modelIdOf, normalizeStrictEchoReasoning } from "./strict-echo.js";
 export { isStrictReasoningEcho, normalizeStrictEchoReasoning };
@@ -605,6 +606,10 @@ type Prepared = {
      *  rebuild `systemInstruction` and to synthesize chunks on every compress
      *  loop round. */
     google?: { system?: string; model?: string };
+    /** #1085: stable-system-anchor update notes for this turn — re-injected
+     *  as trailing user messages so compress-loop rounds see the same
+     *  updated-instructions context the main request did. */
+    systemNotes?: string[];
     nudge?: NudgeDecision;
     /** Render strategy the prepare used for processTurn ("none" for codex
      *  compaction triggers / ACP_RENDER_NONE). The #422 fold-refresh hook in
@@ -1345,10 +1350,18 @@ async function handle(
                 // kernel's empty-instructions non-anchoring path is left
                 // untouched for metadata-less clients).
                 ? codexTurn.value
-                : subagentNamespace(
-                      responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader),
-                      (parsed as ResponsesRequestBody).instructions,
-                  );
+                : opts.stableSystemAnchor
+                  // #1085: with anchoring on, instruction drift is the expected
+                  // event — the sticky head-system anchor absorbs it (trailing
+                  // update notes), so keying a changed-instructions request
+                  // into a `|sub:<fp>` session would orphan the anchor state
+                  // and defeat the feature. Same verbatim-identity treatment
+                  // as the trusted codexTurn branch above.
+                  ? (responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader))
+                  : subagentNamespace(
+                        responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader),
+                        (parsed as ResponsesRequestBody).instructions,
+                    );
         // The session ID is the client-provided conversation value VERBATIM —
         // no hash, no protocol/credential/upstream dimensions (#286): those
         // are all mutable mid-conversation (bearer rotation, relay switching,
@@ -2151,6 +2164,21 @@ function prepareAnthropic(
     let systemOut = parsed.system;
     let toolsOut = parsed.tools;
 
+    // #1085: sticky head-system anchor — freeze the client's own `system` text
+    // at first sight and forward it byte-stable; detected changes ride as
+    // trailing user notes. Mutating parsed.system in place makes every
+    // downstream consumer (injectSystem, Prepared.anthropicSystem → loop)
+    // inherit the anchor, and the failure path below keeps forwarding it too.
+    let sysNotes: string[] = [];
+    if (opts.stableSystemAnchor) {
+        const fresh = extractSystem(parsed.system);
+        const outcome = reconcileSystemAnchor(session, "anthropic", fresh, sessionId, log);
+        sysNotes = outcome.notes;
+        if (outcome.outbound !== fresh) {
+            parsed.system = buildSystem(outcome.outbound, parsed.system);
+        }
+    }
+
     // The classifier passthrough above and prepareResponsesCompact return before
     // this strip; no client emits an ACP panel on those paths, so that's safe.
     const strippedPanels = stripAcpPanelMessages(parsed.messages);
@@ -2229,6 +2257,9 @@ function prepareAnthropic(
         applyCompactionArchive(session, activeBefore, new Set(msgs.map((m) => m.id)), log);
         reapOrphanBlocks(session, msgs, deactivateBlock);
         rebuiltMessages = coreToAnthropic(processedMessages as BiliMessage[], cacheControls);
+        if (sysNotes.length > 0) {
+            rebuiltMessages = [...rebuiltMessages, ...sysNotes.map((text) => ({ role: "user" as const, content: text }))];
+        }
 
         systemOut = injectSystem(parsed, opts, prompts, loopConfig, ensureCanonicalId(session), surface, visibilityMarkers);
         if (injectTools) {
@@ -2253,6 +2284,9 @@ function prepareAnthropic(
     } catch (err) {
         log("warn", `[${sessionId}] kernel transform failed, forwarding unchanged: ${String(err)}`);
         processedMessages = [];
+        if (sysNotes.length > 0) {
+            rebuiltMessages = [...rebuiltMessages, ...sysNotes.map((text) => ({ role: "user" as const, content: text }))];
+        }
     }
     // #532: measure the outbound system+tools overhead for the status panel's
     // SysPrompt row — the kernel breakdown classifies messages only, and on
@@ -2277,7 +2311,7 @@ function prepareAnthropic(
     session.stats.localInputEstimate = estimateCoreMessagesUpper(processedMessages.length > 0 ? processedMessages : originalMessages)
         + countSystemAndToolsTokens(extractSystem(systemOut), toolsOut)
         + imageTokensInParsedBody("anthropic", rebuilt);
-    return { body: JSON.stringify(rebuilt), session, processedMessages, originalMessages, anthropicSystem: parsed.system, protocol: "anthropic", stream, compressInjected: injectTools, pluginMode, nudge, prompts, surface, renderTags: process.env.ACP_RENDER_NONE ? "none" : "text-only" } as Prepared;
+    return { body: JSON.stringify(rebuilt), session, processedMessages, originalMessages, anthropicSystem: parsed.system, systemNotes: sysNotes, protocol: "anthropic", stream, compressInjected: injectTools, pluginMode, nudge, prompts, surface, renderTags: process.env.ACP_RENDER_NONE ? "none" : "text-only" } as Prepared;
 }
 
 function prepareOpenai(
@@ -2301,6 +2335,7 @@ function prepareOpenai(
     const stream = parsed.stream === true;
     ++session.stats.requests;
     let openaiSystemText = "";
+    let sysNotes: string[] = [];
     const stripReasoning = (msgs: BiliMessage[]): BiliMessage[] => withReasoningDrop(msgs, reasoning, log, sessionId, isStrictReasoningEcho(session, upstreamOrigin, modelIdOf(parsed)));
     let openaiOutboundSystem: string | undefined;
     let processedMessages: CoreMessage[] = [];
@@ -2336,6 +2371,13 @@ function prepareOpenai(
         // otherwise the proxy would forward payloads without any system.
         const { msgs, systemText } = openaiToCore(parsed);
         openaiSystemText = systemText;
+        // Title-gen side-requests carry their own tiny system — reconciling
+        // them would pollute the conversation's anchor state.
+        if (opts.stableSystemAnchor && !isTitleGen) {
+            const outcome = reconcileSystemAnchor(session, "openai", systemText, sessionId, log);
+            sysNotes = outcome.notes;
+            openaiSystemText = outcome.outbound;
+        }
         originalMessages = msgs;
         // #1001: pre-turn snapshot — processTurn below assigns fresh refs to every
         // previously-unknown id, which would make rewrite detection read 1.0.
@@ -2394,10 +2436,13 @@ function prepareOpenai(
         // instead, mirroring pai-acp's design. Putting the nudge in system
         // would invalidate the cache every turn.
         const sysParts: string[] = [];
-        if (systemText) sysParts.push(systemText);
+        if (openaiSystemText) sysParts.push(openaiSystemText);
         if (shouldInject) sysParts.push(withConversationIdNote(withMarkerIntegrityNote(withSummaryBudgetNote(buildCompressSystemPrompt(prompts, surface?.promptSections)), visibilityMarkers), ensureCanonicalId(session)));
         if (absorbActive) sysParts.push(buildAbsorbSystemPrompt(absorbToolName(config)));
         rebuiltMessages = injectOpenaiSystem(rebuiltMessages, sysParts);
+        if (sysNotes.length > 0) {
+            rebuiltMessages = [...rebuiltMessages, ...sysNotes.map((text) => ({ role: "user" as const, content: text }))];
+        }
         // #532: capture what bili injects outside the fold space (client system
         // + compress prompt). A head system message already in the rebuilt view
         // is classified by the kernel breakdown — counting only these parts
@@ -2465,7 +2510,7 @@ function prepareOpenai(
     }
     snapshotMessages(session, originalMessages);
     markDirty(session);
-    return { body: JSON.stringify(rebuilt), session, processedMessages, originalMessages, protocol: "openai", stream, compressInjected: injectTools, pluginMode, nudge, prompts, surface, openaiSystemText, renderTags: process.env.ACP_RENDER_NONE ? "none" : "text-only" } as Prepared;
+    return { body: JSON.stringify(rebuilt), session, processedMessages, originalMessages, protocol: "openai", stream, compressInjected: injectTools, pluginMode, nudge, prompts, surface, openaiSystemText, systemNotes: sysNotes, renderTags: process.env.ACP_RENDER_NONE ? "none" : "text-only" } as Prepared;
 }
 
 /** Append the ephemeral nudge to a Gemini `contents` array. Gemini is
@@ -2513,6 +2558,7 @@ function prepareGoogle(
     const sessionId = session.id;
     ++session.stats.requests;
     let googleClientSystem = "";
+    let sysNotes: string[] = [];
     let googleOutboundSystem: string | undefined;
     let systemInstruction: GoogleSystemInstruction | undefined = parsed.systemInstruction;
     let processedMessages: CoreMessage[] = [];
@@ -2533,6 +2579,13 @@ function prepareGoogle(
     try {
         const { msgs, systemText } = googleToCore(parsed);
         googleClientSystem = systemText;
+        // Title-gen side-requests carry their own tiny system — reconciling
+        // them would pollute the conversation's anchor state.
+        if (opts.stableSystemAnchor && !isTitleGen) {
+            const outcome = reconcileSystemAnchor(session, "google", systemText, sessionId, log);
+            sysNotes = outcome.notes;
+            googleClientSystem = outcome.outbound;
+        }
         originalMessages = msgs;
         const tokenCount = effectiveTokenCount(session, msgs);
         const activeBefore = new Set(session.state.blocks.filter((b) => b.active).map((b) => b.blockId));
@@ -2571,17 +2624,20 @@ function prepareGoogle(
         // byte-stable across turns. The per-turn nudge is appended to the
         // trailing user content below (see prepareOpenai for the rationale).
         const sysParts: string[] = [];
-        if (systemText) sysParts.push(systemText);
+        if (googleClientSystem) sysParts.push(googleClientSystem);
         if (shouldInject) sysParts.push(withMarkerIntegrityNote(buildCompressSystemPrompt(prompts, surface?.promptSections), visibilityMarkers));
         if (absorbActive) sysParts.push(buildAbsorbSystemPrompt(absorbToolName(config)));
         googleOutboundSystem = sysParts.join("\n\n");
         // Untouched when nothing was added beyond the client's own text: the
         // original `systemInstruction` object then rides through byte-identical
         // instead of being re-serialized into a new shape.
-        const extraSystemParts = sysParts.slice(systemText ? 1 : 0);
+        const extraSystemParts = sysParts.slice(googleClientSystem ? 1 : 0);
         systemInstruction = extraSystemParts.length > 0 ? { parts: sysParts.map((text) => ({ text })) } : parsed.systemInstruction;
         if (injectTools) {
             toolsOut = injectGoogleTool(parsed.tools, [...(absorbActive ? [ABSORB_TOOL_GOOGLE] : []), ...(rulesActive ? [RULE_TOOL_GOOGLE] : [])], surface?.toolPrompts);
+        }
+        if (sysNotes.length > 0) {
+            rebuiltContents = appendGoogleNudge(rebuiltContents, sysNotes.join("\n\n---\n\n"));
         }
         if (willInjectNudge && turn.nudge) {
             try {
@@ -2605,7 +2661,7 @@ function prepareGoogle(
     }
     snapshotMessages(session, originalMessages);
     markDirty(session);
-    return { body: JSON.stringify(rebuilt), session, processedMessages, originalMessages, protocol: "google", stream, compressInjected: injectTools, pluginMode, nudge, prompts, surface, google: { system: googleClientSystem, model }, renderTags: "text-only" } as Prepared;
+    return { body: JSON.stringify(rebuilt), session, processedMessages, originalMessages, protocol: "google", stream, compressInjected: injectTools, pluginMode, nudge, prompts, surface, google: { system: googleClientSystem, model }, systemNotes: sysNotes, renderTags: "text-only" } as Prepared;
 }
 
 /** `POST /v1beta/models/<model>:countTokens` — the fold-prune twin of
@@ -2698,6 +2754,7 @@ function prepareResponses(
     let toolsOut = parsed.tools;
     let transformOk = false;
     let responsesDevContent: string | undefined;
+    let sysNotes: string[] = [];
 
     // #242: over-long input item ids (poisoned rollouts) 400 upstream on every
     // request; rewrite them to short deterministic ids before anything reads
@@ -2741,6 +2798,14 @@ function prepareResponses(
     try {
         const projection = responsesToCore(parsed);
         responsesProjection = projection;
+        // Compaction-trigger requests are the compression mechanism itself —
+        // their payload shape must not gain anchor state or note items.
+        if (opts.stableSystemAnchor && !isCompactionTrigger) {
+            const fresh = projection.systemParts.join("\n\n---\n\n");
+            const outcome = reconcileSystemAnchor(session, "responses", fresh, sessionId, log);
+            sysNotes = outcome.notes;
+            if (outcome.outbound !== fresh) projection.systemParts = outcome.outbound ? [outcome.outbound] : [];
+        }
         const { msgs } = projection;
         originalMessages = msgs;
         if (process.env.ACP_DEBUG) {
@@ -2804,6 +2869,15 @@ function prepareResponses(
             const devContent = [...projection.systemParts, ...forgedSummaries].join("\n\n---\n\n");
             responsesDevContent = devContent;
             rebuiltInput = injectResponsesDeveloperMessage(rebuiltInput, devContent);
+        }
+        if (sysNotes.length > 0) {
+            const inputItems: ResponseInputItem[] = typeof rebuiltInput === "string"
+                ? [{ type: "message", role: "user", content: rebuiltInput }]
+                : rebuiltInput;
+            for (const text of sysNotes) {
+                inputItems.push({ type: "message", role: "user", content: text });
+            }
+            rebuiltInput = inputItems;
         }
         // A nudge appended after a trailing `compaction_trigger` would break
         // the upstream's "must be the final input item" requirement and is
@@ -2929,6 +3003,7 @@ function prepareResponses(
         processedMessages,
         originalMessages,
         responsesProjection,
+        systemNotes: sysNotes,
         protocol: "responses",
         stream,
         compressInjected: injectTools && !isCompactionTrigger,
@@ -4455,7 +4530,7 @@ async function forward(
                 : "";
             const visibilityMarkers = resolveCompress(opts.routes, route?.rewrittenUrl, (parsedReq as { model?: string }).model, opts.compress).visibilityMarkers ?? true;
             const systemPrompt = withMarkerIntegrityNote(withSummaryBudgetNote(textProtocol ? buildCompressHybridSystemPrompt(prepared.prompts ?? defaultPrompts, prepared.surface?.promptSections) : buildCompressSystemPrompt(prepared.prompts ?? defaultPrompts, prepared.surface?.promptSections)), visibilityMarkers) + absorbSection;
-            const adapter = pickAdapter(prepared.protocol, parsedReq, textProtocol, prepared.responsesProjection, prepared.anthropicSystem, prepared.openaiSystemText, absorbActive ? absorbToolName(loopConfig) : undefined, prepared.google);
+            const adapter = pickAdapter(prepared.protocol, parsedReq, textProtocol, prepared.responsesProjection, prepared.anthropicSystem, prepared.openaiSystemText, absorbActive ? absorbToolName(loopConfig) : undefined, prepared.google, prepared.systemNotes);
             const refreshFolded = async (current: CoreMessage[]): Promise<CoreMessage[]> => {
                 return withSessionLock(prepared.session, () => {
                     // #422: mirror the prepare's fold with the post-compress state so

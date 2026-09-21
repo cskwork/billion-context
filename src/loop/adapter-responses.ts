@@ -258,7 +258,7 @@ function buildCompleted(responseObj: Record<string, unknown> | null): Buffer {
     );
 }
 
-export function createResponsesAdapter(textProtocol?: boolean, projection?: ResponsesProjection, absorbName?: string): CompressLoopAdapter {
+export function createResponsesAdapter(textProtocol?: boolean, projection?: ResponsesProjection, absorbName?: string, notes?: string[]): CompressLoopAdapter {
     const suppressTextLifecycle = !!textProtocol;
     let outputIndex = 0;
     let responseObj: Record<string, unknown> | null = null;
@@ -303,7 +303,10 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
                 ? [...projection.systemParts, systemPrompt]
                 : [systemPrompt];
             const withDev = injectResponsesDeveloperMessage(inputItems, devParts.join("\n\n---\n\n"));
-            const rebuilt: Record<string, unknown> = { ...requestBody, input: withDev };
+            const finalInput = notes && notes.length > 0
+                ? [...withDev, ...notes.map((text) => ({ type: "message" as const, role: "user" as const, content: text }))]
+                : withDev;
+            const rebuilt: Record<string, unknown> = { ...requestBody, input: finalInput };
             if (process.env.ACP_KEEP_RESPONSE_ID !== "1") delete rebuilt.previous_response_id;
             delete rebuilt.instructions;
             return rebuilt;

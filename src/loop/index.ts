@@ -29,10 +29,11 @@ export function pickAdapter(
     openaiSystem?: string,
     absorbName?: string,
     google?: { system?: string; model?: string },
+    systemNotes?: string[],
 ): CompressLoopAdapter {
-    if (protocol === "responses") return createResponsesAdapter(textProtocol, responsesProjection, absorbName);
-    if (protocol === "openai") return createOpenaiAdapter(requestBody, openaiSystem, absorbName);
-    if (protocol === "anthropic") return createAnthropicAdapter(requestBody, anthropicSystem);
-    if (protocol === "google") return createGoogleAdapter(requestBody, google?.system, absorbName, google?.model);
+    if (protocol === "responses") return createResponsesAdapter(textProtocol, responsesProjection, absorbName, systemNotes);
+    if (protocol === "openai") return createOpenaiAdapter(requestBody, openaiSystem, absorbName, systemNotes);
+    if (protocol === "anthropic") return createAnthropicAdapter(requestBody, anthropicSystem, systemNotes);
+    if (protocol === "google") return createGoogleAdapter(requestBody, google?.system, absorbName, google?.model, systemNotes);
     throw new Error(`[acp-loop] unknown protocol: ${protocol}`);
 }

@@ -118,7 +118,7 @@ function buildTextDeltaEvent(index: number, text: string): Buffer {
     );
 }
 
-export function createAnthropicAdapter(requestBody: Record<string, unknown>, originalSystem?: AnthropicRequestBody["system"]): CompressLoopAdapter {
+export function createAnthropicAdapter(requestBody: Record<string, unknown>, originalSystem?: AnthropicRequestBody["system"], notes?: string[]): CompressLoopAdapter {
     const model = (requestBody.model as string) ?? undefined;
     let messageId: string | undefined;
     let clientIndex = 0;
@@ -203,7 +203,10 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
             const baseText = originalSystem !== undefined ? extractSystem(originalSystem) : "";
             const full = baseText ? `${baseText}\n\n---\n\n${systemPrompt}` : systemPrompt;
             const system = originalSystem !== undefined ? buildSystem(full, originalSystem) : full;
-            return { ...body, system, messages };
+            const withNotes = notes && notes.length > 0
+                ? [...messages, ...notes.map((text) => ({ role: "user" as const, content: text }))]
+                : messages;
+            return { ...body, system, messages: withNotes };
         },
 
         async *parseStream(upstream, round) {
