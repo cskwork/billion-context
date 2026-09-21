@@ -66,7 +66,8 @@ import { rulesEnabled, storeEffectiveRules } from "./rules-feature.js";
 import { rewriteJsonResponse, type RewriteCtx } from "./stream.js";
 import { applyRanges } from "./stream.js";
 import { buildSessionCacheReport } from "./cache-ledger.js";
-import { preflightCompress, estimateCoreMessages, estimateCoreMessagesUpper, type PreflightResult } from "./preflight.js";
+import { preflightCompress, estimateCoreMessages, estimateCoreMessagesUpper, estimateRawBodyTokens, type PreflightResult } from "./preflight.js";
+import { gcConfigFromEnv, gcSessionFiles } from "./session-gc.js";
 import { imageTokensInRawBody, imageTokensInParsedBody, resolveImageBilling, type ResolvedImageBilling } from "./image-tokens.js";
 import { renderUI, handleConfigGet, handleConfigPut } from "./web/index.js";
 import { reapOrphanBlocks } from "./orphan-gc.js";
@@ -323,6 +324,17 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     await initSessions();
     loadConversations();
     log("info", `[persist] ${getStore().enabled ? "enabled" : "disabled"}`);
+    // #1082: sweep stale small session files — boot pass + periodic. Runs
+    // against the disk tree, not the in-memory map: evicted/capped sessions
+    // leave files behind that only a disk walk sees.
+    const gcCfg = gcConfigFromEnv();
+    if (gcCfg.enabled && getStore().enabled) {
+        void gcSessionFiles().catch((err) => log("warn", `[gc] sweep failed: ${String(err)}`));
+        const gcTimer = setInterval(() => {
+            void gcSessionFiles().catch((err) => log("warn", `[gc] sweep failed: ${String(err)}`));
+        }, gcCfg.intervalMs);
+        gcTimer.unref?.();
+    }
     // #405 (silent env knobs): the tunnel allowlist is security-relevant —
     // surface it at startup so a remote-client deployment shows WHY private
     // destinations pass or fail.
@@ -1424,6 +1436,14 @@ async function handle(
         // request (route/model can change it — latest wins). Persisted with the
         // session so post-hoc forensics never needs config-mtime archaeology.
         session.meta.activePack = reqSurfacePack;
+        // #1082: rebuild-cost signal for the session-file GC — token estimate
+        // of the RAW wire payload (full history as received, pre-fold/injection).
+        // Text-only (binary fields excluded by design). Latest wins: history
+        // grows monotonically within a session and shrinks after native
+        // compaction boundaries, which is when the re-send really gets cheaper.
+        if (parsed !== null && typeof parsed === "object") {
+            session.metadata.rawInputTokens = estimateRawBodyTokens(parsed);
+        }
         if (anonAffinity) {
             prefixAffinity.note(sessionId, anonAffinity.incomingDepth, anonAffinity.tailHash, anonAffinity.itemHashes);
             scheduleAffinityPersist();

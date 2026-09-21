@@ -495,6 +495,10 @@ Windows 下会自动发现常见 Clash/Mihomo 静态系统代理;Web UI 会显�
 
 当同一会话连续 N 次写失败（默认 `5`）时，代理会打一条一次性、可操作的告警，明确指出要排除的目录。要从根上修复：把 `%USERPROFILE%\.local\share\billion-context\` 加入杀软**排除项**（Windows Defender：设置 → 病毒和威胁防护 → 管理设置 → 排除项 → 添加排除 → 文件夹），并确认没有同步工具（OneDrive / Dropbox / …）在同步该路径。完整步骤见 [CONFIGURATION.zh-CN.md](CONFIGURATION.zh-CN.md) 的「Windows：把会话目录加入杀软排除项」章节。
 
+### 会话文件清理（#1082）
+
+短命会话会留下永远不会再被恢复的小状态文件。持久化开启时，bili 在启动时和每小时扫描一次会话目录：年龄超过 `BILI_SESSION_GC_MAX_AGE_DAYS`（默认 7 天）且最近一次请求体 token 数 ≤ `BILI_SESSION_GC_MAX_TOKENS`（默认 1M）的文件会被删除 —— 继续对话会用客户端自己的历史重建上下文，代价只是一次冷重建。没有记录大小的旧文件则要求**没有活跃压缩块**且 `contextTokens` 不超过同一上限。活会话、不可读文件和加密文件（判断前先用 `BILI_ENCRYPTION_KEY` 解码）都按保守策略处理。设 `BILI_SESSION_GC=0` 可关闭。详见 [CONFIGURATION.zh-CN.md](CONFIGURATION.zh-CN.md)。
+
 ## 状态
 
 早期。协议处理和压缩已通过 mock 测试(500+ 项通过)。真实模型集成测试是下一里程碑。预期会有粗糙的地方。
