@@ -32,7 +32,8 @@ import { dropSessionForGc, peekSession } from "./session.js";
  * The sweep walks the DISK tree, not the in-memory map: sessions evicted by
  * the MAX_SESSIONS LRU cap or dropped at boot still have files, and only a
  * disk walk sees them. mtime is a cheap pre-filter; only age-eligible files
- * are decoded (encrypted BILIENC1 files work via the store's codec).
+ * are decoded (any codec-framed file — encrypted today, zstd-compressed
+ * once #1083 lands — works via the store's format-agnostic reader).
  * Corrupt/unreadable files are left in place, never guessed at.
  */
 
