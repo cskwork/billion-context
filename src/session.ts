@@ -514,6 +514,17 @@ export function applyCompactionArchive(
 // on prior compression history keeps fresh sessions / first replays out.
 const REWRITE_MIN_KNOWN_REFS = 20;
 const REWRITE_MAX_KNOWN_RATIO = 0.5;
+// #1075: clients stamp auxiliary side-requests (Claude Code WebSearch query
+// refinement, title generation, …) with the SAME session id but carry only a
+// handful of brand-new messages — 0/N < 0.5 trips the ratio gate, and the
+// archive+prune that follows wipes the whole ref map, so the next
+// full-history replay burns N fresh refs per side-request until m99999
+// exhausts. A genuine rewrite of a mature conversation never arrives as a
+// near-empty payload, and always shares at least one message id with the
+// prior history (clients keep a tail through compaction), so require both
+// before treating the shrink as real. Missing a genuine rewrite is cheap
+// (stale map entries linger until session end); a false positive is fatal.
+const REWRITE_MIN_INCOMING_TOTAL = 10;
 
 export interface RewriteDetection {
     detected: boolean;
@@ -537,7 +548,8 @@ export function detectUnannouncedHistoryRewrite(
     const detected =
         knownBefore >= REWRITE_MIN_KNOWN_REFS &&
         session.state.blocks.length > 0 &&
-        incomingTotal > 0 &&
+        incomingTotal >= REWRITE_MIN_INCOMING_TOTAL &&
+        knownIncoming > 0 &&
         knownIncoming / incomingTotal < REWRITE_MAX_KNOWN_RATIO;
     return { detected, knownBefore, incomingTotal, knownIncoming };
 }
