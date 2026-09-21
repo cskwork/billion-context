@@ -3800,13 +3800,20 @@ async function forward(
     // are read at CALL time (a role learned / config resolved mid-request applies
     // to later re-sends within the same request). Steering is idempotent, so a
     // re-send neither accumulates the directive nor re-lowers an already-low field.
-    const wireTransform = compatProtocol || steerEnabled
-        ? (b: Record<string, unknown>): Record<string, unknown> => {
-            if (compatProtocol && compatRoles) applyCompatRolesJson(b, compatProtocol, compatRoles);
-            if (steerEnabled) applyOutputSteeringJson(b, wireProtocol, steerCfg);
-            return b;
-        }
-        : undefined;
+    const makeWireTransform = (withVerbosity: boolean) =>
+        compatProtocol || steerEnabled
+            ? (b: Record<string, unknown>): Record<string, unknown> => {
+                if (compatProtocol && compatRoles) applyCompatRolesJson(b, compatProtocol, compatRoles);
+                if (steerEnabled) applyOutputSteeringJson(b, wireProtocol, steerCfg, { verbosity: withVerbosity });
+                return b;
+            }
+            : undefined;
+    const wireTransform = makeWireTransform(true);
+    // Compress rounds re-send WITHOUT the verbosity directive (summary
+    // fidelity: the directive's "never restate paths/code" clause contradicts
+    // the compress prompt's verbatim-preservation contract) — compat rewrite
+    // and effort routing stay (see #1096 review).
+    const compressWireTransform = makeWireTransform(false);
     // Show the final proxied URL (where the request actually lands) as the
     // primary signal. The provider label is appended only for named routes —
     // zero-config requests have a single routing mode now, so the final
@@ -4498,7 +4505,7 @@ async function forward(
                 streamToRead,
                 { core, config, messages: prepared.processedMessages.length > 0 ? prepared.processedMessages : prepared.originalMessages, compressMessages: prepared.originalMessages, session: prepared.session, log: ctx.log, proxyUrl, protocol: prepared.protocol, textProtocol, debug: opts.debug, refreshFolded, visibilityMarkers },
                 parsedReq,
-                { url: upstreamUrl, headers: reqHeaders, wireTransform },
+                { url: upstreamUrl, headers: reqHeaders, wireTransform: compressWireTransform },
                 adapter,
                 systemPrompt,
                 clientAbort.signal,
@@ -4554,7 +4561,7 @@ async function forward(
                         json,
                         { core, config, messages: prepared.originalMessages, session: prepared.session, log: ctx.log, proxyUrl, textProtocol: true, visibilityMarkers },
                         requestBody,
-                        { url: upstreamUrl, headers: requestHeaders, wireTransform },
+                        { url: upstreamUrl, headers: requestHeaders, wireTransform: compressWireTransform },
                     );
                 }
                 // Capture upstream usage so tokenCount (which drives nudge +
