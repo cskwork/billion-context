@@ -206,6 +206,27 @@ export type CompressSettings = {
         /** Rename the wire tool (default "absorb"). Must stay unique against
          *  the client's own tool names or the agent will call its own tool. */
         toolName?: string;
+        /** Deterministic pre-crush channel in front of the absorb gate (#1094).
+         *  When `enabled` (requires `enabled: true` above), eligible oversized
+         *  tool results (≥ `minToolTokens`) are mechanically reduced BEFORE the
+         *  absorb decision: JSON payloads get field-variance folding (constant
+         *  fields hoisted, identical runs collapsed — lossless by construction),
+         *  source code gets comment/docstring/blank-line elision (lossy: elided
+         *  text is not retained). A result crushed below `minToolTokens` never
+         *  triggers a model absorb round-trip; a result still above it gets the
+         *  [ACP absorb] instruction from the quieter payload. Unparseable or
+         *  uncrushable content passes through byte-identical. Host-side only
+         *  (never reaches the kernel). Off unless explicitly enabled. */
+        preCrush?: {
+            /** Enable pre-crush for this scope (`absorb.enabled` must also be
+             *  true at the resolved level). */
+            enabled?: boolean;
+            /** Minimum fraction of tokens the crush must save for the
+             *  replacement to be accepted (anti-noise floor, not a skip gate —
+             *  skipping model round-trips is decided by `minToolTokens`).
+             *  Accepts a ratio in (0,1] or a percent string; default 0.1. */
+            minReduction?: number | string;
+        };
     };
     /** Persistent rule reminders (kernel `Config.rules`, acp-kernel >= 0.0.70).
      *  When `enabled`, an `acp_rule` tool is injected (or advertised in the
@@ -963,6 +984,30 @@ export function parseCompressSettings(v: unknown): (CompressSettings & { injectT
                 } else {
                     if (typeof v !== "string" || v.trim().length === 0) { ok = false; continue; }
                     cleaned.toolName = v.trim();
+                }
+            }
+            if ("preCrush" in ao && ao.preCrush !== undefined) {
+                const p = ao.preCrush;
+                if (!p || typeof p !== "object" || Array.isArray(p)) {
+                    ok = false;
+                } else {
+                    const po = p as Record<string, unknown>;
+                    const pc: NonNullable<NonNullable<CompressSettings["absorb"]>["preCrush"]> = {};
+                    if ("enabled" in po) {
+                        if (typeof po.enabled !== "boolean") ok = false;
+                        else pc.enabled = po.enabled;
+                    }
+                    if ("minReduction" in po) {
+                        const v = po.minReduction;
+                        if (typeof v === "number" || (typeof v === "string" && v.trim().endsWith("%"))) {
+                            const ratio = typeof v === "number" ? v : Number(v.trim().slice(0, -1)) / 100;
+                            if (!Number.isFinite(ratio) || ratio <= 0 || ratio > 1) ok = false;
+                            else pc.minReduction = typeof v === "string" ? v.trim() : v;
+                        } else {
+                            ok = false;
+                        }
+                    }
+                    if (ok) cleaned.preCrush = pc;
                 }
             }
             if (ok) out.absorb = cleaned;

@@ -1,6 +1,7 @@
-import { DEFAULT_ABSORB_CONFIG, defaultPrompts, resolvePrompts, createPackResolver, defaultPackSources, isValidPackName, type AbsorbConfig, type Config, type PackSurface, type Prompts } from "acp-kernel";
+import { DEFAULT_ABSORB_CONFIG, defaultPrompts, resolvePrompts, createPackResolver, defaultPackSources, isValidPackName, type Config, type PackSurface, type Prompts } from "acp-kernel";
 import * as path from "node:path";
 import { findRoute, type CompressSettings, type ProviderRoutes } from "./config.js";
+import { PRE_CRUSH_DEFAULT_MIN_REDUCTION, type PreCrushAwareAbsorb } from "./pre-crush.js";
 import { configDir } from "./paths.js";
 import { log as loggerLog } from "./logger.js";
 
@@ -57,8 +58,15 @@ export function mergeCompress(
     const rangeOf = (s?: CompressSettings): number | undefined => s?.minCompressRangeChars ?? s?.minCompressRange;
     // `absorb` is a second nested-object field, merged sub-field-wise exactly
     // like `prompts`: a model-level minToolTokens must not discard a
-    // provider-level excludeTools.
+    // provider-level excludeTools. Its own nested `preCrush` block gets the
+    // same treatment one level down: a model-level minReduction must not
+    // discard a global-level enabled.
     const absorbLevels = [global?.absorb, provider?.absorb, model?.absorb].filter(Boolean) as NonNullable<CompressSettings["absorb"]>[];
+    const mergedAbsorb = absorbLevels.length > 0 ? Object.assign({}, ...absorbLevels) : undefined;
+    if (mergedAbsorb) {
+        const pcLevels = absorbLevels.map((l) => l.preCrush).filter(Boolean) as NonNullable<NonNullable<CompressSettings["absorb"]>["preCrush"]>[];
+        if (pcLevels.length > 0) mergedAbsorb.preCrush = Object.assign({}, ...pcLevels);
+    }
     const reasoningLevels = [global?.reasoning, provider?.reasoning, model?.reasoning].filter(Boolean) as NonNullable<CompressSettings["reasoning"]>[];
     const reasoningGuardLevels = [global?.reasoningGuard, provider?.reasoningGuard, model?.reasoningGuard].filter(Boolean) as NonNullable<CompressSettings["reasoningGuard"]>[];
     return {
@@ -74,7 +82,7 @@ export function mergeCompress(
         protectedLatestTools: pick("protectedLatestTools"),
         prompts: promptLevels.length > 0 ? Object.assign({}, ...promptLevels) : undefined,
         acknowledgePromptsRisk: pick("acknowledgePromptsRisk"),
-        absorb: absorbLevels.length > 0 ? Object.assign({}, ...absorbLevels) : undefined,
+        absorb: mergedAbsorb,
         rules: pick("rules"),
 
 stripImages: pick("stripImages"),
@@ -200,10 +208,12 @@ export function hasCompressSettings(s: CompressSettings): boolean {
  *  - `protectedLatestTools` → top-level Config (kernel hard-excludes the
  *    latest instance + paired result of matching tools from every compress
  *    range). Whole-array replace, deepest level wins.
-  *  - `absorb` → `absorb` (kernel AbsorbConfig; unset fields inherit the
-  *    kernel DEFAULT_ABSORB_CONFIG, so a partial user block still resolves
-  *    fully). Absent `s.absorb` leaves `base.absorb` untouched — the feature
-  *    stays off unless some level enables it.
+   *  - `absorb` → `absorb` (kernel AbsorbConfig; unset fields inherit the
+   *    kernel DEFAULT_ABSORB_CONFIG, so a partial user block still resolves
+   *    fully). Its nested `preCrush` is host-side only: resolved here and read
+   *    by applyAbsorbView, never handed to the kernel. Absent `s.absorb`
+   *    leaves `base.absorb` untouched — the feature stays off unless some
+   *    level enables it.
   *  - `rules` → `rules = { enabled }` (kernel RuleFeatureConfig; limits stay
   *    at kernel defaults). Absent `s.rules` leaves `base.rules` untouched. */
 export function applyCompressSettings(base: Config, limit: number, s: CompressSettings): Config {
@@ -221,16 +231,23 @@ export function applyCompressSettings(base: Config, limit: number, s: CompressSe
     }
     const tiers = { ...base.tiers };
     if (s.tiers !== undefined) tiers.enabled = s.tiers;
-    let absorb: AbsorbConfig | undefined;
+    let absorb: PreCrushAwareAbsorb | undefined;
     if (s.absorb !== undefined) {
         const d = DEFAULT_ABSORB_CONFIG;
-        absorb = {
+        const block: PreCrushAwareAbsorb = {
             enabled: s.absorb.enabled === true,
             toolName: s.absorb.toolName ?? d.toolName,
             minToolTokens: s.absorb.minToolTokens ?? d.minToolTokens,
             contextThresholdPct: s.absorb.contextThresholdPct !== undefined ? parsePercent(s.absorb.contextThresholdPct) : d.contextThresholdPct,
             excludeTools: s.absorb.excludeTools ?? [...d.excludeTools],
         };
+        if (s.absorb.preCrush !== undefined) {
+            block.preCrush = {
+                enabled: s.absorb.preCrush.enabled === true,
+                minReduction: s.absorb.preCrush.minReduction !== undefined ? parsePercent(s.absorb.preCrush.minReduction) : PRE_CRUSH_DEFAULT_MIN_REDUCTION,
+            };
+        }
+        absorb = block;
     }
     return {
         ...base,

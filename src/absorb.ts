@@ -13,6 +13,7 @@ import {
 } from "acp-kernel";
 import { PROXY_TOOL_NAMES, RULE_TOOL_NAME } from "./compress-tool.js";
 import { effectiveRulesConfig } from "./rules-feature.js";
+import { applyPreCrush, type PreCrushAwareConfig } from "./pre-crush.js";
 import { log as loggerLog } from "./logger.js";
 import type { Session } from "./session.js";
 
@@ -51,16 +52,20 @@ export function isProxyToolFor(name: string, session: Session | undefined, confi
     return effectiveRulesConfig(session, config)?.enabled === true && name === RULE_TOOL_NAME;
 }
 
-// Per-turn view transform: drop absorbed tool-call/result pairs, then append
-// the forced [ACP absorb] instruction to every eligible large tool result.
-// Hiding is unconditional so recorded absorptions stay hidden even if the
-// feature is disabled mid-session; prompting self-gates inside the kernel on
+// Per-turn view transform: drop absorbed tool-call/result pairs, then
+// pre-crush eligible oversized tool results (#1094), then append the forced
+// [ACP absorb] instruction to every remaining eligible large tool result.
+// Pre-crush runs before prompting so the gate sees post-crush sizes: a result
+// crushed below minToolTokens stops triggering a model round-trip. Hiding is
+// unconditional so recorded absorptions stay hidden even if the feature is
+// disabled mid-session; prompting self-gates inside the kernel on
 // config.absorb.enabled (processTurn already injects markers from the same
 // config — the append here is an idempotent safety net). Returns a new array
 // that shares message refs with the input.
-export function applyAbsorbView(messages: CoreMessage[], state: CompressionState, config: Config, tokenCount: number): CoreMessage[] {
+export function applyAbsorbView(messages: CoreMessage[], state: CompressionState, config: PreCrushAwareConfig, tokenCount: number): CoreMessage[] {
     const hidden = hideAbsorbedMessages(messages, state);
-    const prompted = appendAbsorbPrompts(hidden, state, config, tokenCount, defaultCountTokens);
+    const crushed = applyPreCrush(hidden, state, config);
+    const prompted = appendAbsorbPrompts(crushed, state, config, tokenCount, defaultCountTokens);
     return prompted.messages;
 }
 

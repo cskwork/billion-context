@@ -338,7 +338,7 @@
 
 #### `absorb`
 
-- **类型：** `object`（`{ enabled?, minToolTokens?, contextThresholdPct?, excludeTools?, toolName? }`）
+- **类型：** `object`（`{ enabled?, minToolTokens?, contextThresholdPct?, excludeTools?, toolName?, preCrush? }`）
 - **默认值：** *（禁用 — 除非显式设置 `enabled: true`，该特性完全关闭）*
 - **状态：** ACTIVE
 - **说明：** 可选开启的**即时工具结果压缩**（issue #605，经由 `acp-kernel` absorb API）。启用时，大工具结果在到达即被附带强制的 `[ACP absorb]` 指令；模型通过 `absorb` 工具将结果蒸馏为紧凑摘要，原 tool-call/tool-result 配对从下一轮起在线上隐藏 —— 使折叠轮之间的中间会话压力更低。子字段（按字段最深层级胜出，与其他 CompressSettings 字段一致）：
@@ -347,6 +347,10 @@
   - `contextThresholdPct: number|percent-string` — 仅当用量达到 `modelContextLimit` 的此比例时附带提示（`0` = 仅尺寸门槛；`"75%"` 接受）。
   - `excludeTools: string[]` — 永不吸收的工具名模式。**已知限制：对工具*结果*目前无效，直到 [ranxianglei/acp-kernel#213](https://github.com/ranxianglei/acp-kernel/issues/213) 修复发布**（wire 投影不把 `toolName` 携带在结果上，内核名称守卫无法命中）。
   - `toolName: string` — 重命名注入工具（默认 `"absorb"`）；模式、系统提示段与按会话裁决都跟随名称。
+  - `preCrush: object`（`{ enabled?, minReduction? }`）— 可选开启的**确定性预压缩**，运行在模型 absorb 之前（issue #1094）。在 `[ACP absorb]` 决策之前，每个达到门槛的超大结果先经过一个纯函数式、无状态的选择器机械去噪（无模型调用）：**JSON** — 常量字段提升 + 相同行/连续段折叠为带标注的信封（无损，可解码回原始数据）；**代码**（Python、JS/TS）— 注释/文档字符串剔除，模板字符串与字符串字面量安全（设计上有损）；**日志** — 按级别分类选行：所有 ERROR/FAIL 行优先保留、警告去重、摘要行保留、运行时堆栈帧折叠，固定行数上限（设计上有损，附诚实的 `[N lines omitted: …]` 尾注）。压缩后低于 `minToolTokens` 的结果完全跳过模型往返；仍超门槛的结果以去噪后的形态转发并附带常规 absorb 提示。任何无法解析或缩减不足的内容原样通过（fail-open）。除非 `absorb.enabled` 与 `preCrush.enabled` 同时为 `true`，否则关闭。子字段：
+    - `enabled: boolean` — 预压缩通道主开关。
+    - `minReduction: number|percent-string` — 采用该压缩所需的最小缩减比例（默认 `0.1`；边际收益不值得在线上改动字节）。
+    与父块一样按最深层级胜出合并；仅代理侧使用（不交给内核）。策略构造上保守：约 50 行以内的日志不动，散文以及可明确判定为 JSON/源码的内容不会进入日志选择器，ERROR 行永不丢弃。
   注入跟随线上原生工具面：代理模式在 anthropic/openai/responses 原生工具线上注入工具 + 静态系统提示段，插件模式在插件清单中广告它（MCP shell 自动拾取）。Responses **marker/文本协议**路由不支持（无原生工具面 — 强制的 absorb 指令不可满足），标题生成请求（`max_tokens ≤ 200`）跳过注入如压缩提示一样。吸收配对在重启后保持隐藏（在会话状态持久化）。
 
 #### `rules`

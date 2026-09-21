@@ -338,7 +338,7 @@ For each request, the proxy resolves the settings by longest-URL-prefix match (t
 
 #### `absorb`
 
-- **Type:** `object` (`{ enabled?, minToolTokens?, contextThresholdPct?, excludeTools?, toolName? }`)
+- **Type:** `object` (`{ enabled?, minToolTokens?, contextThresholdPct?, excludeTools?, toolName?, preCrush? }`)
 - **Default:** *(disabled — the feature is off unless you set `enabled: true`)*
 - **Status:** ACTIVE
 - **Description:** Opt-in **instant tool-result compression** (issue #605, via the `acp-kernel` absorb API). When enabled, large tool results get a forced `[ACP absorb]` instruction at result time; the model distills the result into a compact summary via the `absorb` tool, and the original tool-call/tool-result pair is hidden from the wire from the next turn on — keeping mid-session pressure lower between fold rounds. Sub-fields (merged deepest-wins like every other CompressSettings field):
@@ -347,6 +347,10 @@ For each request, the proxy resolves the settings by longest-URL-prefix match (t
   - `contextThresholdPct: number|percent-string` — only prompt once usage reaches this fraction of `modelContextLimit` (`0` = size gate alone; `"75%"` is accepted).
   - `excludeTools: string[]` — tool-name patterns never absorbed. **Known limitation:** a no-op on tool *results* until [ranxianglei/acp-kernel#213](https://github.com/ranxianglei/acp-kernel/issues/213) ships (wire projections don't carry `toolName` on results, so the kernel's name guard can't fire).
   - `toolName: string` — rename the injected tool (default `"absorb"`); the schema, system-prompt section and per-session adjudication all follow the name.
+  - `preCrush: object` (`{ enabled?, minReduction? }`) — opt-in **deterministic pre-crush** run in front of the model absorb (issue #1094). Before the `[ACP absorb]` decision, each eligible oversized result is mechanically denoised by a pure, stateless selector (no model call): **JSON** — constant fields hoisted + identical rows/runs folded into annotated envelopes (lossless, decodable back to the original); **code** (Python, JS/TS) — comment/docstring elision with template-literal and string-literal safety (lossy by design); **logs** — level-classified line selection keeping every ERROR/FAIL line first, deduped warnings, summary lines, and collapsed runtime stack frames under a fixed cap (lossy by design, honest `[N lines omitted: …]` footer). Results crushed below `minToolTokens` skip the model round-trip entirely; results still over it are forwarded denoised with the normal absorb prompt. Anything unparseable or below the reduction floor passes through byte-identical (fail-open). Off unless both `absorb.enabled` and `preCrush.enabled` are `true`. Sub-fields:
+    - `enabled: boolean` — master switch for the pre-crush channel.
+    - `minReduction: number|percent-string` — minimum fraction of the payload that must be removed for the crush to be used (default `0.1`; marginal savings are not worth the altered bytes on the wire).
+    Merged deepest-wins like the parent block; host-side only (never handed to the kernel). Strategies are conservative by construction: logs under ~50 lines are untouched, prose and anything confidently JSON or source never reach the log selector, and ERROR lines are never dropped.
   Injection follows the wire's native-tool surface: proxy mode injects the tool + a static system-prompt section on the anthropic/openai/responses native-tools wires, plugin mode advertises it in the plugin manifest (the MCP shell picks it up for free). Responses **marker/text-protocol** routes are not supported (no native tool surface — the REQUIRED absorb instruction would be unsatisfiable), and title-generation requests (`max_tokens ≤ 200`) skip injection like the compress prompt does. Absorbed pairs stay hidden across restarts (persisted in the session state).
 
 #### `rules`
