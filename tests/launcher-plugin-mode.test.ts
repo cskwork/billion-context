@@ -80,7 +80,7 @@ async function startRig(): Promise<Rig> {
         upstream: "http://127.0.0.1",
         routes: { [`http://127.0.0.1:${upstreamPort}`]: { models: { "l162-model": { context: 100_000 } } } },
         modelContextLimit: 100_000,
-        kernelConfig: defaultConfig(100_000),
+        kernelConfig: defaultConfig(100_000, { compress: { minCompressRange: 0 } }),
         compress: { injectTool: true, injectNudge: true },
         promptCache: { routing: "auto" },
         log: false,

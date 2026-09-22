@@ -50,7 +50,7 @@ test("Codex official transport preserves OAuth headers, decodes bodies, and reba
             [`http://127.0.0.1:${upstreamPort}`]: { models: { "gpt-5": { context: 400_000 } } },
         },
         modelContextLimit: 400_000,
-        kernelConfig: defaultConfig(400_000),
+        kernelConfig: defaultConfig(400_000, { compress: { minCompressRange: 0 } }),
         compress: { injectTool: true, injectNudge: true },
         promptCache: { routing: "auto" },
         sessionHeader: "x-acp-session",

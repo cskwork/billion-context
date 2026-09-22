@@ -43,7 +43,7 @@ async function startHarness(): Promise<Harness> {
         upstream: "http://127.0.0.1",
         routes: { [`http://127.0.0.1:${upstreamPort}`]: { models: { "test-model": { context: 400_000 } } } },
         modelContextLimit: 400_000,
-        kernelConfig: defaultConfig(400_000),
+        kernelConfig: defaultConfig(400_000, { compress: { minCompressRange: 0 } }),
         compress: { injectTool: true, injectNudge: true },
         sessionHeader: "x-acp-session",
         log: false,

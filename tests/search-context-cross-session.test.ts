@@ -119,6 +119,19 @@ test("#841 unknown conversation_id → FAILED with id echoed", () => {
     assert.equal(out, '[search_context FAILED: unknown session "pfa-nope"]');
 });
 
+test("#1112: literal 'current' conversation_id aliases to the current session", () => {
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    _resetSessionsForTest();
+    const session = getSession("client-conv-current");
+    const core = compressInto(session);
+    const direct = executeSearchContext({ query: "auth token" }, core, session.state);
+    const lower = executeSearchContextTarget({ query: "auth token", conversation_id: "current" }, core, session.id, session.state);
+    const mixed = executeSearchContextTarget({ query: "auth token", conversation_id: "Current" }, core, session.id, session.state);
+    assert.match(direct, /^Found \d+ block\(s\)/);
+    assert.equal(lower, direct, "'current' must resolve to the current session");
+    assert.equal(mixed, direct, "case-insensitive");
+});
+
 test("#841 foreign no-match and empty-state strings carry session scope", () => {
     const s1 = makeSession("s1");
     const core = compressInto(s1);

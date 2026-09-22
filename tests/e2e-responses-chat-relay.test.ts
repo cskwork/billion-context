@@ -162,7 +162,7 @@ async function startHarness(script: ChatRelayScript, marker: boolean): Promise<H
         upstream: "http://127.0.0.1",
         routes: { [`http://127.0.0.1:${bridge.port}`]: route } as ProxyOptions["routes"],
         modelContextLimit: 400_000,
-        kernelConfig: defaultConfig(400_000),
+        kernelConfig: defaultConfig(400_000, { compress: { minCompressRange: 0 } }),
         compress: { injectTool: true, injectNudge: true },
         promptCache: { routing: "auto" },
         sessionHeader: "x-acp-session",

@@ -587,6 +587,11 @@ type Prepared = {
     protocol: WireProtocol;
     stream: boolean;
     compressInjected: boolean;
+    /** #1112: true for tracked conversation turns that need the compress-loop
+     *  pipeline (usage accounting, tag stripping) even while the ACP surface
+     *  is not yet armed — i.e. the request would have been injected pre-#1112.
+     *  Side requests, title-gen, plugin mode and transform fallbacks stay off. */
+    acpTurn?: boolean;
     /** True when the session is driven by a cooperative agent-side plugin
      *  (x-bili-plugin header, see src/plugin.ts): tools are native, the
      *  response must pass through verbatim, and usage is sniffed instead of
@@ -2148,7 +2153,6 @@ function prepareAnthropic(
     const sessionId = session.id;
     const stream = parsed.stream === true;
     ++session.stats.requests;
-    const injectTools = opts.compress.injectTool && !pluginMode;
     const stripReasoning = (msgs: BiliMessage[]): BiliMessage[] => withReasoningDrop(msgs, reasoning, log, sessionId, isStrictReasoningEcho(session, upstreamOrigin, modelIdOf(parsed)));
 
     if (isAutoModeClassifier(parsed)) {
@@ -2162,6 +2166,7 @@ function prepareAnthropic(
     let rebuiltMessages = parsed.messages;
     let systemOut = parsed.system;
     let toolsOut = parsed.tools;
+    let injectTools = false;
 
     // The classifier passthrough above and prepareResponsesCompact return before
     // this strip; no client emits an ACP panel on those paths, so that's safe.
@@ -2177,6 +2182,8 @@ function prepareAnthropic(
     try {
         const { msgs, cacheControls } = anthropicToCore(parsed);
         originalMessages = msgs;
+        const acpArmed = armAcpSurface(session, msgs, config.compress.minCompressRange, log);
+        injectTools = opts.compress.injectTool && !pluginMode && acpArmed;
         // #1001: pre-turn snapshot — processTurn below assigns fresh refs to every
         // previously-unknown id, which would make rewrite detection read 1.0.
         const knownRefsBefore = new Set(Object.keys(session.state.messageRefs.byRaw));
@@ -2200,11 +2207,11 @@ function prepareAnthropic(
         // strip absorb from the loop config so the REQUIRED instruction never
         // reaches the wire. Hiding recorded absorptions is unaffected
         // (applyAbsorbView hides regardless of enablement).
-        const absorbActive = absorbEnabled(config) && opts.compress.injectTool;
+        const absorbActive = absorbEnabled(config) && opts.compress.injectTool && acpArmed;
         // acp_rule has no processTurn side effect (no markers/instructions are
         // ever injected into messages), so unlike absorb it needs no loop-
         // config stripping — only tool availability matters.
-        const rulesActive = rulesEnabled(config) && opts.compress.injectTool;
+        const rulesActive = rulesEnabled(config) && opts.compress.injectTool && acpArmed;
         const loopConfig = absorbActive ? config : { ...config, absorb: undefined };
         const turn = core.processTurn({ messages: msgs, state: session.state, config: loopConfig, tokenCount, renderTags: process.env.ACP_RENDER_NONE ? "none" : "text-only" });
         session.state = turn.state;
@@ -2225,7 +2232,9 @@ function prepareAnthropic(
             if (t) session.meta.title = t;
         }
         log("info", diagTagSummary(turn.messages, sessionId, "text-only"));
-        const willInjectNudge = opts.compress.injectNudge && !!turn.nudge && (turn.nudge.shouldInject || emergencyNudge(turn.nudge));
+        // #1112: same acpArmed gate as the other wire paths — never nudge a
+        // compress while the compression surface itself is withheld.
+        const willInjectNudge = opts.compress.injectNudge && !!turn.nudge && acpArmed && (turn.nudge.shouldInject || emergencyNudge(turn.nudge));
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, parsed.model, willInjectNudge));
         processedMessages = stripReasoning(stripKernelSummaries(turn.messages, turn.state));
         // #1001: a silent client history rewrite takes the same archive+prune path
@@ -2242,7 +2251,7 @@ function prepareAnthropic(
         reapOrphanBlocks(session, msgs, deactivateBlock);
         rebuiltMessages = coreToAnthropic(processedMessages as BiliMessage[], cacheControls);
 
-        systemOut = injectSystem(parsed, opts, prompts, loopConfig, ensureCanonicalId(session), surface, visibilityMarkers);
+        systemOut = injectSystem(parsed, opts, prompts, loopConfig, ensureCanonicalId(session), surface, visibilityMarkers, acpArmed);
         if (injectTools) {
             toolsOut = injectTool(parsed.tools, [...(absorbActive ? [ABSORB_TOOL] : []), ...(rulesActive ? [RULE_TOOL] : [])], surface?.toolPrompts);
         }
@@ -2289,7 +2298,7 @@ function prepareAnthropic(
     session.stats.localInputEstimate = estimateCoreMessagesUpper(processedMessages.length > 0 ? processedMessages : originalMessages)
         + countSystemAndToolsTokens(extractSystem(systemOut), toolsOut)
         + imageTokensInParsedBody("anthropic", rebuilt);
-    return { body: JSON.stringify(rebuilt), session, processedMessages, originalMessages, anthropicSystem: parsed.system, protocol: "anthropic", stream, compressInjected: injectTools, pluginMode, nudge, prompts, surface, renderTags: process.env.ACP_RENDER_NONE ? "none" : "text-only" } as Prepared;
+    return { body: JSON.stringify(rebuilt), session, processedMessages, originalMessages, anthropicSystem: parsed.system, protocol: "anthropic", stream, compressInjected: injectTools, acpTurn: opts.compress.injectTool && !pluginMode, pluginMode, nudge, prompts, surface, renderTags: process.env.ACP_RENDER_NONE ? "none" : "text-only" } as Prepared;
 }
 
 function prepareOpenai(
@@ -2320,6 +2329,7 @@ function prepareOpenai(
     let nudge: NudgeDecision | undefined;
     let rebuiltMessages = parsed.messages;
     let toolsOut = parsed.tools;
+    let injectTools = false;
 
     const maxTokens = typeof parsed.max_tokens === "number" ? parsed.max_tokens : 8192;
     // Title-generation requests (tiny max_tokens) get no compress tooling so
@@ -2329,8 +2339,7 @@ function prepareOpenai(
     // system prompt bytes (compress prompt added/removed) — which breaks the
     // provider prefix cache for every subsequent turn.
     const isTitleGen = maxTokens <= 200;
-    const shouldInject = opts.compress.injectTool && !isTitleGen;
-    const injectTools = shouldInject && !pluginMode;
+    const wantInject = opts.compress.injectTool && !isTitleGen;
 
     const strippedPanels = stripAcpPanelMessages(parsed.messages);
     if (strippedPanels > 0) {
@@ -2352,6 +2361,9 @@ function prepareOpenai(
         // #1001: pre-turn snapshot — processTurn below assigns fresh refs to every
         // previously-unknown id, which would make rewrite detection read 1.0.
         const knownRefsBefore = new Set(Object.keys(session.state.messageRefs.byRaw));
+        const acpArmed = armAcpSurface(session, msgs, config.compress.minCompressRange, log);
+        const shouldInject = wantInject && acpArmed;
+        injectTools = shouldInject && !pluginMode;
         // tokenCount = upstream's real input_tokens from the previous turn
         // tokenCount = upstream's real input_tokens from the previous turn
         // (see anthropic branch comment + its #553-follow-up exception).
@@ -2477,7 +2489,7 @@ function prepareOpenai(
     }
     snapshotMessages(session, originalMessages);
     markDirty(session);
-    return { body: JSON.stringify(rebuilt), session, processedMessages, originalMessages, protocol: "openai", stream, compressInjected: injectTools, pluginMode, nudge, prompts, surface, openaiSystemText, renderTags: process.env.ACP_RENDER_NONE ? "none" : "text-only" } as Prepared;
+    return { body: JSON.stringify(rebuilt), session, processedMessages, originalMessages, protocol: "openai", stream, compressInjected: injectTools, acpTurn: wantInject && !pluginMode, pluginMode, nudge, prompts, surface, openaiSystemText, renderTags: process.env.ACP_RENDER_NONE ? "none" : "text-only" } as Prepared;
 }
 
 /** Append the ephemeral nudge to a Gemini `contents` array. Gemini is
@@ -2532,6 +2544,7 @@ function prepareGoogle(
     let nudge: NudgeDecision | undefined;
     let rebuiltContents: GoogleContent[] = Array.isArray(parsed.contents) ? parsed.contents : [];
     let toolsOut: GoogleTool[] | undefined = parsed.tools;
+    let injectTools = false;
 
     const genConfig = parsed.generationConfig;
     const declaredMax = genConfig ? genConfig.maxOutputTokens : undefined;
@@ -2539,13 +2552,15 @@ function prepareGoogle(
     // Title-generation requests (tiny budget) get no compress tooling — same
     // heuristic and same prefix-cache rationale as prepareOpenai.
     const isTitleGen = maxTokens <= 200;
-    const shouldInject = opts.compress.injectTool && !isTitleGen;
-    const injectTools = shouldInject && !pluginMode;
+    const wantInject = opts.compress.injectTool && !isTitleGen;
 
     try {
         const { msgs, systemText } = googleToCore(parsed);
         googleClientSystem = systemText;
         originalMessages = msgs;
+        const acpArmed = armAcpSurface(session, msgs, config.compress.minCompressRange, log);
+        const shouldInject = wantInject && acpArmed;
+        injectTools = shouldInject && !pluginMode;
         const tokenCount = effectiveTokenCount(session, msgs);
         const activeBefore = new Set(session.state.blocks.filter((b) => b.active).map((b) => b.blockId));
         const absorbActive = absorbEnabled(config) && shouldInject;
@@ -2617,7 +2632,7 @@ function prepareGoogle(
     }
     snapshotMessages(session, originalMessages);
     markDirty(session);
-    return { body: JSON.stringify(rebuilt), session, processedMessages, originalMessages, protocol: "google", stream, compressInjected: injectTools, pluginMode, nudge, prompts, surface, google: { system: googleClientSystem, model }, renderTags: "text-only" } as Prepared;
+    return { body: JSON.stringify(rebuilt), session, processedMessages, originalMessages, protocol: "google", stream, compressInjected: injectTools, acpTurn: wantInject && !pluginMode, pluginMode, nudge, prompts, surface, google: { system: googleClientSystem, model }, renderTags: "text-only" } as Prepared;
 }
 
 /** `POST /v1beta/models/<model>:countTokens` — the fold-prune twin of
@@ -2713,6 +2728,7 @@ function prepareResponses(
     let toolsOut = parsed.tools;
     let transformOk = false;
     let responsesDevContent: string | undefined;
+    let injectTools = false;
 
     // #242: over-long input item ids (poisoned rollouts) 400 upstream on every
     // request; rewrite them to short deterministic ids before anything reads
@@ -2740,8 +2756,7 @@ function prepareResponses(
         log("info", `[${sessionId}] stripped ${strippedMarkerLines} ACP status marker line(s) from incoming history (ephemeral proxy status, issue #1029)`);
     }
 
-    const shouldInject = opts.compress.injectTool;
-    const injectTools = shouldInject && !pluginMode;
+    const wantInject = opts.compress.injectTool;
     // Codex native remote-compact request: no compress prompt/tools (the model
     // produces the compaction itself), no acp tags, plain passthrough so the
     // response terminal state can gate the rebase marker.
@@ -2758,6 +2773,9 @@ function prepareResponses(
         responsesProjection = projection;
         const { msgs } = projection;
         originalMessages = msgs;
+        const acpArmed = armAcpSurface(session, msgs, config.compress.minCompressRange, log);
+        const shouldInject = wantInject && acpArmed;
+        injectTools = shouldInject && !pluginMode;
         if (process.env.ACP_DEBUG) {
             log("info", `[${sessionId}] input items: ${Array.isArray(parsed.input) ? parsed.input.map((i: ResponseInputItem) => i.type).join(",") : "(string)"}`);
         }
@@ -2947,6 +2965,7 @@ function prepareResponses(
         protocol: "responses",
         stream,
         compressInjected: injectTools && !isCompactionTrigger,
+        acpTurn: wantInject && !pluginMode && !isCompactionTrigger,
         pluginMode,
         responsesTextProtocol,
         nudge,
@@ -3137,6 +3156,32 @@ function isAutoModeClassifier(parsed: AnthropicRequestBody): boolean {
     return stops.some((s) => typeof s === "string" && AUTO_MODE_CLASSIFIER_STOPS.has(s));
 }
 
+// #1112: expose the ACP compression surface (tools + philosophy prompt) only
+// once a compress call can actually succeed — total visible content must reach
+// compress.minCompressRange, below which EVERY range fails the kernel minimum
+// and only guaranteed-failure calls are possible. Fresh sessions got the tools
+// from turn 1, and some models immediately called compress on everything
+// visible, burning the first turn in failure + status/search retry loops.
+// Arming is STICKY per session: once the surface appears it never disappears
+// (removing tools mid-session would break the prefix cache and orphan refs
+// the model already cited). minCompressRange <= 0 restores legacy always-on.
+export function armAcpSurface(
+    session: Session,
+    msgs: CoreMessage[],
+    minChars: number,
+    log: (level: string, msg: string) => void,
+): boolean {
+    if (minChars <= 0 || session.metadata.acpArmed) return true;
+    const chars = msgs.reduce((n, m) => n + (m.text ?? "").length, 0);
+    if (chars >= minChars) {
+        session.metadata.acpArmed = true;
+        markDirty(session);
+        log("info", `[${session.id}] ACP surface armed at ${chars} chars (>= minCompressRange ${minChars}): compress tooling injected from this request on (#1112)`);
+        return true;
+    }
+    return false;
+}
+
 function injectSystem(
     parsed: AnthropicRequestBody,
     opts: ProxyOptions,
@@ -3145,6 +3190,7 @@ function injectSystem(
     noteId: string,
     surface?: PackSurface,
     visibilityMarkers = true,
+    acpArmed = true,
 ): string | AnthropicRequestBody["system"] {
     // ONLY the static compress prompt goes into the system block — it is the
     // prefix-cache anchor and must stay byte-stable across turns. The nudge
@@ -3152,8 +3198,8 @@ function injectSystem(
     // the caller (prepareAnthropic), never merged into system.
     const baseText = extractSystem(parsed.system);
     const parts: string[] = [];
-    if (opts.compress.injectTool) parts.push(withConversationIdNote(withMarkerIntegrityNote(withSummaryBudgetNote(buildCompressSystemPrompt(prompts, surface?.promptSections)), visibilityMarkers), noteId));
-    if (opts.compress.injectTool && absorbEnabled(config)) parts.push(buildAbsorbSystemPrompt(absorbToolName(config)));
+    if (opts.compress.injectTool && acpArmed) parts.push(withConversationIdNote(withMarkerIntegrityNote(withSummaryBudgetNote(buildCompressSystemPrompt(prompts, surface?.promptSections)), visibilityMarkers), noteId));
+    if (opts.compress.injectTool && acpArmed && absorbEnabled(config)) parts.push(buildAbsorbSystemPrompt(absorbToolName(config)));
     if (parts.length === 0) return parsed.system;
     const full = baseText ? `${baseText}\n\n---\n\n${parts.join("\n\n")}` : parts.join("\n\n");
     return buildSystem(full, parsed.system);
@@ -4273,7 +4319,7 @@ async function forward(
         }
         return;
     }
-    if (prepared && prepared.protocol === "responses" && prepared.stream && !prepared.sidePassthrough && !prepared.compressInjected) {
+    if (prepared && prepared.protocol === "responses" && prepared.stream && !prepared.sidePassthrough && !(prepared.compressInjected || !!prepared.acpTurn)) {
         const sse = (upstream.headers.get("content-type") ?? "").includes("text/event-stream");
         if (sse) {
             let reqModel: string | undefined;
@@ -4329,9 +4375,12 @@ async function forward(
     // enter the compress loop — but their chat SSE still gets render-tag
     // echo stripping (#460) below, so history-borne tags echoed in model
     // prose cannot leak to the client and amplify via its replay.
+    // #1112: acpTurn covers conversation turns whose ACP surface is not yet
+    // armed — tools/prompt are withheld from the wire, but loop bookkeeping
+    // (usage accounting, tag stripping) must run exactly as pre-#1112.
+    const acpPipeline = prepared !== null && (prepared.compressInjected || !!prepared.acpTurn);
     const useRewriter =
-        prepared !== null &&
-        prepared.compressInjected &&
+        acpPipeline &&
         prepared.processedMessages.length > 0;
     if (!useRewriter || prepared === null) {
         if (prepared && prepared.resetAfterSuccess) {
@@ -4462,8 +4511,9 @@ async function forward(
             const textProtocol = prepared.protocol === "responses" && !!prepared.responsesTextProtocol;
             // Same absorb gate as prepare*: the section only exists where the
             // tool is callable, keeping loop re-requests byte-consistent with
-            // the first request (prefix-cache anchor).
-            const absorbActive = absorbEnabled(config) && opts.compress.injectTool && !textProtocol;
+            // the first request (prefix-cache anchor). armAcpSurface is sticky
+            // and deterministic, so this returns exactly what prepare decided.
+            const absorbActive = absorbEnabled(config) && opts.compress.injectTool && !textProtocol && armAcpSurface(prepared.session, prepared.originalMessages, config.compress.minCompressRange, log);
             const loopConfig = absorbActive ? config : { ...config, absorb: undefined };
             const absorbSection = absorbActive
                 ? `\n\n---\n\n${buildAbsorbSystemPrompt(absorbToolName(loopConfig))}`

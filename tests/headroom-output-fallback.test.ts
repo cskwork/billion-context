@@ -92,7 +92,7 @@ async function turn2MessageCount(s: Scenario): Promise<number> {
         upstream: "http://127.0.0.1",
         routes: s.models ? { [`http://127.0.0.1:${upstreamPort}`]: { models: s.models } } : {},
         modelContextLimit: 200_000,
-        kernelConfig: defaultConfig(200_000),
+        kernelConfig: defaultConfig(200_000, { compress: { minCompressRange: 0 } }),
         compress: { injectTool: true, injectNudge: true },
         promptCache: { routing: "auto" },
         sessionHeader: "x-acp-session",

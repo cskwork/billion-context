@@ -47,7 +47,7 @@ async function startHarness(injectTool: boolean): Promise<{ proxyPort: number; u
         upstream: "http://127.0.0.1",
         routes: { [`http://127.0.0.1:${upstreamPort}`]: { models: { "gpt-test": { context: 400_000 } } } },
         modelContextLimit: 400_000,
-        kernelConfig: defaultConfig(400_000),
+        kernelConfig: defaultConfig(400_000, { compress: { minCompressRange: 0 } }),
         promptCache: { routing: "auto" },
         compress: { injectTool, injectNudge: false },
         sessionHeader: "x-acp-session",
