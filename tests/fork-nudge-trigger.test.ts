@@ -58,6 +58,9 @@ function msgsOf(raw: string): Array<{ role?: string; content?: unknown }> {
     }
 }
 
+const line = (i: number) =>
+    `const handler_${i} = (req: Request, res: Response) => { res.status(200).json({ status: "ok", id: ${i}, ts: Date.now() }); };`;
+
 // 12 messages: 7 OLD code-heavy ones (~5.5k chars each) + 5 tiny recent ones
 // (inside the preserveRecentMessages=5 soft zone). Char-count upper bound:
 // ~54k/60k ≈ 90% of the window (≥ maxContextLimitPct 0.75 → over-limit for
@@ -66,8 +69,6 @@ function msgsOf(raw: string): Array<{ role?: string; content?: unknown }> {
 // silent). Kernel thresholds differ from the PR's original pin (min pressure
 // benefit 5k) — hence the big-old/tiny-recent shape.
 function forkConversation(): Array<{ role: string; content: string }> {
-    const line = (i: number) =>
-        `const handler_${i} = (req: Request, res: Response) => { res.status(200).json({ status: "ok", id: ${i}, ts: Date.now() }); };`;
     const msgs: Array<{ role: string; content: string }> = [];
     for (let i = 0; i < 12; i++) {
         const role = i % 2 === 0 ? "user" : "assistant";
@@ -76,7 +77,9 @@ function forkConversation(): Array<{ role: string; content: string }> {
     return msgs;
 }
 
-async function runCase(opts: { anonymous: boolean }): Promise<{
+type TurnMsg = { role: string; content: string | Array<Record<string, unknown>> };
+
+async function runCase(opts: { anonymous: boolean; conversation?: TurnMsg[]; window?: number }): Promise<{
     calls: Array<{ stream: boolean; body: string }>;
     status: number;
 }> {
@@ -121,7 +124,7 @@ async function runCase(opts: { anonymous: boolean }): Promise<{
         port: 0,
         host: "127.0.0.1",
         upstream: "http://127.0.0.1",
-        routes: { [`http://127.0.0.1:${upstreamPort}`]: { models: { "claude-small": { context: WINDOW } } } },
+        routes: { [`http://127.0.0.1:${upstreamPort}`]: { models: { "claude-small": { context: opts.window ?? WINDOW } } } },
         modelContextLimit: 400_000,
         kernelConfig: defaultConfig(400_000),
         compress: { injectTool: true, injectNudge: true },
@@ -143,7 +146,7 @@ async function runCase(opts: { anonymous: boolean }): Promise<{
             model: "claude-small",
             max_tokens: 1024,
             stream: true,
-            messages: forkConversation(),
+            messages: opts.conversation ?? forkConversation(),
         });
         const resp = await fetch(`http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/messages`, {
             method: "POST",
@@ -185,4 +188,52 @@ test("e2e: explicit-identity zero-baseline session with the same conversation �
     // Strip the outbound ACP anchor tag (proxy-mode wire format, AGENTS.md §2) before comparing.
     const stripped = msgText(last).replace(/^\x3cacp\s[^>]*>[^\x3c]*\x3c\/acp\x3e/, "").trimStart();
     assert.ok(stripped.startsWith("CODE_11_"), `last message must be the original last message (modulo the outbound ACP anchor tag): ${JSON.stringify(last).slice(0, 200)}`);
+});
+
+// #1137: the anonymous prefix-affinity branch of effectiveTokenCount returned
+// estimateCoreMessagesUpper(msgs) BEFORE the image addend (#1120 fixed only the
+// explicit-identity min-cap branch). Wire codecs move images out of
+// CoreMessage.text into sidecars, so an image-heavy fork replaying its FULL raw
+// history read a text-only char count: usage % far below reality, decideNudge
+// structurally unfireable, over-window payload forwarded raw. A fork replays
+// the whole history in one request, so this request's image term IS the whole
+// history's image mass — hoisting the image-aware bound above the early return
+// is the complete fix. Numbers mirror the #1119 pin in
+// silent-backend-nudge.test.ts, as a single anonymous request:
+//   text-only bound ≈ 46k/80k ≈ 58% — below every band (pre-fix: NO nudge);
+//   + 2 x 10k-token inline images (ceil(b64/4) @ bytes) → ≈ 83% ≥ 75% pressure
+//     band (post-fix: NUDGE). Preflight stays silent throughout.
+const IMG_B64 = "iVBORw0KGgo" + "A".repeat(40_000 - 9); // bytes billing: ceil(40000/4) = 10_000 tokens
+
+test("#1137: anonymous image-heavy fork — image term crosses the pressure band where the text-only bound sits below every band", async () => {
+    const heavy = (i: number) => `CODE_${i}_` + line(i).repeat(62);
+    const med = (i: number) => `NOTE_${i}_` + line(i).repeat(12);
+    const imgPart = (): Record<string, unknown> => ({ type: "image", source: { type: "base64", media_type: "image/png", data: IMG_B64 } });
+    const conversation: TurnMsg[] = [
+        { role: "user", content: heavy(0) },
+        { role: "assistant", content: heavy(1) },
+        { role: "user", content: heavy(2) },
+        { role: "assistant", content: heavy(3) },
+        { role: "user", content: heavy(4) },
+        { role: "assistant", content: heavy(5) },
+        { role: "user", content: med(6) },
+        { role: "assistant", content: med(7) },
+        { role: "user", content: med(8) },
+        { role: "assistant", content: med(9) },
+        { role: "user", content: [{ type: "text", text: "analyze these screenshots" }, imgPart(), imgPart()] },
+    ];
+    const { calls, status } = await runCase({ anonymous: true, conversation, window: 80_000 });
+    assert.equal(status, 200);
+    assert.equal(calls.filter((c) => !c.stream).length, 0, "preflight must stay silent (optimistic estimate under window)");
+    const forward = calls.filter((c) => c.stream).at(-1)!;
+    assert.ok(forward.body.includes('"media_type":"image/png"'), "images must ride along un-folded (nudge is advisory, no fold happened)");
+    for (let i = 0; i < 6; i++) {
+        assert.ok(forward.body.includes(`CODE_${i}_`), `CODE_${i}_ must survive un-folded`);
+    }
+    const msgs = msgsOf(forward.body);
+    const last = msgs.at(-1)!;
+    assert.ok(
+        last.role === "user" && msgText(last).includes(NUDGE_MARKER),
+        `expected trailing user nudge — the text-only bound (~58%) sits below every band, only the image-aware bound (~83%) crosses the 75% pressure band; pre-fix the anonymous branch dropped the image term, got: ${JSON.stringify(forward.body.slice(-800))}`,
+    );
 });
