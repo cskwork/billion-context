@@ -158,16 +158,20 @@ test("e2e #150: guardian subagent request bypasses the main session's compressio
     };
 
     try {
-        const mainResp = await fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(mainBody) });
+        // Metadata-less codex build (pre-0.147: no x-codex-turn-metadata), but
+        // still self-identified by its user agent — the #1106 fingerprint
+        // allowlist keeps the instructions split exactly for codex traffic.
+        const headers = { "content-type": "application/json", "user-agent": "codex_cli_rs/0.146.0" };
+        const mainResp = await fetch(url, { method: "POST", headers, body: JSON.stringify(mainBody) });
         assert.equal(mainResp.status, 200);
         await mainResp.text();
 
-        const guardianResp = await fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(guardianBody) });
+        const guardianResp = await fetch(url, { method: "POST", headers, body: JSON.stringify(guardianBody) });
         assert.equal(guardianResp.status, 200);
         const guardianOut = await guardianResp.text();
         assert.ok(guardianOut.includes("APPROVED"), "guardian round completes upstream");
 
-        const replayResp = await fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(mainBody) });
+        const replayResp = await fetch(url, { method: "POST", headers, body: JSON.stringify(mainBody) });
         assert.equal(replayResp.status, 200);
         await replayResp.text();
 

@@ -91,7 +91,7 @@ import { rewriteGoogleJsonResponse } from "./stream-google.js";
 import { rewriteResponsesJsonResponse } from "./stream-responses.js";
 import { observeResponsesTerminalState } from "./stream-terminal.js";
 import { emitPreflightError, emitStreamError } from "./stream-error.js";
-import { affinityToken, claudeSubagentAgentId, claudeSubagentSplit, clientConversationHeader, codexTurnIdentity, instructionsFingerprintExempt, preferPromptCacheKeyIdentity, type ConversationIdentity } from "./session-id.js";
+import { affinityToken, claudeSubagentAgentId, claudeSubagentSplit, clientConversationHeader, codexTurnIdentity, instructionsFingerprintApplies, preferPromptCacheKeyIdentity, type ConversationIdentity } from "./session-id.js";
 import { prefixAffinity, type AnonymousAffinity } from "./prefix-affinity.js";
 import { maybeAdoptForkBlocks } from "./fork-adoption.js";
 import { flushPrefixAffinity, hydratePrefixAffinity, scheduleAffinityPersist } from "./affinity-persist.js";
@@ -1345,20 +1345,22 @@ async function handle(
                 // kernel's empty-instructions non-anchoring path is left
                 // untouched for metadata-less clients).
                 ? codexTurn.value
-                 : instructionsFingerprintExempt(req.headers)
-                   // #1102: verified persona-scoped native conversation ids
-                   // (opencode ses_ headers / plugin declaration) may see
-                   // instruction drift mid-conversation (AGENTS.md reconcile)
-                   // without a persona change — key them verbatim like the
-                   // trusted codexTurn branch above instead of forking an
-                   // orphan |sub:<fp> session. Trust set + why every other
-                   // signal keeps the fingerprint: see
-                   // instructionsFingerprintExempt in src/session-id.ts.
-                   ? (responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader))
-                   : subagentNamespace(
+                 : instructionsFingerprintApplies(req.headers)
+                   // #1106: the instructions fingerprint is an inverted
+                   // allowlist — it applies ONLY to codex traffic (root
+                   // threads / older builds; subagent threads key by thread-id
+                   // above) and claude-over-Responses (#150/#970 id-sharing
+                   // personas). Everyone else (opencode #1102, grok/mcode,
+                   // plugin lanes, generic x-session-id / body session_id)
+                   // keys verbatim: instructions drift there means the same
+                   // conversation evolved (upgrade / plugin / AGENTS.md),
+                   // not a new persona. See instructionsFingerprintApplies
+                   // in src/session-id.ts.
+                   ? subagentNamespace(
                          responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader),
                          (parsed as ResponsesRequestBody).instructions,
-                     );
+                     )
+                   : (responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader));
         // The session ID is the client-provided conversation value VERBATIM —
         // no hash, no protocol/credential/upstream dimensions (#286): those
         // are all mutable mid-conversation (bearer rotation, relay switching,

@@ -1,3 +1,5 @@
+import { isCodexClient } from "./codex-compact.js";
+
 export type ConversationIdentity = {
     value: string;
     source: "header" | "body-session" | "metadata-session" | "previous-response" | "prompt-cache-key" | "content-fingerprint" | "generated";
@@ -73,42 +75,47 @@ export function conversationHeaderSource(headers: Record<string, string | string
     return undefined;
 }
 
-/** #1102: whether the winning conversation signal is a VERIFIED persona-scoped
- *  native identifier, in which case the Responses-wire instructions fingerprint
- *  must be skipped when keying the compression session.
+/** #1106/#1102: whether the Responses-wire instructions fingerprint should
+ *  participate in the compression-session key at all. Inverted allowlist: the
+ *  fingerprint is OFF by default and applies ONLY to signals with a verified
+ *  id-sharing persona problem.
  *
  * subagentNamespace's instructions fingerprint exists to separate PERSONAS that
- * share one conversation id (Codex threads reuse the task-level session id,
- * #150). For clients whose native conversation id is persona-scoped — one id is
- * minted per persona, so an id can never be reused across personas — the same
- * id carrying different instructions mid-conversation means "same persona,
- * updated system context" (opencode's system-context reconcile after an
- * AGENTS.md edit), not a new persona. Fingerprinting there forks an orphan
- * |sub:<fp> session and resets all compression state.
+ *  share one conversation id. Exactly two defendants ever needed it:
+ *  - codex (#150): task-level session ids are REUSED across tasks, so
+ *    different task instructions under one id must not merge. Modern codex
+ *    (>=0.147) already isolates subagent threads via x-codex-turn-metadata ->
+ *    thread-id verbatim (server.ts keys those directly, bypassing this
+ *    predicate); the fingerprint still matters for root threads and older
+ *    codex builds, detected by the turn-metadata header or the user agent
+ *    (same convention as isCodexClient, #645).
+ *  - claude over Responses (#970): subagents SHARE the main agent's session
+ *    id (the Anthropic path splits them via claudeSubagentSplit; a claude
+ *    client on the Responses wire only has this fingerprint).
  *
- * Trust set (each verified against the client's own source):
- *  - x-session-affinity with a ses_… value / x-opencode-session: opencode stamps
- *    its session id on every model request and mints a fresh child session id
- *    for every task-tool subagent (sessions.create({ parentID })).
- *  - x-bili-plugin-conversation + x-bili-plugin-instructions-mutable: 1 — the
- *    plugin declares its host's conversation ids are persona-scoped. Only the
- *    opencode plugin stamps the declaration today; unverified hosts (dsh,
- *    hermes, …) stay on the fingerprinted path.
+ * Everyone else keys VERBATIM: instructions drift mid-id means "same
+ * conversation, evolved system context" (software upgrade, plugin install,
+ * AGENTS.md edit - the relay-station majority case, #1106), and forking there
+ * resets all compression state for no defending bug. opencode (persona-scoped
+ * ses_ ids, #1102/#1104), grok/mcode (per-session ids by their own source),
+ * plugin conversation ids, and generic x-session-id / body session_id all
+ * stay on the verbatim path now. The x-bili-plugin-instructions-mutable
+ * declaration (#1104) is vestigial: exempt is the default; hosts keep
+ * stamping it for protocol compatibility with older proxies.
  *
- * Everything else deliberately keeps the fingerprint: Codex body/header/metadata
- * session ids (#150), x-claude-code-session-id (Claude subagents SHARE the main
- * agent's session id, #970), grok/mcode/generic x-session-id, prompt-cache-key.
+ * A future client that shares one id across personas and separates them ONLY
+ * by instructions must be added here (same evidence-per-client discipline as
+ * #1104, inverted).
  */
-export function instructionsFingerprintExempt(headers: Record<string, string | string[] | undefined>): boolean {
-    const src = conversationHeaderSource(headers);
-    if (!src) return false;
-    if (src.name === "x-opencode-session") return true;
-    if (src.name === "x-session-affinity" && src.value.startsWith("ses_")) return true;
-    if (src.name === "x-bili-plugin-conversation") {
-        const flag = headers["x-bili-plugin-instructions-mutable"];
-        return typeof flag === "string" && flag.trim() === "1";
-    }
-    return false;
+export function instructionsFingerprintApplies(headers: Record<string, string | string[] | undefined>): boolean {
+    const turnMeta = headers["x-codex-turn-metadata"];
+    if (typeof turnMeta === "string" && turnMeta.trim().length > 0) return true;
+    // One definition of "codex traffic" process-wide (every other codex path in
+    // server.ts uses isCodexClient, #645): case-sensitive by convention. A
+    // case-insensitive match would pull non-codex relays with "Codex"-shaped
+    // UAs back into the fingerprint and re-fork them mid-conversation (#1106).
+    if (isCodexClient(headers)) return true;
+    return conversationHeaderSource(headers)?.name === "x-claude-code-session-id";
 }
 
 /**

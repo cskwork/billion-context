@@ -59,13 +59,12 @@ export const PLUGIN_BYPASS_HEADER = "x-bili-plugin-bypass";
 export const PLUGIN_CONTEXT_WINDOW_HEADER = "x-bili-plugin-context-window";
 export const PLUGIN_MAX_OUTPUT_HEADER = "x-bili-plugin-max-output";
 export const PLUGIN_MODEL_HEADER = "x-bili-plugin-model";
-/** #1102: stamped "1" by plugins whose host mints one conversation id per
- *  persona (opencode: subagents get their own child session ids), so
- *  mid-conversation instruction drift (AGENTS.md reconcile) must NOT fork the
- *  compression session via the instructions fingerprint. Honored only together
- *  with x-bili-plugin + x-bili-plugin-conversation (see
- *  instructionsFingerprintExempt in src/session-id.ts); hosts whose id
- *  semantics are unverified never stamp it. */
+/** #1102/#1106: stamped "1" by plugins whose host mints one conversation id per
+ *  persona (opencode: subagents get their own child session ids). Since the
+ *  instructions fingerprint became an allowlist (#1106 — exempt is the
+ *  default for every non-codex/non-claude signal), this declaration is
+ *  vestigial: hosts keep stamping it for protocol compatibility with older
+ *  proxies, but current proxies key verbatim regardless. */
 export const PLUGIN_INSTRUCTIONS_MUTABLE_HEADER = "x-bili-plugin-instructions-mutable";
 
 export const PLUGIN_PROTOCOL_VERSION = 1;
