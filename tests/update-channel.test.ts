@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { isVersionNewer, normalizeUpdateTag, registryUrlFor } from "../src/update.ts";
+import { isVersionNewer, normalizeRegistryBase, normalizeUpdateTag, registryUrlFor } from "../src/update.ts";
 
 test("isVersionNewer compares numeric segments", () => {
     assert.equal(isVersionNewer("0.1.43", "0.1.41"), true);
@@ -24,6 +24,16 @@ test("isVersionNewer handles prerelease ordering (pre < release, numeric pre par
 test("registryUrlFor follows the configured dist-tag channel", () => {
     assert.equal(registryUrlFor("billion-context", "dev"), "https://registry.npmjs.org/billion-context/dev");
     assert.equal(registryUrlFor("billion-context", "stable"), "https://registry.npmjs.org/billion-context/stable");
+});
+
+test("normalizeRegistryBase keeps the production default when unset and strips trailing slashes", () => {
+    assert.equal(normalizeRegistryBase(undefined), "https://registry.npmjs.org");
+    assert.equal(normalizeRegistryBase(""), "https://registry.npmjs.org");
+    assert.equal(normalizeRegistryBase("   "), "https://registry.npmjs.org");
+    assert.equal(normalizeRegistryBase("http://127.0.0.1:4873"), "http://127.0.0.1:4873");
+    assert.equal(normalizeRegistryBase(" http://127.0.0.1:4873 "), "http://127.0.0.1:4873");
+    assert.equal(normalizeRegistryBase("http://127.0.0.1:4873/"), "http://127.0.0.1:4873");
+    assert.equal(normalizeRegistryBase("http://127.0.0.1:4873///"), "http://127.0.0.1:4873");
 });
 
 test("normalizeUpdateTag defaults to latest and trims/blank-folds", () => {

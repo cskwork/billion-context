@@ -38,7 +38,13 @@ import type { FetchOptions } from "./fetch-util.js";
 // BILI_UPDATE_REGISTRY overrides the registry base URL (full URL, e.g. a
 // loopback verdaccio in the hermetic e2e suite, #1153). Unset = production
 // default, behavior unchanged.
-const REGISTRY_BASE = process.env.BILI_UPDATE_REGISTRY?.trim() || "https://registry.npmjs.org";
+/** Normalize a configured registry base URL: absent/blank → production default; trailing slashes dropped (npm normalizes them too). */
+export function normalizeRegistryBase(raw: string | undefined): string {
+    const v = raw?.trim();
+    if (!v) return "https://registry.npmjs.org";
+    return v.replace(/\/+$/, "");
+}
+const REGISTRY_BASE = normalizeRegistryBase(process.env.BILI_UPDATE_REGISTRY);
 
 /** Normalize a configured dist-tag channel: absent/blank → "latest". */
 export function normalizeUpdateTag(tag: string | undefined): string {
