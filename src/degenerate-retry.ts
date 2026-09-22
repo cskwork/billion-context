@@ -90,7 +90,7 @@ export function makeContinuationRefetch(opts: ContinuationRetryOpts): () => Prom
             // owns, so its own idle timer is dropped — a stalled retry then ends
             // with the client abort instead of an upstream watchdog (the
             // streamed re-request in reasoning-guard.ts does the same).
-            r.clearTimer();
+            r.stopIdleTimer();
             return body;
         } catch (e) {
             opts.log("warn", `[${opts.label}] [plugin] degenerate-terminal retry failed (${e instanceof Error ? e.message : String(e)}); passing the empty turn through`);

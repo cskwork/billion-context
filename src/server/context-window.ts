@@ -62,6 +62,14 @@ export function launcherContextWindow(model: string): number | undefined {
 
 export const windowSourceLogged = new Set<string>();
 
+// Security cap on the beta-negotiated window: unbounded, a hostile
+// `context-<N>m` header would drive the effective window (and thus every
+// compression threshold) toward infinity, disabling all triggers until a real
+// 400 stalls the session (#1064 #12). Kept well above any shipping context
+// window so future betas still generalize while the header stays bounded
+// (#1064 #12).
+export const MAX_ANTHROPIC_BETA_WINDOW = 10_000_000;
+
 /** Parse an `anthropic-beta` header for a larger-context beta (e.g.
  *  `context-1m-2025-08-07` → 1,000,000). The beta lets the CLIENT negotiate a
  *  window beyond the model's standard size, so it is the most direct per-request
@@ -69,8 +77,9 @@ export const windowSourceLogged = new Set<string>();
  *  model table / registry (which list the STANDARD window, e.g. 200K for claude)
  *  and must be re-read on every request (the header may appear/disappear between
  *  requests of the same session, #302). `context-Nm` generalizes to future
- *  larger-context betas (N × 1,000,000). Returns the largest requested window,
- *  or undefined when no context beta is present. */
+ *  larger-context betas (N × 1,000,000), clamped to {@link MAX_ANTHROPIC_BETA_WINDOW}.
+ *  Returns the largest requested window, or undefined when no context beta is
+ *  present. */
 export function anthropicBetaContextWindow(headers: Record<string, string | string[] | undefined>): number | undefined {
     const raw = headers["anthropic-beta"];
     if (raw === undefined) return undefined;
@@ -81,7 +90,7 @@ export function anthropicBetaContextWindow(headers: Record<string, string | stri
         if (!m) continue;
         const n = Number.parseInt(m[1], 10);
         if (!Number.isFinite(n) || n <= 0) continue;
-        const w = n * 1_000_000;
+        const w = Math.min(n * 1_000_000, MAX_ANTHROPIC_BETA_WINDOW);
         if (best === undefined || w > best) best = w;
     }
     return best;
