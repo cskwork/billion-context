@@ -70,9 +70,9 @@ import { ACP_TOOLS_OPENAI } from "../compress-tool.js";
 import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST, unwrapUpstream, wrapUpstream } from "../launcher.js";
 import { createAcpCommandHooks } from "./opencode-acp-command.js";
 import { markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, singleFlight } from "./native-bootstrap.js";
-import { installNativeFetchIntercept, isModelApiUrl, readyOrigin, type NativeInterceptState } from "./native-intercept.js";
+import { createLiveOriginResolver, installNativeFetchIntercept, isModelApiUrl, readyOrigin, replaceRequestTarget, type LiveOriginResolverDeps, type NativeInterceptState } from "./native-intercept.js";
 import { createOpencodeV2Setup, type V2HttpRequestEvent, type V2State } from "./opencode-v2.js";
-import { reportRuntimeInfoOnChange } from "./shared.js";
+import { fetchProxyVersion, reportRuntimeInfoOnChange } from "./shared.js";
 import { callLegacyAcpConfig, isLegacyAcpSession, loadLegacyAcp, type LegacyAcpModule } from "./opencode-legacy.js";
 
 /** Decides whether the native bootstrap should run in this process. */
@@ -98,143 +98,33 @@ export function planNativeOpencode(env: NodeJS.ProcessEnv): { mode: "off" | "att
     return { mode: "spawn" };
 }
 
-const HEALTH_TIMEOUT_MS = 1500;
-const RESPAWN_COOLDOWN_MS = 15_000;
-/** Probe-verdict trust window (#928). Far below RESPAWN_COOLDOWN_MS: that
- *  cooldown already assumes multi-second proxy stability, so a few-second
- *  detection horizon is consistent with it while removing the per-request RTT. */
-const HEALTH_PROBE_TTL_MS = 2_000;
-
-async function probeHealth(origin: string): Promise<boolean> {
-    try {
-        const res = await fetch(`${origin}/__bili/health`, { signal: AbortSignal.timeout(HEALTH_TIMEOUT_MS) });
-        return res.ok;
-    } catch {
-        return false;
-    }
-}
-
-/** Wrap a probe in a per-origin TTL cache (#928). Both verdicts are cached: a
- *  healthy hit skips the steady-state loopback RTT; a dead hit avoids re-paying
- *  the full HEALTH_TIMEOUT_MS on every request across the death+cooldown window.
- *  Stale entries for other origins are evicted on insert, keeping the map bounded. */
-function withProbeTtl(probe: (origin: string) => Promise<boolean>, ttlMs: number): (origin: string) => Promise<boolean> {
-    const cache = new Map<string, { ok: boolean; at: number }>();
-    return (origin) => {
-        const now = Date.now();
-        const hit = cache.get(origin);
-        if (hit !== undefined && now - hit.at < ttlMs) return Promise.resolve(hit.ok);
-        return probe(origin).then((ok) => {
-            const t = Date.now();
-            for (const [key, entry] of cache) if (t - entry.at >= ttlMs) cache.delete(key);
-            cache.set(origin, { ok, at: t });
-            return ok;
-        });
-    };
-}
-
-export interface OpencodeNativeRouteDeps {
-    probe?: (origin: string) => Promise<boolean>;
-    /** Bootstrap retry interval when no live origin is held (tests shrink it). */
-    respawnCooldownMs?: number;
-    /** Probe-verdict cache TTL; defaults to HEALTH_PROBE_TTL_MS (tests shrink it). */
-    probeTtlMs?: number;
-}
+export type OpencodeNativeRouteDeps = LiveOriginResolverDeps;
 
 /** Build the native-mode route callback consumed by createOpencodeV2Setup.
- *  The probe is injectable for tests; the default does a bounded GET of
- *  /__bili/health. */
+ *  #1135: spawn and attach share ONE liveness gate — attach arms
+ *  state.respawn (verifyAttachAndRecover), so a dead external proxy is
+ *  re-probed and, when truly gone, replaced by a self-spawned proxy instead
+ *  of failing every request forever (the old fail-closed branch is gone). */
 export function createNativeRoute(state: NativeInterceptState, deps: OpencodeNativeRouteDeps = {}): (e: V2HttpRequestEvent, s: V2State) => Promise<void> {
-    const probe = withProbeTtl(deps.probe ?? probeHealth, deps.probeTtlMs ?? HEALTH_PROBE_TTL_MS);
-    const respawnCooldownMs = deps.respawnCooldownMs ?? RESPAWN_COOLDOWN_MS;
+    const resolveLive = createLiveOriginResolver(state, deps);
     let warned = false;
-    let attachWarned = false;
-    let lastRespawn = 0;
-
-    const healthyOrigin = async (): Promise<string | undefined> => {
-        let ownedThenLost = false;
-        if (state.origin !== undefined) {
-            if (await probe(state.origin)) return state.origin;
-            // Proxy died mid-session. Clearing origin first makes concurrent
-            // callers share the same state.ready (dedup).
-            ownedThenLost = true;
-            state.origin = undefined;
-        }
-        // Retry bootstrap whenever no live origin is held — either just lost
-        // it or the load-time bootstrap failed (the hook cannot observe send
-        // failures, so nothing else would retry). Cooldown bounds attempts to
-        // one per interval instead of one per request.
-        if (state.respawn !== undefined && (ownedThenLost || Date.now() - lastRespawn >= respawnCooldownMs)) {
-            lastRespawn = Date.now();
-            state.ready = state.respawn();
-        }
-        const o = await readyOrigin(state);
-        if (o !== undefined && (await probe(o))) return o;
-        if (ownedThenLost) state.onGiveUp?.();
-        return undefined;
-    };
-
-    const rewriteToProxy = (ev: V2HttpRequestEvent, target: string, url: string): void => {
-        try {
-            ev.request = new Request(`${target}/bili/${url}`, ev.request as unknown as Request);
-        } catch {
-            // undici refuses to copy a body-bearing Request without explicit
-            // duplex — reconstruct with the body stream passed explicitly.
-            const old = ev.request as unknown as { method?: unknown; headers?: Iterable<readonly [string, string]> | null; body?: ReadableStream<Uint8Array> | null };
-            try {
-                const init: RequestInit & { duplex?: "half" } = { method: typeof old.method === "string" ? old.method : "GET" };
-                const pairs: [string, string][] = [];
-                try {
-                    for (const pair of old.headers ?? []) pairs.push([pair[0], pair[1]]);
-                } catch {}
-                if (pairs.length > 0) init.headers = pairs;
-                if (old.body != null) {
-                    init.body = old.body as RequestInit["body"];
-                    init.duplex = "half";
-                }
-                ev.request = new Request(`${target}/bili/${url}`, init);
-            } catch {
-                // replacement impossible (exotic body) — request goes direct
-            }
-        }
-    };
-
     return async (e, s) => {
         const url = typeof e.request?.url === "string" ? e.request.url : undefined;
         if (url === undefined) return;
         if (!isModelApiUrl(url)) return;
 
-        // Attach mode (#809): route through the user's external proxy. We do
-        // NOT own it — no spawn, no respawn. Fail-closed by construction: we
-        // always rewrite toward the target and never fall back to direct, so a
-        // dead target surfaces as a client-visible connection error (plus one
-        // loud diagnostic), never as silent uncompressed traffic.
-        if (state.attach) {
-            const target = state.origin;
-            if (target === undefined) return;
-            const up = await probe(target);
-            if (!up && !attachWarned) {
-                attachWarned = true;
-                console.error(`bili-native-opencode: external proxy ${target} unreachable — model requests will fail (compression unavailable)`);
-            } else if (up) {
-                attachWarned = false;
-            }
-            s.proxyBase = target;
-            rewriteToProxy(e, target, url);
-            return;
-        }
-
-        const target = await healthyOrigin();
+        const target = await resolveLive();
         if (target === undefined) {
             if (!warned) {
                 warned = true;
                 console.error("bili-native-opencode: proxy unavailable — model requests go direct (uncompressed)");
             }
+            s.proxyBase = undefined;
             return;
         }
         warned = false;
         s.proxyBase = target;
-        rewriteToProxy(e, target, url);
+        replaceRequestTarget(e, `${target}/bili/${url}`);
     };
 }
 
@@ -255,26 +145,110 @@ async function bootstrap(): Promise<string | undefined> {
     }
 }
 
+let _spawnForTest: (() => Promise<string | undefined>) | undefined;
+
+/** Test hook: replace the attach-fallback spawn (and the respawn self-heal's
+ *  spawn) with a stub. Pass undefined to restore. */
+export function _setSpawnForTest(fn?: () => Promise<string | undefined>): void {
+    _spawnForTest = fn;
+}
+
+/** #1135: the attached origin can go stale — at startup (the owning launcher
+ *  exited before this process started) or at runtime (it exits while this
+ *  session still rides the shared proxy, #1130). Probe before trusting it:
+ *  healthy → keep attaching (a transient blip costs nothing — the session
+ *  never migrates); dead → unfreeze the preset env and fall back to spawning
+ *  our own proxy (instance discovery may find another healthy one first),
+ *  re-arming respawn as a pure spawn for subsequent deaths. Resolves to the
+ *  origin the client should use — attachOrigin, the fallback origin, or
+ *  undefined when even the fallback failed. */
+export async function verifyAttachAndRecover(attachOrigin: string): Promise<string | undefined> {
+    const version = await fetchProxyVersion(attachOrigin).catch(() => undefined);
+    if (version !== undefined) {
+        // Restore the readyOrigin short-circuit — a runtime recovery clears
+        // state.origin before re-probing, and a transient blip must not leave
+        // it dangling.
+        state.origin = attachOrigin;
+        process.env.BILLION_CONTEXT_PROXY = attachOrigin;
+        return attachOrigin;
+    }
+    console.error(`bili-native-opencode: attach target ${attachOrigin} is not healthy — falling back to a spawned proxy`);
+    delete process.env.BILLION_CONTEXT_PROXY;
+    state.attach = false;
+    state.origin = undefined;
+    const start = singleFlight(_spawnForTest ?? bootstrap);
+    state.respawn = start;
+    // Publish whatever origin lands on BOTH the shared state and the env —
+    // env readers (compaction reporter, /acp status) must never disagree with
+    // what the route resolves, whoever produced the origin.
+    const landed = start().then((o) => {
+        if (o !== undefined) {
+            state.origin = o;
+            process.env.BILLION_CONTEXT_PROXY = o;
+        }
+        return o;
+    });
+    state.ready = landed;
+    return landed;
+}
+
 const plan = planNativeOpencode(process.env);
-if (plan.mode !== "off") {
+
+/** Wire the shared intercept state for the planned mode. Attach mode arms
+ *  even under NODE_TEST_CONTEXT (it installs no global patches and spawns
+ *  nothing while the target is healthy, so tests can drive it directly);
+ *  spawn mode stays test-guarded because bootstrap forks a real proxy. */
+export function armNativeOpencode(p: typeof plan): void {
+    if (p.mode === "off") return;
     markNativeHost(process.env, "opencode");
-    if (process.env.NODE_TEST_CONTEXT === undefined) {
-        if (plan.mode === "attach") {
-            state.attach = true;
-            state.origin = plan.attachOrigin;
-            // Tools / compaction discover the proxy through this env path, as
-            // in self-spawn; no respawn/onGiveUp — the external proxy isn't
-            // ours to restart or clean up.
-            process.env.BILLION_CONTEXT_PROXY = plan.attachOrigin;
-        } else {
-            const start = singleFlight(bootstrap);
+    if (p.mode === "attach") {
+        state.attach = true;
+        const attachOrigin = p.attachOrigin;
+        if (attachOrigin !== undefined) {
+            // #1135: arm the SAME probe+fallback for runtime death — the
+            // attached proxy is usually owned by ANOTHER launcher that can
+            // exit while this session rides it; the resolver then re-probes
+            // and falls back exactly like at startup. No synchronous
+            // state.origin freeze: V1's server() awaits state.ready so hooks
+            // bind to the LANDED origin, and the V2 route resolves live per
+            // request regardless.
+            process.env.BILLION_CONTEXT_PROXY = attachOrigin;
+            const start = singleFlight(() => verifyAttachAndRecover(attachOrigin));
             state.respawn = start;
             state.onGiveUp = () => {
                 delete process.env.BILLION_CONTEXT_PROXY;
             };
             state.ready = start();
+        } else {
+            state.ready = Promise.resolve(undefined);
         }
+    } else if (process.env.NODE_TEST_CONTEXT === undefined) {
+        const start = singleFlight(bootstrap);
+        state.respawn = start;
+        state.onGiveUp = () => {
+            delete process.env.BILLION_CONTEXT_PROXY;
+        };
+        state.ready = start();
     }
+}
+
+if (plan.mode !== "off") armNativeOpencode(plan);
+
+/** Test hook: expose the armed runtime-recovery seam (mirrors dsh-native). */
+export function _stateRespawnForTest(): (() => Promise<string | undefined>) | undefined {
+    return state.respawn;
+}
+
+/** Test hook: reset the module-level state in place (closures capture the
+ *  object reference) so suites can drive armNativeOpencode repeatedly. */
+export function _resetNativeStateForTest(): void {
+    state.attach = undefined;
+    state.origin = undefined;
+    state.respawn = undefined;
+    state.onGiveUp = undefined;
+    state.ready = Promise.resolve(undefined);
+    _spawnForTest = undefined;
+    delete process.env.BILLION_CONTEXT_PROXY;
 }
 
 // ———— OpenCode 1.x native surface (V1 `.server()`) ————————————————————
@@ -472,8 +446,13 @@ function lastSessionFromMessages(messages: unknown): string | undefined {
     return undefined;
 }
 
-export function createV1ServerHooks(origin: string, ctx: V1PluginContext, deps: V1NativeDeps = {}): V1Hooks {
-    const acp = createAcpCommandHooks(() => origin, ctx);
+// #1135: dynamic origin getter instead of a captured constant — after a
+// runtime death+recovery the live origin changes, and hooks bound to the
+// startup origin would keep forwarding tools to the dead port while traffic
+// had already recovered. A transient undefined (recovery window / give-up)
+// skips proxy-dependent work instead of pointing at a dead origin.
+export function createV1ServerHooks(getOrigin: () => string | undefined, ctx: V1PluginContext, deps: V1NativeDeps = {}): V1Hooks {
+    const acp = createAcpCommandHooks(getOrigin, ctx);
     const legacy = deps.legacy;
     const isLegacy = deps.isLegacy ?? isLegacyAcpSession;
     const log = deps.log ?? ((msg: string) => console.log(msg));
@@ -485,8 +464,11 @@ export function createV1ServerHooks(origin: string, ctx: V1PluginContext, deps: 
                 await callLegacyAcpConfig(legacy.configHook, cfg);
             }
             await acp.config?.(cfg);
-            const n = rewriteV1Providers(cfg, origin);
-            if (n > 0) log(`[bili-opencode-native] v1: rewrote ${n} provider baseURL(s) -> ${origin}/bili/`);
+            const o = getOrigin();
+            if (o !== undefined) {
+                const n = rewriteV1Providers(cfg, o);
+                if (n > 0) log(`[bili-opencode-native] v1: rewrote ${n} provider baseURL(s) -> ${o}/bili/`);
+            }
             windows = extractV1Windows(cfg);
             outputs = extractV1Outputs(cfg);
         },
@@ -537,6 +519,11 @@ export function createV1ServerHooks(origin: string, ctx: V1PluginContext, deps: 
                 output.headers["x-bili-plugin-bypass"] = "1";
                 return;
             }
+            const base = getOrigin();
+            // No live proxy: traffic goes direct — stamping would leak the
+            // conversation id to a raw upstream and mark plugin mode for a
+            // request no bili proxy will ever see.
+            if (base === undefined) return;
             output.headers["x-bili-plugin"] = "opencode";
             output.headers["x-bili-plugin-conversation"] = input.sessionID;
             // #1102: opencode mints one session id per persona (task-tool
@@ -551,7 +538,7 @@ export function createV1ServerHooks(origin: string, ctx: V1PluginContext, deps: 
                 const o = outputs.get(key);
                 if (o !== undefined) output.headers["x-bili-plugin-max-output"] = String(o);
                 output.headers["x-bili-plugin-model"] = model.id;
-                reportRuntimeInfoOnChange(origin, { agent: "opencode", model: model.id, contextWindow: w, maxOutput: o, source: "client-config" });
+                reportRuntimeInfoOnChange(base, { agent: "opencode", model: model.id, contextWindow: w, maxOutput: o, source: "client-config" });
             }
         };
         const forward = deps.forward ?? ((o, conversationId, tool, args) => import("./shared.js").then((m) => m.forwardTool(o, conversationId, tool, args)));
@@ -570,7 +557,9 @@ export function createV1ServerHooks(origin: string, ctx: V1PluginContext, deps: 
                         if (exec !== undefined && isLegacy(v1ctx.sessionID)) {
                             return String((await exec(args, v1ctx)) ?? "");
                         }
-                        return forward(origin, v1ctx.sessionID, name, args);
+                        const base = getOrigin();
+                        if (base === undefined) return "bili: no live proxy yet — compression temporarily unavailable";
+                        return forward(base, v1ctx.sessionID, name, args);
                     },
                 };
             }
@@ -583,7 +572,11 @@ export function createV1ServerHooks(origin: string, ctx: V1PluginContext, deps: 
                     tools[fn.name] = {
                         description: fn.description ?? fn.name,
                         args: jsonSchemaToZodShape(fn.parameters, deps.z),
-                        execute: async (args, v1ctx) => forward(origin, v1ctx.sessionID, fn.name, args),
+                        execute: async (args, v1ctx) => {
+                            const base = getOrigin();
+                            if (base === undefined) return "bili: no live proxy yet — compression temporarily unavailable";
+                            return forward(base, v1ctx.sessionID, fn.name, args);
+                        },
                     };
                 }
             } else {
@@ -606,11 +599,6 @@ async function resolveV1Origin(): Promise<string | undefined> {
 const server = async (ctx: V1PluginContext): Promise<V1Hooks> => {
     if (plan.mode === "off") return {};
     const origin = await resolveV1Origin();
-    if (origin === undefined) {
-        console.error("[bili-opencode-native] v1: proxy bootstrap failed — model traffic goes direct (uncompressed)");
-        return {};
-    }
-    console.log(`[bili-opencode-native] v1 active (proxy ${origin})`);
     // Global fetch patch (pi-native's mechanism): the config-hook rewrite can
     // only catch providers with an EXPLICIT baseURL — V1 has no request-level
     // hook, and providers relying on the SDK default (e.g. bare
@@ -620,10 +608,19 @@ const server = async (ctx: V1PluginContext): Promise<V1Hooks> => {
     // requests too. Idempotent (flag-guarded) and disjoint from the config
     // rewrite: isModelApiUrl passes `/bili/`-prefixed URLs straight through,
     // so already-rewritten providers never double-wrap. Proxy-death respawn /
-    // degrade-to-direct semantics come with the shared state.
+    // degrade-to-direct semantics come with the shared state. Installed BEFORE
+    // the resolution gate (#1135): a failed startup (attach target dead AND
+    // the spawn fallback failed) still recovers at runtime — the patch
+    // observes network failures and drives state.respawn, so SDK-default
+    // providers route again as soon as any proxy is alive.
     if (installNativeFetchIntercept(state)) {
         console.log("[bili-opencode-native] v1: fetch patch installed (catches providers without an explicit baseURL)");
     }
+    if (origin === undefined) {
+        console.error("[bili-opencode-native] v1: no live proxy at startup — traffic goes direct until runtime recovery lands one");
+        return {};
+    }
+    console.log(`[bili-opencode-native] v1 active (proxy ${origin})`);
     let z: ZodLike | undefined;
     try {
         z = (await import("zod")) as ZodLike;
@@ -642,7 +639,7 @@ const server = async (ctx: V1PluginContext): Promise<V1Hooks> => {
     } catch {
         legacy = undefined;
     }
-    return createV1ServerHooks(origin, ctx, { z, legacy });
+    return createV1ServerHooks(() => state.origin, ctx, { z, legacy });
 };
 
 export default { id: "billion-context-opencode-native", setup: createOpencodeV2Setup({ route: createNativeRoute(state) }), server };

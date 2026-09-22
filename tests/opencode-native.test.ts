@@ -1,5 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 
 // The module-level guard reads NODE_TEST_CONTEXT while the module EVALUATES,
 // and static imports hoist above any assignment — so the value must be set
@@ -10,7 +12,7 @@ import type { NativeInterceptState } from "../src/agent/native-intercept.ts";
 import type { V2HttpRequestEvent, V2PluginContext, V2State } from "../src/agent/opencode-v2.ts";
 import { ACP_TOOLS_OPENAI, ABSORB_TOOL_OPENAI } from "../src/compress-tool.ts";
 
-const { shouldBootstrapNativeOpencode, createNativeRoute, planNativeOpencode } = await import("../src/agent/opencode-native.ts");
+const { shouldBootstrapNativeOpencode, createNativeRoute, planNativeOpencode, armNativeOpencode, _resetNativeStateForTest, _setSpawnForTest, _stateRespawnForTest } = await import("../src/agent/opencode-native.ts");
 const { createOpencodeV2Setup } = await import("../src/agent/opencode-v2.ts");
 const { markNativeHost, nativeAttachOrigin } = await import("../src/agent/native-bootstrap.ts");
 const nativeDefault = (await import("../src/agent/opencode-native.ts")).default;
@@ -334,7 +336,10 @@ test("native route: attach mode routes model traffic through the external proxy"
     assert.equal(respawnCalls, 0);
 });
 
-test("native route: attach mode FAILS CLOSED when the external proxy is down", async () => {
+// #1135: the old fail-closed semantics are gone — with no respawn wired the
+// dead target degrades to DIRECT sends (session survives, compression lost)
+// instead of failing every request forever.
+test("native route: attach mode degrades to direct when the external proxy is down and no respawn is wired", async () => {
     const origin = "http://10.0.0.5:9000";
     const state: NativeInterceptState = { attach: true, origin, ready: Promise.resolve(origin) };
     const s: V2State = {};
@@ -348,12 +353,67 @@ test("native route: attach mode FAILS CLOSED when the external proxy is down", a
         await route({ sessionID: "ses_b", request: new Request(MODEL_URL, { method: "POST" }) }, s);
         const second: V2HttpRequestEvent = { sessionID: "ses_b", request: new Request(MODEL_URL, { method: "POST" }) };
         await route(second, s);
-        assert.equal((second.request as Request).url, `${origin}/bili/${MODEL_URL}`);
-        assert.ok(warns.some((w) => w.includes("unreachable")), "expected an unreachable diagnostic");
-        assert.ok(warns.filter((w) => w.includes("unreachable")).length === 1, "expected exactly one warning");
+        assert.equal((second.request as Request).url, MODEL_URL, "dead target without respawn sends direct, not into the dead port");
+        assert.equal(s.proxyBase, undefined);
+        assert.ok(warns.some((w) => w.includes("proxy unavailable")), "expected an unavailability diagnostic");
+        assert.ok(warns.filter((w) => w.includes("proxy unavailable")).length === 1, "expected exactly one warning");
     } finally {
         console.error = origErr;
     }
+});
+
+test("native route: attach mode respawns on runtime death and routes to the replacement (#1135)", async () => {
+    const ext = "http://10.0.0.5:9000";
+    const spawned = "http://127.0.0.1:4321";
+    let respawnCalls = 0;
+    const state: NativeInterceptState = {
+        attach: true,
+        origin: ext,
+        ready: Promise.resolve(ext),
+        respawn: async () => {
+            respawnCalls++;
+            state.origin = spawned;
+            return spawned;
+        },
+    };
+    const probe = async (o: string) => o !== ext;
+    const s: V2State = {};
+    const route = createNativeRoute(state, { probe });
+    const e: V2HttpRequestEvent = { sessionID: "ses_d", request: new Request(MODEL_URL, { method: "POST" }) };
+    await route(e, s);
+    assert.equal(respawnCalls, 1, "one respawn per death");
+    assert.equal((e.request as Request).url, `${spawned}/bili/${MODEL_URL}`, "request re-routed to the replacement");
+    assert.equal(s.proxyBase, spawned);
+    // next request fast-paths through the landed origin
+    const e2: V2HttpRequestEvent = { sessionID: "ses_d", request: new Request(MODEL_URL, { method: "POST" }) };
+    await route(e2, s);
+    assert.equal(respawnCalls, 1, "no re-spawn while the replacement is healthy");
+    assert.equal((e2.request as Request).url, `${spawned}/bili/${MODEL_URL}`);
+});
+
+test("native route: attach mode transient blip re-attaches to the SAME origin (no migration, #1135)", async () => {
+    const ext = "http://10.0.0.5:9000";
+    let up = false;
+    let respawnCalls = 0;
+    const state: NativeInterceptState = {
+        attach: true,
+        origin: ext,
+        ready: Promise.resolve(ext),
+        respawn: async () => {
+            respawnCalls++;
+            up = true;
+            state.origin = ext;
+            return ext;
+        },
+    };
+    const s: V2State = {};
+    const route = createNativeRoute(state, { probe: async () => up, probeTtlMs: 0 });
+    const e: V2HttpRequestEvent = { sessionID: "ses_e", request: new Request(MODEL_URL, { method: "POST" }) };
+    await route(e, s);
+    assert.equal(respawnCalls, 1);
+    assert.equal((e.request as Request).url, `${ext}/bili/${MODEL_URL}`, "re-attached to the same origin");
+    assert.equal(state.origin, ext);
+    assert.equal(s.proxyBase, ext);
 });
 
 test("native route: attach mode leaves non-model requests untouched", async () => {
@@ -366,6 +426,62 @@ test("native route: attach mode leaves non-model requests untouched", async () =
     await route(e, s);
     assert.equal(e.request, req);
     assert.equal(s.proxyBase, undefined);
+});
+
+test("#1135 wiring: attach arms runtime recovery; a dead target falls back to a spawned proxy", async () => {
+    const savedProxy = process.env.BILLION_CONTEXT_PROXY;
+    try {
+        _resetNativeStateForTest();
+        let spawned = 0;
+        _setSpawnForTest(async () => {
+            spawned++;
+            return "http://127.0.0.1:7777";
+        });
+        armNativeOpencode({ mode: "attach", attachOrigin: "http://127.0.0.1:9" });
+        assert.equal(typeof _stateRespawnForTest(), "function", "respawn seam armed at load");
+        // port 9 refuses connections instantly — the manifest probe fails fast,
+        // the fallback spawn lands and replaces the env origin
+        const landed = await _stateRespawnForTest()!();
+        assert.equal(landed, "http://127.0.0.1:7777");
+        assert.ok(spawned >= 1);
+        assert.equal(process.env.BILLION_CONTEXT_PROXY, "http://127.0.0.1:7777");
+    } finally {
+        if (savedProxy === undefined) delete process.env.BILLION_CONTEXT_PROXY;
+        else process.env.BILLION_CONTEXT_PROXY = savedProxy;
+        _resetNativeStateForTest();
+    }
+});
+
+test("#1135 wiring: a healthy attach target stays attached (no migration, no spawn)", async () => {
+    const savedProxy = process.env.BILLION_CONTEXT_PROXY;
+    const server = createServer((req, res) => {
+        if (req.url === "/__bili/plugin/manifest") {
+            res.setHeader("content-type", "application/json");
+            res.end(JSON.stringify({ version: "0.1.134" }));
+            return;
+        }
+        res.end();
+    });
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
+    const port = (server.address() as AddressInfo).port;
+    try {
+        _resetNativeStateForTest();
+        let spawned = 0;
+        _setSpawnForTest(async () => {
+            spawned++;
+            return "http://127.0.0.1:7778";
+        });
+        armNativeOpencode({ mode: "attach", attachOrigin: `http://127.0.0.1:${port}` });
+        const landed = await _stateRespawnForTest()!();
+        assert.equal(landed, `http://127.0.0.1:${port}`, "healthy target resolves to itself");
+        assert.equal(spawned, 0, "no fallback spawn for a healthy target");
+        assert.equal(process.env.BILLION_CONTEXT_PROXY, `http://127.0.0.1:${port}`);
+    } finally {
+        server.close();
+        if (savedProxy === undefined) delete process.env.BILLION_CONTEXT_PROXY;
+        else process.env.BILLION_CONTEXT_PROXY = savedProxy;
+        _resetNativeStateForTest();
+    }
 });
 
 // #928: the health verdict is TTL-cached per origin. Steady-state requests must
