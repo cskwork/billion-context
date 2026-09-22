@@ -97,7 +97,40 @@ function baseConversation(): Array<{ role: string; content: string }> {
     return msgs;
 }
 
-async function runCase(opts: { inputTokens: number | null }): Promise<Record<string, unknown>> {
+type TurnMsg = { role: string; content: string | Array<Record<string, unknown>> };
+
+// #1119: the stale-high cap in effectiveTokenCount (the min() against THIS
+// request's inbound upper bound) used to be TEXT-ONLY — estimateCoreMessagesUpper
+// sums m.text, and the wire codecs move images out of CoreMessage.text into
+// sidecars. Whenever the previous turn's image contribution exceeded the current
+// turn's text growth, the image term was capped away and the nudge numerator went
+// blind to exactly the byte-billed multimodal sessions #728 restored. Fix: the
+// bound carries the current request's image term (resolved billing).
+// Window is 80k (not the shared 60k): the kernel's absolute-token zones
+// (preserveRecentTokens 5k + minPressureBenefit 5k ⇒ ≥ ~10k tokens of compressible
+// text mass) squeeze a 60k window so thin that pre-fix/post-fix states collide.
+// Pins:
+//   turn 1: 6 heavy + 4 medium code messages (~50k chars total) plus two 10k-token
+//           inline images (ceil(b64/4) @ bytes) → idle (nothing measured yet) but
+//           records an estimate carrying a 20k-token image term.
+//   turn 2: same history + small additions → text-only bound sits at ~63% of the
+//           window, below EVERY band (45% first-sight / 70% host emergency
+//           escalation / 75% pressure), yet the image-aware numerator must reach
+//           ~88% ≥ 75% maxContextLimitPct → NUDGE.
+//           Pre-fix: numerator = text-only bound (~63%) → no nudge (the bug).
+//           Compressible mass: the 4 oldest heavies survive the preserveRecentTokens
+//           walk ≈ 7.3k tokens ≥ minPressureBenefit 5k.
+//   turn 3: shrunk history WITHOUT images → no nudge (a client-side shrink
+//           shrinks the bound in BOTH terms — stale-high invariant preserved).
+const IMG_B64 = "iVBORw0KGgo" + "A".repeat(40_000 - 9); // bytes billing: ceil(40000/4) = 10_000 tokens
+const MED = (i: number) => `NOTE_${i}_` + LINE(i).repeat(12);
+
+const imgPart = (): Record<string, unknown> => ({
+    type: "image",
+    source: { type: "base64", media_type: "image/png", data: IMG_B64 },
+});
+
+async function runCase(opts: { inputTokens: number | null; sessionId?: string; turns?: TurnMsg[][]; window?: number }): Promise<Record<string, unknown>> {
     const streamed: string[] = [];
     let nonStream = 0;
     const upstream = http.createServer((req, res) => {
@@ -139,7 +172,7 @@ async function runCase(opts: { inputTokens: number | null }): Promise<Record<str
         port: 0,
         host: "127.0.0.1",
         upstream: "http://127.0.0.1",
-        routes: { [`http://127.0.0.1:${upstreamPort}`]: { models: { "claude-small": { context: WINDOW } } } },
+        routes: { [`http://127.0.0.1:${upstreamPort}`]: { models: { "claude-small": { context: opts.window ?? WINDOW } } } },
         modelContextLimit: 400_000,
         kernelConfig: defaultConfig(400_000),
         compress: { injectTool: true, injectNudge: true },
@@ -155,10 +188,10 @@ async function runCase(opts: { inputTokens: number | null }): Promise<Record<str
     const proxyPort = proxy.address().port;
 
     try {
-        const post = async (messages: Array<{ role: string; content: string }>): Promise<number> => {
+        const post = async (messages: TurnMsg[]): Promise<number> => {
             const resp = await fetch(`http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/messages`, {
                 method: "POST",
-                headers: { "content-type": "application/json", "x-acp-session": "silent-backend-sess" },
+                headers: { "content-type": "application/json", "x-acp-session": opts.sessionId ?? "silent-backend-sess" },
                 body: JSON.stringify({ model: "claude-small", max_tokens: 1024, stream: true, messages }),
             });
             await resp.text();
@@ -170,19 +203,24 @@ async function runCase(opts: { inputTokens: number | null }): Promise<Record<str
         // adds an assistant reply + one heavy follow-up user message (~same
         // scale); turn 3 SHRINKS to the recent small tail (a client-side
         // compaction/edit — the stale-estimate regime).
-        const base = baseConversation();
+        const turns = opts.turns ?? (() => {
+            const base = baseConversation();
+            return [
+                base,
+                [
+                    ...base,
+                    { role: "assistant", content: "ok, done with step one." },
+                    { role: "user", content: HEAVY(99) + " now step two" },
+                ],
+                [
+                    { role: "user", content: "short recent slice one" },
+                    { role: "assistant", content: "ok fine" },
+                    { role: "user", content: "tiny question only" },
+                ],
+            ];
+        })();
         const statuses: number[] = [];
-        statuses.push(await post(base));
-        statuses.push(await post([
-            ...base,
-            { role: "assistant", content: "ok, done with step one." },
-            { role: "user", content: HEAVY(99) + " now step two" },
-        ]));
-        statuses.push(await post([
-            { role: "user", content: "short recent slice one" },
-            { role: "assistant", content: "ok fine" },
-            { role: "user", content: "tiny question only" },
-        ]));
+        for (const t of turns) statuses.push(await post(t));
         return { statuses, streamed, nonStream };
     } finally {
         proxy.close();
@@ -220,4 +258,43 @@ test("#728C: stale-high cap — shrunk history does not re-trigger on the previo
     assert.deepEqual(statuses, [200, 200, 200]);
     assert.ok(streamed[1].includes(NUDGE_MARKER), "precondition: turn 2 nudged (see #728A)");
     assert.ok(!streamed[2].includes(NUDGE_MARKER), "turn 3 (shrunk history) must not nudge — the previous turn's high estimate is capped by this request's inbound upper bound");
+});
+
+test("#1119: silent-backend image term survives the stale-high cap — inline images count toward the nudge numerator", async () => {
+    const turn1: TurnMsg[] = [
+        { role: "user", content: HEAVY(0) },
+        { role: "assistant", content: HEAVY(1) },
+        { role: "user", content: HEAVY(2) },
+        { role: "assistant", content: HEAVY(3) },
+        { role: "user", content: HEAVY(4) },
+        { role: "assistant", content: HEAVY(5) },
+        { role: "user", content: MED(6) },
+        { role: "assistant", content: MED(7) },
+        { role: "user", content: MED(8) },
+        { role: "assistant", content: MED(9) },
+        { role: "user", content: [{ type: "text", text: "analyze these screenshots" }, imgPart(), imgPart()] },
+    ];
+    const turn2: TurnMsg[] = [
+        ...turn1,
+        { role: "assistant", content: "ok, done with step one." },
+        { role: "user", content: "now step two" },
+    ];
+    const turn3: TurnMsg[] = [
+        { role: "user", content: "short recent slice one" },
+        { role: "assistant", content: "ok fine" },
+        { role: "user", content: "tiny question only" },
+    ];
+    const { statuses, streamed, nonStream } = await runCase({ inputTokens: null, sessionId: "silent-backend-img-sess", turns: [turn1, turn2, turn3], window: 80_000 });
+    assert.deepEqual(statuses, [200, 200, 200]);
+    assert.equal(nonStream, 0, "preflight must stay silent (optimistic estimate under window)");
+    assert.equal(streamed.length, 3);
+    assert.ok(!streamed[0].includes(NUDGE_MARKER), "turn 1 must stay idle — nothing measured yet");
+    assert.ok(streamed[1].includes('"media_type":"image/png"'), "images must ride along un-folded (nudge is advisory, no fold happened)");
+    const fwd = msgsOf(streamed[1]);
+    const last = fwd.at(-1)!;
+    assert.ok(
+        last.role === "user" && msgText(last).includes(NUDGE_MARKER),
+        `turn 2 must carry the trailing nudge — the text-only bound (~63%) sits below every band, so only the recorded estimate's image term (2 x 10k tokens) can push the numerator over the 75% pressure band; pre-fix the text-only bound capped it away, got: ${streamed[1].slice(-800)}`,
+    );
+    assert.ok(!streamed[2].includes(NUDGE_MARKER), "turn 3 (shrunk history, no images) must not nudge — a client-side shrink shrinks the bound in BOTH terms");
 });

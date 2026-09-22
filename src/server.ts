@@ -1764,7 +1764,7 @@ async function handle(
                         // Both the model and the stream flag live in the URL path
                         // for this wire (the body carries neither), so they are
                         // derived here instead of read off `work`.
-                        return prepareGoogle(work as GoogleRequestBody, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, nativeWindow, googleModel, googlePathKind(urlPath) === "stream-generate", visibilityMarkers);
+                        return prepareGoogle(work as GoogleRequestBody, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, nativeWindow, googleModel, googlePathKind(urlPath) === "stream-generate", visibilityMarkers, upstreamOrigin);
                     }
                     return protocol === "anthropic"
                         ? prepareAnthropic(work as AnthropicRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, upstreamOrigin, reasoningCfg, visibilityMarkers)
@@ -2134,7 +2134,7 @@ function diagNudge(turn: { nudge?: { shouldInject: boolean; reason: string; cont
 // shrinks → the next estimate drops). Turn 1 of a fresh explicit session
 // still feeds 0 (nothing measured yet; nothing pending either), so
 // first-turn behavior is byte-identical to pre-#728.
-function effectiveTokenCount(session: Session, msgs: CoreMessage[]): number {
+function effectiveTokenCount(session: Session, msgs: CoreMessage[], inboundImageTokens = 0): number {
     if (session.stats.lastInputTokens > 0) return session.stats.lastInputTokens;
     if (session.metadata.anonymousPrefixAffinity) return estimateCoreMessagesUpper(msgs);
     const est = session.stats.localInputEstimate ?? 0;
@@ -2145,7 +2145,14 @@ function effectiveTokenCount(session: Session, msgs: CoreMessage[]): number {
     // us now — never claim more context than the current request could hold.
     // In steady state est <= raw bound always (the outbound fold is never
     // larger than the inbound history), so this is a no-op there.
-    const raw = estimateCoreMessagesUpper(msgs);
+    // #1119: the bound must carry the image term too — the wire codecs move
+    // images out of CoreMessage.text into sidecars, so a text-only bound caps
+    // the recorded estimate's image contribution away whenever the previous
+    // turn carried images, blinding the nudge to exactly the byte-billed
+    // multimodal sessions #728 restored. A client-side shrink still shrinks
+    // the bound (fewer messages AND fewer images), preserving the stale-high
+    // invariant above.
+    const raw = estimateCoreMessagesUpper(msgs) + inboundImageTokens;
     return Math.min(est, raw);
 }
 
@@ -2212,7 +2219,7 @@ function prepareAnthropic(
         // zero-baseline forks replay their FULL raw history with no measurement,
         // so feeding 0 blinds the nudge (usage 0%, growth ref 0) and no
         // compression trigger fires until overflow. See effectiveTokenCount.
-        const tokenCount = effectiveTokenCount(session, msgs);
+        const tokenCount = effectiveTokenCount(session, msgs, imageTokensInParsedBody("anthropic", parsed, imageBillingFor(opts, upstreamOrigin)));
         const activeBefore = new Set(session.state.blocks.filter((b) => b.active).map((b) => b.blockId));
         // Absorb markers are injected by the kernel's processTurn from
         // config.absorb. With no channel to call the tool (injection off),
@@ -2374,7 +2381,7 @@ function prepareOpenai(
         // tokenCount = upstream's real input_tokens from the previous turn
         // tokenCount = upstream's real input_tokens from the previous turn
         // (see anthropic branch comment + its #553-follow-up exception).
-        const tokenCount = effectiveTokenCount(session, msgs);
+        const tokenCount = effectiveTokenCount(session, msgs, imageTokensInParsedBody("openai", parsed, imageBillingFor(opts, billingUpstream ?? upstreamOrigin)));
         const activeBefore = new Set(session.state.blocks.filter((b) => b.active).map((b) => b.blockId));
         // Absorb markers ride in the kernel's processTurn output (gated by
         // config.absorb). Title-gen requests skip ALL injection for
@@ -2540,6 +2547,7 @@ function prepareGoogle(
     model: string | undefined,
     stream: boolean,
     visibilityMarkers: boolean,
+    upstreamOrigin: string,
 ): Prepared {
     const sessionId = session.id;
     ++session.stats.requests;
@@ -2565,7 +2573,7 @@ function prepareGoogle(
         const { msgs, systemText } = googleToCore(parsed);
         googleClientSystem = systemText;
         originalMessages = msgs;
-        const tokenCount = effectiveTokenCount(session, msgs);
+        const tokenCount = effectiveTokenCount(session, msgs, imageTokensInParsedBody("google", parsed, imageBillingFor(opts, upstreamOrigin)));
         const activeBefore = new Set(session.state.blocks.filter((b) => b.active).map((b) => b.blockId));
         const absorbActive = absorbEnabled(config) && shouldInject;
         // acp_rule has no processTurn side effect (no markers/instructions are
@@ -2780,7 +2788,7 @@ function prepareResponses(
         if (process.env.ACP_DEBUG) {
             log("info", `[${sessionId}] input items: ${Array.isArray(parsed.input) ? parsed.input.map((i: ResponseInputItem) => i.type).join(",") : "(string)"}`);
         }
-        const tokenCount = effectiveTokenCount(session, msgs);
+        const tokenCount = effectiveTokenCount(session, msgs, imageTokensInParsedBody("responses", parsed, imageBillingFor(opts, billingUpstream ?? upstreamOrigin)));
         // Absorb markers ride in the kernel's processTurn output (gated by
         // config.absorb). The marker/text protocol has no native tool channel,
         // so strip absorb from the loop config there (both modes).
