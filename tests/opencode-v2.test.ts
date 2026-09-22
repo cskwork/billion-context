@@ -25,6 +25,8 @@ function startFakeProxyV2(): Promise<{ origin: string; toolCalls: Array<{ conver
                 res.writeHead(200, { "content-type": "application/json" });
                 if (data.tool === "acp_status") {
                     res.end(JSON.stringify({ ok: true, result: "STATUS-RESULT" }));
+                } else if (data.tool === "acp_cache") {
+                    res.end(JSON.stringify({ ok: true, result: data.conversationId === "ses_cache_long" ? "L".repeat(9000) : "CACHE-REPORT-OK" }));
                 } else {
                     res.end(JSON.stringify({ ok: false, error: `boom-${data.tool}` }));
                 }
@@ -487,6 +489,104 @@ test("v2 /acp: disabled + valid session still renders the 'disabled' notice", as
             cleanup();
         }
     });
+});
+
+test("v2 setup: /acp-cache registered and renders the cache report via synthetic (#1146)", async () => {
+    const proxy = await startFakeProxyV2();
+    const fake = makeFakeCtx();
+    try {
+        await withEnv({ BILLION_CONTEXT_PROXY: proxy.origin, BILLION_CONTEXT_PLUGIN: undefined }, async () => {
+            const cleanup = await biliOpencodePlugin.setup(fake.ctx as never);
+            try {
+                const cache = fake.addedCommands.find((c) => c.name === "acp-cache");
+                assert.ok(cache, "/acp-cache command registered");
+                await cache!.execute({ sessionID: "ses_cache_1" });
+                await until(() => fake.syntheticCalls.length === 1);
+                assert.equal(fake.syntheticCalls[0].sessionID, "ses_cache_1");
+                assert.match(fake.syntheticCalls[0].description!, /CACHE-REPORT-OK/);
+                assert.match(fake.syntheticCalls[0].text, /not an instruction/);
+                assert.equal(fake.syntheticCalls[0].resume, false);
+                assert.deepEqual(proxy.toolCalls, [{ conversationId: "ses_cache_1", tool: "acp_cache", args: {} }]);
+            } finally {
+                cleanup();
+            }
+        });
+    } finally {
+        await proxy.close();
+    }
+});
+
+test("v2 /acp-cache: full flag maps to detail=full; long reports truncate at the report cap (#1146)", async () => {
+    const proxy = await startFakeProxyV2();
+    const fake = makeFakeCtx();
+    try {
+        await withEnv({ BILLION_CONTEXT_PROXY: proxy.origin, BILLION_CONTEXT_PLUGIN: undefined }, async () => {
+            const cleanup = await biliOpencodePlugin.setup(fake.ctx as never);
+            try {
+                const cache = fake.addedCommands.find((c) => c.name === "acp-cache")!;
+                await cache.execute({ sessionID: "ses_cache_full", arguments: "full" });
+                await until(() => fake.syntheticCalls.length === 1);
+                assert.match(fake.syntheticCalls[0].description!, /CACHE-REPORT-OK/);
+                assert.deepEqual(proxy.toolCalls.at(-1), { conversationId: "ses_cache_full", tool: "acp_cache", args: { detail: "full" } });
+
+                await cache.execute({ sessionID: "ses_cache_long" });
+                await until(() => fake.syntheticCalls.length === 2);
+                const desc = fake.syntheticCalls[1].description ?? "";
+                assert.ok(desc.length <= 8192, `report cap holds (${desc.length})`);
+                assert.match(desc, /\[report truncated\]$/);
+            } finally {
+                cleanup();
+            }
+        });
+    } finally {
+        await proxy.close();
+    }
+});
+
+test("v2 /acp-cache: missing sessionID warns and renders nothing (#1146)", async () => {
+    const proxy = await startFakeProxyV2();
+    const fake = makeFakeCtx();
+    const warns: string[] = [];
+    const origWarn = console.warn;
+    console.warn = (msg?: unknown) => { warns.push(String(msg)); };
+    try {
+        await withEnv({ BILLION_CONTEXT_PROXY: proxy.origin, BILLION_CONTEXT_PLUGIN: undefined }, async () => {
+            const cleanup = await biliOpencodePlugin.setup(fake.ctx as never);
+            try {
+                const cache = fake.addedCommands.find((c) => c.name === "acp-cache")!;
+                await cache.execute({});
+                await new Promise((r) => setTimeout(r, 20));
+                assert.equal(fake.syntheticCalls.length, 0);
+            } finally {
+                cleanup();
+            }
+        });
+        assert.ok(warns.some((w) => w.includes("/acp-cache") && w.includes("sessionID")));
+    } finally {
+        console.warn = origWarn;
+        await proxy.close();
+    }
+});
+
+test("v2 /acp-cache: disabled plugin and no-proxy diagnostics render via synthetic (#1146)", async () => {
+    for (const env of [
+        { BILLION_CONTEXT_PROXY: undefined, BILLION_CONTEXT_PLUGIN: "0" },
+        { BILLION_CONTEXT_PROXY: undefined, BILLION_CONTEXT_PLUGIN: undefined },
+    ] as Array<Record<string, string | undefined>>) {
+        const fake = makeFakeCtx();
+        await withEnv(env, async () => {
+            const cleanup = await biliOpencodePlugin.setup(fake.ctx as never);
+            try {
+                const cache = fake.addedCommands.find((c) => c.name === "acp-cache")!;
+                await cache.execute({ sessionID: "s_diag" });
+                await until(() => fake.syntheticCalls.length === 1);
+                if (env.BILLION_CONTEXT_PLUGIN === "0") assert.match(fake.syntheticCalls[0].description!, /disabled/);
+                else assert.match(fake.syntheticCalls[0].description!, /no proxy detected/);
+            } finally {
+                cleanup();
+            }
+        });
+    }
 });
 
 test("v2 /acp: surfaces status.error when the proxy returns no panel", async () => {

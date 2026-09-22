@@ -47,6 +47,10 @@ import { fetchProxyVersion, fetchStatus, forwardTool, proxyBaseFromEnv, proxyBas
 // timeline cap (~1KB): longer text renders nothing (#880). Panels go to description verbatim under the cap.
 import { V2_SYNTHETIC_TEXT } from "./shared.js";
 const V2_SYNTHETIC_VISIBLE_MAX = 1024;
+// /acp-cache renders a report the user explicitly asked to read — unlike the
+// status panel whose leading lines carry the essence, its tail (LINE ITEMS)
+// is the payload, so it gets a wider visible cap than V2_SYNTHETIC_VISIBLE_MAX.
+const V2_CACHE_REPORT_VISIBLE_MAX = 8192;
 
 type V2Registration = { dispose?: () => void | Promise<void> };
 
@@ -309,6 +313,49 @@ export function createOpencodeV2Setup(options: OpencodeV2SetupOptions = {}): (ct
                             await ctx.session?.synthetic?.({ sessionID: sid, text: V2_SYNTHETIC_TEXT, description, resume: false });
                         } catch (err) {
                             console.error(`[bili-opencode] /acp render failed: ${err instanceof Error ? err.message : String(err)}`);
+                        }
+                    },
+                });
+                // #1146: human entry point for the cache-reconciliation feature —
+                // same report as the acp_cache tool above. The model-facing body
+                // stays the inert one-liner (V2_SYNTHETIC_TEXT), so no proxy-side
+                // stripping wrap is needed here (unlike the V1 ignored-message path).
+                editor.add({
+                    name: "acp-cache",
+                    description: "Prompt-cache reconciliation for this session (same report as the acp_cache tool). Usage: /acp-cache [full]",
+                    execute: async (input) => {
+                        const sid = typeof input.sessionID === "string" ? input.sessionID : "";
+                        if (!sid) {
+                            console.warn("[bili-opencode] /acp-cache invoked without a sessionID; cannot render the cache report");
+                            return;
+                        }
+                        let text: string;
+                        if (pluginDisabled()) {
+                            text = "bili: disabled (BILLION_CONTEXT_PLUGIN=0)";
+                        } else {
+                            const base = state.proxyBase ?? proxyBaseFromEnv();
+                            const argsText = typeof input.arguments === "string" ? input.arguments : "";
+                            const toolArgs = /(^|\s)(--)?full(\s|$)/.test(argsText) ? { detail: "full" as const } : {};
+                            if (!base) {
+                                text = "bili: no proxy detected (set BILLION_CONTEXT_PROXY or point the provider at the proxy's /bili/ URL, then run /acp-cache again)";
+                            } else {
+                                try {
+                                    text = await forwardTool(base, sid, "acp_cache", toolArgs);
+                                } catch (err) {
+                                    const msg = err instanceof Error ? err.message : String(err);
+                                    text = msg.includes("no model request has arrived")
+                                        ? "bili: no ACP session yet for this conversation (send a model request first, then run /acp-cache)"
+                                        : `bili: cache report failed (${msg})`;
+                                }
+                            }
+                        }
+                        try {
+                            const description = text.length > V2_CACHE_REPORT_VISIBLE_MAX
+                                ? text.slice(0, V2_CACHE_REPORT_VISIBLE_MAX - 20) + "\n\n[report truncated]"
+                                : text;
+                            await ctx.session?.synthetic?.({ sessionID: sid, text: V2_SYNTHETIC_TEXT, description, resume: false });
+                        } catch (err) {
+                            console.error(`[bili-opencode] /acp-cache render failed: ${err instanceof Error ? err.message : String(err)}`);
                         }
                     },
                 });

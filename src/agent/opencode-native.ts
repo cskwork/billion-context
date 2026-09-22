@@ -68,7 +68,7 @@
 
 import { ACP_TOOLS_OPENAI } from "../compress-tool.js";
 import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST, unwrapUpstream, wrapUpstream } from "../launcher.js";
-import { createAcpCommandHooks } from "./opencode-acp-command.js";
+import { createAcpCommandHooks, showAcpText } from "./opencode-acp-command.js";
 import { markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, singleFlight } from "./native-bootstrap.js";
 import { createLiveOriginResolver, installNativeFetchIntercept, isModelApiUrl, readyOrigin, replaceRequestTarget, type LiveOriginResolverDeps, type NativeInterceptState } from "./native-intercept.js";
 import { createOpencodeV2Setup, type V2HttpRequestEvent, type V2State } from "./opencode-v2.js";
@@ -476,6 +476,13 @@ export function createV1ServerHooks(getOrigin: () => string | undefined, ctx: V1
             if ((input.command === "acp" || input.command === "dcp") && legacy?.commandHook !== undefined && isLegacy(input.sessionID)) {
                 await legacy.commandHook(input, output);
                 return;
+            }
+            // Legacy sessions ride x-bili-plugin-bypass — their traffic never
+            // enters this proxy's compression state, so the cache report has
+            // nothing to read. Say so instead of surfacing a raw 404.
+            if (input.command === "acp-cache" && isLegacy(input.sessionID)) {
+                await showAcpText(ctx, input.sessionID, "bili: /acp-cache is unavailable for this legacy DCP session (#920) — its traffic bypasses this proxy's compression state; start a new session for the cache report");
+                throw new Error("__BILI_ACP_HANDLED__");
             }
             await acp["command.execute.before"]?.(input);
         },

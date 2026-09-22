@@ -12,6 +12,8 @@ import { once } from "node:events";
 import { execFileSync, spawn } from "node:child_process";
 import {
     applyClaudeManagedBlock,
+    CLAUDE_ACP_CACHE_COMMAND,
+    claudeAcpCacheCommandFile,
     claudeNativeBaseUrl,
     claudeNativeInstalled,
     claudeSettingsFile,
@@ -221,6 +223,64 @@ test("installer round-trip: managed block + MCP face, then removal restores", ()
         assert.equal(restored.hooks, undefined);
         assert.equal(claudeNativeInstalled(), false);
         assert.deepEqual(JSON.parse(fs.readFileSync(box.biliConfig, "utf8")), {}, "nativePort cleared on remove");
+    } finally {
+        unsandbox(prevDir, prevCfg);
+        if (prevClaude === undefined) delete process.env.CLAUDE;
+        else process.env.CLAUDE = prevClaude;
+        if (prevOpt === undefined) delete process.env.BILI_NATIVE_CLAUDE;
+        else process.env.BILI_NATIVE_CLAUDE = prevOpt;
+    }
+});
+
+test("claudeAcpCacheCommandFile: CLAUDE_CONFIG_DIR replaces the whole .claude dir (#1146)", () => {
+    assert.equal(claudeAcpCacheCommandFile({ CLAUDE_CONFIG_DIR: "/tmp/cc" }), path.join("/tmp/cc", "commands", "acp-cache.md"));
+});
+
+test("installer writes and removes the model-mediated /acp-cache command file (#1146)", () => {
+    const prevDir = process.env.CLAUDE_CONFIG_DIR;
+    const prevCfg = process.env.BILI_CONFIG_FILE;
+    const prevClaude = process.env.CLAUDE;
+    const prevOpt = process.env.BILI_NATIVE_CLAUDE;
+    const box = sandbox();
+    try {
+        delete process.env.BILI_NATIVE_CLAUDE;
+        process.env.CLAUDE = fakeClaude(box.dir);
+        const note = pluginInstall("claude");
+        const cmdFile = claudeAcpCacheCommandFile(process.env);
+        assert.equal(cmdFile, path.join(box.dir, "commands", "acp-cache.md"));
+        assert.ok(note.includes(`/acp-cache command -> ${cmdFile} (written)`), note);
+        assert.equal(fs.readFileSync(cmdFile, "utf8"), CLAUDE_ACP_CACHE_COMMAND);
+
+        const removeNote = pluginRemove("claude");
+        assert.ok(removeNote.includes("/acp-cache command removed"), removeNote);
+        assert.equal(fs.existsSync(cmdFile), false);
+    } finally {
+        unsandbox(prevDir, prevCfg);
+        if (prevClaude === undefined) delete process.env.CLAUDE;
+        else process.env.CLAUDE = prevClaude;
+        if (prevOpt === undefined) delete process.env.BILI_NATIVE_CLAUDE;
+        else process.env.BILI_NATIVE_CLAUDE = prevOpt;
+    }
+});
+
+test("installer leaves a foreign acp-cache.md untouched on install and removal (#1146)", () => {
+    const prevDir = process.env.CLAUDE_CONFIG_DIR;
+    const prevCfg = process.env.BILI_CONFIG_FILE;
+    const prevClaude = process.env.CLAUDE;
+    const prevOpt = process.env.BILI_NATIVE_CLAUDE;
+    const box = sandbox();
+    try {
+        delete process.env.BILI_NATIVE_CLAUDE;
+        process.env.CLAUDE = fakeClaude(box.dir);
+        const cmdFile = claudeAcpCacheCommandFile(process.env);
+        fs.mkdirSync(path.dirname(cmdFile), { recursive: true });
+        fs.writeFileSync(cmdFile, "foreign content");
+        const note = pluginInstall("claude");
+        assert.ok(note.includes("(left untouched (foreign content))"), note);
+        assert.equal(fs.readFileSync(cmdFile, "utf8"), "foreign content");
+        const removeNote = pluginRemove("claude");
+        assert.ok(removeNote.includes("/acp-cache command left untouched"), removeNote);
+        assert.equal(fs.readFileSync(cmdFile, "utf8"), "foreign content");
     } finally {
         unsandbox(prevDir, prevCfg);
         if (prevClaude === undefined) delete process.env.CLAUDE;
