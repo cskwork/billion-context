@@ -5,7 +5,8 @@ import os from "node:os";
 import path from "node:path";
 import http from "node:http";
 import { pathToFileURL } from "node:url";
-import { apply, planNativeDsh, shouldBootstrapNativeDsh, _resetRegisterForTest, _setSpawnForTest, _stateHeadersForTest, _stateTakeoverGateForTest } from "../src/agent/dsh-native.ts";
+import { apply, planNativeDsh, shouldBootstrapNativeDsh, _resetRegisterForTest, _setSpawnForTest, _stateHeadersForTest, _stateRespawnForTest, _stateTakeoverGateForTest } from "../src/agent/dsh-native.ts";
+
 import { dshNativeInstalled, isNpmInstallForm, pluginInstall, pluginRemove, pluginStatusAll, selfPackageRoot } from "../src/plugin-install.ts";
 import { DSH_PATCH_BEGIN, DSH_PATCH_END, dshBundleInstalled, dshProfileDirs, planDshSpawn, stripDshManagedPatch, stripLegacyManagedBlock, _setDshRunnersForTest, type DshPlan } from "../src/dsh-channel.ts";
 
@@ -771,6 +772,12 @@ test("#1117 apply() installs takeoverGate keyed on currentInitiator attribution"
             _resetRegisterForTest(proxy.origin);
             const ctx = mockCtx();
             apply(ctx);
+            // Settle the async attach verification before teardown (#983
+            // discipline): a deferred probe hitting a closed proxy would run
+            // the fallback mid-way through a LATER apply() and clobber
+            // state.origin / register.base / the preset env (sequence
+            // pollution exposed when #1130's suites follow this one).
+            await waitFor(() => ctx.registeredTools.length === 1, "initial attach tool registration");
             const gate = _stateTakeoverGateForTest();
             assert.ok(gate !== undefined, "takeoverGate installed");
             // unattributed (background chain, third-party in-process plugin) → NOT claimed
@@ -781,6 +788,67 @@ test("#1117 apply() installs takeoverGate keyed on currentInitiator attribution"
         });
     } finally {
         proxy.close();
+        fs.rmSync(home, { recursive: true, force: true });
+        _resetRegisterForTest(undefined);
+    }
+});
+
+// — #1130: runtime death of a SHARED attach proxy re-probes + falls back ———
+
+test("#1130 apply() attach mode: runtime death of the shared proxy re-probes and falls back to spawn", async () => {
+    const shared = await startMockProxy([]);
+    const calls: Array<{ conversationId: string; tool: string; args: unknown }> = [];
+    const fallback = await startMockProxy(calls);
+    let spawnCalls = 0;
+    _setSpawnForTest(async () => {
+        spawnCalls += 1;
+        return fallback.origin;
+    });
+    const errors: string[] = [];
+    const origErr = console.error;
+    console.error = (...args: unknown[]) => {
+        errors.push(args.map(String).join(" "));
+    };
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-1130-"));
+    try {
+        // terminal B attached to terminal A's launcher proxy at startup —
+        // live preset, no spawn
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: shared.origin }, async () => {
+            _resetRegisterForTest(shared.origin);
+            const ctx = mockCtx();
+            apply(ctx);
+            await waitFor(() => ctx.registeredTools.length === 1, "initial attach tool registration");
+            assert.equal(spawnCalls, 0);
+            // attach mode must arm a runtime respawn seam (the interceptor's
+            // death branch drives exactly this call)
+            const respawn = _stateRespawnForTest();
+            assert.ok(respawn !== undefined, "attach mode armed state.respawn");
+            // terminal A's dsh exits → its launcher kills the shared proxy
+            shared.close();
+            await new Promise((r) => setTimeout(r, 50));
+            const recovered = await respawn();
+            assert.equal(recovered, fallback.origin);
+            assert.equal(spawnCalls, 1);
+            assert.match(errors.join("\n"), /not healthy — falling back/);
+            // the preset env is unfrozen so a later re-apply plans spawn, not attach
+            assert.equal(process.env.BILLION_CONTEXT_PROXY, undefined);
+            // registered tools read the LIVE base — they now forward to the
+            // fallback origin without any re-registration
+            const out = await ctx.registeredTools[0].execute({ summary: "s" }, { agent: { session: { id: "s1130" } } });
+            assert.equal(out, "compressed 42 tokens");
+            assert.deepEqual(calls, [{ conversationId: "s1130", tool: "compress", args: { summary: "s" } }]);
+            // plugin-mode header stamping keeps working against the fallback
+            const headersFor = _stateHeadersForTest();
+            assert.ok(headersFor !== undefined, "headersFor installed");
+            ctx.setInitiator({ session: { id: "s1130" } });
+            await waitFor(() => headersFor("https://api.anthropic.com/v1/messages") !== undefined, "plugin headers stamped");
+            assert.equal(headersFor("https://api.anthropic.com/v1/messages")?.["x-bili-plugin"], "dsh");
+        });
+    } finally {
+        console.error = origErr;
+        _setSpawnForTest(undefined);
+        fallback.close();
+
         fs.rmSync(home, { recursive: true, force: true });
         _resetRegisterForTest(undefined);
     }

@@ -22,12 +22,16 @@ export interface NativeInterceptState {
      *  the traffic. */
     onGiveUp?: () => void;
     /** Attach mode (#809): route through a user-supplied external proxy at
-     *  state.origin instead of a spawned one — no respawn, fail-closed on
-     *  death. Set by the host entry when BILLION_CONTEXT_ATTACH is present.
-     *  Rewrites model URLs to the attach origin exactly like spawn mode
-     *  (opencode V1's fetch patch and #809's probe+rewrite semantics depend
-     *  on it); already-routed `/bili/` URLs still pass through untouched
-     *  except for headersFor stamping. */
+     *  state.origin instead of a spawned one. Set by the host entry when a
+     *  BILLION_CONTEXT_ATTACH / launcher-preset BILLION_CONTEXT_PROXY is
+     *  present. Rewrites model URLs to the attach origin exactly like spawn
+     *  mode (opencode V1's fetch patch and #809's probe+rewrite semantics
+     *  depend on it); already-routed `/bili/` URLs still pass through except
+     *  for headersFor stamping. The attached proxy is often owned by ANOTHER
+     *  launcher that can exit mid-session (#1130) — hosts arm state.respawn
+     *  so an observed death triggers the same runtime recovery as spawn
+     *  mode; without respawn, an observed death degrades to direct sends
+     *  instead of failing every request forever. */
     attach?: boolean;
     /** Optional header hook (#941): called synchronously per model-API
      *  request with the (pre-rewrite) target URL. A non-undefined return is
@@ -164,10 +168,37 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
     if (g[INTERCEPT_FLAG] === true) return false;
     const orig = globalThis.fetch;
     let warned = false;
+    // Origins verified dead-and-replaced during a runtime recovery (#1130).
+    // Launcher settings overlays bake the origin into request URLs, so after
+    // a replace we must reroute those pre-baked URLs before they touch the
+    // network again. Only ever contains origins we ourselves observed dying.
+    const replacedOrigins = new Set<string>();
 
     const patched = async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
         const url = fetchUrlOf(input);
         if (url === undefined) return orig(input, init);
+        // Rebuild a Request-object input against a different target. A
+        // caller-side defect here (already-consumed or locked body) must not
+        // reach the proxy-death branch below — respawning would orphan a
+        // fresh proxy for a request that can never be sent.
+        const makeTarget = (target: string): string | URL | Request =>
+            typeof input === "string" || input instanceof URL ? target : new Request(target, input);
+
+        // Runtime recovery (#1130): the origin just failed against is dead.
+        // Clear it first (readyOrigin must not short-circuit onto the stale
+        // value), ask the owner to bring up a replacement, await it. Returns
+        // the replacement origin, or undefined when nothing came up. An
+        // origin that comes back as ITSELF (transient blip) is not recorded
+        // as replaced — URLs baked against it stay valid.
+        const recover = async (deadOrigin: string): Promise<string | undefined> => {
+            if (state.respawn === undefined) return undefined;
+            state.origin = undefined;
+            state.ready = state.respawn();
+            const again = await readyOrigin(state);
+            if (again !== undefined && again !== deadOrigin) replacedOrigins.add(deadOrigin);
+            return again;
+        };
+
         // Already-routed `/bili/` model requests (launcher settings overlay):
         // routing is done, but plugin headers still decide wire vs plugin
         // mode — stamp and pass through untouched otherwise.
@@ -176,12 +207,58 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
             // #1117: routing already happened (settings overlay), so an
             // unattributed caller cannot be refused here — mark it for
             // byte-untouched passthrough instead of letting it ride the
-            // pipeline as an anonymous client.
+            // pipeline as an anonymous client. Its failures are not ours to
+            // recover: the host's own attributed traffic drives the respawn
+            // below, and once a replacement lands the pre-emptive reroute
+            // carries unattributed riders along (still passthrough-marked).
             const unattributed = state.takeoverGate !== undefined && !state.takeoverGate(routedTarget);
-            const extra = unattributed ? { [BILI_PASSTHROUGH_HEADER]: "1" } : state.headersFor?.(routedTarget);
-            const stamped = withHeaders(input, init, extra);
-            state.onDispatch?.(url, unattributed ? "direct" : "self");
-            return orig(stamped.input, stamped.init);
+            const routedExtra = unattributed ? { [BILI_PASSTHROUGH_HEADER]: "1" } : state.headersFor?.(routedTarget);
+            if (unattributed) {
+                const stamped = withHeaders(input, init, routedExtra);
+                state.onDispatch?.(url, "direct");
+                return orig(stamped.input, stamped.init);
+            }
+            let target = url;
+            const baked = new URL(url);
+            if (replacedOrigins.has(baked.origin)) {
+                // This URL was baked against an origin we already verified
+                // dead-and-replaced (#1130) — reroute it before paying
+                // another connection failure.
+                const fresh = await readyOrigin(state);
+                if (fresh !== undefined && fresh !== baked.origin) target = `${fresh}${baked.pathname}${baked.search}`;
+            }
+            const stamped = withHeaders(target === url ? input : makeTarget(target), init, routedExtra);
+            try {
+                state.onDispatch?.(target, target === url ? "self" : "retry");
+                return await orig(stamped.input, stamped.init);
+            } catch (err) {
+                // The overlay bakes a specific proxy origin into these URLs;
+                // that proxy can die mid-session when its owning launcher
+                // exits while later sessions still ride it (#1130). A
+                // network-level failure (undici TypeError) triggers one
+                // recovery + one retry; if no replacement comes up, degrade
+                // to a direct send of the embedded upstream instead of
+                // failing the request forever. Recovery re-attempts on every
+                // subsequent failure — only this path can reroute the
+                // overlay-baked URLs.
+                if (!(err instanceof TypeError)) throw err;
+                const deadOrigin = new URL(target).origin;
+                const again = await recover(deadOrigin);
+                if (again !== undefined && again !== deadOrigin) {
+                    const u = new URL(target);
+                    const retried = `${again}${u.pathname}${u.search}`;
+                    const restamped = withHeaders(makeTarget(retried), init, routedExtra);
+                    state.onDispatch?.(retried, "retry");
+                    return await orig(restamped.input, restamped.init);
+                }
+                state.onGiveUp?.();
+                if (!warned) {
+                    warned = true;
+                    console.error(`bili-native: no live proxy — model requests go direct (uncompressed): ${routedTarget}`);
+                }
+                state.onDispatch?.(routedTarget, "direct");
+                return orig(makeTarget(routedTarget), init);
+            }
         }
         if (!isModelApiUrl(url)) return orig(input, init);
         // #1117: URL shape alone cannot claim a request — every model call in
@@ -192,13 +269,6 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
             state.onDispatch?.(url, "direct");
             return orig(input, init);
         }
-
-        // Rebuild a Request-object input against the rewritten target. A
-        // caller-side defect here (already-consumed or locked body) must not
-        // reach the proxy-death branch below — respawning would orphan a
-        // fresh proxy for a request that can never be sent.
-        const makeTarget = (target: string): string | URL | Request =>
-            typeof input === "string" || input instanceof URL ? target : new Request(target, input);
 
         const origin = await readyOrigin(state);
         if (origin === undefined) {
@@ -228,23 +298,23 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
             const stamped = withHeaders(first, init, state.headersFor?.(url));
             return await orig(stamped.input, stamped.init);
         } catch (err) {
-            // The spawned proxy can die mid-session (its parent watchdog
-            // fires when the FIRST owning pi exits while later sessions
-            // still ride it). A network-level failure (undici throws
-            // TypeError) triggers one respawn + one retry.
-            if (err instanceof TypeError && state.respawn !== undefined) {
-                state.origin = undefined;
-                state.ready = state.respawn();
-                const again = await readyOrigin(state);
+            // The proxy can die mid-session (its parent watchdog fires when
+            // the FIRST owner exits while later sessions still ride it —
+            // spawned, or shared-attached via another launcher, #1130). A
+            // network-level failure (undici throws TypeError) triggers one
+            // recovery + one retry.
+            if (err instanceof TypeError) {
+                const again = await recover(origin);
                 if (again !== undefined) {
                     const retried = makeTarget(`${again}/bili/${url}`);
                     state.onDispatch?.(`${again}/bili/${url}`, "retry");
                     const stamped = withHeaders(retried, init, state.headersFor?.(url));
                     return await orig(stamped.input, stamped.init);
                 }
-                // Respawn failed — this session runs direct for its lifetime.
-                // Degrade exactly like a bootstrap failure: actually send the
-                // request direct, then let the owner clear proxy-owned state.
+                // No replacement available — this session runs direct for its
+                // lifetime. Degrade exactly like a bootstrap failure: actually
+                // send the request direct, then let the owner clear proxy-owned
+                // state.
                 state.onGiveUp?.();
                 if (!warned) {
                     warned = true;

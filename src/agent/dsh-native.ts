@@ -5,7 +5,8 @@
 // used to carry dsh-acp.ts. Architecture mirrors pi-native.ts:
 //   1. plan: attach (BILLION_CONTEXT_ATTACH ?? BILLION_CONTEXT_PROXY — the
 //      launcher preset, or a user-supplied external proxy; #983: the preset
-//      is probed and a dead one falls back to spawn) or spawn the
+//      is probed and a dead one falls back to spawn; #1130: runtime death of
+//      the shared proxy re-runs the same probe+fallback) or spawn the
 //      package's own proxy (ensureProxyRunning, ephemeral port, parent-pid
 //      watchdog = this dsh process);
 //   2. patch globalThis.fetch (native-intercept.ts) — model-API URLs are
@@ -75,7 +76,9 @@ export function shouldBootstrapNativeDsh(env: NodeJS.ProcessEnv): boolean {
  *  attach (BILLION_CONTEXT_ATTACH ?? BILLION_CONTEXT_PROXY) > spawn. A preset
  *  BILLION_CONTEXT_PROXY is the `bili dsh` launcher (or a user attach):
  *  routing is already owned (proxy envs / settings overlay), so we attach —
- *  stamp headers only, never rewrite, never spawn. */
+ *  probe first (#983), stamp plugin headers, rewrite raw model URLs like
+ *  spawn mode, and fall back to spawning when the attach target is dead
+ *  (at startup, #983, or at runtime, #1130). */
 export function planNativeDsh(env: NodeJS.ProcessEnv): { mode: "off" | "attach" | "spawn"; attachOrigin?: string } {
     if (env.BILLION_CONTEXT_PLUGIN === "0" || env.BILI_NATIVE_DSH === "0") return { mode: "off" };
     if (env.BILI_PROVIDER_REWRITES !== undefined) return { mode: "off" };
@@ -201,17 +204,24 @@ export function _setSpawnForTest(fn?: () => Promise<string | undefined>): void {
     _spawnForTest = fn;
 }
 
-/** #983: a planned attach origin can be stale — the `bili dsh` launcher's
- *  proxy died, or a pre-#983 build froze its spawned origin into
- *  process.env and cordis re-activated this plugin in the same process.
- *  Probe before trusting it: healthy → attach as planned; dead → unfreeze
- *  the preset env and fall back to spawning our own proxy (instance
- *  discovery may find another healthy one first). Resolves to the origin
- *  the plugin should use — attachOrigin, the fallback origin, or undefined
- *  when even the fallback failed (register left base-less). */
+/** #983/#1130: the attached origin can go stale — at startup (the `bili dsh`
+ *  launcher's proxy died, or a pre-#983 build froze its spawned origin into
+ *  process.env and cordis re-activated this plugin in the same process) or
+ *  at runtime (the owning launcher of a SHARED proxy exits while this
+ *  session still rides it). Probe before trusting it: healthy → attach as
+ *  planned; dead → unfreeze the preset env and fall back to spawning our own
+ *  proxy (instance discovery may find another healthy one first). Resolves
+ *  to the origin the plugin should use — attachOrigin, the fallback origin,
+ *  or undefined when even the fallback failed (register left base-less). */
 async function verifyAttachAndRecover(attachOrigin: string): Promise<string | undefined> {
     const version = await fetchProxyVersion(attachOrigin).catch(() => undefined);
-    if (version !== undefined) return attachOrigin;
+    if (version !== undefined) {
+        // #1130: restore the interceptor's readyOrigin short-circuit — a
+        // runtime recovery clears state.origin before re-probing, and a
+        // transient blip must not leave it dangling.
+        state.origin = attachOrigin;
+        return attachOrigin;
+    }
     console.error(`bili-native-dsh: attach target ${attachOrigin} is not healthy — falling back to a spawned proxy`);
     // Unfreeze: only the preset (BILLION_CONTEXT_PROXY) freezes future
     // plans; an explicit BILLION_CONTEXT_ATTACH never touches the preset.
@@ -298,8 +308,8 @@ function maybeRetry(ctx: PluginContext): void {
     if (register.base === undefined) {
         // #983: a failed respawn (onGiveUp) left the register base-less —
         // without this branch the plugin never recovers and tools die for
-        // good. Self-heal: re-arm the spawn bootstrap every retry interval
-        // until a proxy comes back (attach mode has no respawn — nothing to do).
+        // good. Self-heal: re-arm the respawn every retry interval until a
+        // proxy comes back (attach mode arms one since #1130).
         const respawn = state.respawn;
         if (respawn === undefined) return;
         register.retryAt = Date.now() + RETRY_INTERVAL_MS;
@@ -373,13 +383,28 @@ export function apply(ctx: PluginContext): void {
     if (plan.mode === "off") return;
 
     if (plan.mode === "attach") {
+        const attachOrigin = plan.attachOrigin;
         state.attach = true;
-        state.origin = plan.attachOrigin;
-        register.base = plan.attachOrigin;
+        state.origin = attachOrigin;
+        register.base = attachOrigin;
         // #983: no env write (it freezes future plans); the origin is probed
         // first — a dead preset falls back to a spawned proxy, and tools only
         // register once the landed origin is known.
-        state.ready = plan.attachOrigin !== undefined ? verifyAttachAndRecover(plan.attachOrigin) : Promise.resolve(undefined);
+        if (attachOrigin !== undefined) {
+            // #1130: arm the SAME probe+fallback for runtime death — the
+            // attached proxy is usually owned by ANOTHER launcher that can
+            // exit while this session rides it; the interceptor then re-probes
+            // and falls back exactly like at startup.
+            const start = singleFlight(() => verifyAttachAndRecover(attachOrigin));
+            state.respawn = start;
+            state.onGiveUp = () => {
+                register.base = undefined;
+                register.toolsReady = false;
+            };
+            state.ready = start();
+        } else {
+            state.ready = Promise.resolve(undefined);
+        }
     } else if (process.env.NODE_TEST_CONTEXT === undefined) {
         markNativeHost(process.env, "dsh");
         const start = singleFlight(bootstrap);
@@ -461,4 +486,11 @@ export function _stateHeadersForTest(): ((url: string) => Record<string, string>
 
 export function _stateTakeoverGateForTest(): ((url: string) => boolean) | undefined {
     return state.takeoverGate;
+}
+
+/** Test hook: expose the armed runtime-recovery seam — the interceptor's
+ *  death branch drives exactly this call (the fetch patch itself is covered
+ *  in native-intercept.test.ts; under NODE_TEST_CONTEXT it is not installed). */
+export function _stateRespawnForTest(): (() => Promise<string | undefined>) | undefined {
+    return state.respawn;
 }
