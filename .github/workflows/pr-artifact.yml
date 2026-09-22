@@ -22,6 +22,15 @@ jobs:
 
             - run: npm install --ignore-scripts --no-fund --no-audit
 
+            # PR builds publish to dev-lane package billion-context-pr, NEVER to
+            # mainline billion-context (#1149): per-PR-push versions used to bloat
+            # the main packument unboundedly and can never be unpublished later.
+            # CI-only rename — runtime reads the installed manifest
+            # (src/version.ts), so dist/ needs no changes.
+            - name: Use dev package name for PR builds
+              run: |
+                  node -e "const fs=require('node:fs');const f='package.json';const p=JSON.parse(fs.readFileSync(f,'utf8'));p.name='billion-context-pr';fs.writeFileSync(f,JSON.stringify(p,null,4)+'\n');"
+
             - run: npm run build
 
             - name: Publish to npm with PR tag
@@ -36,7 +45,7 @@ jobs:
                   BASE_VERSION=$(echo "$BASE_VERSION" | sed 's/-.*//')
                   PR_VERSION="${BASE_VERSION}-pr.${PR_NUMBER}.${RUN_NUMBER}"
 
-                  echo "Publishing version $PR_VERSION with tag pr-${PR_NUMBER}"
+                  echo "Publishing billion-context-pr@$PR_VERSION with tag pr-${PR_NUMBER}"
                   npm version "$PR_VERSION" --no-git-tag-version
                   npm publish --tag "pr-${PR_NUMBER}" --access public --ignore-scripts
               env:

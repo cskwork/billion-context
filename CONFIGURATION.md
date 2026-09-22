@@ -508,7 +508,7 @@ Environment variables take precedence over the config file. They are useful for 
 | `ACP_UPSTREAM` | Override the default upstream base URL. |
 | `ACP_LOG` | Set to `0` to disable request logging. |
 | `ACP_AUTO_UPDATE` | Set to `0` to disable auto-update checks. |
-| `ACP_UPDATE_TAG` | Dist-tag channel the auto-updater follows (default `latest`, e.g. `dev`). File-config key: `updateTag`. A `pr-N` preview tag is only followed when explicitly configured. |
+| `ACP_UPDATE_TAG` | Dist-tag channel the auto-updater follows (default `latest`, e.g. `dev`). File-config key: `updateTag`. A `pr-N` preview tag is only followed when explicitly configured; since #1149 PR builds publish to the dev package `billion-context-pr` (install `npm i -g billion-context-pr@pr-N`), so `pr-N` on mainline `billion-context` is legacy and frozen. |
 | ~~`BILI_HOST_USAGE_CREDIT`~~ / ~~`hostUsageCredit`~~ | **Removed in #660.** Used to select the host-facing usage mode. The #408 uncompressed-baseline backfill is gone entirely — every host now reports the actually-forwarded (post-fold) request as provider-measured (matches `[acp-usage] input=`). Old values left in env or the config file are ignored; remove them. See the "Bug history lesson" section of PR #691. |
 | `ACP_PROVIDERS` | Path to an external `providers.json` (legacy / shared file). |
 | `BILI_REPLAY_RETRY_BASE_MS` | Base backoff delay (ms) for acp-loop replay retries after a transient upstream rejection (default `1500`; set `0` to disable the delay). See #189. |

@@ -508,7 +508,7 @@
 | `ACP_UPSTREAM` | 覆盖默认上游 base URL。 |
 | `ACP_LOG` | 设为 `0` 关闭请求日志。 |
 | `ACP_AUTO_UPDATE` | 设为 `0` 禁用自动更新检查。 |
-| `ACP_UPDATE_TAG` | 自动更新跟随的 dist-tag 通道（默认 `latest`，如 `dev`）。文件配置键：`updateTag`。`pr-N` 预览 tag 仅在显式配置时才会被跟随。 |
+| `ACP_UPDATE_TAG` | 自动更新跟随的 dist-tag 通道（默认 `latest`，如 `dev`）。文件配置键：`updateTag`。`pr-N` 预览 tag 仅在显式配置时才会被跟随；#1149 起 PR build 已改发到 dev 包 `billion-context-pr`（安装 `npm i -g billion-context-pr@pr-N`），主包 `billion-context` 上的 `pr-N` 为遗留且已冻结。 |
 | ~~`BILI_HOST_USAGE_CREDIT`~~ / ~~`hostUsageCredit`~~ | **#660 已移除。** 曾用于选择宿主可见的用量模式。#408 的未折叠基线回补（backfill）已整体删除 —— 所有宿主现在统一上报“实际转发（后折叠）请求”的 provider 实测用量，与 `[acp-usage] input=` 一致。遗留该环境变量 / 配置键的旧值会被忽略，请删除。教训详见 PR #691 的 “Bug 历史教训” 一节。 |
 | `ACP_PROVIDERS` | 指向外部 `providers.json` 的路径（旧版 / 共享文件）。 |
 | `BILI_REPLAY_RETRY_BASE_MS` | acp-loop 回放重试的基础退避延迟（毫秒）：上游瞬时拒绝后重试（默认 `1500`；设 `0` 关闭延迟）。见 #189。 |
