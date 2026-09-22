@@ -433,8 +433,9 @@ test("apply() attach mode: registers manifest tools verbatim, gates headers, for
             const ctx = mockCtx();
             apply(ctx);
             // under node:test the fetch patch is deliberately NOT installed
-            assert.equal(ctx.registeredCommands.length, 1);
+            assert.equal(ctx.registeredCommands.length, 2);
             assert.equal(ctx.registeredCommands[0].name, "acp");
+            assert.equal(ctx.registeredCommands[1].name, "acp-cache");
 
             // headers gate on toolsReady — no session, no headers; and before
             // registration completes nothing is stamped
@@ -481,6 +482,72 @@ test("apply() attach mode: registers manifest tools verbatim, gates headers, for
         });
     } finally {
         proxy.close();
+        fs.rmSync(home, { recursive: true, force: true });
+        _resetRegisterForTest(undefined);
+    }
+});
+
+test("apply() /acp-cache (#1146): forwards acp_cache bound to the initiator session, falls back to latest", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-cache-"));
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: undefined }, async () => {
+            const calls: Array<{ conversationId: string; tool: string; args: unknown }> = [];
+            const cap = await startMockProxy(calls, (url) =>
+                url.includes("fallback=latest") ? { ok: true, conversationId: "conv-latest", panel: "PANEL-OK" } : undefined);
+            try {
+                _resetRegisterForTest(cap.origin);
+                process.env.BILLION_CONTEXT_PROXY = cap.origin;
+                const ctx = mockCtx();
+                apply(ctx);
+                const cacheCmd = ctx.registeredCommands.find((c) => c.name === "acp-cache");
+                assert.ok(cacheCmd, "acp-cache registered");
+
+                ctx.setInitiator({ session: { id: "session-9" } });
+                const bound = await cacheCmd.handler();
+                assert.equal(bound.kind, "success");
+                assert.deepEqual(calls, [{ conversationId: "session-9", tool: "acp_cache", args: {} }]);
+
+                ctx.setInitiator(undefined);
+                calls.length = 0;
+                const latest = await cacheCmd.handler();
+                assert.equal(latest.kind, "success");
+                assert.deepEqual(calls, [{ conversationId: "conv-latest", tool: "acp_cache", args: {} }]);
+            } finally {
+                cap.close();
+                _resetRegisterForTest(undefined);
+            }
+        });
+    } finally {
+        fs.rmSync(home, { recursive: true, force: true });
+        _resetRegisterForTest(undefined);
+    }
+});
+
+test("apply() /acp-cache (#1146): unreachable proxy reports an error", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-cache-down-"));
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: undefined }, async () => {
+            // healthy attach first (so register.base is set), then kill the
+            // proxy before the handler runs — a dead preset would instead
+            // trigger the #983 spawn fallback, which this test does not want
+            const proxy = await startMockProxy([]);
+            try {
+                _resetRegisterForTest(proxy.origin);
+                process.env.BILLION_CONTEXT_PROXY = proxy.origin;
+                const ctx = mockCtx();
+                apply(ctx);
+                await waitFor(() => ctx.registeredTools.length === 1, "tool registration");
+                const cacheCmd = ctx.registeredCommands.find((c) => c.name === "acp-cache");
+                assert.ok(cacheCmd, "acp-cache registered");
+                proxy.close();
+                const out = await cacheCmd.handler();
+                assert.equal(out.kind, "error");
+                assert.match(out.text, /proxy not reachable/);
+            } finally {
+                _resetRegisterForTest(undefined);
+            }
+        });
+    } finally {
         fs.rmSync(home, { recursive: true, force: true });
         _resetRegisterForTest(undefined);
     }
@@ -645,7 +712,7 @@ test("apply() /acp pre-first-request (#955): renders the runtime-table entry bef
             _resetRegisterForTest(proxy.origin);
             const ctx = mockCtx();
             apply(ctx);
-            assert.equal(ctx.registeredCommands.length, 1);
+            assert.equal(ctx.registeredCommands.length, 2);
             const out = await ctx.registeredCommands[0].handler();
             assert.equal(out.kind, "success");
             assert.match(out.text, /model=qwen-ri/);

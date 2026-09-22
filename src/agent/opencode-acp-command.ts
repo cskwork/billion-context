@@ -8,7 +8,8 @@
 // origin only after bootstrap; the launcher variant captures the env value at
 // module load and serves it verbatim.
 
-import { armedIdleNotice, fetchProxyVersion, noSessionWarning } from "./shared.js";
+import { wrapCacheReport } from "../acp-panel.js";
+import { armedIdleNotice, fetchProxyVersion, forwardTool, noSessionWarning } from "./shared.js";
 
 export interface OpencodeCommandConfig {
     template: string;
@@ -63,10 +64,10 @@ export async function showAcpText(ctx: { client?: OpencodeClient }, sid: string,
     }
 }
 
-/** The /acp command hooks (registration + render). `getProxyBase` returns the
- *  proxy origin or undefined when unavailable — an undefined base renders a
- *  diagnostic instead of failing silently. The config hook ONLY registers the
- *  command; callers layer provider rewriting on top. */
+/** The /acp + /acp-cache command hooks (registration + render). `getProxyBase`
+ *  returns the proxy origin or undefined when unavailable — an undefined base
+ *  renders a diagnostic instead of failing silently. The config hook ONLY
+ *  registers the commands; callers layer provider rewriting on top. */
 export function createAcpCommandHooks(getProxyBase: () => string | undefined, ctx: { client?: OpencodeClient }): OpencodeAcpHooks {
     return {
         config: async (opencodeConfig) => {
@@ -75,14 +76,36 @@ export function createAcpCommandHooks(getProxyBase: () => string | undefined, ct
                 template: "",
                 description: "Show ACP status (billion-context proxy)",
             };
+            // #1146: same report as the acp_cache tool; the [acp-cache] wrap at
+            // render time is what lets the proxy strip it from model context
+            // by content signature (src/acp-panel.ts) — do not drop it.
+            opencodeConfig.command["acp-cache"] = {
+                template: "",
+                description: "Prompt-cache reconciliation for this session (same report as the acp_cache tool). Usage: /acp-cache [full]",
+            };
         },
         "command.execute.before": async (input) => {
-            if (input.command !== "acp") return;
+            if (input.command !== "acp" && input.command !== "acp-cache") return;
             const sid = input.sessionID;
             const proxyBase = getProxyBase();
             let text: string;
             if (proxyBase === undefined || proxyBase.length === 0) {
-                text = "bili: proxy not running (native bootstrap failed) — model traffic goes direct";
+                text = input.command === "acp-cache"
+                    ? "bili: no bili proxy detected — /acp-cache needs the proxy to run the cache report (launch opencode through `bili opencode` or install the native plugin)"
+                    : "bili: proxy not running (native bootstrap failed) — model traffic goes direct";
+            } else if (input.command === "acp-cache") {
+                const toolArgs = /(^|\s)(--)?full(\s|$)/.test(input.arguments ?? "") ? { detail: "full" as const } : {};
+                try {
+                    const report = await forwardTool(proxyBase, sid, "acp_cache", toolArgs);
+                    await showAcpText(ctx, sid, wrapCacheReport(report));
+                } catch (err) {
+                    const msg = err instanceof Error ? err.message : String(err);
+                    text = msg.includes("no model request has arrived")
+                        ? "bili: no ACP session yet for this conversation (send a model request first, then run /acp-cache)"
+                        : `bili: cache report failed (${msg})`;
+                    await showAcpText(ctx, sid, text);
+                }
+                throw new Error("__BILI_ACP_HANDLED__");
             } else {
                 try {
                     const res = await fetch(`${proxyBase}/__bili/plugin/status?conversationId=${encodeURIComponent(sid)}&fallback=latest`);

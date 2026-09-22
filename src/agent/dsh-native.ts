@@ -378,6 +378,56 @@ async function statusOutcome(ctx: PluginContext): Promise<CommandOutcome> {
     };
 }
 
+/** One `/acp-cache` invocation (#1146): same report as the acp_cache tool.
+ *  Session-bound when the host exposes the current session id, else resolved
+ *  through the status endpoint's latest-active fallback. The host's command
+ *  API passes no arguments, so this lane always shows the default
+ *  (summary-ledger) report — no `full`. */
+async function cacheOutcome(ctx: PluginContext): Promise<CommandOutcome> {
+    const base = register.base;
+    if (!base) {
+        return {
+            kind: "error",
+            text: "bili: no proxy detected — install via `bili plugin install dsh` or launch through `bili dsh`.",
+        };
+    }
+    maybeRetry(ctx);
+    const sid = sessionIdOf(ctx);
+    let target = sid;
+    if (target === undefined) {
+        try {
+            const status = await fetchStatusLatest(base);
+            target = typeof status?.conversationId === "string" && status.conversationId.length > 0 ? status.conversationId : undefined;
+        } catch {
+            target = undefined;
+        }
+    }
+    if (target === undefined) {
+        let version: string | undefined;
+        try {
+            version = await fetchProxyVersion(base);
+        } catch {
+            version = undefined;
+        }
+        if (version) {
+            return { kind: "success", text: `billion-context@${version} — proxy connected, compression armed. No model request seen yet; send one, then run /acp-cache again.` };
+        }
+        return {
+            kind: "error",
+            text: `bili: proxy not reachable at ${base} — is the bili proxy still running?`,
+        };
+    }
+    try {
+        return { kind: "success", text: await forwardTool(base, target, "acp_cache", {}) };
+    } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (msg.includes("no model request has arrived")) {
+            return { kind: "success", text: "bili: no ACP session yet for this conversation (send a model request first, then run /acp-cache)" };
+        }
+        return { kind: "error", text: `bili: cache report failed: ${msg}` };
+    }
+}
+
 export function apply(ctx: PluginContext): void {
     const plan = planNativeDsh(process.env);
     if (plan.mode === "off") return;
@@ -460,6 +510,11 @@ export function apply(ctx: PluginContext): void {
         name: "acp",
         description: "Show bili context-compression status",
         handler: () => statusOutcome(ctx),
+    });
+    ctx.commands.register({
+        name: "acp-cache",
+        description: "Prompt-cache reconciliation (same report as the acp_cache tool)",
+        handler: () => cacheOutcome(ctx),
     });
 
     // node:test drives apply() directly with a mock ctx — never patch

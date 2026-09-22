@@ -431,6 +431,26 @@ export function claudeSettingsFile(env: NodeJS.ProcessEnv = process.env): string
     return path.join(base, "settings.json");
 }
 
+// #1146: /acp-cache for claude. Claude Code has no in-process command API —
+// the host's user-level MARKDOWN slash command (<configdir>/commands/<name>.md)
+// is the only seam, and it is model-mediated: the file's body expands into a
+// prompt that drives the bili acp_cache MCP tool, whose output the model pastes
+// back. Ownership is content-based (like the codex block): install never
+// clobbers a foreign/edited file, remove deletes only our exact template.
+export const CLAUDE_ACP_CACHE_COMMAND = `---
+description: billion-context prompt-cache reconciliation report (same as the acp_cache tool)
+---
+Run the \`acp_cache\` tool provided by the \`bili\` MCP server now. If the arguments below contain the word "full", call it with detail:"full"; otherwise call it with no arguments. Then paste the tool's complete output verbatim in a fenced code block — do not summarize, translate, reorder, or omit anything. If the tool is unavailable, reply exactly: bili: acp_cache tool not available (is the bili MCP server registered?)
+
+Arguments: $ARGUMENTS
+`;
+
+/** <CLAUDE_CONFIG_DIR|~/.claude>/commands/acp-cache.md (claude replaces the
+ *  whole directory when CLAUDE_CONFIG_DIR is set — same rule as settings.json). */
+export function claudeAcpCacheCommandFile(env: NodeJS.ProcessEnv = process.env): string {
+    return path.join(path.dirname(claudeSettingsFile(env)), "commands", "acp-cache.md");
+}
+
 /** True for an ANTHROPIC_BASE_URL value written by a bili managed block:
  *  loopback /bili/-wrapped upstream. Any port matches — an older install's
  *  port differs from the current one, and both are ours to rewrite. */
@@ -610,7 +630,22 @@ function claudeInstall(): string {
         const stderr = err instanceof Error && "stderr" in err ? String((err as { stderr?: Buffer | string }).stderr ?? "") : "";
         throw new Error(`claude: MCP registration failed (${stderr.trim() || (err instanceof Error ? err.message : String(err))}) — is the claude CLI on PATH? (the managed settings block at ${file} was written; rerun after fixing the CLI to complete the MCP face)`);
     }
-    return `claude: managed block -> ${file} (${notes.join("; ")}); MCP face -> ${claudeMcpJson()} (pinned ${stableOrigin}) — restart claude to activate`;
+
+    let cmdNote: string;
+    const cmdFile = claudeAcpCacheCommandFile();
+    try {
+        fs.mkdirSync(path.dirname(cmdFile), { recursive: true });
+        const existing = fs.existsSync(cmdFile) ? fs.readFileSync(cmdFile, "utf8") : undefined;
+        if (existing === undefined || existing.trimEnd() === CLAUDE_ACP_CACHE_COMMAND.trimEnd()) {
+            fs.writeFileSync(cmdFile, CLAUDE_ACP_CACHE_COMMAND);
+            cmdNote = `written`;
+        } else {
+            cmdNote = `left untouched (foreign content)`;
+        }
+    } catch (err) {
+        throw new Error(`claude: /acp-cache command write failed (${err instanceof Error ? err.message : String(err)}) — the managed settings block at ${file} and the MCP face were written; fix the permissions and rerun`);
+    }
+    return `claude: managed block -> ${file} (${notes.join("; ")}); /acp-cache command -> ${cmdFile} (${cmdNote}); MCP face -> ${claudeMcpJson()} (pinned ${stableOrigin}) — restart claude to activate`;
 }
 
 function claudeRemove(): string {
@@ -647,6 +682,20 @@ function claudeRemove(): string {
         } catch (err) {
             throw new Error(`claude: MCP removal failed (${err instanceof Error ? err.message : String(err)})${parts.length > 0 ? ` — ${parts.join("; ")} succeeded first` : ""}`);
         }
+    }
+    const cmdFile = claudeAcpCacheCommandFile();
+    try {
+        if (fs.existsSync(cmdFile)) {
+            const content = fs.readFileSync(cmdFile, "utf8");
+            if (content.trimEnd() === CLAUDE_ACP_CACHE_COMMAND.trimEnd()) {
+                fs.unlinkSync(cmdFile);
+                parts.push("/acp-cache command removed");
+            } else {
+                parts.push(`/acp-cache command left untouched (${cmdFile} holds foreign content)`);
+            }
+        }
+    } catch (err) {
+        parts.push(`/acp-cache command removal skipped (${err instanceof Error ? err.message : String(err)})`);
     }
     return parts.length > 0 ? `claude: ${parts.join("; ")}` : `claude: not installed (${file} / ${claudeMcpJson()})`;
 }

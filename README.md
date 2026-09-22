@@ -158,7 +158,7 @@ Pick by your client:
 | **pi** | [`billion-context-pi`](https://github.com/ranxianglei/billion-context-pi) (in-process extension) |
 | **opencode** (1.x / 2.x) | [`billion-context`](https://github.com/ranxianglei/billion-context) — `bili opencode` (launcher) or `bili plugin install opencode` (native, no launcher); standalone [`opencode-acp`](https://github.com/ranxianglei/opencode-acp) remains usable on 1.x. Full guide: [OpenCode](#opencode) |
 | **omp** | [`billion-context`](https://github.com/ranxianglei/billion-context) via `bili omp` (built-in plugin) or `bili plugin install omp` (self-spawning native plugin, no launcher) |
-| **dsh** | `bili dsh` (launcher — full native plugin via `--patch`: tools, session-bound `/acp`, fetch intercept) or `bili plugin install dsh` ≡ `dsh plugin --profile <name> add billion-context` (one unified lane — pnpm-installs the package into each profile so dsh mounts the bundled patch layer; the bili form just drives dsh's own channel per profile and migrates legacy managed blocks) |
+| **dsh** | `bili dsh` (launcher — full native plugin via `--patch`: tools, session-bound `/acp` + `/acp-cache`, fetch intercept) or `bili plugin install dsh` ≡ `dsh plugin --profile <name> add billion-context` (one unified lane — pnpm-installs the package into each profile so dsh mounts the bundled patch layer; the bili form just drives dsh's own channel per profile and migrates legacy managed blocks) |
 | **kimi** | `bili plugin install kimi` (self-spawning native plugin, no launcher — Kimi Code ≥ 2.0.0; per-session routing block in `~/.kimi-code/config.toml`) or `bili kimi` (launcher, cert-MITM) or `/bili/` prefix |
 | **hermes** | `bili plugin install hermes` (self-spawning native plugin, no launcher — Python plugin, #958) or `bili hermes` (launcher, cert-MITM) |
 | **claude** | `bili claude` (launcher) or `bili plugin install claude` (native posture, #964 — managed settings block + session-owned proxy; see the notes below) |
@@ -339,7 +339,7 @@ bili claude                           # launch claude through the proxy
 bili omp                              # pi-style, file-free (#535): env + extension registerProvider + compaction cancel, real ~/.omp untouched
 bili opencode                         # OpenCode (1.x & 2.x): full guide in the [OpenCode](#opencode) section below
 bili hermes                           # file-free (#535): hermes proxy env (HTTPS_PROXY + HERMES_CA_BUNDLE) — https via CONNECT MITM, http via absolute-form forward proxy; real ~/.hermes untouched
-bili dsh                              # deepseek-harness: full native plugin injected via --patch (#941) — compress/decompress/acp_status registered as real dsh tools, requests stamped with the dsh session id (plugin mode), /acp session-bound; non-loopback upstreams ride proxy envs (https MITM, http absolute-form), loopback keeps the overlay DSH_HOME (~/.dsh-bili) rewrite (#535), built-in deepseek route via DEEPSEEK_BASE_URL; dsh native auto-compaction disabled (compaction-basic auto:false)
+bili dsh                              # deepseek-harness: full native plugin injected via --patch (#941) — compress/decompress/acp_status registered as real dsh tools, requests stamped with the dsh session id (plugin mode), /acp + /acp-cache session-bound; non-loopback upstreams ride proxy envs (https MITM, http absolute-form), loopback keeps the overlay DSH_HOME (~/.dsh-bili) rewrite (#535), built-in deepseek route via DEEPSEEK_BASE_URL; dsh native auto-compaction disabled (compaction-basic auto:false)
 bili codebuddy                        # Tencent CodeBuddy Code CLI: CODEBUDDY_BASE_URL /bili/ rewrite (OpenAI chat completions wire), budget aligned via CODEBUDDY_AUTO_COMPACT_WINDOW; real ~/.codebuddy untouched
 bili qoder                            # qoder: model endpoint is hardcoded https (no /bili/ rewrite possible) — cert-MITM via HTTPS_PROXY + NODE_EXTRA_CA_CERTS, default model hosts whitelisted (#653)
 bili trae                             # Trae CLI (ByteDance, closed Go binary, no base-URL override) — cert-MITM via HTTPS_PROXY + SSL_CERT_FILE, model host from TRAE_CLI_API_HOST or the default enterprise gateway (#655)
@@ -692,6 +692,20 @@ an `/acp` slash command — rendered as a synthetic non-model message,
 panel-first like the `acp_status` tool; on older shapes the registration
 stays inert. Note `opencode run` mode dispatches no slash commands at all
 (they pass through to the model) — use the TUI.
+
+The same seam carries `/acp-cache` (#1146) — the human entry point to the
+prompt-cache reconciliation report (identical output to the `acp_cache` tool):
+pi/omp register it natively (`/acp-cache [full]` for the every-line listing);
+opencode V1 renders it as an ignored message the proxy strips from model
+context before it reaches the wire; opencode V2 as a synthetic message (report
+visible up to ~8 KB); dsh (both lanes) shows the default summary ledger — dsh's
+command API passes no arguments, so there is no `full`. Legacy opencode-acp
+sessions (#920) get an explicit unavailable notice instead (their traffic
+bypasses this proxy's compression state). Claude Code has no in-process command
+API: `bili plugin install claude` writes a model-mediated
+`commands/acp-cache.md` markdown command whose prompt drives the `acp_cache`
+MCP tool and pastes the report back verbatim. codex/kimi/hermes expose no
+user-typable command seam — ask the model to call its `acp_cache` tool directly.
 
 ### Legacy opencode-acp sessions (#920)
 

@@ -400,6 +400,34 @@ describe("createV1ServerHooks legacy routing (#920)", () => {
         assert.ok(events.includes("legacy-text:ses_legacy:output"));
     });
 
+    it("/acp-cache on a legacy session renders an unavailable notice without touching the absorbed acp (#1146)", async () => {
+        const events: string[] = [];
+        const prompts: Array<{ sid: string; text: string }> = [];
+        const ctx = {
+            client: {
+                session: {
+                    prompt: async ({ path, body }: { path: { id: string }; body: { noReply: boolean; parts: Array<{ text: string }> } }) => {
+                        prompts.push({ sid: path.id, text: body.parts[0].text });
+                    },
+                },
+            },
+        };
+        const hooks = createV1ServerHooks(() => "http://127.0.0.1:19999", ctx, {
+            z: fakeZ,
+            legacy: fakeLegacyModule(events),
+            isLegacy: (sid) => sid === "ses_legacy",
+            forward: async () => "proxied",
+            log: () => {},
+        });
+        await assert.rejects(
+            hooks["command.execute.before"]?.({ command: "acp-cache", sessionID: "ses_legacy" }),
+            /__BILI_ACP_HANDLED__/,
+        );
+        assert.equal(prompts.length, 1);
+        assert.match(prompts[0].text, /unavailable for this legacy DCP session/);
+        assert.equal(events.filter((e) => e.startsWith("legacy-command")).length, 0);
+    });
+
     it("config hook hides providers from absorbed acp and still rewrites", async () => {
         const events: string[] = [];
         const legacy = fakeLegacyModule(events);
