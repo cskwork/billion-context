@@ -73,7 +73,7 @@ AI 编程助手的<strong>通用上下文压缩代理</strong>
 
 可选的第六个工具 `acp_rule`(`compress.rules: true` —— 见 [CONFIGURATION.zh-CN.md](CONFIGURATION.zh-CN.md))记录**持久化的原则级提醒**:模型记录的简短规则(用户强调的教训、要求记住的行为、撞到的大坑)受硬性保护不被压缩——调用及结果在每次折叠中都保留在上下文中——省略参数则列出已记录规则([ranxianglei/billion-context-pi#433](https://github.com/ranxianglei/billion-context-pi/issues/433))。
 
-同族的保护开关 `compress.protectedLatestTools`(见 [CONFIGURATION.zh-CN.md](CONFIGURATION.zh-CN.md))让累积型工具(客户端的 todo/任务清单,如 `["todo_list", "TodoWrite"]`)的**最新**快照永远不被压缩,旧实例照常折叠 —— agent 的活跃任务清单不会在折叠中丢失(#639)。
+同族的保护开关 `compress.protectedLatestTools`(见 [CONFIGURATION.zh-CN.md](CONFIGURATION.zh-CN.md))让累积型工具(客户端的 todo/任务清单,如 `["todo_list", "TodoWrite"]`)的**最新**快照永远不被压缩,旧实例照常折叠 —— agent 的活跃任务清单不会在折叠中丢失(#639)。其全历史对应项 `compress.protectedTools` 对工具的**全部实例**做硬排除 —— 适用于各次结果相互独立、后续结果不会取代旧结果的内容(如 opencode/pi 的 `skill` 加载);对高频或累积快照型工具保护全部实例会让上下文无界增长(#639),请只用于低频高价值工具。
 
 **如何确认压缩真的生效了。** 代理执行 `compress` 后会以普通 assistant 文本发出确认标记(`📦 [ACP] Compressed …`)—— 但曾观察到模型在持续上下文压力下*自行书写该标记格式*而从未调用工具(#717):约 2 小时内 17 次假"压缩",真实用量一路爬到 89%。因此对话中看到的标记行本身不是持久化完成的证据 —— 请先用 `acp_status` 复核(块数 +1、可压缩区间起点前移)再采信。作为兜底,代理会剥离模型自发的标记形文本并记录 `[marker-echo]` 警告;注入的 nudge 与系统提示词也明确声明标记只由代理发出。
 

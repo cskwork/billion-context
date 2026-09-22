@@ -155,6 +155,23 @@ export type CompressSettings = {
      *  Default: none — opt in per client/agent, since tool names are
      *  client-specific. */
     protectedLatestTools?: string[];
+    /** Tool-name patterns whose tool-calls AND paired results are NEVER
+     *  compressed — every instance, full history (kernel `protectedTools`,
+     *  hard exclusion: matching refs render as `BLOCKED`, so neither suggested
+     *  nor explicit compress ranges can cover them; applies identically in
+     *  both compression modes and on every wire). Built for low-frequency,
+     *  high-value tools whose instances are INDEPENDENT content rather than
+     *  cumulative snapshots (e.g. opencode/pi `skill` loads, one-shot
+     *  references): each load carries unique information that no later result
+     *  supersedes, so folding older loads loses it permanently (#1109).
+     *  ⚠ Trade-off (#639 rationale): protecting ALL instances of a chatty or
+     *  cumulative-snapshot tool makes its history grow unboundedly — use
+     *  `protectedLatestTools` for those instead. Patterns match like kernel
+     *  tool patterns (exact name or `*` glob, e.g. `"skill"`, `"skill_*"`).
+     *  Deepest level wins (global → provider → model), whole-array replace.
+     *  Default: none — opt in per client/agent, since tool names are
+     *  client-specific. */
+    protectedTools?: string[];
     /** Emit 📦/❌ ACP visibility markers after proxy tool executions
      *  (compress / decompress / search_context / acp_status) — both the marker
      *  line streamed to the client and the marker message re-injected into
@@ -907,10 +924,11 @@ export function parseCompressSettings(v: unknown): (CompressSettings & { injectT
         if (typeof obj.tiers !== "boolean") ok = false;
         else out.tiers = obj.tiers;
     }
-    if ("protectedLatestTools" in obj && obj.protectedLatestTools !== undefined) {
-        const v = obj.protectedLatestTools;
+    for (const key of ["protectedLatestTools", "protectedTools"] as const) {
+        if (!(key in obj) || obj[key] === undefined) continue;
+        const v = obj[key];
         if (!Array.isArray(v) || v.length === 0 || v.some((x) => typeof x !== "string" || x.trim().length === 0)) ok = false;
-        else out.protectedLatestTools = (v as string[]).map((x) => x.trim());
+        else (out as Record<string, unknown>)[key] = (v as string[]).map((x) => x.trim());
     }
     if ("stripImages" in obj) {
         if (typeof obj.stripImages !== "boolean") ok = false;
