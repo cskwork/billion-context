@@ -10,6 +10,13 @@ Any agent that can set a base URL — <em>zero per-agent adapter code</em>.
 
 ---
 
+## Community
+
+QQ Group:
+1056132097 (full)
+1108730198 (open)
+
+---
 
 ## 📄 Paper / Preprint
 
@@ -34,14 +41,6 @@ A production-scale longitudinal study: 4.5 months, three hosts, 174,327 model ca
 ---
 
 `billion-context` sits between **any** agent and its model API, rewriting Anthropic/OpenAI streams with [acp-kernel](https://github.com/ranxianglei/acp-kernel) compression. The model decides **when** and **what** to compress into high-fidelity summaries — not a hard truncation limit.
-
-## Community
-
-Discussion, help, and updates on QQ — one group covers all three projects (`billion-context`, `billion-context-pi`, `opencode-acp`). Please join the new group:
-
-**QQ Group: 1108730198**
-
-> The original group **1056132097** is now full and no longer accepts new members.
 
 ## Why
 
@@ -1008,10 +1007,6 @@ steps in [CONFIGURATION.md](CONFIGURATION.md#windows-exclude-the-sessions-dir-fr
 Early. Protocol handling and compression work against mock tests (500+ passing). Real-model integration testing is the next milestone. Expect rough edges.
 
 Client-side plugins for pi / omp / opencode ship inside `billion-context` (`dist/agent/*.js`) for the cooperative-proxy path. See the **"Which do I need?"** section above for how `billion-context`, the standalone `billion-context-pi`, and `opencode-acp` relate.
-
-## Community
-
-QQ group — one shared group for all three projects ([`billion-context`](https://github.com/ranxianglei/billion-context), [`billion-context-pi`](https://github.com/ranxianglei/billion-context-pi), [`opencode-acp`](https://github.com/ranxianglei/opencode-acp)). Join the new group **1108730198**; the original group **1056132097** is now full.
 
 ## License
 

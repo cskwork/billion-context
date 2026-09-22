@@ -10,6 +10,13 @@ AI 编程助手的<strong>通用上下文压缩代理</strong>
 
 ---
 
+## 社区
+
+QQ群:
+1056132097(已满)
+1108730198(未满)
+
+---
 
 ## 📄 论文 / 预印本
 
@@ -34,14 +41,6 @@ AI 编程助手的<strong>通用上下文压缩代理</strong>
 ---
 
 `billion-context` 架在**任意**编程助手与其模型 API 之间,用 [acp-kernel](https://github.com/ranxianglei/acp-kernel) 压缩重写 Anthropic/OpenAI 流。何时压缩、压缩什么 —— <strong>由模型决定</strong>,而非硬截断。
-
-## 社区
-
-交流、求助与更新都在 QQ——同一个群覆盖三个项目(`billion-context`、`billion-context-pi`、`opencode-acp`)。请加入新群:
-
-**QQ 群:1108730198**
-
-> 原群 **1056132097** 已满,不再接受新成员。
 
 ## 为什么
 
@@ -502,10 +501,6 @@ Windows 下会自动发现常见 Clash/Mihomo 静态系统代理;Web UI 会显�
 早期。协议处理和压缩已通过 mock 测试(500+ 项通过)。真实模型集成测试是下一里程碑。预期会有粗糙的地方。
 
 针对 pi / omp / opencode 的客户端插件随 `billion-context` 一起发布(`dist/agent/*.js`),用于协作代理路径。三者(`billion-context`、独立的 `billion-context-pi`、`opencode-acp`)如何取舍,见上文「该选哪个?」一节。
-
-## 社区
-
-QQ 群 —— 三个项目共用一个群（[`billion-context`](https://github.com/ranxianglei/billion-context)、[`billion-context-pi`](https://github.com/ranxianglei/billion-context-pi)、[`opencode-acp`](https://github.com/ranxianglei/opencode-acp)）。请加入新群 **1108730198**,原群 **1056132097** 已满。
 
 ## 许可证
 
