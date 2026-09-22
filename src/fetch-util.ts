@@ -87,7 +87,7 @@ export async function fetchWithTimeout(
     opts: FetchOptions,
     timeoutMs?: number,
     externalSignal?: AbortSignal,
-): Promise<{ response: Response; clearTimer: () => void }> {
+): Promise<{ response: Response; clearTimer: () => void; stopIdleTimer: () => void }> {
     const effective = timeoutMs ?? upstreamTimeoutMs();
     const controller = new AbortController();
     let cleared = false;
@@ -118,10 +118,16 @@ export async function fetchWithTimeout(
             externalSignal.addEventListener("abort", onExternalAbort, { once: true });
         }
     }
-    const cleanup = () => {
+    // Two distinct lifetimes: stopping the idle watchdog must NOT detach the
+    // client-abort listener — splice/continue callers drop the timer but still
+    // rely on client disconnect to cancel a stalled upstream (#1064 #15).
+    const stopIdleTimer = () => {
         cleared = true;
         clearTimeout(timer);
         liveUpstreamTimers.delete(timer);
+    };
+    const cleanup = () => {
+        stopIdleTimer();
         if (onExternalAbort && externalSignal) externalSignal.removeEventListener("abort", onExternalAbort);
     };
     try {
@@ -154,9 +160,10 @@ export async function fetchWithTimeout(
                     headers: raw.headers,
                 }),
                 clearTimer: cleanup,
+                stopIdleTimer,
             };
         }
-        return { response: raw, clearTimer: cleanup };
+        return { response: raw, clearTimer: cleanup, stopIdleTimer };
     } catch (e) {
         cleanup();
         throw e;

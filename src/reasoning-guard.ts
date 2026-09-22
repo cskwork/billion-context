@@ -542,7 +542,7 @@ export async function runReasoningGuard(p: GuardParams): Promise<void> {
                 return;
             }
             const contBody = roundRes.response.body;
-            roundRes.clearTimer();
+            roundRes.stopIdleTimer();
             result = contBody ? await consumeRound(contBody, st, p.res) : { error: "no_body" };
             continue;
         }

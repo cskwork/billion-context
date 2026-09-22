@@ -52,11 +52,6 @@ const TTL_MS = 7 * 24 * 60 * 60 * 1000;
  *  items, so the match offset must be free — not pinned to the stored tail). */
 const TAIL_WINDOW = 8;
 
-/** Minimum window size (items) for a tail-window reattach to be trusted. A
- *  1-2 item window is too weak a signal (a single shared message is common);
- *  below this the request falls through to a new session as before. */
-const MIN_TAIL_MATCH = 3;
-
 /** Per tracked chain, store at most this many per-item hashes (the trailing
  *  ones). Bounds memory (256 chains × 128 × 64B ≈ 2MB) and keeps the tail
  *  window (8) comfortably available. Chains deeper than this lose their head,
@@ -213,10 +208,13 @@ export class PrefixAffinityResolver {
         //    excluded: a head-to-head match is either a full-prefix case
         //    (step 1) or a distinct conversation sharing a templated head —
         //    never a truncation reattach (the retained suffix of a truncation
-        //    starts strictly inside the stored chain).
+        //    starts strictly inside the stored chain). Adoption requires the
+        //    FULL window (incomingDepth >= TAIL_WINDOW): a sub-8 leading run is
+        //    weak identity evidence and lets a short crafted request adopt an
+        //    unrelated stored session by coincidence (#1064 #13).
         const w = Math.min(TAIL_WINDOW, incomingDepth);
         const candidates: ChainEntry[] = [];
-        if (w >= MIN_TAIL_MATCH) {
+        if (w === TAIL_WINDOW) {
             for (const entry of tracked.values()) {
                 const stored = entry.itemHashes;
                 for (let j = 1; j + w <= stored.length; j++) {

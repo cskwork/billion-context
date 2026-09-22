@@ -13,6 +13,7 @@ import {
     type ClientConfig,
 } from "../src/client-config.ts";
 import { parseLauncherModelWindows, anthropicBetaContextWindow } from "../src/server.ts";
+import { MAX_ANTHROPIC_BETA_WINDOW } from "../src/server/context-window.ts";
 
 test("parseOmpYaml: captures per-model contextWindow (models after baseUrl)", () => {
     const yml = [
@@ -251,6 +252,10 @@ test("anthropicBetaContextWindow: future larger-context beta generalizes (contex
     assert.equal(anthropicBetaContextWindow({ "anthropic-beta": "context-2m-2026-01-01" }), 2_000_000);
     // Largest wins when several context betas are present.
     assert.equal(anthropicBetaContextWindow({ "anthropic-beta": "context-1m-2025-08-07, context-2m-2026-01-01" }), 2_000_000);
+});
+
+test("anthropicBetaContextWindow: pathological context-Nm clamps to the safety cap (#1064 #12)", () => {
+    assert.equal(anthropicBetaContextWindow({ "anthropic-beta": "context-9999999m-2030-01-01" }), MAX_ANTHROPIC_BETA_WINDOW);
 });
 
 test("anthropicBetaContextWindow: rejects malformed / non-context tokens", () => {
