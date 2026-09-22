@@ -10,6 +10,7 @@ import {
 } from "../src/discover.ts";
 import {
     parseZcodeConfig,
+    parseZcodePersonalConfig,
     TRAE_DEFAULT_MODEL_HOSTS,
     AIDER_DEFAULT_MODEL_HOSTS,
     readZcodeConfig,
@@ -52,6 +53,17 @@ test("parseZcodeConfig: defensive — non-object / missing provider / non-string
     assert.equal(mixed.providers.notObj, undefined);
 });
 
+function withHome(home: string, fn: () => void): void {
+    const saved = process.env.HOME;
+    process.env.HOME = home;
+    try {
+        fn();
+    } finally {
+        if (saved === undefined) delete process.env.HOME;
+        else process.env.HOME = saved;
+    }
+}
+
 test("readZcodeConfig: reads <home>/v2/config.json", () => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "bili-zcode-"));
     try {
@@ -63,8 +75,10 @@ test("readZcodeConfig: reads <home>/v2/config.json", () => {
                 provider: { p: { options: { baseURL: "https://z.example.com/api" } } },
             }),
         );
-        const cfg = readZcodeConfig(tmp);
-        assert.equal(cfg.providers.p.baseURL, "https://z.example.com/api");
+        withHome(tmp, () => {
+            const cfg = readZcodeConfig(tmp);
+            assert.equal(cfg.providers.p.baseURL, "https://z.example.com/api");
+        });
     } finally {
         fs.rmSync(tmp, { recursive: true, force: true });
     }
@@ -73,10 +87,123 @@ test("readZcodeConfig: reads <home>/v2/config.json", () => {
 test("readZcodeConfig: missing dir or unparseable file → empty providers", () => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "bili-zcode-"));
     try {
-        assert.deepEqual(readZcodeConfig(tmp), { providers: {} });
-        fs.mkdirSync(path.join(tmp, "v2"), { recursive: true });
-        fs.writeFileSync(path.join(tmp, "v2", "config.json"), "not-json{");
-        assert.deepEqual(readZcodeConfig(tmp), { providers: {} });
+        withHome(tmp, () => {
+            assert.deepEqual(readZcodeConfig(tmp), { providers: {} });
+            fs.mkdirSync(path.join(tmp, "v2"), { recursive: true });
+            fs.writeFileSync(path.join(tmp, "v2", "config.json"), "not-json{");
+            assert.deepEqual(readZcodeConfig(tmp), { providers: {} });
+        });
+    } finally {
+        fs.rmSync(tmp, { recursive: true, force: true });
+    }
+});
+
+function zcodePersonalFixture(): unknown {
+    return {
+        schemaVersion: 1,
+        config: {
+            providerOrder: ["custom:foo"],
+            providerConfigRules: {
+                providerRules: [
+                    {
+                        providerId: "custom:foo",
+                        providerName: "Foo Relay",
+                        config: {
+                            group: "standard-personal",
+                            access: { type: "api-key", apiKey: "sk-test" },
+                            api: { type: "openai", baseUrl: "https://custom.foo.example.com/v1" },
+                        },
+                    },
+                    {
+                        providerId: "builtin:bigmodel",
+                        templateId: "bigmodel-coding-plan",
+                        config: { access: { type: "zhipu-coding-plan-api-key", apiKey: "sk-test" } },
+                    },
+                    { config: { api: { baseUrl: "https://nokey.example.com" } } },
+                    "garbage",
+                ],
+            },
+        },
+    };
+}
+
+test("parseZcodePersonalConfig: extracts api.baseUrl from providerRules (#1151)", () => {
+    const cfg = parseZcodePersonalConfig(zcodePersonalFixture());
+    assert.deepEqual(Object.keys(cfg.providers), ["custom:foo"]);
+    assert.equal(cfg.providers["custom:foo"].baseURL, "https://custom.foo.example.com/v1");
+});
+
+test("parseZcodePersonalConfig: defensive — non-object / missing envelope / non-string baseUrl", () => {
+    assert.deepEqual(parseZcodePersonalConfig(null), { providers: {} });
+    assert.deepEqual(parseZcodePersonalConfig("nope"), { providers: {} });
+    assert.deepEqual(parseZcodePersonalConfig({}), { providers: {} });
+    assert.deepEqual(parseZcodePersonalConfig({ config: "wrong" }), { providers: {} });
+    assert.deepEqual(parseZcodePersonalConfig({ config: { providerConfigRules: "wrong" } }), { providers: {} });
+    assert.deepEqual(
+        parseZcodePersonalConfig({ config: { providerConfigRules: { providerRules: [{ providerId: "p", config: { api: { baseUrl: 42 } } }] } } }),
+        { providers: {} },
+    );
+});
+
+test("readZcodeConfig: merges legacy config.json with provider_config.json, personal wins per key (#1151)", () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "bili-zcode-"));
+    try {
+        const v2 = path.join(tmp, "v2");
+        fs.mkdirSync(v2, { recursive: true });
+        fs.writeFileSync(
+            path.join(v2, "config.json"),
+            JSON.stringify({
+                provider: {
+                    legacy: { options: { baseURL: "https://legacy.example.com/api" } },
+                    shared: { options: { baseURL: "https://old.example.com/api" } },
+                },
+            }),
+        );
+        fs.writeFileSync(
+            path.join(v2, "provider_config.json"),
+            JSON.stringify({
+                schemaVersion: 1,
+                config: {
+                    providerConfigRules: {
+                        providerRules: [
+                            { providerId: "custom:foo", config: { api: { baseUrl: "https://custom.foo.example.com/v1" } } },
+                            { providerId: "shared", config: { api: { baseUrl: "https://new.example.com/api" } } },
+                        ],
+                    },
+                },
+            }),
+        );
+        withHome(tmp, () => {
+            const cfg = readZcodeConfig(tmp);
+            assert.equal(cfg.providers.legacy.baseURL, "https://legacy.example.com/api");
+            assert.equal(cfg.providers["custom:foo"].baseURL, "https://custom.foo.example.com/v1");
+            assert.equal(cfg.providers.shared.baseURL, "https://new.example.com/api");
+        });
+    } finally {
+        fs.rmSync(tmp, { recursive: true, force: true });
+    }
+});
+
+test("readZcodeConfig: honors ZCODE_PERSONAL_PROVIDER_CONFIG_FILE override (#1151)", () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "bili-zcode-"));
+    try {
+        const alt = path.join(tmp, "alt", "personal.json");
+        fs.mkdirSync(path.dirname(alt), { recursive: true });
+        fs.writeFileSync(
+            alt,
+            JSON.stringify({
+                schemaVersion: 1,
+                config: {
+                    providerConfigRules: {
+                        providerRules: [{ providerId: "custom:alt", config: { api: { baseUrl: "https://alt.example.com/v1" } } }],
+                    },
+                },
+            }),
+        );
+        withHome(tmp, () => {
+            const cfg = readZcodeConfig(tmp, { ZCODE_PERSONAL_PROVIDER_CONFIG_FILE: alt });
+            assert.equal(cfg.providers["custom:alt"].baseURL, "https://alt.example.com/v1");
+        });
     } finally {
         fs.rmSync(tmp, { recursive: true, force: true });
     }
@@ -254,5 +381,35 @@ test("discoverMitmDomains: mtime change + TTL expiry triggers re-scan", async ()
         assert.ok(after.includes("v2.example.com"), `v2 present after rescan: ${after.join(",")}`);
         assert.ok(!after.includes("v1.example.com"), `v1 gone: ${after.join(",")}`);
         assert.notStrictEqual(after, first);
+    });
+});
+
+test("discoverMitmDomains: discovers hosts from provider_config.json (new personal store, #1151)", async () => {
+    await withTempHome(async (home, env) => {
+        fs.mkdirSync(path.join(home, ".codex"), { recursive: true });
+        _resetDiscoveryCacheForTest();
+        const before = discoverMitmDomains(env);
+        assert.ok(!before.includes("newp.example.com"), `absent before GUI write: ${before.join(",")}`);
+
+        const v2 = path.join(home, ".zcode", "v2");
+        fs.mkdirSync(v2, { recursive: true });
+        fs.writeFileSync(
+            path.join(v2, "provider_config.json"),
+            JSON.stringify({
+                schemaVersion: 1,
+                config: {
+                    providerConfigRules: {
+                        providerRules: [
+                            { providerId: "custom:new", config: { api: { baseUrl: "https://newp.example.com/v1" } } },
+                        ],
+                    },
+                },
+            }),
+        );
+
+        await new Promise<void>((r) => setTimeout(r, 2100));
+
+        const after = discoverMitmDomains(env);
+        assert.ok(after.includes("newp.example.com"), `present after provider_config.json appears: ${after.join(",")}`);
     });
 });

@@ -1415,21 +1415,50 @@ export function parseZcodeConfig(obj: unknown): ZcodeConfig {
     return result;
 }
 
-export function readZcodeConfig(zcodeHome: string): ZcodeConfig {
-    const cfgPath = path.join(zcodeHome, "v2", "config.json");
-    let txt: string;
-    try {
-        txt = fs.readFileSync(cfgPath, "utf8");
-    } catch {
-        return { providers: {} };
+// #1151: ZCode v3.14+ stores personal providers in provider_config.json
+// (zai-org/ZCode packages/provider-node/src/runtime-paths.ts). The legacy
+// config.json is imported once when the personal file is absent and then
+// frozen (no double-write), so discovery must read both and merge.
+export function parseZcodePersonalConfig(obj: unknown): ZcodeConfig {
+    const result: ZcodeConfig = { providers: {} };
+    if (!obj || typeof obj !== "object" || Array.isArray(obj)) return result;
+    const cfg = (obj as { config?: unknown }).config;
+    if (!cfg || typeof cfg !== "object" || Array.isArray(cfg)) return result;
+    const rulesField = (cfg as { providerConfigRules?: unknown }).providerConfigRules;
+    if (!rulesField || typeof rulesField !== "object" || Array.isArray(rulesField)) return result;
+    const rules = (rulesField as { providerRules?: unknown }).providerRules;
+    if (!Array.isArray(rules)) return result;
+    for (const rule of rules) {
+        if (!rule || typeof rule !== "object" || Array.isArray(rule)) continue;
+        const r = rule as { providerId?: unknown; providerName?: unknown; config?: unknown };
+        const key = nonEmpty(r.providerId) ? r.providerId.trim() : nonEmpty(r.providerName) ? r.providerName.trim() : "";
+        if (!key) continue;
+        const cfgObj = r.config && typeof r.config === "object" && !Array.isArray(r.config) ? (r.config as { api?: unknown }).api : undefined;
+        const baseUrl = cfgObj && typeof cfgObj === "object" && !Array.isArray(cfgObj) ? (cfgObj as { baseUrl?: unknown }).baseUrl : undefined;
+        if (typeof baseUrl === "string" && baseUrl.length > 0) result.providers[key] = { baseURL: baseUrl };
     }
-    let parsed: unknown;
-    try {
-        parsed = JSON.parse(txt);
-    } catch {
-        return { providers: {} };
+    return result;
+}
+
+export function resolveZcodeHome(env: NodeJS.ProcessEnv): string {
+    return nonEmpty(env.ZCODE_DATA_BASE_DIR) ? env.ZCODE_DATA_BASE_DIR : path.join(os.homedir(), ".zcode");
+}
+
+export function zcodePersonalConfigFiles(zcodeHome: string, env: NodeJS.ProcessEnv): string[] {
+    const out = [path.join(zcodeHome, "v2", "provider_config.json")];
+    if (nonEmpty(env.ZCODE_DATA_BASE_DIR)) out.push(path.join(env.ZCODE_DATA_BASE_DIR, ".zcode", "v2", "provider_config.json"));
+    if (nonEmpty(env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE)) out.push(env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE);
+    return [...new Set(out)];
+}
+
+export function readZcodeConfig(zcodeHome: string, env: NodeJS.ProcessEnv = process.env): ZcodeConfig {
+    const merged = parseZcodeConfig(readJsonFile(path.join(zcodeHome, "v2", "config.json")));
+    for (const file of zcodePersonalConfigFiles(zcodeHome, env)) {
+        for (const [name, prov] of Object.entries(parseZcodePersonalConfig(readJsonFile(file)).providers)) {
+            merged.providers[name] = prov;
+        }
     }
-    return parseZcodeConfig(parsed);
+    return merged;
 }
 
 export function loadClientConfig(env: NodeJS.ProcessEnv, cwd: string): ClientConfig {
@@ -1439,8 +1468,7 @@ export function loadClientConfig(env: NodeJS.ProcessEnv, cwd: string): ClientCon
     const codexHome = nonEmpty(env.CODEX_HOME) ? env.CODEX_HOME : path.join(home, ".codex");
     config.codex = readCodexConfig(codexHome);
     config.pi = readPiConfig(resolvePiHome(env));
-    const zcodeHome = nonEmpty(env.ZCODE_DATA_BASE_DIR) ? env.ZCODE_DATA_BASE_DIR : path.join(home, ".zcode");
-    config.zcode = readZcodeConfig(zcodeHome);
+    config.zcode = readZcodeConfig(resolveZcodeHome(env), env);
     config.omp = readOmpConfig(resolveOmpHome(env));
     config.opencode = parseOpencodeProviders(readOpencodeConfigRoot(env));
     config.hermes = readHermesConfig(resolveHermesHome(env));

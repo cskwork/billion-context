@@ -3,7 +3,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { loadClientConfig, resolvePiHome, resolveCodebuddyHome, resolveQoderHome, resolveTraeHome, nonEmpty, QODER_DEFAULT_MODEL_HOSTS, TRAE_DEFAULT_MODEL_HOSTS, AIDER_DEFAULT_MODEL_HOSTS, type ClientConfig } from "./client-config.js";
+import { loadClientConfig, resolvePiHome, resolveCodebuddyHome, resolveQoderHome, resolveTraeHome, resolveZcodeHome, zcodePersonalConfigFiles, nonEmpty, QODER_DEFAULT_MODEL_HOSTS, TRAE_DEFAULT_MODEL_HOSTS, AIDER_DEFAULT_MODEL_HOSTS, type ClientConfig } from "./client-config.js";
 
 const TTL_MS = 2000;
 
@@ -75,14 +75,14 @@ export function extractHttpsHosts(config: ClientConfig): string[] {
 function configFilePaths(env: NodeJS.ProcessEnv): string[] {
     const home = os.homedir();
     const codexHome = nonEmpty(env.CODEX_HOME) ? env.CODEX_HOME : path.join(home, ".codex");
-    const zcodeHome = nonEmpty(env.ZCODE_DATA_BASE_DIR) ? env.ZCODE_DATA_BASE_DIR : path.join(home, ".zcode");
     const codebuddyHome = resolveCodebuddyHome(env);
     return [
         path.join(home, ".claude", "settings.json"),
         path.join(process.cwd(), ".claude", "settings.json"),
         path.join(codexHome, "config.toml"),
         path.join(resolvePiHome(env), "models.json"),
-        path.join(zcodeHome, "v2", "config.json"),
+        path.join(resolveZcodeHome(env), "v2", "config.json"),
+        ...zcodePersonalConfigFiles(resolveZcodeHome(env), env),
         path.join(codebuddyHome, "settings.json"),
         path.join(codebuddyHome, "models.json"),
         path.join(process.cwd(), ".codebuddy", "models.json"),
