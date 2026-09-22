@@ -165,6 +165,33 @@ Rules:
   secrets `E2E_UPSTREAM_URL` / `E2E_UPSTREAM_KEY`; a hosted runner cannot
   reach `127.0.0.1` upstreams.
 
+### E2E: Hermetic Local Registry (`ACP_TEST_REGISTRY`)
+
+`tests/e2e/e2e-registry.test.ts` brings its own verdaccio instance (random
+loopback port read back from `listen(0)`, isolated storage/config/home) and
+exercises the REAL self-update chain end-to-end — dist-tag resolve → tarball
+download → sha512 verify → staged extract → in-place install → disk flip —
+plus post-update `plugin install opencode`. Loopback only; zero external
+network, zero secrets, zero tokens.
+
+```bash
+npm run build
+ACP_TEST_REGISTRY=1 node --import tsx --test tests/e2e/e2e-registry.test.ts
+```
+
+Rules:
+
+- Gated by `ACP_TEST_REGISTRY=1`; skips by default, and the `npm test` glob
+  does not cover `tests/e2e/` anyway. CI job: `.github/workflows/ci-registry.yml`.
+- Run it before merging changes to `src/update.ts` or the install/uninstall
+  pipeline (`src/plugin-install.ts`).
+- The updater's registry base URL and check interval are overridable via
+  `BILI_UPDATE_REGISTRY` / `BILI_UPDATE_CHECK_INTERVAL_MS` (defaults unchanged
+  when unset) — these seams exist for this suite (#1153); keep them
+  default-invariant.
+- The fixture MUST bring its own registry instance — never point it at an
+  external (even internal) registry service.
+
 ### Code Quality
 
 - **No `as any`**, **No `@ts-ignore`**

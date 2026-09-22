@@ -35,7 +35,10 @@ import { resolveDshHome, resolveKimiHome, resolveOmpHome, resolvePiHome } from "
 import { proxyDispatcher } from "./upstream-proxy.js";
 import type { FetchOptions } from "./fetch-util.js";
 
-const REGISTRY_BASE = "https://registry.npmjs.org";
+// BILI_UPDATE_REGISTRY overrides the registry base URL (full URL, e.g. a
+// loopback verdaccio in the hermetic e2e suite, #1153). Unset = production
+// default, behavior unchanged.
+const REGISTRY_BASE = process.env.BILI_UPDATE_REGISTRY?.trim() || "https://registry.npmjs.org";
 
 /** Normalize a configured dist-tag channel: absent/blank → "latest". */
 export function normalizeUpdateTag(tag: string | undefined): string {
@@ -46,7 +49,15 @@ export function normalizeUpdateTag(tag: string | undefined): string {
 export function registryUrlFor(packageName: string, tag: string): string {
     return `${REGISTRY_BASE}/${packageName}/${encodeURIComponent(tag)}`;
 }
-const CHECK_INTERVAL_MS = 3 * 60 * 1000;
+const DEFAULT_CHECK_INTERVAL_MS = 3 * 60 * 1000;
+
+// BILI_UPDATE_CHECK_INTERVAL_MS overrides the check period in ms (must be > 0)
+// so the hermetic e2e suite need not wait 3 minutes (#1153). Unset = default.
+function checkIntervalMs(): number {
+    const raw = Number(process.env.BILI_UPDATE_CHECK_INTERVAL_MS?.trim());
+    return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : DEFAULT_CHECK_INTERVAL_MS;
+}
+const CHECK_INTERVAL_MS = checkIntervalMs();
 const THROTTLE_FILE = path.join(cacheDir(), ".update-check");
 const LOCK_FILE = path.join(cacheDir(), ".update-lock");
 const SEMVER_RE = /^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z-.]+)?$/;
