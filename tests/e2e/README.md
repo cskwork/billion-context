@@ -73,3 +73,63 @@ prints codex version, dist path, and an upstream `/models` probe.
 repo's own `dist` (i.e. whatever is on master at dispatch time). The forge
 phase is enabled via a repository variable `E2E_FORGE` so it can be turned on
 once interception ships.
+
+---
+
+# E2E: hermetic local npm registry (`ACP_TEST_REGISTRY`)
+
+`e2e-registry.test.ts` exercises the **real self-update chain** — dist-tag
+resolve → tarball download → sha512 verify → staged extract → in-place install
+→ disk flip — plus post-update `plugin install opencode`, against a verdaccio
+instance the suite **brings itself**. Loopback only; zero external network,
+zero secrets, zero tokens (#1153).
+
+## Running
+
+```bash
+npm run build                                  # fixture republishes dist as-is
+ACP_TEST_REGISTRY=1 node --import tsx --test tests/e2e/e2e-registry.test.ts
+```
+
+By default the suite **skips** (`set ACP_TEST_REGISTRY=1`) so `npm test` stays
+free (the `npm test` glob doesn't cover `tests/e2e/` anyway).
+
+## Environment
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `ACP_TEST_REGISTRY` | – | `1` enables the suite |
+| `BILI_UPDATE_REGISTRY` | `https://registry.npmjs.org` | set by the suite per child process to the local registry URL |
+
+## Mechanics
+
+- **Own instance, always.** The fixture spawns its own verdaccio with an
+  isolated storage dir and a throwaway HOME; it never points at an external
+  (even internal) registry service — those are deployment environments, not
+  test environments.
+- **Random loopback port, read back.** The port comes from a `listen(0)`
+  probe, never guessed or fixed (#360). Readiness is polled via `GET /-/ping`.
+- **Crash-safe teardown.** `t.after` SIGTERMs the process; a 5s SIGKILL
+  fallback covers wedged instances.
+- **Authenticated publish.** verdaccio's anonymous publish is
+  anonymous-*only* (`$anonymous`), which 403s the authenticated npm CLI — the
+  fixture registers a local user via `PUT /-/user/org.couchdb.user:*`, drops
+  the token into the isolated HOME's `.npmrc`, and uses `publish: $all`.
+- **Fake install, real chain.** The "old version" is this repo's own files
+  (per the `files` field) re-packed at a synthetic version, published under
+  the same package name, and extracted under `<work>/global/node_modules/<pkg>`
+  (the path shape matters: `isNpmInstallForm` keys off `node_modules`). The
+  child process runs `dist/index.js update` with fully isolated
+  `HOME`/`XDG_*` homes, so nothing touches the host.
+- **Assertions scrape bili's real log lines** (`[update] checking npm
+  registry for …`, `new version found: … downloading…`, `installed … → ….
+  Restart to finish.`) plus the on-disk `package.json` flip, leftover
+  staging/backup dirs, and lock release.
+- **Deferred scenarios.** Zero-registry-round-trip resolution (#1108) and the
+  `#1149` tag-cleanup regression are next up on this infra; the pinned-entry
+  re-pin assertion lands with PR #1143 (marked in the test as `TODO(#1143)`).
+
+## CI
+
+`.github/workflows/ci-registry.yml` runs on every pull request: ubuntu-latest,
+no secrets, `npm ci` + `npm run build` + the gated suite.
