@@ -458,3 +458,137 @@ test("#1117 takeoverGate: round-1 wire mode is preserved (attributed, no headers
     });
     assert.deepEqual(sink, ["http://127.0.0.1:40001/bili/http://127.0.0.1:8199/v1/messages"]);
 });
+
+// #1130: a settings overlay bakes the proxy origin into /bili/ URLs, so when
+// the owning launcher of a SHARED proxy exits mid-session those baked URLs
+// keep hitting the dead port — permanently, until this recovery lands.
+
+test("install: routed /bili/ request against a dead attach origin recovers and reroutes (#1130)", async () => {
+    const calls: string[] = [];
+    const dispatches: string[] = [];
+    const saved = globalThis.fetch;
+    _resetForTest();
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+        const url = typeof input === "string" ? input : input instanceof URL ? input.href : (input as Request).url;
+        calls.push(url);
+        if (url.startsWith("http://127.0.0.1:40001/")) throw new TypeError("fetch failed");
+        return new Response("{}", { status: 200 });
+    }) as typeof fetch;
+    let respawns = 0;
+    const state: NativeInterceptState = {
+        origin: "http://127.0.0.1:40001",
+        ready: Promise.resolve("http://127.0.0.1:40001"),
+        attach: true,
+        respawn: () => {
+            respawns += 1;
+            state.origin = "http://127.0.0.1:40009";
+            state.ready = Promise.resolve("http://127.0.0.1:40009");
+            return Promise.resolve("http://127.0.0.1:40009");
+        },
+        onDispatch: (_url, action) => dispatches.push(action),
+    };
+    try {
+        assert.equal(installNativeFetchIntercept(state), true);
+        const res = await globalThis.fetch("http://127.0.0.1:40001/bili/http://127.0.0.1:8199/v1/messages");
+        assert.equal(res.status, 200);
+        assert.deepEqual(calls, [
+            "http://127.0.0.1:40001/bili/http://127.0.0.1:8199/v1/messages",
+            "http://127.0.0.1:40009/bili/http://127.0.0.1:8199/v1/messages",
+        ]);
+        assert.deepEqual(dispatches, ["self", "retry"]);
+        assert.equal(respawns, 1);
+        assert.equal(state.origin, "http://127.0.0.1:40009");
+        // The overlay keeps baking the OLD origin — subsequent requests are
+        // rerouted pre-emptively without paying another connection failure.
+        const res2 = await globalThis.fetch("http://127.0.0.1:40001/bili/http://127.0.0.1:8199/v1/messages");
+        assert.equal(res2.status, 200);
+        assert.equal(calls[2], "http://127.0.0.1:40009/bili/http://127.0.0.1:8199/v1/messages");
+        assert.deepEqual(dispatches, ["self", "retry", "retry"]);
+        assert.equal(respawns, 1);
+    } finally {
+        globalThis.fetch = saved;
+        _resetForTest();
+    }
+});
+
+test("install: routed /bili/ request with no respawn degrades to a direct send (#1130)", async () => {
+    const calls: string[] = [];
+    const dispatches: string[] = [];
+    const saved = globalThis.fetch;
+    _resetForTest();
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+        const url = typeof input === "string" ? input : input instanceof URL ? input.href : (input as Request).url;
+        calls.push(url);
+        if (url.startsWith("http://127.0.0.1:40001/")) throw new TypeError("fetch failed");
+        return new Response("{}", { status: 200 });
+    }) as typeof fetch;
+    let giveUps = 0;
+    const state: NativeInterceptState = {
+        origin: "http://127.0.0.1:40001",
+        ready: Promise.resolve("http://127.0.0.1:40001"),
+        attach: true,
+        onGiveUp: () => {
+            giveUps += 1;
+        },
+        onDispatch: (_url, action) => dispatches.push(action),
+    };
+    try {
+        assert.equal(installNativeFetchIntercept(state), true);
+        const res = await globalThis.fetch("http://127.0.0.1:40001/bili/http://127.0.0.1:8199/v1/messages");
+        assert.equal(res.status, 200);
+        assert.deepEqual(calls, [
+            "http://127.0.0.1:40001/bili/http://127.0.0.1:8199/v1/messages",
+            "http://127.0.0.1:8199/v1/messages",
+        ]);
+        assert.deepEqual(dispatches, ["self", "direct"]);
+        assert.equal(giveUps, 1);
+    } finally {
+        globalThis.fetch = saved;
+        _resetForTest();
+    }
+});
+
+test("install: routed /bili/ request whose recovery also fails degrades to direct + onGiveUp (#1130)", async () => {
+    const calls: string[] = [];
+    const dispatches: string[] = [];
+    const saved = globalThis.fetch;
+    _resetForTest();
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+        const url = typeof input === "string" ? input : input instanceof URL ? input.href : (input as Request).url;
+        calls.push(url);
+        if (url.startsWith("http://127.0.0.1:40001/")) throw new TypeError("fetch failed");
+        return new Response("{}", { status: 200 });
+    }) as typeof fetch;
+    let respawns = 0;
+    let giveUps = 0;
+    const state: NativeInterceptState = {
+        origin: "http://127.0.0.1:40001",
+        ready: Promise.resolve("http://127.0.0.1:40001"),
+        attach: true,
+        respawn: () => {
+            respawns += 1;
+            return Promise.resolve(undefined);
+        },
+        onGiveUp: () => {
+            giveUps += 1;
+        },
+        onDispatch: (_url, action) => dispatches.push(action),
+    };
+    try {
+        assert.equal(installNativeFetchIntercept(state), true);
+        const res = await globalThis.fetch("http://127.0.0.1:40001/bili/http://127.0.0.1:8199/v1/messages");
+        assert.equal(res.status, 200);
+        assert.deepEqual(calls, [
+            "http://127.0.0.1:40001/bili/http://127.0.0.1:8199/v1/messages",
+            "http://127.0.0.1:8199/v1/messages",
+        ]);
+        assert.deepEqual(dispatches, ["self", "direct"]);
+        assert.equal(respawns, 1);
+        assert.equal(giveUps, 1);
+        assert.equal(state.origin, undefined);
+    } finally {
+        globalThis.fetch = saved;
+        _resetForTest();
+    }
+
+});
