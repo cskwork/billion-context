@@ -119,30 +119,39 @@ after(() => {
     _setStoreForTest(new SessionStore({ enabled: false }));
 });
 
-test("isGcEligible: raw-token gate wins when recorded", () => {
-    const cfg = { maxAgeMs: 7 * DAY, maxTokens: 1_000_000 };
-    const now = Date.now();
-    assert.equal(isGcEligible({ id: "a", savedAt: now - 10 * DAY, contextTokens: 8000, hasActiveBlocks: true, rawInputTokens: 5000 }, now, cfg), true, "old + small raw → eligible even with active blocks");
-    assert.equal(isGcEligible({ id: "b", savedAt: now - 10 * DAY, contextTokens: 8000, hasActiveBlocks: false, rawInputTokens: 2_000_000 }, now, cfg), false, "raw above threshold → kept");
-    assert.equal(isGcEligible({ id: "c", savedAt: now - DAY, contextTokens: 8000, hasActiveBlocks: false, rawInputTokens: 5000 }, now, cfg), false, "recent → kept");
-});
+    test("isGcEligible: age + never-compressed + size gates all required", () => {
+        const cfg = { maxAgeMs: 7 * DAY, maxTokens: 1_000_000 };
+        const now = Date.parse("2026-09-21T00:00:00Z");
+        const oldSavedAt = now - 10 * DAY;
+        assert.equal(isGcEligible({ id: "a", savedAt: oldSavedAt, contextTokens: 999_999_999, everCompressed: false, rawInputTokens: 5_000 }, now, cfg), true, "old + never compressed + small raw → eligible");
+        assert.equal(isGcEligible({ id: "b", savedAt: oldSavedAt, contextTokens: 0, everCompressed: false, rawInputTokens: 2_000_000 }, now, cfg), false, "raw above threshold keeps");
+        assert.equal(isGcEligible({ id: "c", savedAt: oldSavedAt, contextTokens: 0, everCompressed: true, rawInputTokens: 5_000 }, now, cfg), false, "compressed session keeps even when small");
+        assert.equal(isGcEligible({ id: "d", savedAt: now - 3 * DAY, contextTokens: 0, everCompressed: false, rawInputTokens: 5_000 }, now, cfg), false, "recent keeps");
+    });
 
-test("isGcEligible: blocks+contextTokens fallback when no raw size", () => {
-    const cfg = { maxAgeMs: 7 * DAY, maxTokens: 1_000_000 };
-    const now = Date.now();
-    assert.equal(isGcEligible({ id: "d", savedAt: now - 10 * DAY, contextTokens: 8000, hasActiveBlocks: false, rawInputTokens: null }, now, cfg), true);
-    assert.equal(isGcEligible({ id: "e", savedAt: now - 10 * DAY, contextTokens: 8000, hasActiveBlocks: true, rawInputTokens: null }, now, cfg), false, "active block without raw size → kept");
-    assert.equal(isGcEligible({ id: "f", savedAt: now - 10 * DAY, contextTokens: 2_000_000, hasActiveBlocks: false, rawInputTokens: null }, now, cfg), false, "context above threshold → kept");
-});
+    test("isGcEligible: contextTokens fallback for unrecorded files", () => {
+        const cfg = { maxAgeMs: 7 * DAY, maxTokens: 1_000_000 };
+        const now = Date.parse("2026-09-21T00:00:00Z");
+        const oldSavedAt = now - 10 * DAY;
+        assert.equal(isGcEligible({ id: "a", savedAt: oldSavedAt, contextTokens: 8_000, everCompressed: false, rawInputTokens: null }, now, cfg), true);
+        assert.equal(isGcEligible({ id: "b", savedAt: oldSavedAt, contextTokens: 2_000_000, everCompressed: false, rawInputTokens: null }, now, cfg), false);
+        assert.equal(isGcEligible({ id: "c", savedAt: oldSavedAt, contextTokens: 8_000, everCompressed: true, rawInputTokens: null }, now, cfg), false, "compressed session keeps even when small");
+    });
 
 test("viewFromParsed: envelope v3, legacy flat, corrupt input", () => {
     const rec = viewFromParsed(envelope("s1", 1234, { metadata: { rawInputTokens: 4242 } }));
     assert.ok(rec);
-    assert.deepEqual(rec, { id: "s1", savedAt: 1234, contextTokens: 8000, hasActiveBlocks: false, rawInputTokens: 4242 });
+    assert.deepEqual(rec, { id: "s1", savedAt: 1234, contextTokens: 8000, everCompressed: false, rawInputTokens: 4242 });
 
     const legacy = viewFromParsed(flatLegacy("s2", 999, [{ id: "b1", active: true }], 77));
     assert.ok(legacy);
-    assert.deepEqual(legacy, { id: "s2", savedAt: 999, contextTokens: 77, hasActiveBlocks: true, rawInputTokens: null });
+    assert.deepEqual(legacy, { id: "s2", savedAt: 999, contextTokens: 77, everCompressed: true, rawInputTokens: null });
+
+    const inact = viewFromParsed(envelope("s4", 1234, { state: { blocks: [{ id: "b9", active: false }] } }));
+    assert.ok(inact && inact.everCompressed === true, "inactive-only blocks still count as compressed");
+
+    const folded = viewFromParsed(envelope("s5", 1234, { state: { blocks: [] }, blockContents: { b1: { source: "x" } } }));
+    assert.ok(folded && folded.everCompressed === true, "stored fold content counts as compressed");
 
     assert.equal(viewFromParsed(null), null);
     assert.equal(viewFromParsed("garbage"), null);
@@ -150,15 +159,22 @@ test("viewFromParsed: envelope v3, legacy flat, corrupt input", () => {
     assert.equal(viewFromParsed({ savedAt: -5 }), null);
 });
 
-test("gcConfigFromEnv: defaults and overrides", async () => {
+test("gcConfigFromEnv: disabled by default, opt-in only", async () => {
     await withEnv(
         { BILI_SESSION_GC: undefined, BILI_SESSION_GC_MAX_AGE_DAYS: undefined, BILI_SESSION_GC_MAX_TOKENS: undefined, BILI_SESSION_GC_INTERVAL_MS: undefined },
         async () => {
             const def = gcConfigFromEnv();
-            assert.deepEqual(def, { enabled: true, maxAgeMs: 7 * DAY, maxTokens: 1_000_000, intervalMs: 3_600_000 });
-            await withEnv({ BILI_SESSION_GC: "0" }, async () => {
-                assert.equal(gcConfigFromEnv().enabled, false);
-            });
+            assert.deepEqual(def, { enabled: false, maxAgeMs: 7 * DAY, maxTokens: 1_000_000, intervalMs: 3_600_000 });
+            for (const on of ["1", "true", "ON"]) {
+                await withEnv({ BILI_SESSION_GC: on }, async () => {
+                    assert.equal(gcConfigFromEnv().enabled, true, `${on} enables`);
+                });
+            }
+            for (const off of ["0", "false", "off", "garbage"]) {
+                await withEnv({ BILI_SESSION_GC: off }, async () => {
+                    assert.equal(gcConfigFromEnv().enabled, false, `${off} does not enable`);
+                });
+            }
             await withEnv({ BILI_SESSION_GC_MAX_AGE_DAYS: "30", BILI_SESSION_GC_MAX_TOKENS: "abc", BILI_SESSION_GC_INTERVAL_MS: "60000" }, async () => {
                 const c = gcConfigFromEnv();
                 assert.equal(c.maxAgeMs, 30 * DAY);
@@ -171,48 +187,57 @@ test("gcConfigFromEnv: defaults and overrides", async () => {
 
 test("gcSessionFiles: deletes old small files, keeps recent/large/compressed/corrupt, ignores temps", async () => {
     const dir = tmpDir("bili-gc-sweep-");
-    const store = new SessionStore({ dir, debounceMs: 500 });
-    const oldSavedAt = Date.now() - 10 * DAY;
-    const fDel = writeFile(dir, "anthropic/host_del.json", JSON.stringify(envelope("gc-del", oldSavedAt, { metadata: { rawInputTokens: 5000 } })), 10);
-    const fBigRaw = writeFile(dir, "anthropic/host_big.json", JSON.stringify(envelope("gc-big", oldSavedAt, { metadata: { rawInputTokens: 2_000_000 } })), 10);
-    const fRecent = writeFile(dir, "anthropic/host_recent.json", JSON.stringify(envelope("gc-recent", Date.now() - DAY, { metadata: { rawInputTokens: 5000 } })), 1);
-    const fLegacyNoBlocks = writeFile(dir, "openai/host_legacy.json", JSON.stringify(flatLegacy("gc-legacy", oldSavedAt, [], 4000)), 10);
-    const fLegacyBlocks = writeFile(dir, "openai/host_legacy_blocks.json", JSON.stringify(flatLegacy("gc-legacy-blocks", oldSavedAt, [{ id: "b1", active: true }], 4000)), 10);
-    const fCorrupt = writeFile(dir, "openai/host_corrupt.json", "{not json", 10);
-    writeFile(dir, "openai/.hidden.json", "{}", 10);
-    writeFile(dir, "openai/x.tmp-enc-1-2.json", "{}", 10);
-    const onlySub = "solo";
-    const fSolo = writeFile(dir, `${onlySub}/host_solo.json`, JSON.stringify(envelope("gc-solo", oldSavedAt, { metadata: { rawInputTokens: 100 } })), 10);
+    await withEnv({ BILI_SESSION_GC: "1" }, async () => {
+        const store = new SessionStore({ dir, debounceMs: 500 });
+        const oldSavedAt = Date.now() - 10 * DAY;
+        const fDel = writeFile(dir, "anthropic/host_del.json", JSON.stringify(envelope("gc-del", oldSavedAt, { metadata: { rawInputTokens: 5000 } })), 10);
+        const fBigRaw = writeFile(dir, "anthropic/host_big.json", JSON.stringify(envelope("gc-big", oldSavedAt, { metadata: { rawInputTokens: 2_000_000 } })), 10);
+        const fRecent = writeFile(dir, "anthropic/host_recent.json", JSON.stringify(envelope("gc-recent", Date.now() - DAY, { metadata: { rawInputTokens: 5000 } })), 1);
+        const fLegacyNoBlocks = writeFile(dir, "openai/host_legacy.json", JSON.stringify(flatLegacy("gc-legacy", oldSavedAt, [], 4000)), 10);
+        const fLegacyBlocks = writeFile(dir, "openai/host_legacy_blocks.json", JSON.stringify(flatLegacy("gc-legacy-blocks", oldSavedAt, [{ id: "b1", active: true }], 4000)), 10);
+        const fKeepInact = writeFile(dir, "openai/host_inact.json", JSON.stringify(envelope("gc-inact", oldSavedAt, { metadata: { rawInputTokens: 5000 }, state: { blocks: [{ id: "b9", active: false }] } })), 10);
+        const fCorrupt = writeFile(dir, "openai/host_corrupt.json", "{not json", 10);
+        writeFile(dir, "openai/.hidden.json", "{}", 10);
+        writeFile(dir, "openai/x.tmp-enc-1-2.json", "{}", 10);
+        const onlySub = "solo";
+        const fSolo = writeFile(dir, `${onlySub}/host_solo.json`, JSON.stringify(envelope("gc-solo", oldSavedAt, { metadata: { rawInputTokens: 100 } })), 10);
 
-    const res = await gcSessionFiles({ dir, store, now: Date.now() });
-    assert.equal(res.removed, 3, `expected 3 removed, got ${JSON.stringify(res)}`);
-    assert.equal(res.unreadable, 1);
-    assert.ok(!existsSync(fDel));
-    assert.ok(!existsSync(fLegacyNoBlocks));
-    assert.ok(!existsSync(fSolo));
-    assert.ok(!existsSync(path.join(dir, onlySub)), "emptied protocol subdir removed");
-    assert.ok(existsSync(fBigRaw));
-    assert.ok(existsSync(fRecent));
-    assert.ok(existsSync(fLegacyBlocks));
-    assert.ok(existsSync(fCorrupt));
-    assert.ok(res.bytesFreed > 0);
+        const res = await gcSessionFiles({ dir, store, now: Date.now() });
+        assert.equal(res.removed, 3, `expected 3 removed, got ${JSON.stringify(res)}`);
+        assert.equal(res.unreadable, 1);
+        assert.ok(!existsSync(fDel));
+        assert.ok(!existsSync(fLegacyNoBlocks));
+        assert.ok(!existsSync(fSolo));
+        assert.ok(!existsSync(path.join(dir, onlySub)), "emptied protocol subdir removed");
+        assert.ok(existsSync(fBigRaw));
+        assert.ok(existsSync(fRecent));
+        assert.ok(existsSync(fLegacyBlocks));
+        assert.ok(existsSync(fKeepInact), "once-compressed session kept even when small (inactive-only blocks)");
+        assert.ok(existsSync(fCorrupt));
+        assert.ok(res.bytesFreed > 0);
+    });
 });
 
-test("gcSessionFiles: BILI_SESSION_GC=0 disables the sweep", async () => {
+test("gcSessionFiles: disabled unless explicitly enabled (opt-in)", async () => {
     const dir = tmpDir("bili-gc-off-");
     const store = new SessionStore({ dir, debounceMs: 500 });
     const oldSavedAt = Date.now() - 10 * DAY;
     const fDel = writeFile(dir, "anthropic/host_off.json", JSON.stringify(envelope("gc-off", oldSavedAt, { metadata: { rawInputTokens: 5000 } })), 10);
+    await withEnv({ BILI_SESSION_GC: undefined }, async () => {
+        const res = await gcSessionFiles({ dir, store, now: Date.now() });
+        assert.equal(res.removed, 0, "unset env → disabled by default");
+        assert.ok(existsSync(fDel));
+    });
     await withEnv({ BILI_SESSION_GC: "off" }, async () => {
         const res = await gcSessionFiles({ dir, store, now: Date.now() });
-        assert.equal(res.removed, 0);
+        assert.equal(res.removed, 0, "explicit off → disabled");
         assert.ok(existsSync(fDel));
     });
 });
 
 test("gcSessionFiles: decodes encrypted (BILIENC1) files before judging eligibility", async () => {
     const keyHex = "ab".repeat(32);
-    await withEnv({ BILI_ENCRYPTION_KEY: keyHex }, async () => {
+    await withEnv({ BILI_ENCRYPTION_KEY: keyHex, BILI_SESSION_GC: "1" }, async () => {
         const dir = tmpDir("bili-gc-enc-");
         const store = new SessionStore({ dir, debounceMs: 500 });
         const codec = createSessionCodec(parseEncryptionKey(keyHex));
@@ -226,7 +251,7 @@ test("gcSessionFiles: decodes encrypted (BILIENC1) files before judging eligibil
 
 test("readRawFile: format-agnostic — plain JSON parses, codec frames decode, garbage is null (GC keeps)", async () => {
     const keyHex = "cd".repeat(32);
-    await withEnv({ BILI_ENCRYPTION_KEY: keyHex }, async () => {
+    await withEnv({ BILI_ENCRYPTION_KEY: keyHex, BILI_SESSION_GC: "1" }, async () => {
         const dir = tmpDir("bili-gc-raw-");
         const store = new SessionStore({ dir, debounceMs: 500 });
         const codec = createSessionCodec(parseEncryptionKey(keyHex));
@@ -253,36 +278,40 @@ test("readRawFile: format-agnostic — plain JSON parses, codec frames decode, g
 
 test("gcSessionFiles: resident fresh sessions are kept; idle residents are dropped and deleted", async () => {
     const dir = tmpDir("bili-gc-res-");
-    const store = new SessionStore({ dir, debounceMs: 500 });
-    _setStoreForTest(store);
-    const oldSavedAt = Date.now() - 10 * DAY;
-    const fFresh = writeFile(dir, "anthropic/host_fresh.json", JSON.stringify(envelope("gc-res-fresh", oldSavedAt, { metadata: { rawInputTokens: 5000 } })), 10);
-    const fIdle = writeFile(dir, "anthropic/host_idle.json", JSON.stringify(envelope("gc-res-idle", oldSavedAt, { metadata: { rawInputTokens: 5000 } })), 10);
-    getSession("gc-res-fresh", { protocol: "openai", upstreamOrigin: "https://x.example" });
-    getSession("gc-res-idle", { protocol: "openai", upstreamOrigin: "https://x.example" });
-    peekSession("gc-res-idle")!.lastSeen = oldSavedAt;
+    await withEnv({ BILI_SESSION_GC: "1" }, async () => {
+        const store = new SessionStore({ dir, debounceMs: 500 });
+        _setStoreForTest(store);
+        const oldSavedAt = Date.now() - 10 * DAY;
+        const fFresh = writeFile(dir, "anthropic/host_fresh.json", JSON.stringify(envelope("gc-res-fresh", oldSavedAt, { metadata: { rawInputTokens: 5000 } })), 10);
+        const fIdle = writeFile(dir, "anthropic/host_idle.json", JSON.stringify(envelope("gc-res-idle", oldSavedAt, { metadata: { rawInputTokens: 5000 } })), 10);
+        getSession("gc-res-fresh", { protocol: "openai", upstreamOrigin: "https://x.example" });
+        getSession("gc-res-idle", { protocol: "openai", upstreamOrigin: "https://x.example" });
+        peekSession("gc-res-idle")!.lastSeen = oldSavedAt;
 
-    const res = await gcSessionFiles({ dir, store, now: Date.now() });
-    assert.equal(res.removed, 1, JSON.stringify(res));
-    assert.ok(existsSync(fFresh), "fresh resident kept on disk");
-    assert.ok(peekSession("gc-res-fresh"), "fresh resident stays in memory");
-    assert.ok(!existsSync(fIdle), "idle resident deleted");
-    assert.equal(peekSession("gc-res-idle"), undefined, "idle resident dropped from map");
+        const res = await gcSessionFiles({ dir, store, now: Date.now() });
+        assert.equal(res.removed, 1, JSON.stringify(res));
+        assert.ok(existsSync(fFresh), "fresh resident kept on disk");
+        assert.ok(peekSession("gc-res-fresh"), "fresh resident stays in memory");
+        assert.ok(!existsSync(fIdle), "idle resident deleted");
+        assert.equal(peekSession("gc-res-idle"), undefined, "idle resident dropped from map");
+    });
 });
 
 test("gcSessionFiles: pending in-memory saves are not deleted before they land", async () => {
     const dir = tmpDir("bili-gc-pend-");
-    const store = new SessionStore({ dir, debounceMs: 60_000 });
-    _setStoreForTest(store);
-    const oldSavedAt = Date.now() - 10 * DAY;
-    const fPend = writeFile(dir, "anthropic/host_pend.json", JSON.stringify(envelope("gc-pend", oldSavedAt, { metadata: { rawInputTokens: 5000 } })), 10);
-    const s = getSession("gc-pend", { protocol: "openai", upstreamOrigin: "https://x.example" });
-    s.lastSeen = oldSavedAt;
-    markDirty(s);
-    const res = await gcSessionFiles({ dir, store, now: Date.now() });
-    assert.equal(res.removed, 0, JSON.stringify(res));
-    assert.ok(existsSync(fPend));
-    store.cancelAll();
+    await withEnv({ BILI_SESSION_GC: "1" }, async () => {
+        const store = new SessionStore({ dir, debounceMs: 60_000 });
+        _setStoreForTest(store);
+        const oldSavedAt = Date.now() - 10 * DAY;
+        const fPend = writeFile(dir, "anthropic/host_pend.json", JSON.stringify(envelope("gc-pend", oldSavedAt, { metadata: { rawInputTokens: 5000 } })), 10);
+        const s = getSession("gc-pend", { protocol: "openai", upstreamOrigin: "https://x.example" });
+        s.lastSeen = oldSavedAt;
+        markDirty(s);
+        const res = await gcSessionFiles({ dir, store, now: Date.now() });
+        assert.equal(res.removed, 0, JSON.stringify(res));
+        assert.ok(existsSync(fPend));
+        store.cancelAll();
+    });
 });
 
 test("records rawInputTokens per turn and persists it (#1082)", async () => {
