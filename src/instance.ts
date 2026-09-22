@@ -21,7 +21,22 @@ export interface ProxyInstanceFile {
     mitmDomains: string[];
     modelWindows: Record<string, number>;
     modelMaxOutputs?: Record<string, number>;
+    /** Summary-model launch config (BILI_COMPACT_MODEL / BILI_DELEGATE_SUMMARY)
+     *  so a launcher only attaches to a proxy running the same setting. */
+    compactModel?: string;
+    delegateSummary?: boolean;
     launchToken?: string;
+}
+
+/** The summary-model launch config as recorded in the instance file: the
+ *  proxy writes it from its own env, the launcher derives the wanted value
+ *  from env + CLI overrides the same way, so attach compares like with like. */
+export function launcherSummaryConfig(env: NodeJS.ProcessEnv): { compactModel?: string; delegateSummary?: boolean } {
+    const compactModel = env.BILI_COMPACT_MODEL?.trim();
+    return {
+        ...(compactModel ? { compactModel } : {}),
+        ...(env.BILI_DELEGATE_SUMMARY?.trim() === "1" ? { delegateSummary: true } : {}),
+    };
 }
 
 export function isProxyInstanceFile(v: ProxyInstanceFile | { origin: string } | undefined): v is ProxyInstanceFile {
@@ -64,6 +79,8 @@ export function readProxyInstanceFile(file?: string): ProxyInstanceFile | { orig
                     mitmDomains: Array.isArray(parsed.mitmDomains) ? parsed.mitmDomains.map(String) : [],
                     modelWindows: windows,
                     modelMaxOutputs: Object.keys(maxOutputs).length > 0 ? maxOutputs : undefined,
+                    ...(typeof parsed.compactModel === "string" && parsed.compactModel ? { compactModel: parsed.compactModel } : {}),
+                    ...(parsed.delegateSummary === true ? { delegateSummary: true } : {}),
                     launchToken: typeof parsed.launchToken === "string" ? parsed.launchToken : undefined,
                 };
             }

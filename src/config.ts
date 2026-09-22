@@ -198,6 +198,24 @@ export type CompressSettings = {
      *  builtin (`default`, `lean`)]. Deepest-wins like every other field;
      *  unknown names fall back to the identity surface. Kernel >= 0.0.66. */
     promptPack?: string;
+    /** Model id used for the proxy's OWN summarization calls (preflight
+     *  overflow summaries and delegated compress summaries) instead of the
+     *  request's model. Same upstream URL, headers and wire protocol — only
+     *  the `model` field changes. A non-transient 4xx from the override model
+     *  (e.g. model not found) falls back to the request model with a warning.
+     *  Env `BILI_COMPACT_MODEL` wins over every config level. Unset = the
+     *  request model (unchanged behavior). Not applied on the Gemini wire
+     *  (the model lives in the URL path there). */
+    summaryModel?: string;
+    /** Delegated summary mode (proxy mode only): the injected compress tool
+     *  asks the main model for ranges only, and the proxy writes each
+     *  range's summary by calling {@link summaryModel}. A summary the model
+     *  still provides is kept. Requires `summaryModel` (ignored with a
+     *  one-time warning otherwise); only applies to streaming
+     *  anthropic/openai/responses tool-protocol requests. Plugin mode (the
+     *  agent executes compress) is unaffected. Env `BILI_DELEGATE_SUMMARY`
+     *  (1/0) wins over every config level. Default false. */
+    delegateSummary?: boolean;
     /** Instant tool-result absorption (kernel absorb API, acp-kernel >= 0.0.54).
      *  When `enabled`, eligible large tool results carry a forced [ACP absorb]
      *  instruction and the model distills them via the injected `absorb` tool;
@@ -1020,6 +1038,14 @@ export function parseCompressSettings(v: unknown): (CompressSettings & { injectT
     if ("promptPack" in obj && obj.promptPack !== undefined) {
         if (typeof obj.promptPack !== "string" || obj.promptPack.trim().length === 0) ok = false;
         else out.promptPack = obj.promptPack.trim();
+    }
+    if ("summaryModel" in obj && obj.summaryModel !== undefined) {
+        if (typeof obj.summaryModel !== "string" || obj.summaryModel.trim().length === 0) ok = false;
+        else out.summaryModel = obj.summaryModel.trim();
+    }
+    if ("delegateSummary" in obj && obj.delegateSummary !== undefined) {
+        if (typeof obj.delegateSummary !== "boolean") ok = false;
+        else out.delegateSummary = obj.delegateSummary;
     }
     if ("reasoningGuard" in obj && obj.reasoningGuard !== undefined) {
         const rg = obj.reasoningGuard;

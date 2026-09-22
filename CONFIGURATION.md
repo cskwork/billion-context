@@ -347,6 +347,21 @@ For each request, the proxy resolves the settings by longest-URL-prefix match (t
 - **Status:** ACTIVE
 - **Description:** Select a named prompt pack — a curated surface preset covering tool descriptions, compress system-prompt sections, and nudge sections — resolved from the kernel's pack chain: **project** `./.billion-context/packs/<name>.json` → **user** `<configDir>/packs/<name>.json` → **builtin** (`default`, `lean`). Built-in `lean` swaps the four ACP tool descriptions for one-liners (no snippet/guideline chrome) while keeping the compression rules default. Unknown names fall back to the identity surface with a one-time warning. Same three-level merge as the other fields; pack-surface sections (tool/section overrides) apply directly, without the `acknowledgePromptsRisk` gate — that gate governs only inline `compress.prompts` rule-text overrides. Note a pack's `prompts` block is ignored by this proxy: rule-text overrides are possible only via inline `compress.prompts`. Requires `acp-kernel` >= 0.0.66.
 
+#### `summaryModel`
+
+- **Type:** `string` (model id, e.g. `"claude-haiku-4-5"`)
+- **Default:** *(unset — summaries use the request's model; behavior unchanged)*
+- **Status:** ACTIVE
+- **Description:** Model the proxy uses for its **own** summarization calls: preflight overflow summaries and, with [`delegateSummary`](#delegatesummary), delegated compress summaries. The call goes to the same upstream URL with the same headers and wire protocol as the request — only the `model` field changes, so the model must be served by that same upstream. If the override model is rejected with a non-transient 4xx (e.g. model not found), bili logs a warning and falls back to the request model for that and every later summary call to the same upstream, so the turn is not broken. The first successful override call logs `[summary-model] summaries use model=…`. Not applied on the Gemini wire (the model is part of the URL path there; a one-time warning is logged). Env [`BILI_COMPACT_MODEL`](#environment-variables) wins over every config level; the launcher flag `--compact-model` sets that env. Deepest-wins like every other field; a blank or non-string value rejects the whole `compress` block.
+- **Scope:** Codex native compaction is unaffected: in the default `intercept` mode bili forges the compaction from its existing block summaries (no model call), and in `pass` mode codex's own compaction request is forwarded unchanged. Claude Code's own `/compact` / auto-compact request is also forwarded unchanged (bili has no reliable way to tell it apart from a normal turn).
+
+#### `delegateSummary`
+
+- **Type:** `boolean`
+- **Default:** `false`
+- **Status:** ACTIVE
+- **Description:** Delegated summary mode. The main model only **chooses** what to compress: the injected `compress` tool asks for ranges (`{startId, endId, topic?}` or a one-line `mA–mB topic` string) with no summary, and the system prompt / nudge say so. bili then writes each range's summary by calling [`summaryModel`](#summarymodel) with the same summarization prompt and machinery preflight uses, and folds the range. A summary the model still provides is kept as-is. If any delegated summary cannot be produced, the whole compress call returns a `Compression FAILED` tool result and nothing is folded (no content is dropped). Requires `summaryModel` (or `BILI_COMPACT_MODEL`); without one it is ignored with a one-time warning. Applies only in **proxy mode** (bili executes `compress`) on **streaming** Anthropic / OpenAI chat / Responses tool-protocol requests; non-streaming requests, the Responses marker/text protocol, the Gemini wire, and **plugin mode** (the agent executes `compress`, e.g. `bili pi` / native plugins) keep the model-written summary contract unchanged. Env `BILI_DELEGATE_SUMMARY=1`/`0` wins over every config level; the launcher flag `--delegate-summary` sets it.
+
 #### `absorb`
 
 - **Type:** `object` (`{ enabled?, minToolTokens?, contextThresholdPct?, excludeTools?, toolName? }`)
@@ -569,6 +584,8 @@ Environment variables take precedence over the config file. They are useful for 
 | `BILI_LAUNCHER_PLUGIN` | Set `0` to disable the launcher's bili MCP server injection for claude/codex (pure wire mode); `1` forces plugin mode. Default: injected — except codex with a local/private upstream (sglang/vllm/ollama cannot parse codex's namespace tool type, so bili auto-falls back to wire tools there). See [Launcher Reference](#launcher-reference). |
 | `BILI_LAUNCHER_DIRECT` | Set `1` for direct-URL routing in the launcher (drop MITM/CA trust). See [Launcher Reference](#launcher-reference). |
 | `BILI_CLAUDE_UPSTREAM` | claude direct mode: your relay endpoint, when `ANTHROPIC_BASE_URL` already points at a relay the launcher would otherwise bypass. |
+| `BILI_COMPACT_MODEL` | Model id for the proxy's own summary calls (preflight + delegated compress); same upstream, only `model` changes. Live-read per request; wins over `compress.summaryModel` at every level. Unset = config value, else the request model. Set by the launcher flag `--compact-model`. See [`summaryModel`](#summarymodel). |
+| `BILI_DELEGATE_SUMMARY` | `1` enables / `0` disables [delegated summary mode](#delegatesummary), winning over `compress.delegateSummary` at every level. Needs a summary model (`BILI_COMPACT_MODEL` or `compress.summaryModel`). Set by the launcher flag `--delegate-summary`. |
 | `BILI_CODEX_COMPACT` | Codex native-compaction handling. Default `intercept`: bili intercepts codex's compaction requests and forges a local handoff to the ACP state when the safety gate passes (transform ok + steady-state usage < 90% of the window + at least one active compressed block) — trigger form forges a 2-frame SSE, endpoint form forges `{output}` — and never contacts upstream. Forged ACP summaries are re-injected as a history-borne handoff message (developer-message fallback) so compressed content stays visible after codex truncates its history. Set `pass` to opt out and forward codex's compaction requests upstream (native compaction backstops). On any gate failure the request passes through untouched. |
 
 ---
@@ -625,6 +642,8 @@ Anything after `--` in a launcher command is passed through to the client verbat
 | `--no-passthrough` | Force compression on (overrides config) |
 | `--no-auto-update` | Disable background self-update for this run |
 | `--mitm-domain <domain>` | Extra MITM whitelist entry (repeatable; launcher only) |
+| `--compact-model <MODEL>` | Summary model for the proxy's own summary calls (sets `BILI_COMPACT_MODEL`; `--compact-model=<MODEL>` also works). Unlike other bili flags it is also accepted **after** the client name (`bili claude --compact-model <MODEL>`) and stripped from the client's args — except after an explicit `--`, which forwards everything verbatim. A launcher only attaches to a running proxy started with the same value. |
+| `--delegate-summary` | Enable delegated summary mode (sets `BILI_DELEGATE_SUMMARY=1`); same placement rules as `--compact-model`. |
 
 ---
 

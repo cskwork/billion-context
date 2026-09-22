@@ -125,6 +125,13 @@ Options (override config file / env):
   --no-passthrough                 force compression on (overrides config)
   --no-auto-update                 disable background self-update this run
   --auto-restart-on-update         self-restart when a newer version is already installed on disk (default off)
+  --compact-model <MODEL>          model for the proxy's own summary calls (preflight +
+                                   delegated compress); sets BILI_COMPACT_MODEL. Also
+                                   accepted after the client name (bili claude
+                                   --compact-model <MODEL>) and stripped from its args
+  --delegate-summary               main model picks compress ranges only; the proxy writes
+                                   the summaries with --compact-model (BILI_DELEGATE_SUMMARY=1;
+                                   also accepted after the client name)
 
 Config: ${defaultConfigFile()}
   Set port/host/debug/providers/compress/autoUpdate there. See README §Configuration.
@@ -147,6 +154,37 @@ type Parsed = {
     pluginAgent?: PluginAgent;
     pluginWithMcp?: boolean;
 };
+
+/** The summary-model flags are the one exception to "everything after the
+ *  client name goes to the client": `bili claude --compact-model X` is the
+ *  natural spelling, and no supported client defines these flags. They are
+ *  consumed (and removed) from the client args up to an explicit `--`;
+ *  anything after that separator is forwarded verbatim. */
+export function extractSummaryFlags(args: string[], overrides: Record<string, string | undefined>): string[] {
+    const out: string[] = [];
+    for (let i = 0; i < args.length; i++) {
+        const a = args[i]!;
+        if (a === "--") {
+            out.push(...args.slice(i));
+            break;
+        }
+        if (a === "--delegate-summary") {
+            overrides.BILI_DELEGATE_SUMMARY = "1";
+            continue;
+        }
+        if (a === "--compact-model" || a.startsWith("--compact-model=")) {
+            const val = a === "--compact-model" ? args[++i] : a.slice("--compact-model=".length);
+            if (val === undefined || val.trim().length === 0) {
+                console.error("bili: --compact-model requires a non-empty value");
+                process.exit(2);
+            }
+            overrides.BILI_COMPACT_MODEL = val.trim();
+            continue;
+        }
+        out.push(a);
+    }
+    return out;
+}
 
 export function parseArgs(argv: string[]): Parsed {
     const overrides: Record<string, string | undefined> = {};
@@ -171,7 +209,7 @@ export function parseArgs(argv: string[]): Parsed {
             // Consume a leading "--" separator (documented form: `bili <client> [opts --] [args]`)
             // so it is never forwarded to the client (clap-style parsers treat everything
             // after "--" as positionals).
-            clientArgs = rest[0] === "--" ? rest.slice(1) : rest;
+            clientArgs = rest[0] === "--" ? rest.slice(1) : extractSummaryFlags(rest, overrides);
             break;
         }
         switch (a) {
@@ -221,6 +259,18 @@ export function parseArgs(argv: string[]): Parsed {
             }
             case "--with-mcp":
                 pluginWithMcp = true;
+                break;
+            case "--compact-model": {
+                const val = argv[++i];
+                if (val === undefined || val.trim().length === 0) {
+                    console.error(`bili: ${a} requires a non-empty value`);
+                    process.exit(2);
+                }
+                overrides.BILI_COMPACT_MODEL = val.trim();
+                break;
+            }
+            case "--delegate-summary":
+                overrides.BILI_DELEGATE_SUMMARY = "1";
                 break;
             case "-F":
             case "--port":

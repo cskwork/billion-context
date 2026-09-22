@@ -122,7 +122,7 @@ function normalizedSpecKey(ranges: ParsedRange[]): string {
         .sort()
         .join(",");
 }
-function recordCompressFailure(session: Session, key: string, repeatAdvice?: string): string {
+export function recordCompressFailure(session: Session, key: string, repeatAdvice?: string): string {
     if (!key) return "";
     const prev = session.metadata[FAIL_STREAK_KEY];
     const keys = Array.isArray(prev) ? prev.filter((k): k is string => typeof k === "string") : [];
