@@ -100,6 +100,22 @@ test("#841 omitted or own conversation_id → current-session behavior unchanged
     assert.ok(!outOmitted.includes("in session"), "no foreign scope on current-session search");
 });
 
+test("#1125 literal \"current\" (any case) resolves to the current session", () => {
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    _resetSessionsForTest();
+    const session = makeSession("pfa-real-id");
+    const core = compressInto(session);
+    const direct = executeSearchContext({ query: "auth token" }, core, session.state);
+    const outLower = executeSearchContextTarget({ query: "auth token", conversation_id: "current" }, core, "pfa-real-id", session.state);
+    const outUpper = executeSearchContextTarget({ query: "auth token", conversation_id: "Current" }, core, "pfa-real-id", session.state);
+    const outMixed = executeSearchContextTarget({ query: "auth token", conversation_id: "cUrReNt" }, core, "pfa-real-id", session.state);
+    assert.equal(outLower, direct, "'current' must equal direct current-session execution");
+    assert.equal(outUpper, direct, "'Current' must equal direct current-session execution");
+    assert.equal(outMixed, direct, "'cUrReNt' must equal direct current-session execution");
+    assert.ok(!outLower.includes("in session"), "no foreign scope on the 'current' alias");
+    assert.ok(!outLower.includes("FAILED"), "'current' must not fail as an unknown session");
+});
+
 test("#841 self-reference via canonical alias keeps current-session semantics", () => {
     _setStoreForTest(new SessionStore({ enabled: false }));
     _resetSessionsForTest();
