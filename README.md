@@ -37,9 +37,9 @@ A production-scale longitudinal study: 4.5 months, three hosts, 174,327 model ca
 
 ## Community
 
-Discussion, help, and updates on QQ — one group covers all three projects (`billion-context`, `billion-context-pi`, `opencode-acp`):
+Discussion, help, and updates on QQ — one group covers all three projects (`billion-context`, `billion-context-pi`, `opencode-acp`). The original group is full — please join the new one:
 
-**QQ Group: 1056132097**
+**QQ Group: 1108730198** _(original 1056132097 is now full)_
 
 ## Why
 
@@ -1009,7 +1009,7 @@ Client-side plugins for pi / omp / opencode ship inside `billion-context` (`dist
 
 ## Community
 
-QQ group — one shared group for all three projects ([`billion-context`](https://github.com/ranxianglei/billion-context), [`billion-context-pi`](https://github.com/ranxianglei/billion-context-pi), [`opencode-acp`](https://github.com/ranxianglei/opencode-acp)): **1056132097**
+QQ group — one shared group for all three projects ([`billion-context`](https://github.com/ranxianglei/billion-context), [`billion-context-pi`](https://github.com/ranxianglei/billion-context-pi), [`opencode-acp`](https://github.com/ranxianglei/opencode-acp)): **1108730198** _(original 1056132097 is now full)_
 
 ## License
 

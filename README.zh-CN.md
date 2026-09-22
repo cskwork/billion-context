@@ -37,9 +37,9 @@ AI 编程助手的<strong>通用上下文压缩代理</strong>
 
 ## 社区
 
-交流、求助与更新都在 QQ——同一个群覆盖三个项目(`billion-context`、`billion-context-pi`、`opencode-acp`):
+交流、求助与更新都在 QQ——同一个群覆盖三个项目(`billion-context`、`billion-context-pi`、`opencode-acp`)。原群已满,请加入新群:
 
-**QQ 群:1056132097**
+**QQ 群:1108730198**(原群 1056132097 已满)
 
 ## 为什么
 
@@ -503,7 +503,7 @@ Windows 下会自动发现常见 Clash/Mihomo 静态系统代理;Web UI 会显�
 
 ## 社区
 
-QQ 群 —— 三个项目共用一个群（[`billion-context`](https://github.com/ranxianglei/billion-context)、[`billion-context-pi`](https://github.com/ranxianglei/billion-context-pi)、[`opencode-acp`](https://github.com/ranxianglei/opencode-acp)）：**1056132097**
+QQ 群 —— 三个项目共用一个群（[`billion-context`](https://github.com/ranxianglei/billion-context)、[`billion-context-pi`](https://github.com/ranxianglei/billion-context-pi)、[`opencode-acp`](https://github.com/ranxianglei/opencode-acp)）：**1108730198**（原群 1056132097 已满）
 
 ## 许可证
 
