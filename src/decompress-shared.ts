@@ -179,7 +179,9 @@ export function executeSearchContextTarget(
     state: CompressionState,
 ): string {
     const requested = typeof args.conversation_id === "string" ? args.conversation_id.trim() : "";
-    if (!requested || requested === sessionId) return executeSearchContext(args, core, state);
+    // #1125: honor the param description's "Defaults to the current conversation" —
+    // the literal "current" (any case) resolves to this session, not the foreign lookup.
+    if (!requested || requested === sessionId || requested.toLowerCase() === "current") return executeSearchContext(args, core, state);
     // A self-reference under an alias form (canonical pfa-* id) keeps plain
     // current-session semantics — no "historical session" framing.
     const self = peekSession(requested) ?? findSessionByCanonicalId(requested);
