@@ -230,7 +230,10 @@ test("overflow: compression really happens in codex; bulk folded, sentinels reta
 	assert.ok(summaries.length >= 2, `expected repeated summarization as context accumulated (got ${summaries.length})`);
 	const mains = oracle.filter((o) => !o.isSummary);
 	assert.ok(mains.length >= 2, "expected several forwarded requests");
-	const lens = mains.map((m) => m.inputLen);
+	// Boundedness is measured over the load turns: the warmup turn carries no filler
+	// and, below minCompressRange, no ACP surface either (#1112), so its payload is
+	// structurally smaller than steady state and must not set the floor here.
+	const lens = mains.slice(1).map((m) => m.inputLen);
 	const minLen = Math.min(...lens);
 	const peak = Math.max(...lens);
 	assert.ok(peak <= minLen * 1.3, `despite ~20KB filler injected on every load turn the forwarded payload must stay bounded (min=${minLen}, peak=${peak}); unbounded growth would mean compression is not folding the bulk`);
