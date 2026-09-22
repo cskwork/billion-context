@@ -272,7 +272,7 @@ mode), and reports the client's **own model config** to the proxy so
 compression budgets use the real window instead of a registry guess.
 Opt-out envs: `BILI_NATIVE_PI=0`, `BILI_NATIVE_OMP=0`,
 `BILI_NATIVE_OPENCODE=0`, `BILI_NATIVE_DSH=0`, `BILI_NATIVE_KIMI=0`,
-`BILI_NATIVE_HERMES=0`. Full
+`BILI_NATIVE_HERMES=0`, `BILI_NATIVE_ZCODE=0`. Full
 mechanics: [TECHNICAL-NOTES.md](TECHNICAL-NOTES.md).
 
 **Runtime-info protocol (#955).** A native plugin reads the model config
@@ -305,8 +305,14 @@ Notes:
   claude` writes a managed settings block (static `/bili/` URL +
   `SessionStart` hook) plus an MCP shell pinned to a stable port — the
   proxy lives and dies with the session. Opt out with
-  `BILI_NATIVE_CLAUDE=0` (passthrough). Mechanics:
-  [TECHNICAL-NOTES.md](TECHNICAL-NOTES.md).
+   `BILI_NATIVE_CLAUDE=0` (passthrough). Mechanics:
+   [TECHNICAL-NOTES.md](TECHNICAL-NOTES.md).
+- `zcode` also has a **native posture** (#1145): `bili plugin install
+  zcode` writes `~/.zcode/cli/config.json` (`hooks.enabled` +
+  `SessionStart` hook + stdio MCP server) and rewrites the bigmodel
+  coding-plan provider's `baseURL` to `<proxy>/bili/<upstream>` per
+  session (both store generations: legacy `v2/config.json` and v3.14+
+  `provider_config.json`) — full mechanics in the "ZCode" section below.
 - `jcode` has no native mode at all: it is a compiled Rust binary with no
   plugin or extension seam, its only per-provider request surface is a static
   TOML header table applied verbatim to every request, and its MCP servers
