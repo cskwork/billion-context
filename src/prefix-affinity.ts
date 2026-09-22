@@ -28,9 +28,20 @@ import { createHash } from "node:crypto";
  * relay switching, protocol-translating relays). Partitioning by them orphans
  * state exactly when the user keeps talking. The content chain is the only
  * immutable anchor: the same person switching keys or relays mid-conversation
- * keeps the session, which is the correct semantics. Safety: matching a stored
- * chain requires possessing a byte-identical history, so the folded state
- * reveals nothing the requester does not already hold.
+ * keeps the session, which is the correct semantics.
+ *
+ * Matching is HEAD-ANCHORED ONLY. A client that TRUNCATED its replayed
+ * history does not reattach the stored chain — it forks into a fresh session
+ * (birth attributed via lineage, see resolve step 2). The former
+ * "tail-window reattach" (#316) adopted sessions on a contiguous MID-CHAIN
+ * match, which is symmetric evidence: it cannot distinguish "same
+ * conversation, truncated replay" from "a different conversation quoting
+ * shared content" (templated tool outputs, standard files, stock errors —
+ * parallel agents on one codebase produce these naturally). Removed in
+ * #1115; rejected alternatives are documented in SESSION-IDENTITY.md.
+ *
+ * Safety: matching a stored chain requires holding a byte-identical HEAD, so
+ * the folded state reveals nothing the requester does not already hold.
  */
 
 /** Creation/match floor on the canonical size of the hashed messages.
@@ -45,17 +56,16 @@ const MAX_TRACKED_SESSIONS = 256;
 /** Chains unused for this long stop matching (sessions may outlive tracking). */
 const TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
-/** Tail-window reattach window (#316 / PR-B): the incoming's LEADING items
- *  are searched for as a contiguous run at ANY offset inside each stored
- *  chain's per-item hashes (the incoming head is the retained suffix of the
- *  stored history, but a rolling-window client may retain any number of
- *  items, so the match offset must be free — not pinned to the stored tail). */
-const TAIL_WINDOW = 8;
+/** Leading-run length used to attribute a NEW anonymous session's birth to a
+ *  truncated replay of a tracked chain (#1115: lineage attribution ONLY —
+ *  never affects matching). */
+const TRUNCATION_LINEAGE_WINDOW = 8;
 
 /** Per tracked chain, store at most this many per-item hashes (the trailing
- *  ones). Bounds memory (256 chains × 128 × 64B ≈ 2MB) and keeps the tail
- *  window (8) comfortably available. Chains deeper than this lose their head,
- *  so fork-lineage prefix detection is best-effort for very long chains. */
+ *  ones). Bounds memory (256 chains × 128 × 64B ≈ 2MB) and keeps lineage
+ *  lookups (fork-LCP + truncated-run, both ≤ 8 items) comfortably available.
+ *  Chains deeper than this lose their head, so fork-lineage LCP detection
+ *  degrades to "unknown" rather than guessing. */
 const MAX_STORED_ITEMS = 128;
 
 /** Minimum shared prefix (items) to record a "forked" lineage on a new
@@ -73,12 +83,11 @@ export interface AnonymousAffinity {
     incomingDepth: number;
     /** Chain hash of the incoming tail (log correlation). */
     tailHash: string;
-    /** How the session was resolved: a full-prefix match, a tail-window
-     *  reattach (truncated replay), or a brand-new session. */
-    via: "prefix" | "tail-window" | "new";
+    /** How the session was resolved: a full-prefix match or a brand-new
+     *  session. (Truncated replays no longer reattach — #1115.) */
+    via: "prefix" | "new";
     /** Per-item hashes of the incoming (trailing, capped at MAX_STORED_ITEMS) —
-     *  passed to note() so the tracked chain can serve future tail-window
-     *  reattach + fork-lineage lookups. */
+     *  passed to note() so the tracked chain can serve fork-lineage lookups. */
     itemHashes: string[];
     /** Lineage for a NEW session: the discarded match candidates and why they
      *  were abandoned. Recorded for UI/debug only — NEVER used for matching. */
@@ -148,8 +157,8 @@ function chainHashes(messages: unknown[]): string[] {
 
 /** Position-INDEPENDENT per-item hashes: itemHashes[i] = sha256(canonical(msg_i)).
  *  Unlike the progressive chainHashes (which depend on the full prefix and so
- *  cannot match across a truncation), these let a window of the incoming head
- *  be compared against a window of a stored tail item-for-item. */
+ *  cannot match across a truncation), these support lineage lookups: fork-LCP
+ *  from index 0, and truncated-run detection strictly inside a stored chain. */
 function perItemHashes(messages: unknown[]): string[] {
     return messages.map((m) => sha256(stableStringify(m)));
 }
@@ -160,6 +169,22 @@ function lcpLength(a: string[], b: string[]): number {
     let i = 0;
     while (i < n && a[i] === b[i]) i++;
     return i;
+}
+
+/** True iff `needle` occurs contiguously in `haystack` at some offset j ≥ 1
+ *  (strictly inside — offset 0 is the full-prefix case, handled by resolve
+ *  step 1). Truncated-lineage attribution only (#1115). */
+function containsRun(haystack: string[], needle: string[]): boolean {
+    const w = needle.length;
+    if (w === 0 || haystack.length < w + 1) return false;
+    for (let j = 1; j + w <= haystack.length; j++) {
+        let hit = true;
+        for (let i = 0; i < w; i++) {
+            if (haystack[j + i] !== needle[i]) { hit = false; break; }
+        }
+        if (hit) return true;
+    }
+    return false;
 }
 
 export class PrefixAffinityResolver {
@@ -199,71 +224,40 @@ export class PrefixAffinityResolver {
             };
         }
 
-        // 2. Tail-window reattach (#316 / PR-B): a client that dropped its
-        //    oldest messages replays a retained suffix of the stored history
-        //    (plus new appends), so the incoming's LEADING items must appear
-        //    as a contiguous run somewhere inside the stored chain's item
-        //    hashes — at any offset, not just the stored tail (a rolling-window
-        //    client may retain more items than TAIL_WINDOW). Offset 0 is
-        //    excluded: a head-to-head match is either a full-prefix case
-        //    (step 1) or a distinct conversation sharing a templated head —
-        //    never a truncation reattach (the retained suffix of a truncation
-        //    starts strictly inside the stored chain). Adoption requires the
-        //    FULL window (incomingDepth >= TAIL_WINDOW): a sub-8 leading run is
-        //    weak identity evidence and lets a short crafted request adopt an
-        //    unrelated stored session by coincidence (#1064 #13).
-        const w = Math.min(TAIL_WINDOW, incomingDepth);
-        const candidates: ChainEntry[] = [];
-        if (w === TAIL_WINDOW) {
-            for (const entry of tracked.values()) {
-                const stored = entry.itemHashes;
-                for (let j = 1; j + w <= stored.length; j++) {
-                    let match = true;
-                    for (let i = 0; i < w; i++) {
-                        if (incItemHashes[i] !== stored[j + i]) {
-                            match = false;
-                            break;
-                        }
-                    }
-                    if (match) {
-                        candidates.push(entry);
-                        break;
-                    }
-                }
-            }
-        }
-        if (candidates.length === 1) {
-            const entry = candidates[0]!;
-            const w = Math.min(TAIL_WINDOW, incomingDepth, entry.depth);
-            return {
-                sessionId: entry.sessionId,
-                matchedDepth: w,
-                storedDepth: entry.depth,
-                incomingDepth,
-                tailHash,
-                via: "tail-window",
-                itemHashes: storedItemHashes,
-            };
-        }
-
-        // 3. New session, anchored deterministically on its current tail so an
+        // 2. New session, anchored deterministically on its current tail so an
         //    identical replay after a proxy restart reattaches the same id.
-        //    Record lineage (UI/debug only) for the discarded candidates.
+        //    Lineage (UI/debug ONLY — never used for matching, #1115):
+        //    "forked" when the incoming shares a leading prefix with a tracked
+        //    chain (diverged/edited history); else "truncated" when its leading
+        //    run sits strictly INSIDE a tracked chain (the client dropped its
+        //    oldest messages). That second case used to ADOPT the parent
+        //    session (tail-window reattach, #316); #1115 removed the adoption
+        //    because a mid-chain contiguous match is symmetric evidence, not
+        //    ownership — the scan survives solely so logs show where such a
+        //    fork was born.
         let lineage: AnonymousAffinity["lineage"];
-        if (candidates.length > 1) {
-            lineage = { parents: candidates.map((c) => c.sessionId), reason: "truncated" };
-        } else {
-            let forkParent: ChainEntry | undefined;
-            let forkLcp = 0;
-            for (const entry of tracked.values()) {
-                if (entry.depth > MAX_STORED_ITEMS) continue;
-                const lcp = lcpLength(incItemHashes, entry.itemHashes);
-                if (lcp >= MIN_FORK_PREFIX && lcp > forkLcp) {
-                    forkLcp = lcp;
-                    forkParent = entry;
-                }
+        let forkParent: ChainEntry | undefined;
+        let forkLcp = 0;
+        for (const entry of tracked.values()) {
+            if (entry.depth > MAX_STORED_ITEMS) continue;
+            const lcp = lcpLength(incItemHashes, entry.itemHashes);
+            if (lcp >= MIN_FORK_PREFIX && lcp > forkLcp) {
+                forkLcp = lcp;
+                forkParent = entry;
             }
-            if (forkParent) lineage = { parents: [forkParent.sessionId], reason: "forked", sharedPrefix: forkLcp };
+        }
+        if (forkParent) {
+            lineage = { parents: [forkParent.sessionId], reason: "forked", sharedPrefix: forkLcp };
+        } else {
+            const w = Math.min(TRUNCATION_LINEAGE_WINDOW, incomingDepth);
+            if (w >= MIN_FORK_PREFIX) {
+                const needle = incItemHashes.slice(0, w);
+                const parents: string[] = [];
+                for (const entry of tracked.values()) {
+                    if (containsRun(entry.itemHashes, needle)) parents.push(entry.sessionId);
+                }
+                if (parents.length > 0) lineage = { parents, reason: "truncated" };
+            }
         }
         const sessionId = `pfa-${sha256(`${tailHash}\u0000${incomingDepth}`).slice(0, 16)}`;
         return {

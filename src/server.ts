@@ -1439,10 +1439,7 @@ async function handle(
                     : { error: { type: "invalid_request_error", message: NO_IDENTITY_MESSAGE } }));
                 return;
             }
-            if (anonAffinity.via === "tail-window") {
-                log("info", `[prefix-affinity] anonymous ${protocol} request → session ${anonAffinity.sessionId} (tail-window reattach window=${anonAffinity.matchedDepth}/${anonAffinity.incomingDepth}, tail=${anonAffinity.tailHash.slice(0, 8)}; truncated replay reattached, kernel reconciles by message id)`);
-                loggerLog("info", `[prefix-affinity] session ${anonAffinity.sessionId} reattached via tail-window (window ${anonAffinity.matchedDepth}/${anonAffinity.incomingDepth}, tail=${anonAffinity.tailHash.slice(0, 8)})`);
-            } else if (anonAffinity.matchedDepth > 0) {
+            if (anonAffinity.matchedDepth > 0) {
                 log("info", `[prefix-affinity] anonymous ${protocol} request → session ${anonAffinity.sessionId} (prefix match depth=${anonAffinity.matchedDepth}/${anonAffinity.incomingDepth}, tail=${anonAffinity.tailHash.slice(0, 8)}; fork semantics: diverged histories split on their next request)`);
                 loggerLog("info", `[prefix-affinity] session ${anonAffinity.sessionId} matched at depth ${anonAffinity.matchedDepth}/${anonAffinity.incomingDepth} (tail=${anonAffinity.tailHash.slice(0, 8)})`);
             } else {
