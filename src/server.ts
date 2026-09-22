@@ -2136,7 +2136,16 @@ function diagNudge(turn: { nudge?: { shouldInject: boolean; reason: string; cont
 // first-turn behavior is byte-identical to pre-#728.
 function effectiveTokenCount(session: Session, msgs: CoreMessage[], inboundImageTokens = 0): number {
     if (session.stats.lastInputTokens > 0) return session.stats.lastInputTokens;
-    if (session.metadata.anonymousPrefixAffinity) return estimateCoreMessagesUpper(msgs);
+    // The inbound upper bound carries the image term in BOTH zero-baseline
+    // regimes (#1119/#1137): the wire codecs move images out of
+    // CoreMessage.text into sidecars, so a text-only bound drops them.
+    // #1137: an anonymous prefix-affinity fork (#553) replays its FULL raw
+    // history — images included — in this one request, so this request's
+    // image mass IS the history's image mass; returning the text-only bound
+    // there left image-heavy forks reading single-digit usage % and nudging
+    // only at overflow.
+    const raw = estimateCoreMessagesUpper(msgs) + inboundImageTokens;
+    if (session.metadata.anonymousPrefixAffinity) return raw;
     const est = session.stats.localInputEstimate ?? 0;
     if (est <= 0) return 0;
     // Cap by THIS request's inbound upper bound: the recorded estimate lags by
@@ -2144,15 +2153,9 @@ function effectiveTokenCount(session: Session, msgs: CoreMessage[], inboundImage
     // edit) the previous turn's payload can be larger than what is in front of
     // us now — never claim more context than the current request could hold.
     // In steady state est <= raw bound always (the outbound fold is never
-    // larger than the inbound history), so this is a no-op there.
-    // #1119: the bound must carry the image term too — the wire codecs move
-    // images out of CoreMessage.text into sidecars, so a text-only bound caps
-    // the recorded estimate's image contribution away whenever the previous
-    // turn carried images, blinding the nudge to exactly the byte-billed
-    // multimodal sessions #728 restored. A client-side shrink still shrinks
-    // the bound (fewer messages AND fewer images), preserving the stale-high
-    // invariant above.
-    const raw = estimateCoreMessagesUpper(msgs) + inboundImageTokens;
+    // larger than the inbound history), so this is a no-op there. A
+    // client-side shrink still shrinks the bound (fewer messages AND fewer
+    // images), preserving the stale-high invariant.
     return Math.min(est, raw);
 }
 

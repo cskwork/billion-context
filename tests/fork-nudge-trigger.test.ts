@@ -186,3 +186,116 @@ test("e2e: explicit-identity zero-baseline session with the same conversation �
     const stripped = msgText(last).replace(/^\x3cacp\s[^>]*>[^\x3c]*\x3c\/acp\x3e/, "").trimStart();
     assert.ok(stripped.startsWith("CODE_11_"), `last message must be the original last message (modulo the outbound ACP anchor tag): ${JSON.stringify(last).slice(0, 200)}`);
 });
+
+// #1137: the anonymous-branch upper bound must carry the image term. An
+// image-heavy fork (client reload replaying screenshot history) reuses the
+// A-conversation text (~54k chars — proven T1 mass ~5.7k ≥ minPressureBenefit)
+// in a 100k window so the TEXT-only bound sits at ~54%, below every band,
+// while the byte-billed image mass (3 × 10k) lifts the total to ~84% — over
+// the 75% pressure band. Pre-fix the branch returned the text-only bound and
+// the nudge stayed idle until overflow. Bytes billing: ceil(b64 length / 4)
+// per image (same shape as silent-backend-nudge.test.ts).
+const IMG_WINDOW = 100_000;
+const IMG_B64 = "iVBORw0KGgo" + "A".repeat(40_000 - 9); // 10_000 tokens
+const imgPart = (): Record<string, unknown> => ({
+    type: "image",
+    source: { type: "base64", media_type: "image/png", data: IMG_B64 },
+});
+
+function imageForkConversation(): Array<{ role: string; content: unknown }> {
+    // forkConversation() verbatim (7 old ~7.3k-char messages + 5 tiny recent)
+    // with one recent user message swapped to carry 3 inline screenshots —
+    // the recent zone is preserved anyway, so T1 mass is unchanged.
+    const msgs = forkConversation().map((m) => ({ ...m })) as Array<{ role: string; content: unknown }>;
+    msgs[10] = { role: "user", content: [{ type: "text", text: "tiny question with screenshots" }, imgPart(), imgPart(), imgPart()] };
+    return msgs;
+}
+
+async function runImageCase(): Promise<Array<{ stream: boolean; body: string }>> {
+    const calls: Array<{ stream: boolean; body: string }> = [];
+    const upstream = http.createServer((req, res) => {
+        const chunks: Buffer[] = [];
+        req.on("data", (c: Buffer) => chunks.push(c));
+        req.on("end", () => {
+            const raw = Buffer.concat(chunks).toString("utf8");
+            let parsed: { stream?: boolean } = {};
+            try {
+                parsed = JSON.parse(raw);
+            } catch {
+                /* keep {} */
+            }
+            calls.push({ stream: !!parsed.stream, body: raw });
+            if (parsed.stream) {
+                res.writeHead(200, { "content-type": "text/event-stream" });
+                res.end(okSse(1000));
+            } else {
+                res.writeHead(200, { "content-type": "application/json" });
+                res.end(JSON.stringify({
+                    id: "msg_summary",
+                    type: "message",
+                    role: "assistant",
+                    model: "claude-small",
+                    content: [{ type: "text", text: "SUMMARY TEXT" }],
+                    stop_reason: "end_turn",
+                    usage: { input_tokens: 500, output_tokens: 50 },
+                }));
+            }
+        });
+    });
+    upstream.listen(0, "127.0.0.1");
+    await once(upstream, "listening");
+    const upstreamPort = upstream.address().port;
+
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    _resetSessionsForTest();
+    setRegistryForTest({});
+    const proxy = await startServer({
+        port: 0,
+        host: "127.0.0.1",
+        upstream: "http://127.0.0.1",
+        routes: { [`http://127.0.0.1:${upstreamPort}`]: { models: { "claude-small": { context: IMG_WINDOW } } } },
+        modelContextLimit: 400_000,
+        kernelConfig: defaultConfig(400_000),
+        compress: { injectTool: true, injectNudge: true },
+        promptCache: { routing: "auto" },
+        sessionHeader: "x-acp-session",
+        log: false,
+        debug: false,
+        passthrough: false,
+        autoUpdate: false,
+        mitm: { enabled: false, domains: [] },
+    } as ProxyOptions);
+    await once(proxy, "listening");
+    const proxyPort = proxy.address().port;
+
+    try {
+        const resp = await fetch(`http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/messages`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+                model: "claude-small",
+                max_tokens: 1024,
+                stream: true,
+                messages: imageForkConversation(),
+            }),
+        });
+        await resp.text();
+        return calls;
+    } finally {
+        proxy.close();
+        upstream.close();
+    }
+}
+
+test("e2e: #1137 anonymous image-heavy fork → image term crosses the pressure band, nudge injects", async () => {
+    const calls = await runImageCase();
+    assert.equal(calls.filter((c) => !c.stream).length, 0, "preflight must stay silent (optimistic estimate under window)");
+    const forward = calls.filter((c) => c.stream).at(-1)!;
+    const msgs = msgsOf(forward.body);
+    const last = msgs.at(-1)!;
+    assert.ok(
+        last.role === "user" && msgText(last).includes(NUDGE_MARKER),
+        `expected trailing user nudge — text-only bound (~54%) sits below every band, only the image term (3 × 10k) can cross it; got: ${forward.body.slice(-800)}`,
+    );
+    assert.ok(forward.body.includes("image/png"), "images must ride along un-folded (nudge is advisory)");
+});
