@@ -59,6 +59,14 @@ export const PLUGIN_BYPASS_HEADER = "x-bili-plugin-bypass";
 export const PLUGIN_CONTEXT_WINDOW_HEADER = "x-bili-plugin-context-window";
 export const PLUGIN_MAX_OUTPUT_HEADER = "x-bili-plugin-max-output";
 export const PLUGIN_MODEL_HEADER = "x-bili-plugin-model";
+/** #1102: stamped "1" by plugins whose host mints one conversation id per
+ *  persona (opencode: subagents get their own child session ids), so
+ *  mid-conversation instruction drift (AGENTS.md reconcile) must NOT fork the
+ *  compression session via the instructions fingerprint. Honored only together
+ *  with x-bili-plugin + x-bili-plugin-conversation (see
+ *  instructionsFingerprintExempt in src/session-id.ts); hosts whose id
+ *  semantics are unverified never stamp it. */
+export const PLUGIN_INSTRUCTIONS_MUTABLE_HEADER = "x-bili-plugin-instructions-mutable";
 
 export const PLUGIN_PROTOCOL_VERSION = 1;
 
@@ -532,7 +540,7 @@ export function handlePluginManifest(res: import("node:http").ServerResponse): v
             openai: withSearchContextConversationDescription([...BILI_ACP_TOOLS_OPENAI, ABSORB_TOOL_OPENAI, RULE_TOOL_OPENAI].map(withConversationIdParam)),
             responses: withSearchContextConversationDescription([...BILI_ACP_TOOLS_RESPONSES, ABSORB_TOOL_RESPONSES, RULE_TOOL_RESPONSES].map(withConversationIdParam)),
         },
-        headers: { agent: PLUGIN_AGENT_HEADER, conversation: PLUGIN_CONVERSATION_HEADER, contextWindow: PLUGIN_CONTEXT_WINDOW_HEADER, maxOutput: PLUGIN_MAX_OUTPUT_HEADER, model: PLUGIN_MODEL_HEADER },
+        headers: { agent: PLUGIN_AGENT_HEADER, conversation: PLUGIN_CONVERSATION_HEADER, contextWindow: PLUGIN_CONTEXT_WINDOW_HEADER, maxOutput: PLUGIN_MAX_OUTPUT_HEADER, model: PLUGIN_MODEL_HEADER, instructionsMutable: PLUGIN_INSTRUCTIONS_MUTABLE_HEADER },
         toolEndpoint: "/__bili/plugin/tool",
         statusEndpoint: "/__bili/plugin/status",
         runtimeInfoEndpoint: "/__bili/plugin/runtime-info",

@@ -539,6 +539,10 @@ export function createV1ServerHooks(origin: string, ctx: V1PluginContext, deps: 
             }
             output.headers["x-bili-plugin"] = "opencode";
             output.headers["x-bili-plugin-conversation"] = input.sessionID;
+            // #1102: opencode mints one session id per persona (task-tool
+            // subagents get fresh child ids), so instruction drift (AGENTS.md
+            // reconcile) must not fork the compression session.
+            output.headers["x-bili-plugin-instructions-mutable"] = "1";
             const model = input.model;
             if (model && typeof model.providerID === "string" && typeof model.id === "string") {
                 const key = `${model.providerID}/${model.id}`;

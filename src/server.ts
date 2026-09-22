@@ -91,7 +91,7 @@ import { rewriteGoogleJsonResponse } from "./stream-google.js";
 import { rewriteResponsesJsonResponse } from "./stream-responses.js";
 import { observeResponsesTerminalState } from "./stream-terminal.js";
 import { emitPreflightError, emitStreamError } from "./stream-error.js";
-import { affinityToken, claudeSubagentAgentId, claudeSubagentSplit, clientConversationHeader, codexTurnIdentity, preferPromptCacheKeyIdentity, type ConversationIdentity } from "./session-id.js";
+import { affinityToken, claudeSubagentAgentId, claudeSubagentSplit, clientConversationHeader, codexTurnIdentity, instructionsFingerprintExempt, preferPromptCacheKeyIdentity, type ConversationIdentity } from "./session-id.js";
 import { prefixAffinity, type AnonymousAffinity } from "./prefix-affinity.js";
 import { maybeAdoptForkBlocks } from "./fork-adoption.js";
 import { flushPrefixAffinity, hydratePrefixAffinity, scheduleAffinityPersist } from "./affinity-persist.js";
@@ -1345,10 +1345,20 @@ async function handle(
                 // kernel's empty-instructions non-anchoring path is left
                 // untouched for metadata-less clients).
                 ? codexTurn.value
-                : subagentNamespace(
-                      responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader),
-                      (parsed as ResponsesRequestBody).instructions,
-                  );
+                 : instructionsFingerprintExempt(req.headers)
+                   // #1102: verified persona-scoped native conversation ids
+                   // (opencode ses_ headers / plugin declaration) may see
+                   // instruction drift mid-conversation (AGENTS.md reconcile)
+                   // without a persona change — key them verbatim like the
+                   // trusted codexTurn branch above instead of forking an
+                   // orphan |sub:<fp> session. Trust set + why every other
+                   // signal keeps the fingerprint: see
+                   // instructionsFingerprintExempt in src/session-id.ts.
+                   ? (responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader))
+                   : subagentNamespace(
+                         responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader),
+                         (parsed as ResponsesRequestBody).instructions,
+                     );
         // The session ID is the client-provided conversation value VERBATIM —
         // no hash, no protocol/credential/upstream dimensions (#286): those
         // are all mutable mid-conversation (bearer rotation, relay switching,

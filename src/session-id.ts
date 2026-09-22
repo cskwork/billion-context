@@ -34,6 +34,13 @@ export type ConversationIdentity = {
 
 /** Pull a client-provided conversation signal from headers, if any. */
 export function clientConversationHeader(headers: Record<string, string | string[] | undefined>): string | undefined {
+    return conversationHeaderSource(headers)?.value;
+}
+
+/** Same header walk as clientConversationHeader, but also reports WHICH header
+ *  won — needed by callers whose trust decision depends on the signal's origin
+ *  (#1102), not just its value. */
+export function conversationHeaderSource(headers: Record<string, string | string[] | undefined>): { name: string; value: string } | undefined {
     // x-bili-plugin-conversation first: a cooperative plugin's explicit
     // statement of which conversation it is driving (see src/plugin.ts).
     // It outranks every other signal — the plugin owns the session identity
@@ -61,9 +68,47 @@ export function clientConversationHeader(headers: Record<string, string | string
     for (const name of names) {
         if (name === "x-bili-plugin-conversation" && !pluginMarker) continue;
         const v = headers[name];
-        if (typeof v === "string" && v.trim().length > 0) return v.trim();
+        if (typeof v === "string" && v.trim().length > 0) return { name, value: v.trim() };
     }
     return undefined;
+}
+
+/** #1102: whether the winning conversation signal is a VERIFIED persona-scoped
+ *  native identifier, in which case the Responses-wire instructions fingerprint
+ *  must be skipped when keying the compression session.
+ *
+ * subagentNamespace's instructions fingerprint exists to separate PERSONAS that
+ * share one conversation id (Codex threads reuse the task-level session id,
+ * #150). For clients whose native conversation id is persona-scoped — one id is
+ * minted per persona, so an id can never be reused across personas — the same
+ * id carrying different instructions mid-conversation means "same persona,
+ * updated system context" (opencode's system-context reconcile after an
+ * AGENTS.md edit), not a new persona. Fingerprinting there forks an orphan
+ * |sub:<fp> session and resets all compression state.
+ *
+ * Trust set (each verified against the client's own source):
+ *  - x-session-affinity with a ses_… value / x-opencode-session: opencode stamps
+ *    its session id on every model request and mints a fresh child session id
+ *    for every task-tool subagent (sessions.create({ parentID })).
+ *  - x-bili-plugin-conversation + x-bili-plugin-instructions-mutable: 1 — the
+ *    plugin declares its host's conversation ids are persona-scoped. Only the
+ *    opencode plugin stamps the declaration today; unverified hosts (dsh,
+ *    hermes, …) stay on the fingerprinted path.
+ *
+ * Everything else deliberately keeps the fingerprint: Codex body/header/metadata
+ * session ids (#150), x-claude-code-session-id (Claude subagents SHARE the main
+ * agent's session id, #970), grok/mcode/generic x-session-id, prompt-cache-key.
+ */
+export function instructionsFingerprintExempt(headers: Record<string, string | string[] | undefined>): boolean {
+    const src = conversationHeaderSource(headers);
+    if (!src) return false;
+    if (src.name === "x-opencode-session") return true;
+    if (src.name === "x-session-affinity" && src.value.startsWith("ses_")) return true;
+    if (src.name === "x-bili-plugin-conversation") {
+        const flag = headers["x-bili-plugin-instructions-mutable"];
+        return typeof flag === "string" && flag.trim() === "1";
+    }
+    return false;
 }
 
 /**
