@@ -360,3 +360,58 @@ test("e2e anthropic: auto-mode classifier (stop_sequences </severity>/</block>) 
         await h.close();
     }
 });
+
+test("e2e anthropic: client-sent cache_control breakpoints ride their logical blocks across turns (#1092 salvage / #1097 prerequisite)", async () => {
+    // Breakpoint placement must be identity-keyed (content-hash ids through the
+    // kernel round-trip), never index-based: a breakpoint that migrates to a
+    // newer block or lands on injected content silently disables prefix caching
+    // for everything after it (opencode#43507 class). No anchor feature involved:
+    // the head legitimately changes between turns and is forwarded verbatim.
+    const h = await startHarness([textScript(), textScript(), textScript()]);
+    try {
+        const CC = { type: "ephemeral" };
+        let hist: AnthropicUserMessage[] = [];
+        for (const [sysText, userText] of [["CC-SYS-V1", "cc-hello-1"], ["CC-SYS-V2", "cc-hello-2"], ["CC-SYS-V2", "cc-hello-3"]] as Array<[string, string]>) {
+            const newMsg: AnthropicUserMessage = { role: "user", content: [{ type: "text", text: userText, ...(hist.length === 0 ? { cache_control: CC } : {}) }] };
+            const resp = await fetch(`http://127.0.0.1:${h.proxyPort}/bili/http://127.0.0.1:${h.upstreamPort}/v1/messages`, {
+                method: "POST",
+                headers: { "content-type": "application/json", "x-acp-session": "e2e-anthropic-cc" },
+                body: JSON.stringify({ model: "claude-test", max_tokens: 1024, stream: true, system: [{ type: "text", text: sysText, cache_control: CC }], messages: [...hist, newMsg] }),
+            });
+            assert.equal(resp.status, 200);
+            await resp.text();
+            hist.push(newMsg, { role: "assistant", content: [{ type: "text", text: "Hello world!" }] });
+        }
+
+        type CcBlock = { type?: string; text?: string; cache_control?: unknown };
+        const ccBlocksOf = (body: string): CcBlock[] => {
+            const sent = JSON.parse(body) as { system?: string | CcBlock[]; messages: Array<{ role: string; content: string | CcBlock[] }> };
+            const out: CcBlock[] = [];
+            for (const b of Array.isArray(sent.system) ? sent.system : []) if (b.cache_control !== undefined) out.push(b);
+            for (const m of sent.messages) {
+                const blocks = typeof m.content === "string" ? [{ text: m.content }] : m.content;
+                for (const b of blocks) if (b.cache_control !== undefined) out.push(b);
+            }
+            return out;
+        };
+        const sysCcText = (body: string): string => {
+            const sent = JSON.parse(body) as { system?: string | CcBlock[] };
+            return Array.isArray(sent.system) ? (sent.system[0]?.text ?? "") : "";
+        };
+        const [t1, t2, t3] = h.captured.slice(0, 3).map((c) => c.body);
+        assert.ok(t1 && t2 && t3, "expected 3 captured upstream requests");
+        assert.equal(ccBlocksOf(t1!).length, 2, "turn 1: exactly the two client breakpoints");
+        assert.ok(sysCcText(t1!).includes("CC-SYS-V1"), "turn 1: system breakpoint rides the client head");
+        assert.ok(ccBlocksOf(t1!).some((b) => (b.text ?? "").includes("cc-hello-1")), "turn 1: history-block breakpoint preserved");
+        assert.equal(ccBlocksOf(t2!).length, 2, "turn 2: breakpoint count invariant after a legitimate head change");
+        assert.ok(sysCcText(t2!).includes("CC-SYS-V2"), "turn 2: changed head forwarded verbatim with its breakpoint");
+        assert.ok(!sysCcText(t2!).includes("CC-SYS-V1"), "turn 2: no anchoring on master — old head bytes do not linger");
+        assert.ok(ccBlocksOf(t2!).some((b) => (b.text ?? "").includes("cc-hello-1")), "turn 2: history breakpoint stays on the same logical block");
+        assert.ok(!ccBlocksOf(t2!).some((b) => (b.text ?? "").includes("cc-hello-2")), "turn 2: no breakpoint migrates to newer history");
+        assert.equal(ccBlocksOf(t3!).length, 2, "turn 3: steady-turn breakpoint count invariant");
+        assert.ok(sysCcText(t3!).includes("CC-SYS-V2"), "turn 3: system breakpoint stable on steady turns");
+        assert.ok(ccBlocksOf(t3!).some((b) => (b.text ?? "").includes("cc-hello-1")), "turn 3: history breakpoint stable on steady turns");
+    } finally {
+        await h.close();
+    }
+});
