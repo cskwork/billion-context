@@ -6,6 +6,8 @@
 // at extension load always wins. The patch is surgical — it rewrites ONLY
 // model-API shaped URLs and leaves every other request untouched.
 
+import { BILI_PASSTHROUGH_HEADER } from "../util.js";
+
 export interface NativeInterceptState {
     /** Proxy origin ("http://127.0.0.1:PORT") once the bootstrap resolved.
      *  Written by the owner (pi-native.ts); read synchronously on each call. */
@@ -34,6 +36,14 @@ export interface NativeInterceptState {
      *  mode exactly like pi.ts's before_provider_headers stamp. Returning
      *  undefined sends the request untouched (wire mode). */
     headersFor?: (url: string) => Record<string, string> | undefined;
+    /** #1117: attribution gate — called synchronously per model-API request
+     *  with the (pre-rewrite) target URL. Returning false means the caller is
+     *  NOT the host itself (e.g. a third-party in-process plugin riding the
+     *  host's LLM bridge, whose model calls hit the same URLs): the request is
+     *  NOT claimed — raw URLs send direct, already-routed `/bili/` URLs are
+     *  stamped with the passthrough marker instead. Undefined (hosts without
+     *  an attribution signal) keeps URL-shape claiming for every caller. */
+    takeoverGate?: (url: string) => boolean;
     /** How long a pre-ready model request waits for the bootstrap before
      *  falling back to a direct (uncompressed) send. */
     readyTimeoutMs?: number;
@@ -163,11 +173,25 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
         // mode — stamp and pass through untouched otherwise.
         const routedTarget = routedBiliModelUrl(url);
         if (routedTarget !== undefined) {
-            const stamped = withHeaders(input, init, state.headersFor?.(routedTarget));
-            state.onDispatch?.(url, "self");
+            // #1117: routing already happened (settings overlay), so an
+            // unattributed caller cannot be refused here — mark it for
+            // byte-untouched passthrough instead of letting it ride the
+            // pipeline as an anonymous client.
+            const unattributed = state.takeoverGate !== undefined && !state.takeoverGate(routedTarget);
+            const extra = unattributed ? { [BILI_PASSTHROUGH_HEADER]: "1" } : state.headersFor?.(routedTarget);
+            const stamped = withHeaders(input, init, extra);
+            state.onDispatch?.(url, unattributed ? "direct" : "self");
             return orig(stamped.input, stamped.init);
         }
         if (!isModelApiUrl(url)) return orig(input, init);
+        // #1117: URL shape alone cannot claim a request — every model call in
+        // the process hits the same endpoints. When the host supplies an
+        // attribution gate, an unattributed caller keeps its original URL and
+        // sends direct (never touches a bili proxy).
+        if (state.takeoverGate !== undefined && !state.takeoverGate(url)) {
+            state.onDispatch?.(url, "direct");
+            return orig(input, init);
+        }
 
         // Rebuild a Request-object input against the rewritten target. A
         // caller-side defect here (already-consumed or locked body) must not

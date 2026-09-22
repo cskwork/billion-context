@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import http from "node:http";
 import { pathToFileURL } from "node:url";
-import { apply, planNativeDsh, shouldBootstrapNativeDsh, _resetRegisterForTest, _setSpawnForTest, _stateHeadersForTest } from "../src/agent/dsh-native.ts";
+import { apply, planNativeDsh, shouldBootstrapNativeDsh, _resetRegisterForTest, _setSpawnForTest, _stateHeadersForTest, _stateTakeoverGateForTest } from "../src/agent/dsh-native.ts";
 import { dshNativeInstalled, isNpmInstallForm, pluginInstall, pluginRemove, pluginStatusAll, selfPackageRoot } from "../src/plugin-install.ts";
 import { DSH_PATCH_BEGIN, DSH_PATCH_END, dshBundleInstalled, dshProfileDirs, planDshSpawn, stripDshManagedPatch, stripLegacyManagedBlock, _setDshRunnersForTest, type DshPlan } from "../src/dsh-channel.ts";
 
@@ -758,6 +758,29 @@ test("#983 maybeRetry self-heals a base-less register after a failed respawn", a
     } finally {
         _setSpawnForTest(undefined);
         forward.close();
+        fs.rmSync(home, { recursive: true, force: true });
+        _resetRegisterForTest(undefined);
+    }
+});
+
+test("#1117 apply() installs takeoverGate keyed on currentInitiator attribution", async () => {
+    const proxy = await startMockProxy([]);
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-1117-"));
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin }, async () => {
+            _resetRegisterForTest(proxy.origin);
+            const ctx = mockCtx();
+            apply(ctx);
+            const gate = _stateTakeoverGateForTest();
+            assert.ok(gate !== undefined, "takeoverGate installed");
+            // unattributed (background chain, third-party in-process plugin) → NOT claimed
+            assert.equal(gate("https://api.anthropic.com/v1/messages"), false);
+            // attributed (the host's own agent chain) → claimed
+            ctx.setInitiator({ session: { id: "s1117" } });
+            assert.equal(gate("https://api.anthropic.com/v1/messages"), true);
+        });
+    } finally {
+        proxy.close();
         fs.rmSync(home, { recursive: true, force: true });
         _resetRegisterForTest(undefined);
     }

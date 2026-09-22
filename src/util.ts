@@ -7,6 +7,15 @@ import { createHash } from "node:crypto";
 // never send this header except through our own plugin.
 export const BILI_PLUGIN_BYPASS_HEADER = "x-bili-plugin-bypass";
 
+// #1117: stamped by the native fetch patch (agent/native-intercept.ts) on
+// model requests the host CANNOT attribute to its own agent chain (dsh:
+// AsyncLocalStorage currentInitiator absent — e.g. a third-party in-process
+// plugin riding the host's LLM bridge) whose URL is already /bili/-routed by
+// the settings overlay and thus cannot be refused client-side. The proxy
+// relays such requests byte-untouched — no session, no injection, no guard —
+// mirroring what a direct send without the overlay would have been.
+export const BILI_PASSTHROUGH_HEADER = "x-bili-passthrough";
+
 /**
  * Cryptographic hash of a string, truncated to a 64-bit id (16 hex chars).
  *
