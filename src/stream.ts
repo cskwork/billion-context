@@ -245,7 +245,20 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
             // duplicates the snapshot's lo–hi exactly when no fold covers
             // anything, so only append it when active blocks exist.
             const spanHint = ctx.session.state.blocks.some((b) => b.active) ? compressibleSpanHint(ctx.session.state) : "";
-            return `[Compression FAILED: ${errs}${revNote}${currentRefsSnapshot(ctx)}${recordCompressFailure(ctx.session, normalizedSpecKey(ranges))}${spanHint}]`;
+            // #1112: when the ENTIRE visible context is under the minimum, no
+            // COMBINATION of ranges can succeed either (the kernel sums chars
+            // across ranges against one threshold) — the generic "combine more
+            // messages" advice sent models into acp_status/search_context
+            // retry loops on fresh sessions. Append a conclusive verdict to the
+            // standard failure (keeping the kernel reason + #847 reversal note
+            // intact, all on one line for the client marker) so the model stops
+            // inspecting state and lets the original turn continue.
+            const minChars = ctx.config.compress.minCompressRange;
+            const totalChars = ctx.messages.reduce((n, m) => n + (m.text ?? "").length, 0);
+            const noViableAnywhere = minChars > 0 && totalChars < minChars
+                ? ` This conversation holds only ${totalChars} char(s) — below the ${minChars}-char minimum, so NO range can succeed yet; do not retry compress or call acp_status/search_context about it — continue answering the user's task.`
+                : "";
+            return `[Compression FAILED: ${errs}${revNote}${currentRefsSnapshot(ctx)}${recordCompressFailure(ctx.session, normalizedSpecKey(ranges))}${spanHint}${noViableAnywhere}]`;
         }
         clearCompressFailures(ctx.session);
 
