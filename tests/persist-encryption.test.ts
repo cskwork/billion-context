@@ -5,7 +5,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { SessionStore } from "../src/persist.ts";
-import { createSessionCodec, ENCRYPT_MAGIC, parseEncryptionKey } from "../src/encrypt.ts";
+import { createStorageCodec, ENCRYPT_MAGIC, parseEncryptionKey } from "../src/encrypt.ts";
 import type { Session } from "../src/session.ts";
 import { createInitialState } from "acp-kernel";
 
@@ -43,6 +43,7 @@ async function withTempDir(name: string, fn: (h: Harness) => Promise<void>): Pro
             await fn(h);
         } finally {
             delete process.env.BILI_ENCRYPTION_KEY;
+            delete process.env.BILI_PERSIST_ZSTD;
             rmSync(dir, { recursive: true, force: true });
         }
     });
@@ -68,8 +69,8 @@ test("parseEncryptionKey accepts hex and base64, rejects everything else", () =>
 });
 
 test("codec: roundtrip, magic prefix, per-write nonce, tamper and wrong-key rejection", () => {
-    const codec = createSessionCodec(Buffer.from(KEY, "hex"));
-    const other = createSessionCodec(Buffer.from(KEY_OTHER, "hex"));
+    const codec = createStorageCodec({ key: Buffer.from(KEY, "hex") })!;
+    const other = createStorageCodec({ key: Buffer.from(KEY_OTHER, "hex") })!;
     const json = JSON.stringify({ hello: "world", n: [1, 2, 3] });
 
     const enc = Buffer.isBuffer(codec.encode(json)) ? codec.encode(json) : Buffer.from(codec.encode(json));
@@ -87,9 +88,9 @@ test("codec: roundtrip, magic prefix, per-write nonce, tamper and wrong-key reje
 });
 
 test("codec passes legacy plaintext through untouched", () => {
-    const codec = createSessionCodec(Buffer.from(KEY, "hex"));
-    const json = '{"version":3,"id":"x"}';
-    assert.equal(codec.decode(Buffer.from(json, "utf8")), json);
+    const codec = createStorageCodec({ key: Buffer.from(KEY, "hex") })!;
+    const plain = JSON.stringify({ version: 3, savedAt: 1, id: "s", payload: { protocol: "openai" } });
+    assert.equal(codec.decode(Buffer.from(plain, "utf8")), plain);
 });
 
 await withTempDir("writes are encrypted on disk when the key is set", async (h) => {
@@ -108,47 +109,57 @@ await withTempDir("writes are encrypted on disk when the key is set", async (h) 
     }
 });
 
-await withTempDir("boot migrates legacy plaintext files to encrypted in place", async (h) => {
-    // Phase 1: legacy plaintext tree written by an unencrypted store.
+await withTempDir("boot never rewrites legacy plaintext files (downgrade safety)", async (h) => {
+    // Phase 1: pre-#1080 plaintext tree (zstd opt-out = what older bili wrote).
+    process.env.BILI_PERSIST_ZSTD = "0";
     const legacy = newStore(h);
     await legacy.writeNow(makeSession("s-1"));
     await legacy.writeNow(makeSession("s-2"));
     legacy.cancelAll();
+    delete process.env.BILI_PERSIST_ZSTD;
 
-    // Phase 2: boot with the key — every unencoded file must be taken over.
+    // Phase 2: boot with the key — files must load but stay byte-identical
+    // plaintext. A boot-time mass rewrite (the #1083 draft) makes a
+    // downgrade destroy history: old bili reads its own framing as
+    // "corrupt", resumes into an empty session, and the next save
+    // overwrites the real one.
     process.env.BILI_ENCRYPTION_KEY = KEY;
     const store = newStore(h);
     try {
         const loaded = await store.boot();
-        assert.equal(loaded.size, 2, "both legacy sessions load");
+        assert.equal(loaded.size, 2, "both legacy sessions load through the codec fallback");
         assert.ok(loaded.has("s-1") && loaded.has("s-2"));
         for (const id of ["s-1", "s-2"]) {
             const file = join(h.dir, "openai", "upstream_" + createHash("sha256").update(id, "utf8").digest("hex").slice(0, 24) + ".json");
             const head = readFileSync(file).subarray(0, ENCRYPT_MAGIC.length);
-            assert.ok(head.equals(ENCRYPT_MAGIC), `${id} file re-encoded in place`);
+            assert.ok(!head.equals(ENCRYPT_MAGIC), `${id} file left untouched by boot`);
         }
-        assert.ok(h.logs.some((l) => l.msg.includes("re-encoded 2 legacy session file(s)")), "migration logged");
+        assert.ok(!h.logs.some((l) => l.msg.includes("re-encoded")), "no migration log");
 
-        // Phase 3: second boot is a no-op (no double-wrap, no re-migration log).
+        // Phase 3: organic conversion — the next real save of s-1 encodes it;
+        // s-2 stays plaintext until it is saved too. Second boot loads both.
+        await store.writeNow(loaded.get("s-1")!);
         store.cancelAll();
-        const logs2: LogLine[] = [];
-        const again = new SessionStore({ dir: h.dir, debounceMs: 0, enabled: true, log: (level, msg) => logs2.push({ level, msg }) });
+        const f1 = join(h.dir, "openai", "upstream_" + createHash("sha256").update("s-1", "utf8").digest("hex").slice(0, 24) + ".json");
+        assert.ok(readFileSync(f1).subarray(0, ENCRYPT_MAGIC.length).equals(ENCRYPT_MAGIC), "s-1 converts on its next save");
+        const again = newStore(h);
         try {
             const loaded2 = await again.boot();
-            assert.equal(loaded2.size, 2, "still exactly 2 sessions — no double encoding");
-            assert.ok(!logs2.some((l) => l.msg.includes("re-encoded")), "no migration on an already-encoded tree");
+            assert.equal(loaded2.size, 2, "mixed-format tree loads together");
         } finally {
             again.cancelAll();
         }
     } finally {
         store.cancelAll();
+        delete process.env.BILI_ENCRYPTION_KEY;
     }
 });
 
-await withTempDir("migration covers spill-style .fb.json files and leaves corrupt files alone", async (h) => {
+await withTempDir("boot leaves foreign and corrupt files alone (no rewrites, no crashes)", async (h) => {
     mkdirSync(join(h.dir, "openai"), { recursive: true });
     const spill = join(h.dir, "openai", "s-spill.fb.json");
-    writeFileSync(spill, JSON.stringify({ version: 3, savedAt: Date.now(), id: "s-spill", payload: {} }), "utf8");
+    const spillBody = JSON.stringify({ version: 3, savedAt: Date.now(), id: "s-spill", payload: {} });
+    writeFileSync(spill, spillBody, "utf8");
     const corrupt = join(h.dir, "openai", "garbage_deadbeef.json");
     writeFileSync(corrupt, "%%% not json %%%", "utf8");
 
@@ -157,34 +168,38 @@ await withTempDir("migration covers spill-style .fb.json files and leaves corrup
     try {
         const loaded = await store.boot();
         assert.equal(loaded.size, 0, "neither fake file is a valid session record");
-        assert.ok(readFileSync(spill).subarray(0, ENCRYPT_MAGIC.length).equals(ENCRYPT_MAGIC), "spill file re-encoded");
+        assert.equal(readFileSync(spill, "utf8"), spillBody, "foreign spill file byte-identical");
         assert.equal(readFileSync(corrupt, "utf8"), "%%% not json %%%", "unreadable file left in place");
-        assert.ok(h.logs.some((l) => l.level === "warn" && l.msg.includes("leaving unreadable file in place")));
     } finally {
         store.cancelAll();
+        delete process.env.BILI_ENCRYPTION_KEY;
     }
 });
 
-await withTempDir("boot sweeps orphaned .tmp-enc-* temps left by a crashed migration", async (h) => {
+await withTempDir("boot sweeps orphaned .tmp-enc-* temps left by a crashed write", async (h) => {
+    // Pre-#1080 plaintext file (zstd opt-out), same as what older bili wrote.
+    process.env.BILI_PERSIST_ZSTD = "0";
     const legacy = newStore(h);
     await legacy.writeNow(makeSession("s-crash"));
     legacy.cancelAll();
+    delete process.env.BILI_PERSIST_ZSTD;
 
     // Simulate a process death between the temp write and the rename: a
     // stale temp sits next to an unencoded legacy file.
     const file = join(h.dir, "openai", "upstream_" + createHash("sha256").update("s-crash", "utf8").digest("hex").slice(0, 24) + ".json");
     const orphan = `${file}.tmp-enc-99999-1700000000000`;
-    writeFileSync(orphan, "stale temp from a crashed migration");
+    writeFileSync(orphan, "stale temp from a crashed write");
 
     process.env.BILI_ENCRYPTION_KEY = KEY;
     const store = newStore(h);
     try {
         const loaded = await store.boot();
-        assert.equal(loaded.size, 1, "legacy session loads after migration");
-        assert.ok(readFileSync(file).subarray(0, ENCRYPT_MAGIC.length).equals(ENCRYPT_MAGIC), "file re-encoded in place");
+        assert.equal(loaded.size, 1, "legacy session loads");
+        assert.ok(!readFileSync(file).subarray(0, ENCRYPT_MAGIC.length).equals(ENCRYPT_MAGIC), "legacy file NOT rewritten by boot");
         assert.equal(existsSync(orphan), false, "orphaned temp swept on next boot");
     } finally {
         store.cancelAll();
+        delete process.env.BILI_ENCRYPTION_KEY;
     }
 });
 
@@ -209,7 +224,8 @@ await withTempDir("invalid key fails fast at construction", async (h) => {
     assert.throws(() => newStore(h), /BILI_ENCRYPTION_KEY.*exactly 32 bytes/);
 });
 
-await withTempDir("without a key, files stay plaintext (zero behavior change)", async (h) => {
+await withTempDir("without a key and zstd opted out, files stay plaintext", async (h) => {
+    process.env.BILI_PERSIST_ZSTD = "0";
     const store = newStore(h);
     try {
         await store.writeNow(makeSession("s-plain"));
