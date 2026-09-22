@@ -246,7 +246,7 @@ For each request, the proxy resolves the settings by longest-URL-prefix match (t
 - **Type:** `number | string`
 - **Default:** *(the model's native window)*
 - **Status:** ACTIVE
-- **Description:** The context window size, in tokens. This is the **denominator** the engine uses for its usage ratio (`usage = tokens / modelContextLimit`) — it is **not** a truncation cap. Accepts an absolute number (`200000`) or a percent string (`"80%"` = 80% of the model's native window, resolved from the built-in table or models.dev registry). When omitted at every level, the native window is used. This is the highest-priority source for the model limit; it overrides the built-in table, the legacy per-model `context` field, and the top-level `modelContextLimit`.
+- **Description:** The context window size, in tokens. This is the **denominator** the engine uses for its usage ratio (`usage = tokens / modelContextLimit`) — it is **not** a truncation cap. Accepts an absolute number (`200000`) or a percent string (`"80%"` = 80% of the model's native window, resolved from the built-in table or models.dev registry). When omitted at every level, the native window is used. This is the highest-priority source for the model limit; it overrides the built-in table, the legacy per-model `context` field, and the top-level `modelContextLimit`. Note it also serves as the **hard preflight wall**: once a payload reaches this value the proxy proactively folds context before forwarding, and if folding cannot bring it under, the request fails fast instead of being sent upstream. To keep day-to-day context small while still letting large reads burst up to the native window, keep `modelContextLimit` at its native value and use `maxContextLimit` as the soft target instead (see [Soft target with elastic headroom](#soft-target-with-elastic-headroom-1122)).
 
 #### `outputHeadroomMaxPct`
 
@@ -436,6 +436,34 @@ These two toggles are honoured only at the **global** level. Setting them inside
 - **Default:** `true`
 - **Status:** ACTIVE
 - **Description:** Inject automatic compression-nudge messages when usage thresholds are crossed. Set `false` (or `ACP_COMPRESS_NUDGE=0`) to disable nudge injection. Disabling both `injectTool` and `injectNudge` is functionally similar to `passthrough`, except the proxy still tracks token usage.
+
+### Soft target with elastic headroom (#1122)
+
+Autonomous agents often want two things at once: keep the *active* context small (cost/latency), while allowing a single task to burst well past that target when it genuinely needs to (e.g., reading a large file). Setting `modelContextLimit` below the model's native window cannot express that — one field plays two roles at once (the usage-ratio denominator **and** the hard preflight wall), so any payload above it gets folded mid-task or fails fast (#1122).
+
+Express it with the existing soft bands instead: keep the limit at the native window, pin the target with `maxContextLimit`:
+
+```jsonc
+// model with a 200k native window; keep ~70k active, allow bursts up to the real edge
+{
+  "compress": {
+    "modelContextLimit": 200000,   // = native window → hard wall only at the true edge
+    "maxContextLimit": "35%"       // forced-nudge zone starts ≈ 70k (= target ÷ native window)
+  }
+}
+```
+
+How compression actually decides (acp-kernel, verified):
+
+1. **Growth layer (day-to-day driver, absolute tokens):** a proactive nudge fires once cumulative growth since the last anchor (session start / last nudge / post-compression reset) reaches the growth floor **and** enough compressible mass has accumulated. Both numbers are absolute and window-independent by design: adaptive step = `clamp(round(window × 5%), 20k, 50k)` → 20k on windows ≤ ~400k, capped at 50k on ≥1M windows; growth floor ≈ 20k (22.5k on ≥1M). This layer keeps compressing long sessions even far below any percentage band.
+2. **Pressure layer (percent of the window):** `usage ≥ maxContextLimit` (default 75%) → a nudge is injected every turn until context drops back under; `usage ≥ emergencyThresholdPercent` (default 95%) → forced nudge + emergency truncation.
+3. **Qualification layer (kernel default 45%, not exposed):** gates only the turn-1 cold-start ticket and the block-count floor for T2/T3 tier escalation — not part of the day-to-day path.
+
+Note: setting `maxContextLimit` below the kernel's 45% default works correctly (the layers are independent), but acp-kernel logs a per-turn validation warning (`minContextLimitPct must not exceed maxContextLimitPct`) — log noise only, thresholds are unaffected.
+
+Behavior vs an old low-limit config (e.g., `modelContextLimit: 70000`): the hard wall moves from 70k to the native window (large reads stop being crushed mid-task or failing fast); the forced zone moves from 75%×70k ≈ 52.5k to your chosen %×native; below the forced zone the context drifts per the growth layer instead of being pinned every turn — that drift is the price of elasticity. If you need a strict daily ceiling *and* burst headroom simultaneously, static percentage bands cannot express both; choose the % for the ceiling you accept, or track structure-aware compression (#344).
+
+The same fields work per-provider / per-model (three-level merge), and hot-reload via the web UI.
 
 ### Three-level merge example
 
