@@ -161,6 +161,7 @@ Pick by your client:
 | **dsh** | `bili dsh` (launcher — full native plugin via `--patch`: tools, session-bound `/acp`, fetch intercept) or `bili plugin install dsh` ≡ `dsh plugin --profile <name> add billion-context` (one unified lane — pnpm-installs the package into each profile so dsh mounts the bundled patch layer; the bili form just drives dsh's own channel per profile and migrates legacy managed blocks) |
 | **kimi** | `bili plugin install kimi` (self-spawning native plugin, no launcher — Kimi Code ≥ 2.0.0; per-session routing block in `~/.kimi-code/config.toml`) or `bili kimi` (launcher, cert-MITM) or `/bili/` prefix |
 | **hermes** | `bili plugin install hermes` (self-spawning native plugin, no launcher — Python plugin, #958) or `bili hermes` (launcher, cert-MITM) |
+| **zcode** (Z.ai / bigmodel coding plan) | `bili plugin install zcode` (self-spawning native plugin, no launcher — per-session routing block in the bigmodel provider store, #1145) or cert-MITM through the GUI's Settings → Network (HTTP proxy + CA path) or `/bili/` prefix |
 | **claude** | `bili claude` (launcher) or `bili plugin install claude` (native posture, #964 — managed settings block + session-owned proxy; see the notes below) |
 | **jcode** | [`billion-context`](https://github.com/ranxianglei/billion-context) via `bili jcode` (launcher, cert-MITM) or `/bili/` prefix — no native plugin possible: compiled Rust binary with no plugin seam, and its static per-provider config can't stamp per-request headers ([#962](https://github.com/ranxianglei/billion-context/issues/962)) |
 | **gemini** (Gemini CLI) | `bili gemini` (launcher, `GOOGLE_GEMINI_BASE_URL` `/bili/` rewrite) or `/bili/` prefix — launcher-only: gemini-cli's extension system reaches custom commands only, no in-loop tool seam (#1043) |
@@ -198,12 +199,12 @@ Three ways to use it — pick one:
 Mechanism details behind these three options (plugin lifecycle, runtime-info
 protocol, injection priority) live in [TECHNICAL-NOTES.md](TECHNICAL-NOTES.md).
 
-### Option 1 — Native plugin (`bili plugin install pi` / `omp` / `opencode` / `dsh` / `kimi` / `hermes`)
+### Option 1 — Native plugin (`bili plugin install pi` / `omp` / `opencode` / `dsh` / `kimi` / `hermes` / `zcode`)
 
 The proxy lives inside the client: install once, then start the client
 exactly as you always do — no launcher command, no env vars, no fixed port,
 no URL edits. Supported today for **pi**, **omp**, **opencode** (1.x and
-2.x), **dsh**, **kimi** and **hermes**:
+2.x), **dsh**, **kimi**, **hermes** and **zcode**:
 
 ```bash
 bili plugin install pi          # registers a "billion-context" entry in pi's settings (npm form when bili itself was npm-installed)
@@ -212,6 +213,7 @@ bili plugin install opencode    # registers the plugin in opencode's real config
 bili plugin install dsh         # runs 'dsh plugin --profile <name> add billion-context' for every existing profile
 bili plugin install kimi        # writes $KIMI_CODE_HOME/plugins/managed/billion-context/kimi.plugin.json (+ installed.json record); per-session routing block lands in config.toml on first start (Kimi Code >= 2.0.0)
 bili plugin install hermes      # copies the Python plugin into ~/.hermes/plugins/billion-context/ (+ machine-owned bili.json sidecar) and enables it via `hermes plugins enable billion-context`
+bili plugin install zcode       # writes hooks.enabled + a SessionStart hook + mcp.servers.bili into ~/.zcode/cli/config.json; per-session routing lands in the bigmodel provider store on first start
 bili plugin remove <client>     # undo (dsh removes through the same channel; config snapshots go to .bili-bak)
 bili plugin update [client]     # bring every lane's bili presence up to date, each through its own owner (see below)
 ```
@@ -249,7 +251,7 @@ overwrites that copy in place:
 | **pi** | pi's package manager (npm form) | **`pi update`** — bili never overwrites it |
 | **opencode** | opencode's plugin dir | **opencode's plugin manager** — bili never overwrites it |
 | **dsh** | each profile's pnpm store | global bili self-update re-runs dsh's plugin channel per profile (or `dsh plugin add billion-context@latest`); pnpm's hardlinked store must never be copied over in place |
-| omp / claude / codex / kimi | no copy — entries point at the global bili install | they update together with the global copy |
+| omp / claude / codex / kimi / zcode | no copy — entries point at the global bili install | they update together with the global copy |
 | **hermes** | `~/.hermes/plugins/billion-context/` (copied files + `bili.json` sidecar pointing at the global dist) | **`bili plugin update hermes`** re-copies the files; the sidecar tracks the global install |
 
 This is enforced in code, not just convention: the self-updater
@@ -539,6 +541,64 @@ pure-stdlib Python module shipped inside the npm package:
   that transport exposes headers. Inert when `BILLION_CONTEXT_PROXY` is set
   (the launcher owns the proxy) or `BILI_PROVIDER_REWRITES` is defined.
   Opt-out: `BILI_NATIVE_HERMES=0`.
+
+### ZCode (Z.ai / bigmodel coding plan)
+
+Three aligned modes: `/bili/` URL prefix, cert-MITM through the GUI's
+Settings → Network (HTTP proxy + root-CA path), and native plugin mode
+(`bili plugin install zcode`, #1145). ZCode's extension surface is
+Claude-Code-shaped but declarative: user-level hooks and stdio MCP servers in
+`~/.zcode/cli/config.json`, no in-process JS seam. So the native lane ships
+two small node scripts that do the work around the client:
+
+- **Install:** `bili plugin install zcode` writes `~/.zcode/cli/config.json`:
+  sets `hooks.enabled = true`, appends a `SessionStart` process hook
+  (`node <root>/dist/zcode/bootstrap-hook.js`) and registers a stdio MCP
+  server `mcp.servers.bili` (`node <root>/dist/zcode/mcp-entry.js`). A
+  pre-existing user-owned `mcp.servers.bili` entry is never overwritten — the
+  installer refuses loudly instead. No URL is frozen at install time; routing
+  happens per session. Remove with `bili plugin remove zcode` (strips only
+  bili's entries, reverts `hooks.enabled` when it was the one to enable it,
+  and restores the provider store from its snapshot).
+- **Per-session bootstrap:** each ZCode session spawns the MCP child as a
+  direct process; at startup it attaches to a healthy proxy
+  (`BILLION_CONTEXT_PROXY`) or spawns its own on an ephemeral port, then
+  rewrites the active provider store with idempotent JSON surgery under a
+  mkdir lockfile: the bigmodel coding-plan provider entries' `baseURL` becomes
+  `http://127.0.0.1:<port>/bili/<upstream>` (the builtin default upstream is
+  `https://open.bigmodel.cn/api/anthropic`; any custom baseURL you set is
+  preserved verbatim behind the wrapper). Both store generations are handled:
+  legacy `~/.zcode/v2/config.json` (`provider.<id>.options.baseURL`) and the
+  v3.14+ personal store `~/.zcode/v2/provider_config.json`
+  (`config.providerConfigRules.providerRules[].config.api.baseUrl`) — when
+  both exist, the new store wins. The original file is snapshotted to
+  `<file>.bili-bak` once per user edit (the snapshot always reflects your last
+  real state, never bili's own writes); every other key is preserved
+  byte-for-byte. Legacy-generation clients load provider config at startup —
+  restart ZCode once after installing; newer builds pick up routing changes
+  mid-session (~1 s polling). The `SessionStart` hook runs the same bootstrap
+  opportunistically (attach-only — it never spawns); its non-blocking race is
+  tolerated by design: round 1 may ride wire mode, and the invariant is never
+  pointing `baseURL` at a dead port.
+- **Plugin-mode stamping:** once the MCP child verifies the ACP tool list
+  against the live proxy manifest, the routed entries gain
+  `headers["x-bili-plugin"] = "zcode"` — until then traffic rides wire mode.
+  Tool calls bind via the per-call `conversation_id` argument (#760).
+- **Watchdog & lifecycle:** the MCP child probes the proxy every 30 s. In
+  attach mode it waits forever (it never touches a user-owned proxy); in spawn
+  mode a dead proxy is respawned and the routing rewritten to the new origin.
+  If recovery fails, the managed rewrite is removed so traffic degrades back
+  to direct upstream rather than hitting a dead port. When a session ends,
+  ZCode kills the MCP child and the parent-pid watchdog tears down the spawned
+  proxy. Concurrent sessions share the first-spawned proxy; when it goes away
+  the remaining sessions respawn and re-route automatically.
+- **Known limitations:** ZCode's anti-fraud fingerprinting (#661) applies to
+  MITM-rebuilt bodies on `zcode.z.ai` login traffic — native mode does not
+  touch that surface (model traffic flows through the provider store, not the
+  GUI proxy); if you also run the GUI-proxy/MITM setup, keep the
+  `"mitm://zcode.z.ai": { "passthrough": true }` route. Inert when
+  `BILLION_CONTEXT_PROXY` is set (attach mode owns the proxy) or
+  `BILI_PROVIDER_REWRITES` is defined. Opt-out: `BILI_NATIVE_ZCODE=0`.
 
 ### Gemini family (Gemini CLI / iFlow CLI / Qwen Code)
 
