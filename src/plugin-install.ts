@@ -23,6 +23,9 @@
 //            it self-spawns/attaches a proxy and routes traffic via HTTPS_PROXY +
 //            HERMES_CA_BUNDLE, the same wire path as `bili hermes`; enablement is
 //            delegated to `hermes plugins enable`)
+//   zcode    ~/.zcode/cli/config.json  hooks.enabled + SessionStart hook +
+//            mcp.servers.bili (stdio MCP); provider-store routing happens
+//            per-session, see src/zcode/ (no URL frozen at install time)
 // Installers throw on failure (bad/locked config, missing host CLI); the CLI
 // layer catches, prints `bili plugin: <msg>` and exits 1.
 
@@ -39,6 +42,8 @@ import { isPidAlive, isProxyInstanceFile, readProxyInstanceFile } from "./instan
 import { DSH_PACKAGE, dshBundleInstalled, dshHasLegacyManagedBlock, dshProfileDependsOnBili, dshProfileDirs, planDshSpawn, refreshDshProfileBundles, runDshPlugin, stripLegacyManagedBlock } from "./dsh-channel.js";
 import { fetchRegistryVersion } from "./update.js";
 import { restoreKimiBackup, unrouteKimi } from "./kimi/native.js";
+import { inspectZcodeRouting, resolveZcodeDataDir } from "./zcode/json-edit.js";
+import { restoreZcodeBackup, unrouteZcode } from "./zcode/native.js";
 
 /** #403: never freeze a dead or unverifiable origin into a client's
  *  persistent config — the MCP shell would dial it forever. An explicit
@@ -57,7 +62,7 @@ function proxyOriginForInstall(): string {
     return inst.origin;
 }
 
-export const PLUGIN_AGENTS = ["pi", "omp", "claude", "codex", "opencode", "dsh", "kimi", "hermes"] as const;
+export const PLUGIN_AGENTS = ["pi", "omp", "claude", "codex", "opencode", "dsh", "kimi", "hermes", "zcode"] as const;
 export type PluginAgent = (typeof PLUGIN_AGENTS)[number];
 
 export function selfPackageRoot(): string {
@@ -1491,16 +1496,165 @@ function hermesStatus(): string {
 
 // — dispatch ————————————————————————————————————————————————————————————
 
+// — zcode (#1145) ————————————————————————————————————————————————
+// Native posture (claude#964 + kimi#963 combo): managed hook/MCP entries in
+// ~/.zcode/cli/config.json point at THIS install's dist; provider-store
+// routing happens per-session in src/zcode/, so no URL is frozen here.
+
+const ZCODE_HOOK_ENTRY_RE = /(?:^|[\\/])zcode[\\/]bootstrap-hook\.(?:js|ts)$/;
+const ZCODE_MCP_ENTRY_RE = /(?:^|[\\/])zcode[\\/]mcp-entry\.(?:js|ts)$/;
+
+function zcodeUserConfigFile(): string {
+    return path.join(os.homedir(), ".zcode", "cli", "config.json");
+}
+
+function zcodeAsPlain(value: unknown): Record<string, unknown> | undefined {
+    return value !== null && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined;
+}
+
+function zcodeArgsMatch(args: unknown, re: RegExp): boolean {
+    return Array.isArray(args) && args.some((a) => typeof a === "string" && re.test(a));
+}
+
+export function isOursZcodeHookEntry(entry: unknown): boolean {
+    const hooks = zcodeAsPlain(entry)?.hooks;
+    if (!Array.isArray(hooks)) return false;
+    return hooks.some((h) => zcodeArgsMatch(zcodeAsPlain(h)?.args, ZCODE_HOOK_ENTRY_RE));
+}
+
+export function isOursZcodeMcpServer(server: unknown): boolean {
+    const s = zcodeAsPlain(server);
+    return !!s && s.type === "stdio" && zcodeArgsMatch(s.args, ZCODE_MCP_ENTRY_RE);
+}
+
+/** Managed-block apply for ~/.zcode/cli/config.json (#1145). Pure over the
+ *  parsed doc: enables hooks, upserts our SessionStart entry, and owns ONLY
+ *  mcp.servers.bili when it already points at our dist — a user's own "bili"
+ *  server throws instead of being clobbered (§7.3). */
+export function applyZcodeManagedConfig(doc: Record<string, unknown>, opts: { hookEntry: string; mcpEntry: string }): { data: Record<string, unknown>; notes: string[] } {
+    const data = structuredClone(doc);
+    const notes: string[] = [];
+    const hooks = zcodeAsPlain(data.hooks) ?? {};
+    if (hooks.enabled !== true) {
+        hooks.enabled = true;
+        notes.push("enabled hooks (hooks.enabled was off)");
+    }
+    const events = zcodeAsPlain(hooks.events) ?? {};
+    const sessionStart = Array.isArray(events.SessionStart) ? [...(events.SessionStart as unknown[])] : [];
+    const kept = sessionStart.filter((e) => !isOursZcodeHookEntry(e));
+    if (kept.length !== sessionStart.length) notes.push("replaced a previous bili SessionStart entry");
+    kept.push({ hooks: [{ type: "process", command: "node", args: [opts.hookEntry] }] });
+    events.SessionStart = kept;
+    hooks.events = events;
+    data.hooks = hooks;
+    const mcp = zcodeAsPlain(data.mcp) ?? {};
+    const servers = zcodeAsPlain(mcp.servers) ?? {};
+    if (servers.bili !== undefined && !isOursZcodeMcpServer(servers.bili)) {
+        throw new Error(`${zcodeUserConfigFile()} already defines mcp.servers.bili owned by something else — rename or remove it first; refusing to overwrite`);
+    }
+    servers.bili = { type: "stdio", command: "node", args: [opts.mcpEntry] };
+    mcp.servers = servers;
+    data.mcp = mcp;
+    return { data, notes };
+}
+
+export function stripZcodeManagedConfig(doc: Record<string, unknown>): { data: Record<string, unknown>; removed: string[] } {
+    const data = structuredClone(doc);
+    const removed: string[] = [];
+    const hooks = zcodeAsPlain(data.hooks);
+    if (hooks) {
+        const events = zcodeAsPlain(hooks.events);
+        if (events && Array.isArray(events.SessionStart)) {
+            const kept = (events.SessionStart as unknown[]).filter((e) => !isOursZcodeHookEntry(e));
+            if (kept.length !== (events.SessionStart as unknown[]).length) {
+                removed.push("hooks.events.SessionStart entry");
+                if (kept.length > 0) events.SessionStart = kept;
+                else delete events.SessionStart;
+                if (Object.keys(events).length === 0) delete hooks.events;
+                if (Object.keys(hooks).length === 0) delete data.hooks;
+            }
+        }
+    }
+    const mcp = zcodeAsPlain(data.mcp);
+    if (mcp) {
+        const servers = zcodeAsPlain(mcp.servers);
+        if (servers && servers.bili !== undefined && isOursZcodeMcpServer(servers.bili)) {
+            removed.push("mcp.servers.bili");
+            delete servers.bili;
+            if (Object.keys(servers).length === 0) delete mcp.servers;
+            if (Object.keys(mcp).length === 0) delete data.mcp;
+        }
+    }
+    return { data, removed };
+}
+
+function zcodeInstall(): string {
+    const root = selfPackageRoot();
+    const hookEntry = path.join(root, "dist", "zcode", "bootstrap-hook.js");
+    const mcpEntry = path.join(root, "dist", "zcode", "mcp-entry.js");
+    requireDistFile(hookEntry);
+    requireDistFile(mcpEntry);
+    const file = zcodeUserConfigFile();
+    const { data, notes } = applyZcodeManagedConfig(readJson(file), { hookEntry, mcpEntry });
+    writeJson(file, data);
+    return `wrote the billion-context hook+MCP into ${file}${notes.length > 0 ? ` (${notes.join("; ")})` : ""} — start a new ZCode session to activate`;
+}
+
+function zcodeRemove(): string {
+    const file = zcodeUserConfigFile();
+    const notes: string[] = [];
+    try {
+        const doc = readJson(file);
+        const { data, removed } = stripZcodeManagedConfig(doc);
+        if (removed.length > 0) {
+            // Revert hooks.enabled only when the pre-install snapshot shows we
+            // are the reason it is on (never drop a user-owned switch).
+            let bak: Record<string, unknown> | undefined;
+            try {
+                bak = JSON.parse(fs.readFileSync(`${file}.bili-bak`, "utf8")) as Record<string, unknown>;
+            } catch {}
+            const hooks = zcodeAsPlain(data.hooks);
+            if (hooks && Object.keys(hooks).length === 1 && hooks.enabled === true) {
+                const bakEnabled = zcodeAsPlain(bak?.hooks)?.enabled === true;
+                if (!bakEnabled) delete hooks.enabled;
+                if (Object.keys(hooks).length === 0) delete data.hooks;
+            }
+            writeJson(file, data);
+        }
+        for (const r of removed) notes.push(`removed ${r}`);
+    } catch {}
+    const restored = restoreZcodeBackup({ log: (msg) => notes.push(msg) });
+    if (!restored.restored) unrouteZcode({ log: () => {} });
+    return notes.length > 0 ? `removed the billion-context zcode lane (${notes.join("; ")}) — start a new ZCode session to finish` : "not installed";
+}
+
+function zcodeStatus(): string {
+    let hasHook = false;
+    let hasMcp = false;
+    try {
+        const doc = readJson(zcodeUserConfigFile());
+        const sessionStart = zcodeAsPlain(zcodeAsPlain(doc.hooks)?.events)?.SessionStart;
+        hasHook = Array.isArray(sessionStart) && (sessionStart as unknown[]).some(isOursZcodeHookEntry);
+        hasMcp = isOursZcodeMcpServer(zcodeAsPlain(zcodeAsPlain(doc.mcp)?.servers)?.bili);
+    } catch {}
+    let status = hasHook && hasMcp ? "installed" : hasHook || hasMcp ? "partially installed — rerun 'bili plugin install zcode' to fix" : "not installed";
+    try {
+        const routed = inspectZcodeRouting(resolveZcodeDataDir(process.env));
+        if (routed && routed.wrapped.length > 0) status += ` (routing ${routed.kind} store: ${routed.wrapped.map((w) => w.id).join(", ")})`;
+    } catch {}
+    return status;
+}
+
 export function isPluginAgent(value: string): value is PluginAgent {
     return (PLUGIN_AGENTS as readonly string[]).includes(value);
 }
 
 export function pluginInstall(agent: PluginAgent, opts: { withMcp?: boolean } = {}): string {
-    return agent === "pi" ? piInstall() : agent === "omp" ? ompInstall() : agent === "claude" ? claudeInstall() : agent === "codex" ? codexInstall() : agent === "dsh" ? dshInstall() : agent === "kimi" ? kimiInstall() : agent === "hermes" ? hermesInstall() : opencodeInstall(opts.withMcp === true);
+    return agent === "pi" ? piInstall() : agent === "omp" ? ompInstall() : agent === "claude" ? claudeInstall() : agent === "codex" ? codexInstall() : agent === "dsh" ? dshInstall() : agent === "kimi" ? kimiInstall() : agent === "hermes" ? hermesInstall() : agent === "zcode" ? zcodeInstall() : opencodeInstall(opts.withMcp === true);
 }
 
 export function pluginRemove(agent: PluginAgent): string {
-    return agent === "pi" ? piRemove() : agent === "omp" ? ompRemove() : agent === "claude" ? claudeRemove() : agent === "codex" ? codexRemove() : agent === "dsh" ? dshRemove() : agent === "kimi" ? kimiRemove() : agent === "hermes" ? hermesRemove() : opencodeRemove();
+    return agent === "pi" ? piRemove() : agent === "omp" ? ompRemove() : agent === "claude" ? claudeRemove() : agent === "codex" ? codexRemove() : agent === "dsh" ? dshRemove() : agent === "kimi" ? kimiRemove() : agent === "hermes" ? hermesRemove() : agent === "zcode" ? zcodeRemove() : opencodeRemove();
 }
 
 export function pluginStatusAll(): Array<{ agent: string; status: string; channel: string }> {
@@ -1513,6 +1667,7 @@ export function pluginStatusAll(): Array<{ agent: string; status: string; channe
         ["dsh", dshStatus],
         ["kimi", kimiStatus],
         ["hermes", hermesStatus],
+        ["zcode", zcodeStatus],
     ];
     return checks.map(([agent, check]) => {
         try {
@@ -1526,7 +1681,7 @@ export function pluginStatusAll(): Array<{ agent: string; status: string; channe
 // #991 single-writer: every lane's update path, user-facing. Host-managed
 // copies (pi's npm entry, opencode's plugin dir) are only ever updated by
 // their host; dsh profile bundles track the global version; reference lanes
-// (omp/claude/codex/kimi/hermes) follow the global bili install itself —
+// (omp/claude/codex/kimi/hermes/zcode) follow the global bili install itself —
 // hermes additionally re-copies its Python files via `bili plugin update hermes`.
 const UPDATE_CHANNEL: Record<PluginAgent, string> = {
     pi: "pi update (pi owns the npm:billion-context copy)",
@@ -1537,6 +1692,7 @@ const UPDATE_CHANNEL: Record<PluginAgent, string> = {
     dsh: "the global bili self-update (profile bundles track it)",
     kimi: "the global bili install (plugin points at its dist)",
     hermes: "the global bili install (sidecar points at its dist); `bili plugin update hermes` re-copies the plugin",
+    zcode: "the global bili install (hook/MCP point at its dist)",
 };
 
 export interface PluginUpdateOpts {
