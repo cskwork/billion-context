@@ -450,6 +450,14 @@ export type ProxyOptions = {
      *  fully-present compression blocks instead of restarting at zero.
      *  Enable with `forkAdoption: true` or env BILI_FORK_ADOPTION=1. */
     forkAdoption?: boolean;
+    /** Content fallback of the bili→bili chain detection: when an inbound
+     *  request carries ACP artifacts (render tags / ACP tool-call history)
+     *  but no x-bili-hop header and no local compression state for the
+     *  session, pass it through verbatim instead of processing (#1086).
+     *  Default ON; escape valve via env BILI_CHAIN_CONTENT=0 or
+     *  `chainContentDetection: false` in the config file (env wins). The
+     *  x-bili-hop signal is unaffected by this switch. */
+    chainContentDetection?: boolean;
 };
 
 /** Re-read ONLY the routes from the current config sources, returning a fresh
@@ -620,6 +628,7 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
         maskHosts: (env.BILI_LOG_MASK_HOSTS ?? (fileConfig.maskHosts === false ? "0" : "1")) !== "0",
         subagentSplit: (env.BILI_SUBAGENT_SPLIT ?? (fileConfig.subagentSplit === false ? "0" : "1")) !== "0",
         forkAdoption: (env.BILI_FORK_ADOPTION ?? (fileConfig.forkAdoption === true ? "1" : "0")) !== "0",
+        chainContentDetection: (env.BILI_CHAIN_CONTENT ?? (fileConfig.chainContentDetection === false ? "0" : "1")) !== "0",
     };
 }
 
@@ -670,6 +679,10 @@ type FileConfig = {
      *  zero compression state. Default false; env BILI_FORK_ADOPTION=1/0
      *  wins over the file. */
     forkAdoption?: boolean;
+    /** Set `false` to disable the ACP-artifact content fallback of the
+     *  bili→bili chain detection (#1086); x-bili-hop stays active either way.
+     *  Env BILI_CHAIN_CONTENT=0 wins over the file. */
+    chainContentDetection?: boolean;
     /** Global wire-compat block. `roles` maps message roles to the role name
      *  upstreams accept (e.g. `{"developer":"system"}`) — applied to the
      *  final forwarded body for openai/responses requests (#552). */

@@ -45,7 +45,7 @@ import {
     subagentNamespace,
 } from "acp-kernel/wire";
 import { responsesToCoreWithToolImages as responsesToCore, patchResponsesInputWithToolImages as patchResponsesInput } from "./responses-tool-output.js";
-import { getSession, listSessions, type Session, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight, totalInFlight, withSessionLock, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, snapshotMessages, applyCompactionArchive, detectUnannouncedHistoryRewrite, markCompactionBoundary, ensureCanonicalId, storeEffectiveConfig } from "./session.js";
+import { getSession, hasProcessedState, listSessions, type Session, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight, totalInFlight, withSessionLock, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, snapshotMessages, applyCompactionArchive, detectUnannouncedHistoryRewrite, markCompactionBoundary, ensureCanonicalId, storeEffectiveConfig } from "./session.js";
 import { detectStaleInstall } from "./update.js";
 import { PACKAGE_NAME, VERSION } from "./version.js";
 import {
@@ -111,6 +111,19 @@ import { buildForwardHeaders, connectionNamedHeaders, NO_IDENTITY_MESSAGE, RESPO
 import { isSideRequest, outputBudgetField, restoreOutputBudget, SIDE_REQUEST_MAX_TOKENS, sideRequestGuard } from "./server/side-request.js";
 import { clampOutgoingOutput, countSystemAndToolsTokens, emergencyNudge, estimateInputTokens, estimateWireOverhead } from "./server/budget.js";
 import { awaitDrain, bufferToStream, dumpStreamToFile, pipeThrough, readStreamToBuffer } from "./server/stream-io.js";
+import { artifactSeedHit, detectAcpArtifacts } from "./server/chain-artifacts.js";
+
+// #1086: sessions already warned about by the ACP-artifact content fallback —
+// one warn per session instead of one per request (a chained session can run
+// thousands of turns). Bounded FIFO: evict the oldest once past the cap.
+const warnedChainSessions = new Set<string>();
+export const WARNED_CHAIN_SESSION_CAP = 4096;
+export function _resetChainWarningsForTest(): void {
+    warnedChainSessions.clear();
+}
+export function _chainWarnSetForTest(): Set<string> {
+    return warnedChainSessions;
+}
 
 // #1073: a forward-proxy-style (absolute-form) request whose authority IS this
 // instance's own listening endpoint — e.g. a health prober configured with our
@@ -1014,6 +1027,19 @@ async function handle(
             ? `[chain] inbound request carries THIS instance's ${BILI_HOP_HEADER} marker (${hopMarker}) — self-loop detected. Passing through without processing; check your upstream config (it may point back to this instance).`
             : `[chain] inbound request carries ${BILI_HOP_HEADER} from another bili instance (${hopMarker}) — bili→bili chain detected. Passing through without processing to avoid double compression; keep only one bili instance in the chain.`);
     }
+    // #1086: byte pre-filter for the ACP-artifact content fallback — the only
+    // remaining signal when a middlebox strips x-bili-hop. The DECISION is
+    // deferred until session identity is resolved below: artifacts in a
+    // session THIS instance processed are self-produced and must run through
+    // the kernel (v0.1.133 judged them chains before binding, which stopped
+    // compression permanently on single-instance setups).
+    // #1100: "no local state ⇒ foreign" is only sound when persistence proves
+    // ownership across a restart. With BILI_PERSIST=0 an instance can't recover
+    // ownership, so "no state" is ambiguous with our own replayed session — a
+    // decisive passthrough would re-brick compression (#1086). Skip the fallback
+    // entirely when the store is disabled; the hop marker above still catches chains.
+    const artifactSeed = hopMarker === undefined && bodyBuffer.length > 0
+        && opts.chainContentDetection !== false && getStore().enabled && artifactSeedHit(bodyBuffer);
     // #920: legacy opencode-acp sessions bypass the whole pipeline. The thin
     // plugin stamps this header per request for sessions with acp state on
     // disk; acp owns their context in-process, so binding/injecting/compressing
@@ -1426,6 +1452,30 @@ async function handle(
             }
         }
         const sessionId = anonAffinity ? anonAffinity.sessionId : conversation;
+        // #1086: content-fallback chain verdict, now that identity is known.
+        // Artifacts + processed local state ⇒ self-produced: process normally.
+        // Artifacts + NO local state ⇒ an upstream bili already compressed
+        // this payload and its headers were stripped: forward verbatim and
+        // create no session state (same contract as the hop-marker path).
+        // Returning before getSession also skips note()/register consumption,
+        // so a foreign session leaves no trace in this instance.
+        if (artifactSeed) {
+            const artifactKind = detectAcpArtifacts(bodyBuffer, parsed);
+            if (artifactKind !== null && !hasProcessedState(sessionId, { protocol })) {
+                if (!warnedChainSessions.has(sessionId)) {
+                    warnedChainSessions.add(sessionId);
+                    if (warnedChainSessions.size > WARNED_CHAIN_SESSION_CAP) {
+                        warnedChainSessions.delete(warnedChainSessions.values().next().value as string);
+                    }
+                    log("warn", `[chain] inbound ${protocol} request carries ACP compression artifacts (${artifactKind}) but neither ${BILI_HOP_HEADER} nor local compression state for session ${sessionId} — likely a bili→bili chain whose headers were stripped. Passing through without processing; if this is your own client, disable the content fallback with chainContentDetection=false (env BILI_CHAIN_CONTENT=0).`);
+                }
+                await forward(req, res, opts, bodyBuffer, null, core, config, log, route, instanceId, undefined);
+                return;
+            }
+            if (artifactKind !== null) {
+                log("debug", `[chain] ACP artifacts (${artifactKind}) belong to this instance's own session ${sessionId} — self-produced, processing normally (#1086)`);
+            }
+        }
         // Two separate uses of the conversation signal:
         //  - `affinity`: header value forwarded upstream for sticky-routing /
         //    cache pools. Synthesized as ses_<conversation> when the client
