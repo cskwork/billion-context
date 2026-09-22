@@ -1,11 +1,12 @@
 // #1085 e2e: sticky head-system anchor through the REAL proxy. When a client's
 // head system text (ambient instructions such as AGENTS.md) changes mid-session,
 // the proxy must keep forwarding the FIRST-seen head byte-stable (the provider
-// prefix-cache anchor) and append one trailing user note carrying the full new
-// text — instead of letting the changed head invalidate the whole cached prefix.
-// Also covers the interop contract: a third-party client that already implements
-// its own version (constant system + in-history update messages) must pass
-// through with ZERO bili-side injection.
+// prefix-cache anchor) and append one trailing user note carrying a compact
+// line diff of the change — instead of letting the changed head invalidate the
+// whole cached prefix. Also covers the interop contract: a third-party client
+// that already implements its own version (constant system + in-history update
+// messages) must pass through with ZERO bili-side injection — and that
+// plugin-mode agents are never anchored at all (owner scope: plain-proxy only).
 // Session D (anthropic wire): client-sent cache_control breakpoints must ride
 // on the SAME logical blocks across turns and never land on an injected note
 // (opencode#43507 class of regression: a breakpoint on a message that can
@@ -143,8 +144,11 @@ test("e2e #1085: changed head system stays anchored; updates ride as trailing no
 
     try {
         // --- Session A: OpenAI wire, head system changes between turns ---
-        const SYS_V1 = "AMBIENT-INSTRUCTIONS-V1 (agents.md snapshot at session start)";
-        const SYS_V2 = "AMBIENT-INSTRUCTIONS-V2 (edited mid-session)";
+        // Multi-line AGENTS.md-style heads differing in exactly one line: a
+        // localized edit that must take the diff-note path (a fully rewritten
+        // single-line head would be non-localized → deliberate anchor replace).
+        const SYS_V1 = ["# Project rules", "Always run npm test before committing.", "Use TypeScript strict mode.", "Keep diffs minimal."].join("\n");
+        const SYS_V2 = ["# Project rules", "Always run npm test AND the e2e suite before committing.", "Use TypeScript strict mode.", "Keep diffs minimal."].join("\n");
         const histA: ChatMsg[] = [];
         let reply = await chatTurn("anchor-e2e", "gpt-test", { messages: [{ role: "system", content: SYS_V1 }, { role: "user", content: "hello 1" }] });
         histA.push({ role: "user", content: "hello 1" }, { role: "assistant", content: reply });
@@ -157,12 +161,14 @@ test("e2e #1085: changed head system stays anchored; updates ride as trailing no
         // Turn 1: head anchored, no notes yet.
         assert.ok(leadingSystem(a1!).includes(SYS_V1), "turn 1 head must carry the original system");
         assert.equal(markerMessages(a1!).length, 0, "turn 1 must carry no update notes");
-        // Turn 2: head BYTE-STABLE (still V1, never V2), exactly one trailing note with the full V2 text.
+        // Turn 2: head BYTE-STABLE (still V1, never V2), exactly one trailing
+        // note carrying a compact diff of the one-line edit.
         assert.equal(leadingSystem(a2!), leadingSystem(a1!), "head system must stay byte-identical after a detected change");
-        assert.ok(!leadingSystem(a2!).includes(SYS_V2), "changed head text must NOT replace the anchor");
+        assert.ok(!leadingSystem(a2!).includes("AND the e2e suite"), "changed head text must NOT replace the anchor");
         const notes2 = markerMessages(a2!);
         assert.equal(notes2.length, 1, "exactly one update note after a single change");
-        assert.ok(notes2[0]!.includes(SYS_V2), "note must carry the full replacement text");
+        assert.ok(notes2[0]!.includes("-Always run npm test before committing."), "note must show the removed line");
+        assert.ok(notes2[0]!.includes("+Always run npm test AND the e2e suite before committing."), "note must show the added line");
         const sentA2 = JSON.parse(a2!) as { messages: ChatMsg[] };
         assert.equal(sentA2.messages[sentA2.messages.length - 1]?.role, "user", "note must trail the conversation");
         // Turn 3: unchanged head — no duplicated note.
@@ -195,8 +201,8 @@ test("e2e #1085: changed head system stays anchored; updates ride as trailing no
         assert.ok(b2Text.includes(TP_UPDATE), "third-party in-history update must pass through untouched");
 
         // --- Session C: Responses wire (codex-style instructions) ---
-        const INST_V1 = "CODEX-INSTRUCTIONS-V1";
-        const INST_V2 = "CODEX-INSTRUCTIONS-V2";
+        const INST_V1 = ["You are a coding agent.", "Follow repo conventions.", "Run tests before finishing.", "Be concise."].join("\n");
+        const INST_V2 = ["You are a coding agent.", "Follow repo conventions and its AGENTS.md.", "Run tests before finishing.", "Be concise."].join("\n");
         const inputC: Array<Record<string, unknown>> = [];
         for (const [inst, userText] of [[INST_V1, "c1"], [INST_V2, "c2"], [INST_V2, "c3"]] as Array<[string, string]>) {
             const res = await fetch(respUrl, {
@@ -229,13 +235,16 @@ test("e2e #1085: changed head system stays anchored; updates ride as trailing no
         assert.ok(!devOf(c2!).includes(INST_V2), "changed instructions must NOT replace the anchor");
         const cnotes = markerItems(c2!);
         assert.equal(cnotes.length, 1, "exactly one responses update note after a single change");
-        assert.ok(cnotes[0]!.includes(INST_V2), "responses note must carry the full replacement text");
+        assert.ok(cnotes[0]!.includes("-Follow repo conventions."), "responses note must show the removed line");
+        assert.ok(cnotes[0]!.includes("+Follow repo conventions and its AGENTS.md."), "responses note must show the added line");
         assert.equal(devOf(c3!), devOf(c1!), "responses developer message must remain byte-identical on steady turns");
         assert.equal(markerItems(c3!).length, 1, "steady responses turns must not duplicate the note");
 
         // --- Session D: Anthropic wire — client-sent cache_control breakpoints ---
-        const SYS_D1 = "ANTHROPIC-AMBIENT-V1";
-        const SYS_D2 = "ANTHROPIC-AMBIENT-V2";
+        // Multi-line heads differing in ONE line: a localized file-style edit
+        // (>=70% shared lines) so the anchor is kept and a diff note appended.
+        const SYS_D1 = "ANTHROPIC-AMBIENT-V1\nline two\nline three\nline four";
+        const SYS_D2 = "ANTHROPIC-AMBIENT-V2\nline two\nline three\nline four";
         const antUrl = `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/messages`;
         const CC = { type: "ephemeral" };
         let histD: Array<Record<string, unknown>> = [];
@@ -288,7 +297,7 @@ test("e2e #1085: changed head system stays anchored; updates ride as trailing no
         assert.ok(!ccBlocks(d2!).some((b) => (b.text ?? "").startsWith(MARKER)), "turn 2: no breakpoint may land on an update note");
         const dnotes = antNotes(d2!);
         assert.equal(dnotes.length, 1, "exactly one anthropic update note after a single change");
-        assert.ok(dnotes[0]!.includes(SYS_D2), "anthropic note must carry the full replacement text");
+        assert.ok(dnotes[0]!.includes("+ANTHROPIC-AMBIENT-V2") && dnotes[0]!.includes("-ANTHROPIC-AMBIENT-V1"), "anthropic note must carry the line diff of the change");
         const lastD2 = antBody(d2!).messages[antBody(d2!).messages.length - 1];
         assert.equal(lastD2.role, "user", "anthropic note must trail the conversation");
         // Turn 3: steady — same breakpoint signature, note not duplicated.
@@ -297,6 +306,30 @@ test("e2e #1085: changed head system stays anchored; updates ride as trailing no
         assert.ok(hasCcOn(d3!, "d-hello-1"), "turn 3: history-block breakpoint preserved");
         assert.ok(!ccBlocks(d3!).some((b) => (b.text ?? "").startsWith(MARKER)), "turn 3: no breakpoint on a note");
         assert.equal(antNotes(d3!).length, 1, "steady anthropic turns must not duplicate the note");
+
+        // --- Session E: plugin-mode agent — anchoring is plain-proxy scope
+        // only (#1085 owner decision); a registered agent keeps full control
+        // of its own head, so bili must forward changes verbatim, no notes. ---
+        const histE: ChatMsg[] = [];
+        async function pluginTurn(body: Record<string, unknown>): Promise<string> {
+            const res = await fetch(chatUrl, {
+                method: "POST",
+                headers: { "content-type": "application/json", "x-acp-session": "plugin-e2e", "x-bili-plugin": "e2e-agent" },
+                body: JSON.stringify({ model: "gpt-test", stream: false, ...body }),
+            });
+            if (!res.ok) throw new Error(`plugin turn failed: HTTP ${res.status}: ${await res.text()}`);
+            const json = (await res.json()) as { choices: Array<{ message: { content?: string } }> };
+            return json.choices[0]?.message?.content ?? "";
+        }
+        reply = await pluginTurn({ messages: [{ role: "system", content: SYS_V1 }, { role: "user", content: "e1" }] });
+        histE.push({ role: "user", content: "e1" }, { role: "assistant", content: reply });
+        await pluginTurn({ messages: [{ role: "system", content: SYS_V2 }, ...histE, { role: "user", content: "e2" }] });
+
+        const [e1, e2] = captured.slice(12, 14);
+        assert.ok(e1 && e2, "expected 2 captured plugin-mode requests");
+        assert.ok(leadingSystem(e2!).includes("AND the e2e suite"), "plugin-mode head change must pass through verbatim (no anchoring)");
+        assert.notEqual(leadingSystem(e2!), leadingSystem(e1!), "plugin-mode head must NOT be frozen to the first-seen bytes");
+        assert.equal(markerMessages(e2!).length, 0, "plugin mode must get zero update notes");
     } finally {
         await close(proxy);
         await close(upstream);
