@@ -15,10 +15,11 @@ import type { StateStoreCodec } from "acp-kernel/persist";
  * file next to the data sits on the same untrusted filesystem and defeats the
  * purpose.
  *
- * COMPRESSION (#1080): session JSON is large and fully reversible, so it is
- * zstd-compressed BY DEFAULT for storage cost; BILI_PERSIST_ZSTD=0 keeps plain
- * JSON. Clients and tools never see the on-disk format — the store decodes
- * transparently and `bili export` renders plaintext.
+ * COMPRESSION (#1080, owner decision): session JSON is zstd-compressed only
+ * when opted in (BILI_PERSIST_ZSTD=1/true); the default stays plain JSON for
+ * recoverability and downgrade safety. Clients and tools never see the
+ * on-disk format — the store decodes transparently and `bili export` renders
+ * plaintext.
  *
  * FORMATS (v1):
  *   encrypted (BILIENC1):
@@ -116,7 +117,7 @@ export interface StorageCodecOptions {
  *  (warn + skip). */
 export function createStorageCodec(opts: StorageCodecOptions = {}): StateStoreCodec | undefined {
     const key = opts.key ?? null;
-    const compress = opts.compress ?? true;
+    const compress = opts.compress ?? false;
     if (!key && !compress) return undefined;
     return {
         encode(data: string): Buffer {

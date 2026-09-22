@@ -71,7 +71,7 @@ function filePath(dir: string, id: string): string {
 }
 
 test("codec: plain roundtrip is deterministic and carries the BILIZSTD1 header", () => {
-    const codec = createStorageCodec()!;
+    const codec = createStorageCodec({ compress: true })!;
     // Compressible payload large enough that framing strictly shrinks it (the
     // size guard frames only when compression actually wins).
     const json = JSON.stringify({ hello: "world ".repeat(400) });
@@ -82,16 +82,16 @@ test("codec: plain roundtrip is deterministic and carries the BILIZSTD1 header",
     assert.deepEqual(Buffer.from(codec.encode(json)), enc, "no nonce -> deterministic bytes");
 });
 
-test("codec: config matrix — only key or compression produce a codec", () => {
+test("codec: config matrix — plain JSON by default, key or opt-in produce a codec", () => {
+    assert.equal(createStorageCodec({}), undefined, "default opts: no key, no compression -> plain JSON");
     assert.equal(createStorageCodec({ compress: false }), undefined);
     assert.equal(createStorageCodec({ key: null, compress: false }), undefined);
-    assert.ok(createStorageCodec({}), "default opts compress by default");
     assert.ok(createStorageCodec({ key: randomBytes(32) }), "key alone");
     assert.ok(createStorageCodec({ compress: true }), "compression alone");
 });
 
 test("codec: legacy plaintext passthrough + magic dispatch across trees", () => {
-    const plain = createStorageCodec()!;
+    const plain = createStorageCodec({ compress: true })!;
     const keyed = createStorageCodec({ key: Buffer.from(KEY, "hex") })!;
     const json = JSON.stringify({ a: 1 });
     assert.equal(plain.decode(Buffer.from(json, "utf8")), json, "legacy plaintext passes through");
@@ -102,21 +102,26 @@ test("codec: legacy plaintext passthrough + magic dispatch across trees", () => 
     assert.throws(() => plain.decode(eBuf), /BILI_ENCRYPTION_KEY/, "reading encrypted without a key says exactly that");
 });
 
-test("codec: key + default compression keeps BILIENC1 in zstd mode (#708 behavior)", () => {
+test("codec: key + explicit compression keeps BILIENC1 in zstd mode (#708 behavior)", () => {
     if (!NATIVE_ZSTD) return;
-    const keyed = createStorageCodec({ key: Buffer.from(KEY, "hex") })!;
+    const keyed = createStorageCodec({ key: Buffer.from(KEY, "hex"), compress: true })!;
     const json = JSON.stringify({ a: "value ".repeat(500) });
     const enc = Buffer.from(keyed.encode(json));
     assert.ok(enc.subarray(0, ENCRYPT_MAGIC.length).equals(ENCRYPT_MAGIC));
     assert.equal(enc[8], 0x01, "format version");
-    assert.equal(enc[9], 0x01, "mode byte stays zstd by default");
+    assert.equal(enc[9], 0x01, "mode byte records the zstd body");
     assert.equal(keyed.decode(enc), json);
+    // Key alone defaults to an unframed raw body (compression is opt-in).
+    const keyedDefault = createStorageCodec({ key: Buffer.from(KEY, "hex") })!;
+    const encRaw = Buffer.from(keyedDefault.encode(json));
+    assert.equal(encRaw[9], 0x00, "key alone -> raw body mode byte");
+    assert.equal(keyedDefault.decode(encRaw), json);
 });
 
 test("fzstd fallback decodes node:zlib frames (static fixture)", () => {
     _setZstdAvailableForTest(false);
     try {
-        const codec = createStorageCodec()!;
+        const codec = createStorageCodec({ compress: true })!;
         const body = Buffer.from(ZSTD_FIXTURE_B64, "base64");
         const frame = Buffer.concat([ZSTD_MAGIC, Buffer.from([0x01, 0x01]), body]);
         assert.equal(codec.decode(frame), ZSTD_FIXTURE_PLAIN);
@@ -125,7 +130,8 @@ test("fzstd fallback decodes node:zlib frames (static fixture)", () => {
     }
 });
 
-withTempDir("store: no-key tree writes BILIZSTD1 by default and loads it back", async (h) => {
+withTempDir("store: BILI_PERSIST_ZSTD=1 writes BILIZSTD1 and loads it back", async (h) => {
+    process.env.BILI_PERSIST_ZSTD = "1";
     const store = newStore(h);
     await store.writeNow(makeSession("s-z"));
     store.cancelAll();
@@ -133,11 +139,23 @@ withTempDir("store: no-key tree writes BILIZSTD1 by default and loads it back", 
     assert.ok(buf.subarray(0, 9).equals(ZSTD_MAGIC), "file on disk starts with BILIZSTD1");
     const loaded = await newStore(h).boot();
     assert.ok(loaded.has("s-z"), "loads back through the same codec");
-    assert.ok(h.logs.some((l) => l.msg.includes("compression enabled")), "boot logs the default-on codec");
+    assert.ok(h.logs.some((l) => l.msg.includes("compression enabled")), "boot logs the opt-in codec");
 });
 
-withTempDir("store: large session shrinks vs the opt-out baseline", async (h) => {
+withTempDir("store: default (env unset) writes bare JSON and loads it back", async (h) => {
+    const store = newStore(h);
+    await store.writeNow(makeSession("s-def"));
+    store.cancelAll();
+    const text = readFileSync(filePath(h.dir, "s-def"), "utf8");
+    assert.equal(text[0], "{", "default stays plain JSON (compression is opt-in)");
+    const loaded = await newStore(h).boot();
+    assert.equal(loaded.size, 1);
+    assert.ok(!h.logs.some((l) => l.msg.includes("compression enabled")));
+});
+
+withTempDir("store: large session shrinks vs the default plain-JSON baseline", async (h) => {
     if (!NATIVE_ZSTD) return;
+    process.env.BILI_PERSIST_ZSTD = "1";
     const big = makeSession("s-big", 20_000);
     big.blockContents.set("b1", "acp-block-summary-content ".repeat(20_000));
     const first = newStore(h);
@@ -164,7 +182,8 @@ withTempDir("store: BILI_PERSIST_ZSTD=0 keeps files as plain JSON", async (h) =>
     assert.ok(!h.logs.some((l) => l.msg.includes("compression enabled")));
 });
 
-withTempDir("store: runtimes without native zstd write unframed plain JSON (no key, no framing)", async (h) => {
+withTempDir("store: opted-in runtime without native zstd falls back to unframed plain JSON", async (h) => {
+    process.env.BILI_PERSIST_ZSTD = "1";
     _setZstdAvailableForTest(false);
     const store = newStore(h);
     await store.writeNow(makeSession("s-oldrt"));
@@ -178,6 +197,7 @@ withTempDir("store: runtimes without native zstd write unframed plain JSON (no k
 
 withTempDir("store: old runtime reads files written by a newer one (fzstd path)", async (h) => {
     if (!NATIVE_ZSTD) return;
+    process.env.BILI_PERSIST_ZSTD = "1";
     const writer = newStore(h);
     await writer.writeNow(makeSession("s-new"));
     writer.cancelAll();
@@ -189,16 +209,15 @@ withTempDir("store: old runtime reads files written by a newer one (fzstd path)"
 });
 
 withTempDir("boot NEVER rewrites legacy plaintext files (downgrade safety, #1080 review)", async (h) => {
-    process.env.BILI_PERSIST_ZSTD = "0";
     const legacy = newStore(h);
     await legacy.writeNow(makeSession("s-1"));
     await legacy.writeNow(makeSession("s-2"));
     legacy.cancelAll();
-    delete process.env.BILI_PERSIST_ZSTD;
+    process.env.BILI_PERSIST_ZSTD = "1";
     const before = h.logs.length;
     const store = newStore(h);
     const loaded = await store.boot();
-    assert.equal(loaded.size, 2, "both legacy sessions load under the zstd-default codec");
+    assert.equal(loaded.size, 2, "both legacy sessions load under the compression-enabled codec");
     for (const id of ["s-1", "s-2"]) {
         const raw = readFileSync(filePath(h.dir, id));
         assert.ok(raw[0] === 0x7b /* '{' */, `${id} still plain JSON on disk after boot`);
@@ -214,13 +233,12 @@ withTempDir("boot NEVER rewrites legacy plaintext files (downgrade safety, #1080
 });
 
 withTempDir("mixed tree: legacy plaintext and BILIZSTD1 coexist until boot", async (h) => {
-    process.env.BILI_PERSIST_ZSTD = "0";
     const legacy = newStore(h);
     await legacy.writeNow(makeSession("s-old"));
     legacy.cancelAll();
-    delete process.env.BILI_PERSIST_ZSTD;
+    process.env.BILI_PERSIST_ZSTD = "1";
     const store = newStore(h);
-    await store.writeNow(makeSession("s-new"));
+    await store.writeNow(makeSession("s-new", 4_000));
     store.cancelAll();
     const loaded = await newStore(h).boot();
     assert.ok(loaded.has("s-old") && loaded.has("s-new"), "both formats readable in one tree");
@@ -229,6 +247,7 @@ withTempDir("mixed tree: legacy plaintext and BILIZSTD1 coexist until boot", asy
 });
 
 withTempDir("keyed boot leaves BILIZSTD1 files untouched and readable", async (h) => {
+    process.env.BILI_PERSIST_ZSTD = "1";
     const store = newStore(h);
     await store.writeNow(makeSession("s-z"));
     store.cancelAll();
@@ -240,6 +259,7 @@ withTempDir("keyed boot leaves BILIZSTD1 files untouched and readable", async (h
 });
 
 withTempDir("no-key boot reports BILIENC1 files as unreadable instead of corrupt garbage", async (h) => {
+    process.env.BILI_PERSIST_ZSTD = "1";
     process.env.BILI_ENCRYPTION_KEY = KEY;
     const writer = newStore(h);
     await writer.writeNow(makeSession("s-secret"));
@@ -270,7 +290,7 @@ withTempDir("decoupling: key + BILI_PERSIST_ZSTD=0 keeps BILIENC1 with a raw bod
 });
 
 test("codec: payloads that do not shrink stay unframed plain JSON (size guard)", () => {
-    const codec = createStorageCodec()!;
+    const codec = createStorageCodec({ compress: true })!;
     // Small enough that zstd framing (magic + header + frame overhead)
     // cannot beat the bare payload — the guard must return it verbatim.
     const tiny = JSON.stringify({ hello: "world", n: [1, 2, 3] });

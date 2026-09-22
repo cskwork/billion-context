@@ -36,8 +36,9 @@ import type { WireProtocol } from "./util.js";
  *    by an older version, so a schema change never breaks old files.
  *  - Disable with BILI_PERSIST=0 for ephemeral/test runs.
  *  - Storage encoding at rest: via the kernel store's codec hook, every file
- *    is zstd-compressed BY DEFAULT (#1080, BILIZSTD1 envelope; opt out with
- *    BILI_PERSIST_ZSTD=0) and, independently, AES-256-GCM-encrypted when
+ *    is optionally zstd-compressed when BILI_PERSIST_ZSTD=1/true (default
+ *    off — plain JSON; #1080, BILIZSTD1 envelope) and, independently,
+ *    AES-256-GCM-encrypted when
  *    BILI_ENCRYPTION_KEY (hex/base64, exactly 32 bytes) is set (#708,
  *    BILIENC1 envelope) — the body-mode byte records compression even inside
  *    BILIENC1, so the two stay separately configurable. Legacy plaintext
@@ -208,10 +209,10 @@ export class SessionStore {
         const baseLog = opts?.log ?? defaultLogger;
         this.log = baseLog;
         // #708/#1080: env-only storage policy (a key file next to the data
-        // sits on the same untrusted filesystem). Compression is ON by
-        // default (#1080); BILI_PERSIST_ZSTD=0 keeps plain JSON. Invalid key
-        // values throw here — fail fast at startup instead of running
-        // silently unencrypted.
+        // sits on the same untrusted filesystem). Compression is OPT-IN
+        // (owner decision, #1080): BILI_PERSIST_ZSTD=1/true enables it, the
+        // default stays plain JSON. Invalid key values throw here — fail
+        // fast at startup instead of running silently unencrypted.
         const keyEnv = process.env.BILI_ENCRYPTION_KEY;
         let key: Buffer | null = null;
         if (keyEnv) key = parseEncryptionKey(keyEnv);
@@ -660,13 +661,13 @@ function persistEnabled(): boolean {
     return true;
 }
 
-/** #1080: zstd-compress session files by default — reversible and invisible
- *  to clients, storage cost is the driver; BILI_PERSIST_ZSTD=0/false keeps
- *  them as plain JSON. */
+/** #1080 (owner decision): session files stay plain JSON by default —
+ *  recoverability (jq/grep-debuggable, no downgrade tail risk) beats silent
+ *  disk savings. Only BILI_PERSIST_ZSTD=1/true opts into zstd (BILIZSTD1);
+ *  anything else (0/false/unset) keeps plain JSON. */
 function persistZstdEnabled(): boolean {
     const env = process.env.BILI_PERSIST_ZSTD;
-    if (env === "0" || env === "false") return false;
-    return true;
+    return env === "1" || env === "true";
 }
 
 /** Temp name used by atomic codec writes: `<file>.tmp-enc-<pid>-<ts>`. A
