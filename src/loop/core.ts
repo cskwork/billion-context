@@ -206,6 +206,8 @@ function recordUsage(
     if (total > 0) {
         ctx.session.stats.lastInputTokens = Math.max(0, total - (ctx.session.stats.compressCreditTokens ?? 0));
         ctx.session.stats.lastInputTokensSource = "usage";
+        // #1110: a real usage report retires the one-shot overflow arm.
+        delete ctx.session.stats.overflowArmTokens;
     }
     if (typeof cached === "number" && total > 0) {
         ctx.session.stats.cachedTokens += cached;

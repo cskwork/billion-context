@@ -462,3 +462,42 @@ test("e2e: overflow 400 on a side request arms the stated window; next one is bl
         await closeRig(rig);
     }
 });
+
+test("e2e: healthy host baseline must NOT clamp an unrelated side request (#1110)", async () => {
+    const rig = await startRig(); // declared window 200_000
+    try {
+        const url = `http://127.0.0.1:${rig.proxyPort}/bili/http://127.0.0.1:${rig.upstreamPort}/v1/messages`;
+        const headers: Record<string, string> = { "content-type": "application/json", "x-acp-session": SESSION };
+
+        // Host conversation active and healthy: one normal main turn whose real
+        // usage lands at MAIN_INPUT_TOKENS (50k) → nudge baseline 50k, source
+        // "usage". NO overflow ever happened, so there is NO overflow arm.
+        const r1 = await fetch(url, { method: "POST", headers, body: JSON.stringify({ model: MODEL, max_tokens: 1024, stream: true, messages: mainConversation(8) }) });
+        assert.equal(r1.status, 200);
+        await r1.text();
+
+        const s1 = getSession(SESSION);
+        assert.ok(s1, "session exists after the main turn");
+        assert.equal(s1.stats.lastInputTokens, MAIN_INPUT_TOKENS, "healthy host turn sets the nudge baseline");
+        assert.equal(s1.stats.lastInputTokensSource, "usage", "baseline provenance is a real usage report");
+        assert.equal(s1.stats.overflowArmTokens, undefined, "#1110: no overflow occurred → no arm");
+
+        // An UNRELATED in-process caller's fixed-size request (the MemOS shape):
+        // no tools, tiny output budget → a side request, but its raw body (~90k
+        // tokens) exceeds the host's 50k baseline × 1.15 while still fitting the
+        // model's real 200k window. Pre-#1110 the guard clamped the effective
+        // window to that 50k baseline and 413'd this permanently; post-fix it
+        // must forward verbatim.
+        const bigSideContent = "z".repeat(360_000);
+        const r2 = await fetch(url, { method: "POST", headers, body: JSON.stringify({ model: MODEL, max_tokens: 100, stream: true, messages: [{ role: "user", content: bigSideContent }] }) });
+        assert.equal(r2.status, 200, "#1110: unrelated side request that fits the real window must forward, not be 413'd by the host baseline");
+        await r2.text();
+        assert.ok(rig.upstreamHits >= 2, "the unrelated side request reached the upstream");
+
+        // Side passthrough left the host baseline and kernel state untouched.
+        assert.equal(getSession(SESSION).stats.lastInputTokens, MAIN_INPUT_TOKENS, "side request did not clobber the host baseline");
+        assert.equal(getSession(SESSION).stats.overflowArmTokens, undefined, "#1110: a forwarded (non-overflow) side request must not mint an arm");
+    } finally {
+        await closeRig(rig);
+    }
+});
