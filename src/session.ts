@@ -252,6 +252,15 @@ export function getSession(id: string, meta?: { protocol?: Session["meta"]["prot
         reloaded.lastSeen = Date.now();
         reloaded.restored = false;
         reloaded.persisted = true;
+        // A memory-miss reload puts a NEW resident entry back into the pool; the
+        // new-session cap guard below is unreachable on this path, so enforce it
+        // here or evict-then-revisit grows the pool past MAX_SESSIONS (#1064).
+        if (sessions.size >= MAX_SESSIONS) {
+            const evicted = evictOldest();
+            if (!evicted) {
+                throw new Error(`session pool exhausted (MAX_SESSIONS=${MAX_SESSIONS}; all in-flight)`);
+            }
+        }
         sessions.set(id, reloaded);
         return reloaded;
     }

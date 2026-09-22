@@ -1,5 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { loadOptions, parseUpstreamProxyMode } from "../src/config.ts";
 import { resolveProxyDecision } from "../src/upstream-proxy.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
@@ -140,6 +143,27 @@ test("getSession: evicts an idle session to make room when at MAX", () => {
         assert.notEqual(a.id, b.id);
     } finally {
         _resetSessionsForTest();
+    }
+});
+
+test("getSession: evict-then-revisit reload enforces MAX_SESSIONS (#1064)", () => {
+    const dir = mkdtempSync(join(tmpdir(), "bili-sesscap-"));
+    _setStoreForTest(new SessionStore({ dir, debounceMs: 5, enabled: true }));
+    _resetSessionsForTest(1);
+    try {
+        getSession("a");
+        assert.equal(_sessionsSizeForTest(), 1);
+        // New session b evicts idle a; eviction flushes a to disk first.
+        getSession("b");
+        assert.equal(_sessionsSizeForTest(), 1, "eviction keeps pool at MAX");
+        // Revisit a: memory miss → disk reload. Before #1064 the reload path
+        // returned before the cap guard, so the pool grew past MAX_SESSIONS.
+        const reloaded = getSession("a");
+        assert.equal(reloaded.id, "a", "reloaded from disk");
+        assert.equal(_sessionsSizeForTest(), 1, "reload must evict first — pool stays at MAX");
+    } finally {
+        _resetSessionsForTest();
+        rmSync(dir, { recursive: true, force: true });
     }
 });
 

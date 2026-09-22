@@ -110,7 +110,7 @@ import { BILI_HOP_HEADER, anthropicBetaContextWindow, LAUNCHER_MODEL_WINDOWS, LA
 import { buildForwardHeaders, connectionNamedHeaders, NO_IDENTITY_MESSAGE, RESPONSE_ONLY_STRIP_HEADERS, safeSessionId, UPSTREAM_HOP_HEADERS } from "./server/headers.js";
 import { isSideRequest, outputBudgetField, restoreOutputBudget, SIDE_REQUEST_MAX_TOKENS, sideRequestGuard } from "./server/side-request.js";
 import { clampOutgoingOutput, countSystemAndToolsTokens, emergencyNudge, estimateInputTokens, estimateWireOverhead } from "./server/budget.js";
-import { bufferToStream, dumpStreamToFile, pipeThrough, readStreamToBuffer } from "./server/stream-io.js";
+import { awaitDrain, bufferToStream, dumpStreamToFile, pipeThrough, readStreamToBuffer } from "./server/stream-io.js";
 
 // #1073: a forward-proxy-style (absolute-form) request whose authority IS this
 // instance's own listening endpoint — e.g. a health prober configured with our
@@ -2695,8 +2695,11 @@ function prepareResponses(
     let echoReplaced = false;
     if (Array.isArray(parsed.input)) {
         const { items, replaced, dropped } = replaceBiliCompactionItems(parsed.input);
-        if (replaced > 0 || dropped > 0) {
-            echoReplaced = true;
+        if (replaced + dropped > 0) {
+            // Only a real replacement carries a summary into the history; a
+            // drop-only echo removed a marker blob without inserting one, so the
+            // forge-time captured summaries must still be re-injected (#1064).
+            if (replaced > 0) echoReplaced = true;
             log("info", `[${sessionId}] replaced ${replaced} echoed bili compaction item(s) with summary handoff message(s)${dropped > 0 ? `, dropped ${dropped} legacy marker item(s)` : ""}`);
             parsed.input = items as typeof parsed.input;
         }
@@ -4510,10 +4513,7 @@ async function forward(
                 }
                 res.write(chunk);
                 if (res.writableNeedDrain) {
-                    await Promise.race([
-                        new Promise<void>((r) => res.once("drain", () => r())),
-                        new Promise<void>((r) => res.once("close", () => r())),
-                    ]);
+                    await awaitDrain(res);
                 }
                 if (res.destroyed || res.writableEnded) break;
             }

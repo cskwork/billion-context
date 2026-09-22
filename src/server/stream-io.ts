@@ -45,6 +45,7 @@ export interface DrainableResponse {
     destroyed?: boolean;
     writableEnded?: boolean;
     once(event: string, cb: () => void): unknown;
+    removeListener?(event: string, cb: () => void): unknown;
 }
 
 // Backpressure wait that also resolves when the CLIENT goes away (#100). A
@@ -56,9 +57,17 @@ export interface DrainableResponse {
 export function awaitDrain(res: DrainableResponse): Promise<void> {
     if (res.destroyed || res.writableEnded) return Promise.resolve();
     return new Promise((resolve) => {
-        res.once("drain", resolve);
-        res.once("close", resolve);
-        res.once("error", resolve);
+        // One shared settle: when any of the three fires, drop the other two or
+        // they leak on every backpressure wait (MaxListenersExceededWarning).
+        const done = (): void => {
+            res.removeListener?.("drain", done);
+            res.removeListener?.("close", done);
+            res.removeListener?.("error", done);
+            resolve();
+        };
+        res.once("drain", done);
+        res.once("close", done);
+        res.once("error", done);
     });
 }
 

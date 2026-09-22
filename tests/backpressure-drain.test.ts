@@ -55,6 +55,18 @@ test("awaitDrain resolves on error", async () => {
     assert.equal(resolved, true, "error must resolve");
 });
 
+test("awaitDrain removes its one-shot listeners once resolved (no listener leak)", async () => {
+    const res = new EventEmitter();
+    void awaitDrain(res as never);
+    assert.equal(res.listenerCount("drain"), 1, "drain listener armed while pending");
+    assert.equal(res.listenerCount("close"), 1, "close listener armed while pending");
+    assert.equal(res.listenerCount("error"), 1, "error listener armed while pending");
+    res.emit("drain");
+    assert.equal(res.listenerCount("drain"), 0, "drain listener removed after resolving");
+    assert.equal(res.listenerCount("close"), 0, "close listener removed after resolving");
+    assert.equal(res.listenerCount("error"), 0, "error listener removed after resolving");
+});
+
 test("awaitDrain resolves immediately for an already-dead response without registering listeners", async () => {
     let listenerCalls = 0;
     const res = { destroyed: true, writableEnded: false, once: () => { listenerCalls += 1; } };
