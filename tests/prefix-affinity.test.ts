@@ -111,6 +111,47 @@ test("prefix-affinity: system+user openai shape (shared system must not collide)
     assert.notEqual(b!.sessionId, a!.sessionId, "identical system prefix must not merge distinct conversations");
 });
 
+test("prefix-affinity: rotating leading system message keeps the session (#1148)", () => {
+    const r = new PrefixAffinityResolver();
+    const sysA = { role: "system", content: "You are X. Date: 2026-09-22. cwd: /a. budget: 50k" };
+    const sysB = { role: "system", content: "You are X. Date: 2026-09-23. cwd: /b. budget: 48k" };
+    const base = [user("hello there friend"), { role: "assistant", content: "hi" }];
+    const a = r.resolve([sysA, ...base]);
+    assert.ok(a);
+    r.note(a.sessionId, a.incomingDepth, a.tailHash, a.itemHashes);
+
+    // Same conversation, next turn, harness rotated the system prompt bytes.
+    const b = r.resolve([sysB, ...base, user("next turn question")]);
+    assert.ok(b);
+    assert.equal(b.sessionId, a.sessionId, "rotating leading system must not fork the session");
+    assert.equal(b.via, "prefix");
+    assert.equal(b.matchedDepth, 2, "match depth counts normalized (non-system) items");
+});
+
+test("prefix-affinity: rotating leading developer-role message keeps the session (#1148)", () => {
+    const r = new PrefixAffinityResolver();
+    const devA = { role: "developer", content: "harness instructions variant one with substance" };
+    const devB = { role: "developer", content: "harness instructions variant two with substance" };
+    const a = r.resolve([devA, user("first question with substance")]);
+    assert.ok(a);
+    r.note(a.sessionId, a.incomingDepth, a.tailHash, a.itemHashes);
+    const b = r.resolve([devB, user("first question with substance"), { role: "assistant", content: "r1" }]);
+    assert.ok(b);
+    assert.equal(b.sessionId, a.sessionId, "developer-role carrier rotates like system");
+});
+
+test("prefix-affinity: non-leading system message still bakes into the chain", () => {
+    const r = new PrefixAffinityResolver();
+    const midA = { role: "system", content: "mid-history injection variant one with substance" };
+    const midB = { role: "system", content: "mid-history injection variant two with substance" };
+    const a = r.resolve([user("opener with substance"), midA]);
+    assert.ok(a);
+    r.note(a.sessionId, a.incomingDepth, a.tailHash, a.itemHashes);
+    const b = r.resolve([user("opener with substance"), midB]);
+    assert.ok(b);
+    assert.notEqual(b.sessionId, a.sessionId, "only the LEADING run is normalized; mid-history system is content");
+});
+
 test("prefix-affinity: LRU cap bounds tracked sessions", () => {
     const r = new PrefixAffinityResolver();
     for (let i = 0; i < 262; i++) {

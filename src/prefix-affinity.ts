@@ -31,6 +31,14 @@ import { createHash } from "node:crypto";
  * keeps the session, which is the correct semantics. Safety: matching a stored
  * chain requires possessing a byte-identical history, so the folded state
  * reveals nothing the requester does not already hold.
+ *
+ * Identity normalization (#1148): the LEADING contiguous run of
+ * system/developer-role messages is stripped before hashing. On the other three
+ * protocols the system prompt is a top-level field OUTSIDE the hashed array
+ * (anthropic `system`, responses `instructions`, google `systemInstruction`);
+ * only the OpenAI-style inline form baked it into the chain, so every system
+ * rotation (harnesses stamping date/cwd/token-budget each turn) forked the
+ * session with zero state and no lineage.
  */
 
 /** Creation/match floor on the canonical size of the hashed messages.
@@ -137,6 +145,26 @@ function hasUserMessage(messages: unknown[]): boolean {
     return messages.some((m) => !!m && typeof m === "object" && (m as { role?: unknown }).role === "user");
 }
 
+/** Strip the LEADING contiguous run of system/developer-role messages (#1148).
+ *  On the other three protocols the system prompt is a top-level field OUTSIDE
+ *  the hashed array (anthropic `system`, responses `instructions`, google
+ *  `systemInstruction`); only the OpenAI-style inline form baked it into the
+ *  identity chain, so a harness rotating date/cwd/token-budget into system each
+ *  turn forked the session every turn with no lineage. Normalizing here aligns
+ *  all four protocols. Only the leading run is stripped — a mid-history system
+ *  message is conversation content and stays in the chain. */
+function stripLeadingSystem(messages: unknown[]): unknown[] {
+    let i = 0;
+    while (i < messages.length) {
+        const m = messages[i];
+        if (!m || typeof m !== "object") break;
+        const role = (m as { role?: unknown }).role;
+        if (role !== "system" && role !== "developer") break;
+        i++;
+    }
+    return messages.slice(i);
+}
+
 /** Progressive chain hashes: hashes[i] covers messages[0..i]. */
 function chainHashes(messages: unknown[]): string[] {
     const hashes: string[] = [];
@@ -176,11 +204,12 @@ export class PrefixAffinityResolver {
      * (caller keeps the #286 explicit 400).
      */
     resolve(messages: unknown[]): AnonymousAffinity | null {
-        const hashes = chainHashes(messages);
+        const body = stripLeadingSystem(messages);
+        const hashes = chainHashes(body);
         if (hashes.length === 0 || !hasUserMessage(messages)) return null;
         const incomingDepth = hashes.length;
         const tailHash = hashes[incomingDepth - 1]!;
-        const incItemHashes = perItemHashes(messages);
+        const incItemHashes = perItemHashes(body);
         const storedItemHashes = incItemHashes.slice(-MAX_STORED_ITEMS);
         const tracked = this.trackedChains;
         this.expire(tracked);
