@@ -188,7 +188,7 @@ describe("createV1ServerHooks", () => {
 
     it("registers /acp command, rewrites providers, stamps headers and tools when zod present", async () => {
         const deps = makeDeps();
-        const hooks = createV1ServerHooks(origin, {}, deps);
+        const hooks = createV1ServerHooks(() => origin, {}, deps);
         assert.ok(hooks.config);
         assert.ok(hooks["chat.headers"]);
         assert.ok(hooks["command.execute.before"]);
@@ -213,7 +213,7 @@ describe("createV1ServerHooks", () => {
     });
 
     it("degrades to proxy mode (no headers, no tools) when zod is unavailable", async () => {
-        const hooks = createV1ServerHooks(origin, {}, {});
+        const hooks = createV1ServerHooks(() => origin, {}, {});
         assert.equal(hooks["chat.headers"], undefined);
         assert.equal(hooks.tool, undefined);
         assert.ok(hooks.config);
@@ -224,7 +224,7 @@ describe("createV1ServerHooks", () => {
 
     it("stamps x-bili-plugin-context-window from config-declared model limits (omits when absent)", async () => {
         const deps = makeDeps();
-        const hooks = createV1ServerHooks(origin, {}, deps);
+        const hooks = createV1ServerHooks(() => origin, {}, deps);
         assert.ok(hooks["chat.headers"]);
         const cfg: V1Config = {
             provider: {
@@ -245,13 +245,43 @@ describe("createV1ServerHooks", () => {
 
     it("command.execute.before only reacts to /acp", async () => {
         const deps = makeDeps();
-        const hooks = createV1ServerHooks(origin, {}, deps);
+        const hooks = createV1ServerHooks(() => origin, {}, deps);
         await hooks["command.execute.before"]?.({ command: "other", sessionID: "s" });
         // /acp path throws the sentinel after rendering — assert the sentinel shape
         await assert.rejects(
             hooks["command.execute.before"]?.({ command: "acp", sessionID: "ses_x" }),
             /__BILI_ACP_HANDLED__/,
         );
+    });
+
+    it("#1135: tool forwards follow the origin across a runtime recovery", async () => {
+        const forwarded: string[] = [];
+        let live: string | undefined = "http://127.0.0.1:19199";
+        const deps = makeDeps();
+        deps.forward = async (o: string) => {
+            forwarded.push(o);
+            return "ok";
+        };
+        const hooks = createV1ServerHooks(() => live, {}, deps);
+        await hooks.tool?.compress?.execute({}, { sessionID: "s" });
+        live = "http://127.0.0.1:19200";
+        await hooks.tool?.compress?.execute({}, { sessionID: "s" });
+        assert.deepEqual(forwarded, ["http://127.0.0.1:19199", "http://127.0.0.1:19200"]);
+    });
+
+    it("#1135: a transiently undefined origin skips stamping and degrades tools to a notice", async () => {
+        let live: string | undefined;
+        const hooks = createV1ServerHooks(() => live, {}, makeDeps());
+        const headers: Record<string, string> = {};
+        await hooks["chat.headers"]?.({ sessionID: "ses_1" }, { headers });
+        assert.equal(headers["x-bili-plugin"], undefined);
+        assert.equal(headers["x-bili-plugin-conversation"], undefined);
+        const out = await hooks.tool?.compress?.execute({}, { sessionID: "ses_1" });
+        assert.match(out, /no live proxy/);
+        live = "http://127.0.0.1:19199";
+        const h2: Record<string, string> = {};
+        await hooks["chat.headers"]?.({ sessionID: "ses_1" }, { headers: h2 });
+        assert.equal(h2["x-bili-plugin"], "opencode");
     });
 });
 
@@ -316,7 +346,7 @@ describe("createV1ServerHooks legacy routing (#920)", () => {
         const events: string[] = [];
         const legacy = fakeLegacyModule(events);
         const forwarded: { sid: string; tool: string; args: unknown }[] = [];
-        const hooks = createV1ServerHooks("http://127.0.0.1:19999", {}, {
+        const hooks = createV1ServerHooks(() => "http://127.0.0.1:19999", {}, {
             z: fakeZ,
             legacy,
             isLegacy: (sid) => sid === "ses_legacy",
@@ -376,7 +406,7 @@ describe("createV1ServerHooks legacy routing (#920)", () => {
         const cfg: V1Config = {
             provider: { testprov: { options: { baseURL: "http://127.0.0.1:19998/v1" } } },
         };
-        await createV1ServerHooks("http://127.0.0.1:19999", {}, {
+        await createV1ServerHooks(() => "http://127.0.0.1:19999", {}, {
             z: fakeZ,
             legacy,
             isLegacy: () => false,

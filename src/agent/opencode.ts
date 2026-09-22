@@ -16,9 +16,12 @@
 // The /acp command hooks themselves live in src/agent/opencode-acp-command.ts
 // and are shared with the native V1 entry (opencode-native.ts).
 
+import { LAUNCHER_DEFAULT_HOST, ensureProxyRunning } from "../launcher.js";
 import { createAcpCommandHooks } from "./opencode-acp-command.js";
-import { createOpencodeV2Setup } from "./opencode-v2.js";
-import { installNativeFetchIntercept, type NativeInterceptState } from "./native-intercept.js";
+import { nativeProxyScriptPath, singleFlight } from "./native-bootstrap.js";
+import { createLiveOriginResolver, installNativeFetchIntercept, isModelApiUrl, replaceRequestTarget, routedBiliModelUrl, type NativeInterceptState } from "./native-intercept.js";
+import { createOpencodeV2Setup, type V2HttpRequestEvent, type V2State } from "./opencode-v2.js";
+import { fetchProxyVersion } from "./shared.js";
 
 export { showAcpText } from "./opencode-acp-command.js";
 export type {
@@ -55,22 +58,109 @@ interface OpencodeHooks {
 
 const proxyBase = process.env.BILLION_CONTEXT_PROXY ?? "";
 
+// #1135: shared lifecycle state for BOTH lanes — the V1 fetch patch and the
+// V2 http.request route observe the same proxy and drive the same recovery.
+// The launcher's proxy is often SHARED across multiple `bili opencode`
+// launches (instance discovery attaches later launches to the first one);
+// when the owning launcher exits, its parent-pid watchdog tears the proxy
+// down and every attach-side client's baked URLs point at a dead port.
+// Spawning our own replacement (watchdog = THIS opencode process) restores
+// compression without a manual restart — the ownership transfer is the
+// watchdog's job, and instance discovery may find another healthy one first.
+let _respawnForTest: (() => Promise<string | undefined>) | undefined;
+
+/** Test hook: replace the attach respawn body (re-probe + self-spawn) with a
+ *  stub so suites never fork a real proxy. Pass undefined to restore. */
+export function _setRespawnForTest(fn?: () => Promise<string | undefined>): void {
+    _respawnForTest = fn;
+}
+
+/** Test hook: expose the armed intercept state so stub respawns can publish
+ *  their landed origin exactly like the real respawnOwnProxy does. */
+export function _interceptStateForTest(): NativeInterceptState | undefined {
+    return intercept;
+}
+
+const intercept: NativeInterceptState | undefined = proxyBase === "" ? undefined : {
+    origin: proxyBase,
+    ready: Promise.resolve(proxyBase),
+    respawn: singleFlight(() => (_respawnForTest ?? respawnOwnProxy)()),
+    onGiveUp: () => {
+        delete process.env.BILLION_CONTEXT_PROXY;
+    },
+};
+
+/** Re-probe the attached origin first: a transient blip must not migrate the
+ *  session to a fresh proxy — restore the same origin when it is back. Only a
+ *  truly dead origin falls through to spawning our own replacement. */
+async function respawnOwnProxy(): Promise<string | undefined> {
+    if (proxyBase !== "") {
+        const version = await fetchProxyVersion(proxyBase).catch(() => undefined);
+        if (version !== undefined) {
+            if (intercept !== undefined) intercept.origin = proxyBase;
+            process.env.BILLION_CONTEXT_PROXY = proxyBase;
+            return proxyBase;
+        }
+    }
+    try {
+        const handle = await ensureProxyRunning(
+            { host: LAUNCHER_DEFAULT_HOST, port: 0, passthrough: false, debug: false },
+            { scriptPath: nativeProxyScriptPath() },
+        );
+        if (intercept !== undefined) intercept.origin = handle.origin;
+        process.env.BILLION_CONTEXT_PROXY = handle.origin;
+        return handle.origin;
+    } catch (err) {
+        console.error(`[bili-opencode] proxy respawn failed — model traffic goes direct (uncompressed): ${err instanceof Error ? err.message : String(err)}`);
+        return undefined;
+    }
+}
+
 const server = async (ctx: OpencodePluginContext): Promise<OpencodeHooks> => {
     if (!proxyBase) return {};
     console.log("[bili-opencode] plugin active (proxy " + proxyBase + ")");
     // V1 host: same SDK-default-baseURL gap as the native entry — the
     // launcher's config-file rewrite only catches explicit baseURLs. Global
-    // fetch patch catches the rest; `origin` is already resolved (the
-    // launcher owns the proxy lifecycle, no respawn hooks needed).
-    const intercept: NativeInterceptState = { origin: proxyBase, ready: Promise.resolve(proxyBase) };
-    if (installNativeFetchIntercept(intercept)) {
+    // fetch patch catches the rest; runtime recovery rides the shared state.
+    if (intercept !== undefined && installNativeFetchIntercept(intercept)) {
         console.log("[bili-opencode] v1: fetch patch installed (catches providers without an explicit baseURL)");
     }
     return {
-        ...createAcpCommandHooks(() => proxyBase, ctx),
+        ...createAcpCommandHooks(() => intercept?.origin ?? proxyBase, ctx),
     };
 };
 
-const setup = createOpencodeV2Setup();
+// V2 lane: routes provider requests through the LIVE proxy origin. Handles
+// BOTH URL shapes: baked `<proxy>/bili/<upstream>` overlays from the
+// launcher's config rewrite (re-baked to the current origin on recovery) and
+// raw model-API URLs from SDK-default providers (routed like the native
+// entry does). A dead origin degrades to a DIRECT send of the upstream URL
+// rather than failing closed — compression is lost, the session survives.
+const route = intercept === undefined ? undefined : (() => {
+    const resolveLive = createLiveOriginResolver(intercept);
+    let warned = false;
+    return async (e: V2HttpRequestEvent, s: V2State): Promise<void> => {
+        const url = typeof e.request?.url === "string" ? e.request.url : undefined;
+        if (url === undefined) return;
+        const upstream = routedBiliModelUrl(url);
+        if (upstream === undefined && !isModelApiUrl(url)) return;
+        const live = await resolveLive();
+        if (live === undefined) {
+            if (!warned) {
+                warned = true;
+                console.error("[bili-opencode] no live bili proxy — model requests go direct (uncompressed)");
+            }
+            s.proxyBase = undefined;
+            if (upstream !== undefined) replaceRequestTarget(e, upstream);
+            return;
+        }
+        warned = false;
+        s.proxyBase = live;
+        const target = `${live}/bili/${upstream ?? url}`;
+        if (target !== url) replaceRequestTarget(e, target);
+    };
+})();
+
+const setup = createOpencodeV2Setup(route === undefined ? {} : { route });
 
 export default { id: "billion-context-opencode", setup, server };

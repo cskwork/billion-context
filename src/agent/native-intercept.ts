@@ -161,6 +161,125 @@ export async function readyOrigin(state: NativeInterceptState): Promise<string |
     return withTimeout(state.ready, state.readyTimeoutMs ?? 15000);
 }
 
+// ———— Live-origin resolution (#1135) ——————————————————————————————
+// Shared by BOTH OpenCode lanes (the native entry's V2 route and the
+// launcher plugin's V2 route): each outgoing request resolves the LIVE proxy
+// origin — fast-path the held origin through a TTL-cached health probe, and
+// when it is dead drive state.respawn (cooldown-gated unless we just lost an
+// origin we were actively routing to) and adopt whatever replacement lands.
+// A transient blip that recovers to the SAME origin costs nothing (the
+// session never migrates); a genuinely dead origin falls back to whatever the
+// owner's respawn produces (a self-spawned proxy, or another healthy shared
+// instance via discovery). Returns undefined when nothing is alive — callers
+// MUST degrade to direct sends, not fail-closed.
+
+const HEALTH_TIMEOUT_MS = 1500;
+/** Probe-verdict trust window (#928). Far below RESPAWN_COOLDOWN_MS: that
+ *  cooldown already assumes multi-second proxy stability, so a few-second
+ *  detection horizon is consistent with it while removing the per-request RTT. */
+const HEALTH_PROBE_TTL_MS = 2_000;
+const RESPAWN_COOLDOWN_MS = 15_000;
+
+export async function probeHealth(origin: string): Promise<boolean> {
+    try {
+        const res = await fetch(`${origin}/__bili/health`, { signal: AbortSignal.timeout(HEALTH_TIMEOUT_MS) });
+        return res.ok;
+    } catch {
+        return false;
+    }
+}
+
+/** Wrap a probe in a per-origin TTL cache (#928). Both verdicts are cached: a
+ *  healthy hit skips the steady-state loopback RTT; a dead hit avoids re-paying
+ *  the full HEALTH_TIMEOUT_MS on every request across the death+cooldown window.
+ *  Stale entries for other origins are evicted on insert, keeping the map bounded. */
+export function withProbeTtl(probe: (origin: string) => Promise<boolean>, ttlMs: number): (origin: string) => Promise<boolean> {
+    const cache = new Map<string, { ok: boolean; at: number }>();
+    return (origin) => {
+        const now = Date.now();
+        const hit = cache.get(origin);
+        if (hit !== undefined && now - hit.at < ttlMs) return Promise.resolve(hit.ok);
+        return probe(origin).then((ok) => {
+            const t = Date.now();
+            for (const [key, entry] of cache) if (t - entry.at >= ttlMs) cache.delete(key);
+            cache.set(origin, { ok, at: t });
+            return ok;
+        });
+    };
+}
+
+export interface LiveOriginResolverDeps {
+    /** Injectable health probe (tests); defaults to GET /__bili/health. */
+    probe?: (origin: string) => Promise<boolean>;
+    /** Bootstrap retry interval when no live origin is held (tests shrink it). */
+    respawnCooldownMs?: number;
+    /** Probe-verdict cache TTL; defaults to HEALTH_PROBE_TTL_MS (tests shrink it). */
+    probeTtlMs?: number;
+}
+
+/** Build the per-request live-origin resolver over a shared intercept state.
+ *  The owner arms `state.respawn` (self-spawn for spawn mode, probe-then-
+ *  fallback for attach mode — #1130/#1135); this resolver only decides WHEN
+ *  to fire it and whether the result is actually alive. */
+export function createLiveOriginResolver(state: NativeInterceptState, deps: LiveOriginResolverDeps = {}): () => Promise<string | undefined> {
+    const probe = withProbeTtl(deps.probe ?? probeHealth, deps.probeTtlMs ?? HEALTH_PROBE_TTL_MS);
+    const respawnCooldownMs = deps.respawnCooldownMs ?? RESPAWN_COOLDOWN_MS;
+    let lastRespawn = 0;
+    return async (): Promise<string | undefined> => {
+        let ownedThenLost = false;
+        if (state.origin !== undefined) {
+            if (await probe(state.origin)) return state.origin;
+            // Proxy died mid-session. Clearing origin first makes concurrent
+            // callers share the same state.ready (dedup).
+            ownedThenLost = true;
+            state.origin = undefined;
+        }
+        // Retry bootstrap whenever no live origin is held — either just lost
+        // it or the load-time bootstrap failed (the hook cannot observe send
+        // failures, so nothing else would retry). Cooldown bounds attempts to
+        // one per interval instead of one per request.
+        if (state.respawn !== undefined && (ownedThenLost || Date.now() - lastRespawn >= respawnCooldownMs)) {
+            lastRespawn = Date.now();
+            state.ready = state.respawn();
+        }
+        const o = await readyOrigin(state);
+        if (o !== undefined && (await probe(o))) return o;
+        if (ownedThenLost) state.onGiveUp?.();
+        return undefined;
+    };
+}
+
+/** Replace the outgoing request reference with a new Request against
+ *  `target`, preserving method/headers/body (a Request.url is read-only,
+ *  #810 — the reference itself moves). When the body cannot be copied the
+ *  original request is left untouched (it goes direct rather than dying). */
+export function replaceRequestTarget(e: { request?: unknown }, target: string): void {
+    const old = e.request;
+    if (old == null) return;
+    try {
+        e.request = new Request(target, old as unknown as Request);
+    } catch {
+        // undici refuses to copy a body-bearing Request without explicit
+        // duplex — reconstruct with the body stream passed explicitly.
+        const src = old as unknown as { method?: unknown; headers?: Iterable<readonly [string, string]> | null; body?: ReadableStream<Uint8Array> | null };
+        try {
+            const init: RequestInit & { duplex?: "half" } = { method: typeof src.method === "string" ? src.method : "GET" };
+            const pairs: [string, string][] = [];
+            try {
+                for (const pair of src.headers ?? []) pairs.push([pair[0], pair[1]]);
+            } catch {}
+            if (pairs.length > 0) init.headers = pairs;
+            if (src.body != null) {
+                init.body = src.body as RequestInit["body"];
+                init.duplex = "half";
+            }
+            e.request = new Request(target, init);
+        } catch {
+            // replacement impossible (exotic body) — request goes direct
+        }
+    }
+}
+
 /** Install the global fetch patch. Idempotent: a second call is a no-op
  *  (returns false) so double-loading the entry cannot double-wrap. */
 export function installNativeFetchIntercept(state: NativeInterceptState): boolean {
