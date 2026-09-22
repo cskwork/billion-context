@@ -7,6 +7,9 @@ import { startServer, type ProxyOptions, isSideRequest, outputBudgetField, resto
 import { estimateRawBodyTokens } from "../src/preflight.ts";
 import { inspectContextOverflow } from "../src/util.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { getSession, _resetSessionsForTest } from "../src/session.ts";
 
@@ -209,7 +212,7 @@ interface Rig {
 // sonnet-4-5 → 200k) unless the operator explicitly tunes
 // compress.modelContextLimit, which outranks everything (#344). The rig exposes
 // both so tests can pin the exact window the guard sees.
-async function startRig(opts?: { modelContextLimit?: number; compressModelContextLimit?: number }): Promise<Rig> {
+async function startRig(opts?: { modelContextLimit?: number; compressModelContextLimit?: number; store?: SessionStore }): Promise<Rig> {
     const modelContextLimit = opts?.modelContextLimit ?? 200_000;
     const rig: Rig = { proxyPort: 0, upstreamPort: 0, proxy: null as unknown as http.Server, upstream: null as unknown as http.Server, sideScript: null, lastBody: null, upstreamHits: 0, sideErrorStatus: null, sideErrorBody: null };
     const upstream = http.createServer((req, res) => {
@@ -238,7 +241,7 @@ async function startRig(opts?: { modelContextLimit?: number; compressModelContex
     await once(upstream, "listening");
     const upstreamPort = upstream.address().port as number;
 
-    _setStoreForTest(new SessionStore({ enabled: false }));
+    _setStoreForTest(opts?.store ?? new SessionStore({ enabled: false }));
     setRegistryForTest({});
     _resetSessionsForTest();
     const proxy = await startServer({
@@ -499,5 +502,121 @@ test("e2e: healthy host baseline must NOT clamp an unrelated side request (#1110
         assert.equal(getSession(SESSION).stats.overflowArmTokens, undefined, "#1110: a forwarded (non-overflow) side request must not mint an arm");
     } finally {
         await closeRig(rig);
+    }
+});
+
+// #1129: the RELEASE direction of the one-shot overflow arm. #554/#1110 pin
+// the ARMING direction (overflow 400 → next oversized side request 413s
+// locally); nothing pinned that a REAL usage report on a later main turn
+// retires the arm so the side request forwards again. The release rests on
+// paired `delete session.stats.overflowArmTokens` writes (streaming
+// src/loop/core.ts, non-streaming src/server.ts, plugin src/plugin.ts, plus
+// resetSessionCompression) — a refactor that mis-gates any of them would
+// 413 side requests permanently: the #1110 deadlock re-entered through the
+// overflow path.
+test("e2e: real usage report RETIRES the overflow arm — the blocked side request forwards again (#1129)", async () => {
+    const rig = await startRig(); // declared window 200_000
+    try {
+        const url = `http://127.0.0.1:${rig.proxyPort}/bili/http://127.0.0.1:${rig.upstreamPort}/v1/messages`;
+        const headers: Record<string, string> = { "content-type": "application/json", "x-acp-session": SESSION };
+
+        // 1) ARM — same shape as the #554 arm test: ~155k payload fits the
+        //    declared 200k window (first attempt forwards) but exceeds the real
+        //    120,000 the upstream states in its overflow marker.
+        const big = mainConversation(1200);
+        rig.sideErrorStatus = 400;
+        rig.sideErrorBody = JSON.stringify({ error: { message: "exceed_context_size_error (198,277 / 198,661 > 120,000)" } });
+        const r1 = await fetch(url, { method: "POST", headers, body: JSON.stringify({ model: MODEL, max_tokens: 100, stream: true, messages: big }) });
+        assert.equal(r1.status, 400, "first overflow surfaces to the client");
+        await r1.text();
+        const s1 = getSession(SESSION);
+        assert.ok(s1);
+        assert.equal(s1.stats.overflowArmTokens, 120_000, "arm recorded separately from the nudge baseline (#1110)");
+
+        // 2) Armed → identical side request is blocked locally, no upstream hit.
+        const r2 = await fetch(url, { method: "POST", headers, body: JSON.stringify({ model: MODEL, max_tokens: 100, stream: true, messages: big }) });
+        assert.equal(r2.status, 413);
+        await r2.text();
+        assert.equal(rig.upstreamHits, 1, "armed guard blocks without a second upstream hit");
+
+        // 3) RELEASE — one healthy MAIN turn streams a real usage report. The
+        //    streaming recordUsage path (src/loop/core.ts) must delete the arm
+        //    alongside the lastInputTokens = "usage" write.
+        const r3 = await fetch(url, { method: "POST", headers, body: JSON.stringify({ model: MODEL, max_tokens: 1024, stream: true, messages: mainConversation(8) }) });
+        assert.equal(r3.status, 200);
+        await r3.text();
+        const s3 = getSession(SESSION);
+        assert.equal(s3.stats.lastInputTokens, MAIN_INPUT_TOKENS, "main turn resets the nudge baseline");
+        assert.equal(s3.stats.lastInputTokensSource, "usage", "release provenance is a real usage report");
+        assert.equal(s3.stats.overflowArmTokens, undefined, "#1129: a real usage report retires the one-shot arm");
+
+        // 4) The SAME oversized-but-fits-declared-window side request forwards
+        //    again — the released arm must not linger as a permanent clamp.
+        rig.sideErrorStatus = null;
+        const r4 = await fetch(url, { method: "POST", headers, body: JSON.stringify({ model: MODEL, max_tokens: 100, stream: true, messages: big }) });
+        assert.equal(r4.status, 200, "#1129: released arm lets the side request through again");
+        await r4.text();
+        assert.equal(rig.upstreamHits, 3, "overflow + main + resent side request — nothing else hit the upstream");
+    } finally {
+        await closeRig(rig);
+    }
+});
+
+test("e2e: the overflow arm survives a restart round-trip; usage after reload releases it (#1129)", async () => {
+    // Restart shape: armed session flushed to disk, memory cleared, a FRESH
+    // store instance over the same dir (process restart). The arm must still
+    // block locally after reload, and a real usage report must still release it.
+    const dir = mkdtempSync(join(tmpdir(), "bili-side-arm-"));
+    const store = new SessionStore({ dir, debounceMs: 5, enabled: true });
+    let store2: SessionStore | null = null;
+    const rig = await startRig({ store });
+    try {
+        const url = `http://127.0.0.1:${rig.proxyPort}/bili/http://127.0.0.1:${rig.upstreamPort}/v1/messages`;
+        const headers: Record<string, string> = { "content-type": "application/json", "x-acp-session": SESSION };
+
+        // ARM: overflow 400 → arm at the stated 120k.
+        const big = mainConversation(1200);
+        rig.sideErrorStatus = 400;
+        rig.sideErrorBody = JSON.stringify({ error: { message: "exceed_context_size_error (198,277 / 198,661 > 120,000)" } });
+        const r1 = await fetch(url, { method: "POST", headers, body: JSON.stringify({ model: MODEL, max_tokens: 100, stream: true, messages: big }) });
+        assert.equal(r1.status, 400);
+        await r1.text();
+        assert.equal(getSession(SESSION).stats.overflowArmTokens, 120_000, "armed in memory");
+
+        // Flush the armed session to disk (the arm path markDirty'd it; force
+        // the debounce so the restart has something to reload).
+        await store.flushAll();
+
+        // RESTART: clear memory, swap in a fresh store over the same dir.
+        _resetSessionsForTest();
+        store2 = new SessionStore({ dir, debounceMs: 5, enabled: true });
+        _setStoreForTest(store2);
+
+        // Still blocked after the round-trip: the reload path (memory miss →
+        // store.loadSync) must restore the arm, and the guard must honor it.
+        const r2 = await fetch(url, { method: "POST", headers, body: JSON.stringify({ model: MODEL, max_tokens: 100, stream: true, messages: big }) });
+        assert.equal(r2.status, 413, "arm survives the restart round-trip and still blocks locally");
+        await r2.text();
+        assert.equal(rig.upstreamHits, 1, "no upstream hit for the post-restart block");
+        const s2 = getSession(SESSION);
+        assert.equal(s2.stats.overflowArmTokens, 120_000, "reloaded session carries the armed window");
+
+        // RELEASE after restart: a healthy main turn's real usage retires it.
+        const r3 = await fetch(url, { method: "POST", headers, body: JSON.stringify({ model: MODEL, max_tokens: 1024, stream: true, messages: mainConversation(8) }) });
+        assert.equal(r3.status, 200);
+        await r3.text();
+        assert.equal(getSession(SESSION).stats.overflowArmTokens, undefined, "usage report releases the reloaded arm too");
+
+        // Forwards again.
+        rig.sideErrorStatus = null;
+        const r4 = await fetch(url, { method: "POST", headers, body: JSON.stringify({ model: MODEL, max_tokens: 100, stream: true, messages: big }) });
+        assert.equal(r4.status, 200, "released after restart — side request forwards again");
+        await r4.text();
+        assert.equal(rig.upstreamHits, 3);
+    } finally {
+        await closeRig(rig);
+        store.cancelAll();
+        store2?.cancelAll();
+        rmSync(dir, { recursive: true, force: true });
     }
 });
