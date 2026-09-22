@@ -461,7 +461,7 @@ How compression actually decides (acp-kernel, verified):
 
 Note: setting `maxContextLimit` below the kernel's 45% default works correctly (the layers are independent), but acp-kernel logs a per-turn validation warning (`minContextLimitPct must not exceed maxContextLimitPct`) — log noise only, thresholds are unaffected.
 
-Behavior vs an old low-limit config (e.g., `modelContextLimit: 70000`): the hard wall moves from 70k to the native window (large reads stop being crushed mid-task or failing fast); the forced zone moves from 75%×70k ≈ 52.5k to your chosen %×native; below the forced zone the context drifts per the growth layer instead of being pinned every turn — that drift is the price of elasticity. If you need a strict daily ceiling *and* burst headroom simultaneously, static percentage bands cannot express both; choose the % for the ceiling you accept, or track structure-aware compression (#344).
+Behavior vs an old low-limit config (e.g., `modelContextLimit: 70000`): the hard wall moves from 70k to the native window (large reads stop being crushed mid-task or failing fast); the forced zone moves from 75%×70k ≈ 52.5k to your chosen %×native; below the forced zone the context drifts per the growth layer instead of being pinned every turn — that drift is the price of elasticity. If you need a strict daily ceiling *and* burst headroom simultaneously, static percentage bands cannot express both; choose the % for the ceiling you accept, or track structure-aware compression ([acp-kernel#344](https://github.com/ranxianglei/acp-kernel/issues/344)).
 
 The same fields work per-provider / per-model (three-level merge), and hot-reload via the web UI.
 
