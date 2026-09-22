@@ -317,6 +317,17 @@ For each request, the proxy resolves the settings by longest-URL-prefix match (t
 - **Status:** ACTIVE
 - **Description:** Tool-name patterns whose **latest** tool-call + paired result are never compressed (kernel `protectedLatestTools`, requires `acp-kernel` >= 0.0.80). Built for cumulative-snapshot tools — e.g. an agent's todo/task list, where every newer result supersedes the older ones: only the newest instance is the source of truth, so protecting **all** instances (via `protectedTools`) would make that tool's history grow unboundedly, while protecting the **latest** keeps the live snapshot in context and lets every superseded instance fold normally. This solves the "agent forgets its task list after compression" failure (#639). Protection is a HARD exclusion: the latest instance is unaddressable (its refs render as `BLOCKED`), so neither suggested nor explicit compress ranges can cover it; it applies identically in both compression modes and on every wire. Patterns match like kernel tool patterns (exact name or `*` glob, e.g. `"todo_list"`, `"TodoWrite"`, `"todo*"`). Whole-array replace at the deepest defined level. Example: `{ "compress": { "protectedLatestTools": ["todo_list", "TodoWrite"] } }`.
 
+#### `protectedTools`
+
+- **Type:** `string[]` (tool-name patterns, e.g. `["skill"]`)
+- **Default:** `[]` *(none — opt in per client, tool names are client-specific)*
+- **Status:** ACTIVE
+- **Description:** Tool-name patterns whose tool-calls AND paired results are **never compressed — every instance, full history** (kernel `protectedTools`). Protection is a HARD exclusion: all matching refs render as `BLOCKED`, so neither suggested nor explicit compress ranges can cover any instance; it applies identically in both compression modes and on every wire. Patterns match like kernel tool patterns (exact name or `*` glob, e.g. `"skill"`, `"skill_*"`). Whole-array replace at the deepest defined level. Example: `{ "compress": { "protectedTools": ["skill"] } }`.
+- **⚠ When to use which knob (read before configuring):** choose by how a tool's results relate to each other:
+  - **Independent content** — each instance carries unique information no later result supersedes (opencode/pi `skill` loads, one-shot references): use `protectedTools`. Folding an old load loses its content permanently; protection keeps every load in context (#1109).
+  - **Cumulative snapshots** — each newer result supersedes the older ones (a client's todo/task list): use `protectedLatestTools`. Protecting **all** instances of such a tool makes its history grow unboundedly — the exact failure #639 worked around by protecting only the latest.
+  - Rule of thumb: low-frequency, high-value tools → `protectedTools`; chatty tools → never full-history protect (context grows without bound); cumulative-snapshot tools → `protectedLatestTools`.
+
 #### `prompts`
 - **Default:** *(kernel defaults — see `acp-kernel` `defaultPrompts`)*
 - **Status:** ACTIVE
