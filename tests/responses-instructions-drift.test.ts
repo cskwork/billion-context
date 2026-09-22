@@ -8,40 +8,42 @@ import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { _resetSessionsForTest } from "../src/session.ts";
-import { conversationHeaderSource, instructionsFingerprintExempt } from "../src/session-id.ts";
+import { conversationHeaderSource, instructionsFingerprintApplies } from "../src/session-id.ts";
 
 // #1102: opencode's system-context reconcile rewrites `instructions` whenever
 // AGENTS.md is edited mid-session. Its conversation ids are persona-scoped
 // (one session id per persona; task-tool subagents mint fresh child ids), so
 // same-id + drifted instructions must NOT fork the compression namespace.
+// #1106 inverts the default: the fingerprint is an allowlist (codex +
+// claude-over-Responses only); everyone else keys verbatim.
 
-test("instructionsFingerprintExempt: opencode native session ids are persona-scoped", () => {
-    assert.equal(instructionsFingerprintExempt({ "x-session-affinity": "ses_abc123XYZ" }), true);
-    assert.equal(instructionsFingerprintExempt({ "x-session-affinity": "  ses_trimmed  " }), true);
-    assert.equal(instructionsFingerprintExempt({ "x-opencode-session": "zen-sess-1" }), true);
+test("instructionsFingerprintApplies: codex traffic keeps the fingerprint (#150)", () => {
+    assert.equal(instructionsFingerprintApplies({ "x-codex-turn-metadata": '{"thread_source":"user","thread_id":"t-1"}', "thread-id": "t-1", "session-id": "sess-150" }), true);
+    assert.equal(instructionsFingerprintApplies({ "x-codex-turn-metadata": "not-json", "session-id": "sess-150" }), true);
+    assert.equal(instructionsFingerprintApplies({ "user-agent": "codex_cli_rs/0.147.0 (Ubuntu)", "session-id": "sess-150" }), true);
 });
 
-test("instructionsFingerprintExempt: non-opencode senders of generic headers stay fingerprinted", () => {
-    assert.equal(instructionsFingerprintExempt({ "x-session-affinity": "task-123" }), false);
-    assert.equal(instructionsFingerprintExempt({ "x-session-id": "ses_looks_like_opencode" }), false);
-    assert.equal(instructionsFingerprintExempt({ "session-id": "thread-9" }), false);
-    assert.equal(instructionsFingerprintExempt({ "x-claude-code-session-id": "uuid-1" }), false);
-    assert.equal(instructionsFingerprintExempt({}), false);
+test("instructionsFingerprintApplies: claude-over-Responses keeps the fingerprint (#970)", () => {
+    assert.equal(instructionsFingerprintApplies({ "x-claude-code-session-id": "uuid-1" }), true);
+    assert.equal(instructionsFingerprintApplies({ "x-claude-code-session-id": "uuid-1", "x-session-affinity": "ses_abc" }), true);
 });
 
-test("instructionsFingerprintExempt: claude header outranks affinity (shared-id subagents must stay split)", () => {
-    assert.equal(instructionsFingerprintExempt({ "x-claude-code-session-id": "uuid-1", "x-session-affinity": "ses_abc" }), false);
+test("instructionsFingerprintApplies: everyone else keys verbatim (#1106)", () => {
+    assert.equal(instructionsFingerprintApplies({ "x-session-affinity": "ses_abc123XYZ" }), false);
+    assert.equal(instructionsFingerprintApplies({ "x-opencode-session": "zen-sess-1" }), false);
+    assert.equal(instructionsFingerprintApplies({ "x-session-id": "generic-relay-client-7" }), false);
+    assert.equal(instructionsFingerprintApplies({ "session-id": "thread-9" }), false);
+    assert.equal(instructionsFingerprintApplies({ "x-grok-session-id": "gr-1" }), false);
+    assert.equal(instructionsFingerprintApplies({ "x-mavis-session-id": "mc-1" }), false);
+    assert.equal(instructionsFingerprintApplies({ "user-agent": "CherryStudio/1.0", "x-session-id": "cs-1" }), false);
+    assert.equal(instructionsFingerprintApplies({}), false);
 });
 
-test("instructionsFingerprintExempt: plugin declaration requires marker + conversation + flag", () => {
+test("instructionsFingerprintApplies: plugin declaration flag is vestigial (#1106)", () => {
     const base = { "x-bili-plugin": "opencode", "x-bili-plugin-conversation": "c-1", "x-bili-plugin-instructions-mutable": "1" };
-    assert.equal(instructionsFingerprintExempt(base), true);
-    assert.equal(instructionsFingerprintExempt({ ...base, "x-bili-plugin-instructions-mutable": undefined }), false);
-    assert.equal(instructionsFingerprintExempt({ ...base, "x-bili-plugin": undefined }), false);
-    assert.equal(instructionsFingerprintExempt({ ...base, "x-bili-plugin-conversation": undefined }), false);
-    // the protocol honors the declaration from any cooperative plugin — the
-    // contract is that only hosts with VERIFIED persona-scoped ids stamp it
-    assert.equal(instructionsFingerprintExempt({ "x-bili-plugin": "future-host", "x-bili-plugin-conversation": "c-2", "x-bili-plugin-instructions-mutable": "1" }), true);
+    assert.equal(instructionsFingerprintApplies(base), false);
+    assert.equal(instructionsFingerprintApplies({ ...base, "x-bili-plugin-instructions-mutable": undefined }), false);
+    assert.equal(instructionsFingerprintApplies({ "x-bili-plugin": "future-host", "x-bili-plugin-conversation": "c-2", "x-bili-plugin-instructions-mutable": "1" }), false);
 });
 
 test("conversationHeaderSource: reports the winning header with priority order intact", () => {
@@ -199,13 +201,15 @@ test("e2e #1102: opencode AGENTS.md edit (instructions drift) keeps ONE session 
     });
 });
 
-test("e2e #1102: plugin-declared opencode session keeps ONE session across instructions drift", async () => {
+test("e2e #1106: plugin conversation without the mutable flag stays ONE session (flag is vestigial)", async () => {
     _setStoreForTest(new SessionStore({ enabled: false }));
     _resetSessionsForTest();
     setRegistryForTest({});
 
     const CONVERSATION = "plg-drift-e2e";
-    const headers = { "content-type": "application/json", "x-bili-plugin": "opencode", "x-bili-plugin-conversation": CONVERSATION, "x-bili-plugin-instructions-mutable": "1" };
+    // no x-bili-plugin-instructions-mutable — under #1104 this forked; under
+    // the #1106 allowlist default the plugin lane keys verbatim regardless
+    const headers = { "content-type": "application/json", "x-bili-plugin": "opencode", "x-bili-plugin-conversation": CONVERSATION };
 
     await withProxy((_req, res) => {
         res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
@@ -223,7 +227,74 @@ test("e2e #1102: plugin-declared opencode session keeps ONE session across instr
 
         assert.equal(bodies.length, 2);
         const stats = await (await fetch(statsUrl)).json();
-        assert.equal(stats.sessions.length, 1, "plugin-declared persona-scoped id must not fork on instruction drift");
+        assert.equal(stats.sessions.length, 1, "plugin lane keys verbatim; the mutable flag is no longer required");
         assert.equal(stats.sessions[0].id, CONVERSATION);
+    });
+});
+
+test("e2e #1106: generic relay client (x-session-id) keeps ONE session across instructions drift", async () => {
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    _resetSessionsForTest();
+    setRegistryForTest({});
+
+    const GENERIC_ID = "relay-client-conv-42";
+    const headers = { "content-type": "application/json", "x-session-id": GENERIC_ID, "user-agent": "SomeRelayClient/2.3" };
+
+    await withProxy((_req, res) => {
+        res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
+        res.write(textEvents("relay lane answer"));
+        res.write(completed(800));
+        res.end();
+    }, async (url, statsUrl, bodies) => {
+        const input = [{ type: "message", role: "user", content: "initial turn" }];
+        // system prompt rewritten mid-conversation: software upgrade / plugin
+        // install / AGENTS.md edit — the #1106 relay majority case
+        const req1 = await fetch(url, { method: "POST", headers, body: JSON.stringify({ model: "gpt-drift-e2e", stream: true, instructions: "system prompt v1 (base)", input }) });
+        assert.equal(req1.status, 200);
+        await req1.text();
+        const req2 = await fetch(url, { method: "POST", headers, body: JSON.stringify({ model: "gpt-drift-e2e", stream: true, instructions: "system prompt v2 (upgraded, new plugin tools, AGENTS.md edited)", input: [...input, { type: "message", role: "assistant", content: "ok" }, { type: "message", role: "user", content: "second turn" }] }) });
+        assert.equal(req2.status, 200);
+        await req2.text();
+
+        assert.equal(bodies.length, 2);
+        const stats = await (await fetch(statsUrl)).json();
+        assert.equal(stats.sessions.length, 1, "generic id + instructions drift = same conversation evolving, no fork");
+        assert.equal(stats.sessions[0].id, GENERIC_ID);
+    });
+});
+
+test("e2e #150: codex root thread reusing a task id across personas still splits by instructions fingerprint", async () => {
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    _resetSessionsForTest();
+    setRegistryForTest({});
+
+    const TASK_ID = "codex-task-id-9";
+    const headers = {
+        "content-type": "application/json",
+        "user-agent": "codex_cli_rs/0.147.0",
+        "session-id": TASK_ID,
+        "x-codex-turn-metadata": JSON.stringify({ thread_source: "user", thread_id: "t-root" }),
+        "thread-id": "t-root",
+    };
+
+    await withProxy((_req, res) => {
+        res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
+        res.write(textEvents("codex answer"));
+        res.write(completed(700));
+        res.end();
+    }, async (url, statsUrl, _bodies) => {
+        const input = [{ type: "message", role: "user", content: "task turn" }];
+        const req1 = await fetch(url, { method: "POST", headers, body: JSON.stringify({ model: "gpt-drift-e2e", stream: true, instructions: "task A persona instructions", input }) });
+        assert.equal(req1.status, 200);
+        await req1.text();
+        const req2 = await fetch(url, { method: "POST", headers, body: JSON.stringify({ model: "gpt-drift-e2e", stream: true, instructions: "task B persona instructions (different task reusing the id)", input }) });
+        assert.equal(req2.status, 200);
+        await req2.text();
+
+        const stats = await (await fetch(statsUrl)).json();
+        assert.equal(stats.sessions.length, 2, "codex id-sharing personas stay split (#150 allowlist entry)");
+        const ids = stats.sessions.map((s: { id: string }) => s.id).sort();
+        assert.equal(ids[0], TASK_ID);
+        assert.ok(ids[1].startsWith(`${TASK_ID}|sub:`), `forked namespace, got ${ids[1]}`);
     });
 });
