@@ -1,3 +1,5 @@
+import { isCodexClient } from "./codex-compact.js";
+
 export type ConversationIdentity = {
     value: string;
     source: "header" | "body-session" | "metadata-session" | "previous-response" | "prompt-cache-key" | "content-fingerprint" | "generated";
@@ -85,7 +87,8 @@ export function conversationHeaderSource(headers: Record<string, string | string
  *    (>=0.147) already isolates subagent threads via x-codex-turn-metadata ->
  *    thread-id verbatim (server.ts keys those directly, bypassing this
  *    predicate); the fingerprint still matters for root threads and older
- *    codex builds, detected by the turn-metadata header or the user agent.
+ *    codex builds, detected by the turn-metadata header or the user agent
+ *    (same convention as isCodexClient, #645).
  *  - claude over Responses (#970): subagents SHARE the main agent's session
  *    id (the Anthropic path splits them via claudeSubagentSplit; a claude
  *    client on the Responses wire only has this fingerprint).
@@ -107,8 +110,11 @@ export function conversationHeaderSource(headers: Record<string, string | string
 export function instructionsFingerprintApplies(headers: Record<string, string | string[] | undefined>): boolean {
     const turnMeta = headers["x-codex-turn-metadata"];
     if (typeof turnMeta === "string" && turnMeta.trim().length > 0) return true;
-    const ua = headers["user-agent"];
-    if (typeof ua === "string" && /codex/i.test(ua)) return true;
+    // One definition of "codex traffic" process-wide (every other codex path in
+    // server.ts uses isCodexClient, #645): case-sensitive by convention. A
+    // case-insensitive match would pull non-codex relays with "Codex"-shaped
+    // UAs back into the fingerprint and re-fork them mid-conversation (#1106).
+    if (isCodexClient(headers)) return true;
     return conversationHeaderSource(headers)?.name === "x-claude-code-session-id";
 }
 

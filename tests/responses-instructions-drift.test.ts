@@ -26,6 +26,9 @@ test("instructionsFingerprintApplies: codex traffic keeps the fingerprint (#150)
 test("instructionsFingerprintApplies: claude-over-Responses keeps the fingerprint (#970)", () => {
     assert.equal(instructionsFingerprintApplies({ "x-claude-code-session-id": "uuid-1" }), true);
     assert.equal(instructionsFingerprintApplies({ "x-claude-code-session-id": "uuid-1", "x-session-affinity": "ses_abc" }), true);
+    // only counts when the claude header WINS the walk — an outranking plugin
+    // conversation id moves the request onto the verbatim default
+    assert.equal(instructionsFingerprintApplies({ "x-bili-plugin": "host", "x-bili-plugin-conversation": "c-1", "x-claude-code-session-id": "uuid-1" }), false);
 });
 
 test("instructionsFingerprintApplies: everyone else keys verbatim (#1106)", () => {
@@ -36,6 +39,9 @@ test("instructionsFingerprintApplies: everyone else keys verbatim (#1106)", () =
     assert.equal(instructionsFingerprintApplies({ "x-grok-session-id": "gr-1" }), false);
     assert.equal(instructionsFingerprintApplies({ "x-mavis-session-id": "mc-1" }), false);
     assert.equal(instructionsFingerprintApplies({ "user-agent": "CherryStudio/1.0", "x-session-id": "cs-1" }), false);
+    // codex UA detection stays case-sensitive (isCodexClient convention, #645)
+    // so relays with "Codex"-shaped UAs are not pulled back into the fingerprint
+    assert.equal(instructionsFingerprintApplies({ "user-agent": "CodeXchange/1.0", "x-session-id": "cx-1" }), false);
     assert.equal(instructionsFingerprintApplies({}), false);
 });
 
