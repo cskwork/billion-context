@@ -1350,13 +1350,16 @@ async function handle(
                 // kernel's empty-instructions non-anchoring path is left
                 // untouched for metadata-less clients).
                 ? codexTurn.value
-                : opts.stableSystemAnchor
-                  // #1085: with anchoring on, instruction drift is the expected
-                  // event — the sticky head-system anchor absorbs it (trailing
-                  // update notes), so keying a changed-instructions request
-                  // into a `|sub:<fp>` session would orphan the anchor state
-                  // and defeat the feature. Same verbatim-identity treatment
-                  // as the trusted codexTurn branch above.
+                : opts.stableSystemAnchor && pluginAgentHeader(req.headers) === undefined
+                  // #1085: with anchoring on (plain-proxy mode only — see the
+                  // prepare* gates), instruction drift is the expected event —
+                  // the sticky head-system anchor absorbs it (trailing update
+                  // notes), so keying a changed-instructions request into a
+                  // `|sub:<fp>` session would orphan the anchor state and
+                  // defeat the feature. Plugin requests keep default identity
+                  // derivation because they never get anchored. Same
+                  // verbatim-identity treatment as the trusted codexTurn
+                  // branch above.
                   ? (responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader))
                   : subagentNamespace(
                         responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader),
@@ -2170,7 +2173,10 @@ function prepareAnthropic(
     // downstream consumer (injectSystem, Prepared.anthropicSystem → loop)
     // inherit the anchor, and the failure path below keeps forwarding it too.
     let sysNotes: string[] = [];
-    if (opts.stableSystemAnchor) {
+    // Plugin-mode agents own their context management and may already apply
+    // their own cache-friendly head handling (#1085 scope: plain-proxy mode
+    // only) — anchoring them would double-process.
+    if (opts.stableSystemAnchor && !pluginMode) {
         const fresh = extractSystem(parsed.system);
         const outcome = reconcileSystemAnchor(session, "anthropic", fresh, sessionId, log);
         sysNotes = outcome.notes;
@@ -2373,7 +2379,7 @@ function prepareOpenai(
         openaiSystemText = systemText;
         // Title-gen side-requests carry their own tiny system — reconciling
         // them would pollute the conversation's anchor state.
-        if (opts.stableSystemAnchor && !isTitleGen) {
+        if (opts.stableSystemAnchor && !pluginMode && !isTitleGen) {
             const outcome = reconcileSystemAnchor(session, "openai", systemText, sessionId, log);
             sysNotes = outcome.notes;
             openaiSystemText = outcome.outbound;
@@ -2581,7 +2587,7 @@ function prepareGoogle(
         googleClientSystem = systemText;
         // Title-gen side-requests carry their own tiny system — reconciling
         // them would pollute the conversation's anchor state.
-        if (opts.stableSystemAnchor && !isTitleGen) {
+        if (opts.stableSystemAnchor && !pluginMode && !isTitleGen) {
             const outcome = reconcileSystemAnchor(session, "google", systemText, sessionId, log);
             sysNotes = outcome.notes;
             googleClientSystem = outcome.outbound;
@@ -2800,7 +2806,7 @@ function prepareResponses(
         responsesProjection = projection;
         // Compaction-trigger requests are the compression mechanism itself —
         // their payload shape must not gain anchor state or note items.
-        if (opts.stableSystemAnchor && !isCompactionTrigger) {
+        if (opts.stableSystemAnchor && !pluginMode && !isCompactionTrigger) {
             const fresh = projection.systemParts.join("\n\n---\n\n");
             const outcome = reconcileSystemAnchor(session, "responses", fresh, sessionId, log);
             sysNotes = outcome.notes;
