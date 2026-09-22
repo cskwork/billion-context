@@ -38,7 +38,7 @@ jobs:
               run: |
                   set -uo pipefail
                   REPO="${{ github.repository }}"
-                  PKG="billion-context"
+                  PKGS="billion-context billion-context-pr"
 
                   BUF="$BUFFER_DAYS_INPUT"
                   case "$BUF" in ''|*[!0-9]*) BUF=3 ;; esac
@@ -46,21 +46,8 @@ jobs:
                   [ -z "$DRY" ] && DRY="true"
                   [ "$EVENT_NAME" = "schedule" ] && DRY="false"
                   [ "$DRY" = "false" ] || DRY="true"
-                  echo "package=$PKG dry_run=$DRY buffer_days=$BUF event=$EVENT_NAME"
+                  echo "packages=$PKGS dry_run=$DRY buffer_days=$BUF event=$EVENT_NAME"
 
-                  # 1) Collect pr-<number> dist-tags
-                  npm view "$PKG" dist-tags --json > tags.json
-                  node -p "'total dist-tags: ' + Object.keys(JSON.parse(require('fs').readFileSync('tags.json','utf8'))).length"
-                  node -e '
-                      const t = JSON.parse(require("fs").readFileSync("tags.json", "utf8"));
-                      for (const tag of Object.keys(t)) {
-                          const m = /^pr-(\d+)$/ .exec(tag);
-                          if (m) console.log(m[1]);
-                      }' | sort -un > prnums.txt
-                  N_TOTAL=$(wc -l < prnums.txt)
-                  echo "numeric pr-* tags: $N_TOTAL"
-
-                  # 2) Query each PR's state (parallel)
                   cat > prstate.sh <<'EOF'
                   #!/bin/sh
                   n="$1"
@@ -82,52 +69,77 @@ jobs:
                   printf '%s\t%s\n' "$n" "$out"
                   EOF
                   chmod +x prstate.sh
-                  cat prnums.txt | xargs -P 8 -n1 ./prstate.sh > prstates.tsv
 
-                  # Safety guardrail: if the GitHub API looked down, most lookups
-                  # fail -> almost everything reads NOTFOUND. Abort instead of
-                  # mass-deleting.
-                  N_NF=$(grep -c 'NOTFOUND' prstates.tsv || true)
-                  if [ "$N_NF" -gt 0 ] && [ $((N_NF * 4)) -gt "$N_TOTAL" ]; then
-                      echo "::error::aborted: $N_NF/$N_TOTAL PR lookups returned NOTFOUND (GitHub API failure suspected)"
-                      exit 1
-                  fi
-
-                  # 3) Classify: deletable = PR gone (deleted) OR closed before cutoff
                   CUTOFF=$(date -u -d "@$(( $(date -u +%s) - BUF * 86400 ))" +%Y-%m-%dT%H:%M:%SZ)
                   echo "cutoff: $CUTOFF (deletable = closed before this date, or PR deleted)"
-                  : > del_notfound.txt
-                  : > del_closed.txt
-                  awk -F'\t' -v cut="$CUTOFF" '
-                      $2 == "NOTFOUND"           { print $1 >> "del_notfound.txt" }
-                      $2 == "closed" && $3 != "" && $3 < cut { print $1 >> "del_closed.txt" }
-                  ' prstates.tsv
-                  sort -n del_notfound.txt del_closed.txt > deletable.txt
-                  N_DEL=$(wc -l < deletable.txt)
-                  N_CLOSED=$(wc -l < del_closed.txt)
-                  N_OPEN=$(awk -F'\t' '$2=="open"' prstates.tsv | wc -l)
-                  N_ERR=$(awk -F'\t' '$2=="ERR"' prstates.tsv | wc -l)
-                  echo "summary: deletable=$N_DEL (closed-stale=$N_CLOSED, pr-deleted=$N_NF) open-kept=$N_OPEN recent-kept=$((N_TOTAL - N_DEL - N_OPEN)) lookup-errors-skipped=$N_ERR"
 
-                  # 4) Execute (or report)
-                  if [ "$DRY" = "true" ]; then
-                      echo "### DRY RUN — would remove $N_DEL dist-tags:"
-                      sed 's/^/  pr-/' deletable.txt
-                      exit 0
-                  fi
-                  ok=0
-                  fail=0
-                  : > rm-errors.log
-                  while read -r n; do
-                      if npm dist-tag rm "$PKG" "pr-$n" >/dev/null 2>>rm-errors.log; then
-                          ok=$((ok + 1))
-                      else
-                          fail=$((fail + 1))
-                          echo "failed: pr-$n"
+                  for PKG in $PKGS; do
+                      echo "=== package: $PKG ==="
+
+                      # 1) Collect pr-<number> dist-tags. A package may not exist yet
+                      #    (billion-context-pr before its first post-merge publish):
+                      #    skip it instead of failing the job.
+                      if ! npm view "$PKG" dist-tags --json > tags.json 2> view.err; then
+                          echo "skip $PKG: npm view failed — $(sed -n '1p' view.err 2>/dev/null || true)"
+                          continue
                       fi
-                  done < deletable.txt
-                  echo "removed: ok=$ok failed=$fail"
-                  [ -s rm-errors.log ] && tail -n 50 rm-errors.log
-                  npm view "$PKG" dist-tags --json > after.json
-                  node -p "'dist-tags remaining: ' + Object.keys(JSON.parse(require('fs').readFileSync('after.json','utf8'))).length"
-                  [ "$fail" -eq 0 ] || exit 1
+                      node -p "'total dist-tags [$PKG]: ' + Object.keys(JSON.parse(require('fs').readFileSync('tags.json','utf8'))).length"
+                      node -e '
+                          const t = JSON.parse(require("fs").readFileSync("tags.json", "utf8"));
+                          for (const tag of Object.keys(t)) {
+                              const m = /^pr-(\d+)$/ .exec(tag);
+                              if (m) console.log(m[1]);
+                          }' | sort -un > prnums.txt
+                      N_TOTAL=$(wc -l < prnums.txt)
+                      echo "numeric pr-* tags [$PKG]: $N_TOTAL"
+
+                      # 2) Query each PR's state (parallel)
+                      cat prnums.txt | xargs -P 8 -n1 ./prstate.sh > prstates.tsv
+
+                      # Safety guardrail (per-package): GitHub API down -> most lookups
+                      # NOTFOUND -> abort instead of mass-deleting.
+                      N_NF=$(grep -c 'NOTFOUND' prstates.tsv || true)
+                      if [ "$N_NF" -gt 0 ] && [ $((N_NF * 4)) -gt "$N_TOTAL" ]; then
+                          echo "::error::aborted ($PKG): $N_NF/$N_TOTAL PR lookups returned NOTFOUND (GitHub API failure suspected)"
+                          exit 1
+                      fi
+
+                      # 3) Classify: deletable = PR gone (deleted) OR closed before cutoff
+                      : > del_notfound.txt
+                      : > del_closed.txt
+                      awk -F'\t' -v cut="$CUTOFF" '
+                          $2 == "NOTFOUND"           { print $1 >> "del_notfound.txt" }
+                          $2 == "closed" && $3 != "" && $3 < cut { print $1 >> "del_closed.txt" }
+                      ' prstates.tsv
+                      sort -n del_notfound.txt del_closed.txt > deletable.txt
+                      N_DEL=$(wc -l < deletable.txt)
+                      N_CLOSED=$(wc -l < del_closed.txt)
+                      N_OPEN=$(awk -F'\t' '$2=="open"' prstates.tsv | wc -l)
+                      N_ERR=$(awk -F'\t' '$2=="ERR"' prstates.tsv | wc -l)
+                      echo "summary [$PKG]: deletable=$N_DEL (closed-stale=$N_CLOSED, pr-deleted=$N_NF) open-kept=$N_OPEN recent-kept=$((N_TOTAL - N_DEL - N_OPEN)) lookup-errors-skipped=$N_ERR"
+
+                      # 4) Execute (or report)
+                      if [ "$DRY" = "true" ]; then
+                          echo "### DRY RUN [$PKG] — would remove $N_DEL dist-tags:"
+                          sed 's/^/  pr-/' deletable.txt
+                          continue
+                      fi
+                      ok=0
+                      fail=0
+                      : > rm-errors.log
+                      while read -r n; do
+                          if npm dist-tag rm "$PKG" "pr-$n" >/dev/null 2>>rm-errors.log; then
+                              ok=$((ok + 1))
+                          else
+                              fail=$((fail + 1))
+                              echo "failed: pr-$n"
+                          fi
+                      done < deletable.txt
+                      echo "removed [$PKG]: ok=$ok failed=$fail"
+                      [ -s rm-errors.log ] && tail -n 50 rm-errors.log
+                      npm view "$PKG" dist-tags --json > after.json 2>/dev/null \
+                          && node -p "'dist-tags remaining [$PKG]: ' + Object.keys(JSON.parse(require('fs').readFileSync('after.json','utf8'))).length" \
+                          || echo "after-count [$PKG]: unavailable"
+                      [ "$fail" -eq 0 ] || exit 1
+                  done
+                  echo "=== sweep complete ==="
