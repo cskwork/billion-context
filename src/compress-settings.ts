@@ -87,7 +87,36 @@ stripImages: pick("stripImages"),
         reasoning: reasoningLevels.length > 0 ? Object.assign({}, ...reasoningLevels) : undefined,
         reasoningGuard: reasoningGuardLevels.length > 0 ? Object.assign({}, ...reasoningGuardLevels) : undefined,
         promptPack: pick("promptPack"),
+        summaryModel: pick("summaryModel"),
+        delegateSummary: pick("delegateSummary"),
     };
+}
+
+/** Effective summarization model for the proxy's own summary calls: env
+ *  BILI_COMPACT_MODEL (read live, like BILI_IMAGE_BILLING) wins over the
+ *  merged config; undefined = use the request model. Non-string/blank values
+ *  count as unset. */
+export function effectiveSummaryModel(s: CompressSettings, env: NodeJS.ProcessEnv = process.env): string | undefined {
+    const fromEnv = env.BILI_COMPACT_MODEL?.trim();
+    if (fromEnv) return fromEnv;
+    return typeof s.summaryModel === "string" && s.summaryModel.trim() ? s.summaryModel.trim() : undefined;
+}
+
+let warnedDelegateWithoutModel = false;
+
+/** Effective delegated-summary switch: env BILI_DELEGATE_SUMMARY ("1"/"0")
+ *  wins over the merged config. Requires an effective summary model — when
+ *  missing, the switch is ignored with a one-time warning. */
+export function effectiveDelegateSummary(s: CompressSettings, env: NodeJS.ProcessEnv = process.env): boolean {
+    const raw = env.BILI_DELEGATE_SUMMARY?.trim();
+    const wanted = raw === "1" || raw === "0" ? raw === "1" : s.delegateSummary === true;
+    if (!wanted) return false;
+    if (effectiveSummaryModel(s, env) !== undefined) return true;
+    if (!warnedDelegateWithoutModel) {
+        warnedDelegateWithoutModel = true;
+        loggerLog("warn", "[compress] delegateSummary IGNORED: no summaryModel (config compress.summaryModel or env BILI_COMPACT_MODEL) is set");
+    }
+    return false;
 }
 
 /** Resolve the merged compression settings for one request: global → provider

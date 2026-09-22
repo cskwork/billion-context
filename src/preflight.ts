@@ -1,6 +1,7 @@
 import {
     defaultCountTokens,
     viableRanges,
+    type CompressionBlock,
     type CompressionCore,
     type Config,
     type CoreMessage,
@@ -70,6 +71,10 @@ export interface PreflightDeps {
     url: string;
     headers: Record<string, string>;
     model: string;
+    /** Model id for the summarization calls when it differs from the request
+     *  model (compress.summaryModel / BILI_COMPACT_MODEL). Same URL, headers
+     *  and protocol; a non-transient 4xx falls back to `model`. */
+    summaryModel?: string;
     proxyUrl?: string;
     signal?: AbortSignal;
     log: (level: string, msg: string) => void;
@@ -104,7 +109,7 @@ export interface PreflightFailure {
 // unusable branch carries a diagnosis of what the body actually contained so
 // it is logged and surfaced in the fail-fast message instead of the generic
 // "summary too short".
-type SummaryOutcome = { summary: string } | { unusable: string };
+export type SummaryOutcome = { summary: string } | { unusable: string };
 
 export interface PreflightResult {
     compressedRanges: number;
@@ -634,10 +639,57 @@ function emptyCompletionDetail(json: Record<string, unknown>): string | null {
     return parts.length > 0 ? ` (${parts.join(", ")})` : "";
 }
 
-async function summarizeRange(deps: PreflightDeps, content: string, startRef: string, endRef: string): Promise<SummaryOutcome> {
+const PREFLIGHT_SUMMARY_REASON = "the session context exceeds the current model's window";
+
+// Summary-model override bookkeeping, process-wide: which (url, model) pairs
+// already logged their first summary, and which override models the upstream
+// rejected with a non-transient 4xx (every later call goes straight to the
+// request model instead of paying the rejection again).
+const summaryModelLogged = new Set<string>();
+const summaryModelRejected = new Set<string>();
+
+function isOverrideRejection(err: unknown): err is UpstreamHttpError {
+    return err instanceof UpstreamHttpError && err.status >= 400 && err.status < 500 && !isTransientUpstreamError(err.status, err.body);
+}
+
+/** Summarize one rendered range. When `deps.summaryModel` names a different
+ *  model, the call goes to it first (same URL/headers/protocol); a
+ *  non-transient 4xx from the override falls back to the request model with a
+ *  warning, and that override is not retried for the same upstream again.
+ *  The Gemini wire carries the model in the URL path, so the override is not
+ *  applied there. */
+export async function summarizeRange(deps: PreflightDeps, content: string, startRef: string, endRef: string, reason: string = PREFLIGHT_SUMMARY_REASON): Promise<SummaryOutcome> {
+    const override = deps.summaryModel?.trim();
+    const rejectKey = `${deps.url}\u0000${override}`;
+    if (!override || override === deps.model || summaryModelRejected.has(rejectKey)) {
+        return summarizeRangeWith(deps, content, startRef, endRef, reason);
+    }
+    if (deps.protocol === "google") {
+        if (!summaryModelLogged.has(rejectKey)) {
+            summaryModelLogged.add(rejectKey);
+            deps.log("warn", `[summary-model] summaryModel=${override} not applied on the Gemini wire (model is in the URL path); summarizing with ${deps.model}`);
+        }
+        return summarizeRangeWith(deps, content, startRef, endRef, reason);
+    }
+    try {
+        const out = await summarizeRangeWith({ ...deps, model: override }, content, startRef, endRef, reason);
+        if (!summaryModelLogged.has(rejectKey)) {
+            summaryModelLogged.add(rejectKey);
+            deps.log("info", `[summary-model] summaries use model=${override} (request model=${deps.model})`);
+        }
+        return out;
+    } catch (err) {
+        if (!isOverrideRejection(err)) throw err;
+        summaryModelRejected.add(rejectKey);
+        deps.log("warn", `[summary-model] summaryModel=${override} rejected by the upstream (HTTP ${err.status}); falling back to request model ${deps.model}`);
+        return summarizeRangeWith(deps, content, startRef, endRef, reason);
+    }
+}
+
+async function summarizeRangeWith(deps: PreflightDeps, content: string, startRef: string, endRef: string, reason: string): Promise<SummaryOutcome> {
     const system =
         buildCompressSystemPrompt(deps.prompts, deps.surface?.promptSections) +
-        `\n\nTASK: The conversation segment below (messages ${startRef}–${endRef}) must be compressed because the session context exceeds the current model's window. Write a tier-1 compression summary of the segment following every rule above. Output ONLY the summary text — no preamble, no closing remarks, no tool calls.`;
+        `\n\nTASK: The conversation segment below (messages ${startRef}–${endRef}) must be compressed because ${reason}. Write a tier-1 compression summary of the segment following every rule above. Output ONLY the summary text — no preamble, no closing remarks, no tool calls.`;
     // #626: the session remembers upstreams that require stream:true, so the
     // extra 400 round-trip is paid at most once per session (persisted with
     // the session metadata). #663: likewise, per URL+model, upstreams that
@@ -795,6 +847,90 @@ function noEmergencyTruncate(config: Config): Config {
     return { ...config, modelContextLimit: config.modelContextLimit * 100 };
 }
 
+/** Render the text a summary call sees for one ref range: a dry-run
+ *  applyCompression resolves exactly which raw messages and child blocks the
+ *  fold would consume; direct messages render host-side (with #781 image
+ *  notes), consumed child blocks stay summaries. `planned` is undefined when
+ *  the kernel would not create a block for the range (`errors` says why). */
+export function renderRangeContent(
+    core: CompressionCore,
+    messages: CoreMessage[],
+    state: Session["state"],
+    config: Config,
+    startRef: string,
+    endRef: string,
+): { content: string; planned?: CompressionBlock; errors?: string[] } {
+    const preview = core.applyCompression({
+        messages,
+        state,
+        config,
+        ranges: [{ startRef, endRef, summary: "x".repeat(Math.max(MIN_SUMMARY_CHARS, config.compress.minSummaryLength)) }],
+    });
+    const previousBlockIds = new Set(state.blocks.map((block) => block.blockId));
+    const planned = preview.state.blocks.find((block) => !previousBlockIds.has(block.blockId));
+    if (!planned) return { content: "", errors: preview.result.errors };
+    // Direct raw messages render host-side: #781 image notes live in BiliMessage
+    // sidecars the kernel never sees. Consumed child blocks render through the
+    // kernel from the original state so they stay summaries.
+    const idxById = new Map(messages.map((m, i) => [m.id, i]));
+    const parts: string[] = [];
+    for (const id of planned.directMessageIds) {
+        const i = idxById.get(id);
+        if (i === undefined) continue;
+        const m = messages[i];
+        let text = m.text ?? "";
+        const notes = imagePlaceholders(m);
+        if (notes.length > 0) {
+            const note = notes.join(" ");
+            text = text === IMAGE_PLACEHOLDER ? note : text ? `${text}\n${note}` : note;
+        }
+        if (!text) continue;
+        const label =
+            m.contentType === "tool-call"
+                ? `assistant tool-call ${m.toolName ?? "?"}`
+                : m.contentType === "tool-result"
+                  ? `tool result ${m.toolName ?? "?"}`
+                  : m.contentType === "reasoning"
+                    ? "assistant reasoning"
+                    : m.role;
+        parts.push(`[${label}]\n${text}`);
+    }
+    for (const nid of planned.directBlockIds) {
+        const nb = state.blocks.find((b) => b.blockId === nid);
+        // The child stays a summary: its raw text is already condensed, and
+        // re-expanding it would defeat the compression this fold performs.
+        if (!nb) continue;
+        const label = nb.topic ? `${nb.blockId}: ${nb.topic}` : nb.blockId;
+        parts.push(`[summarized ${label}]\n${nb.summary}`);
+    }
+    return { content: parts.join("\n\n"), planned };
+}
+
+/** Summarize one already-rendered range outside the preflight loop
+ *  (delegated compress summaries): the content is split into
+ *  window-budgeted slices exactly like preflight does, each slice goes
+ *  through {@link summarizeRange} (summary-model override + fallback), and the
+ *  parts are joined. Unusable when any slice is unusable, when the slice count
+ *  exceeds the per-preflight call budget, or when the joined summary exceeds
+ *  the kernel's maxSummaryLength. HTTP/transport errors propagate. */
+export async function summarizeRenderedRange(deps: PreflightDeps, content: string, startRef: string, endRef: string, reason: string): Promise<SummaryOutcome> {
+    const budget = Math.max(MIN_CHUNK_TOKENS, Math.floor(deps.config.modelContextLimit * CHUNK_FRACTION));
+    const chunks = splitSummaryContent(content, budget, defaultCountTokens);
+    if (chunks.length > MAX_SUMMARY_CALLS_PER_PREFLIGHT) {
+        return { unusable: `range needs ${chunks.length} summary calls (budget ${MAX_SUMMARY_CALLS_PER_PREFLIGHT}); choose a smaller range` };
+    }
+    const parts: string[] = [];
+    for (const chunk of chunks) {
+        const part = await summarizeRange(deps, chunk, startRef, endRef, reason);
+        if ("unusable" in part) return part;
+        parts.push(part.summary);
+    }
+    const summary = parts.join("\n\n");
+    const max = deps.config.compress.maxSummaryLength;
+    if (max > 0 && summary.length > max) return { unusable: `assembled summary (${summary.length} chars) exceeds maxSummaryLength (${max})` };
+    return { summary };
+}
+
 export async function preflightCompress(deps: PreflightDeps, messages: CoreMessage[]): Promise<PreflightResult> {
     const limit = deps.config.modelContextLimit;
     let target = Math.min(limit, deps.compressionTarget ?? limit);
@@ -950,50 +1086,10 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                     deps.log("warn", `[preflight] normalized reversed range ${startRef}–${endRef} → ${endRef}–${startRef} (non-monotonic refs after client history rewrite, #1001)`);
                     [startRef, endRef] = [endRef, startRef];
                 }
-                const preview = deps.core.applyCompression({
-                    messages,
-                    state: deps.session.state,
-                    config: activeConfig,
-                    ranges: [{ startRef, endRef, summary: "x".repeat(Math.max(MIN_SUMMARY_CHARS, activeConfig.compress.minSummaryLength)) }],
-                });
-                const previousBlockIds = new Set(deps.session.state.blocks.map((block) => block.blockId));
-                const planned = preview.state.blocks.find((block) => !previousBlockIds.has(block.blockId));
-                if (!planned) continue;
-                // Direct raw messages render host-side: #781 image notes live in BiliMessage
-                // sidecars the kernel never sees. Consumed child blocks render through the
-                // kernel from the original state so they stay summaries.
-                const idxById = new Map(messages.map((m, i) => [m.id, i]));
-                const parts: string[] = [];
-                for (const id of planned.directMessageIds) {
-                    const i = idxById.get(id);
-                    if (i === undefined) continue;
-                    const m = messages[i];
-                    let text = m.text ?? "";
-                    const notes = imagePlaceholders(m);
-                    if (notes.length > 0) {
-                        const note = notes.join(" ");
-                        text = text === IMAGE_PLACEHOLDER ? note : text ? `${text}\n${note}` : note;
-                    }
-                    if (!text) continue;
-                    const label =
-                        m.contentType === "tool-call"
-                            ? `assistant tool-call ${m.toolName ?? "?"}`
-                            : m.contentType === "tool-result"
-                              ? `tool result ${m.toolName ?? "?"}`
-                              : m.contentType === "reasoning"
-                                ? "assistant reasoning"
-                                : m.role;
-                    parts.push(`[${label}]\n${text}`);
-                }
-                for (const nid of planned.directBlockIds) {
-                    const nb = deps.session.state.blocks.find((b) => b.blockId === nid);
-                    // The child stays a summary: its raw text is already condensed, and
-                    // re-expanding it would defeat the compression this fold performs.
-                    if (!nb) continue;
-                    const label = nb.topic ? `${nb.blockId}: ${nb.topic}` : nb.blockId;
-                    parts.push(`[summarized ${label}]\n${nb.summary}`);
-                }
-                const content = parts.join("\n\n");
+                const rendered = renderRangeContent(deps.core, messages, deps.session.state, activeConfig, startRef, endRef);
+                if (!rendered.planned) continue;
+                const planned = rendered.planned;
+                const content = rendered.content;
                 if (content.length === 0) continue;
                 let summary: string | null = null;
                 let outcome: SummaryOutcome | undefined;

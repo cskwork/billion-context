@@ -99,6 +99,11 @@ export interface LoopCtx {
      *  rebuilt history. Default (undefined) keeps markers on. Paired
      *  tool-call/tool-result messages are unaffected. */
     visibilityMarkers?: boolean;
+    /** Delegated summary mode: fills the summaries the main model left out of
+     *  a compress call (via the summary model) before it executes. Returns the
+     *  rewritten args, or an error string that becomes the tool result. Runs
+     *  OUTSIDE the session lock (it makes upstream calls). */
+    fillCompressSummaries?: (args: Record<string, unknown>) => Promise<{ args: Record<string, unknown> } | { error: string }>;
 }
 
 export interface RequestOptions {
@@ -588,7 +593,10 @@ export async function* runCompressLoop(
                     } catch {
                         parsedArgs = {};
                     }
-                    const result = await withSessionLock(ctx.session, () => executeProxyTool(call.name, parsedArgs, ctx, call.callId));
+                    const delegated = call.name === "compress" && ctx.fillCompressSummaries ? await ctx.fillCompressSummaries(parsedArgs) : { args: parsedArgs };
+                    const result = "error" in delegated
+                        ? delegated.error
+                        : await withSessionLock(ctx.session, () => executeProxyTool(call.name, delegated.args, ctx, call.callId));
                     proxyResults.push({ name: call.name, callId: call.callId, result, arguments: call.arguments, signature: call.signature });
                     if (ctx.visibilityMarkers !== false) {
                         const markerKey = `${call.name}\u0000${result}`;

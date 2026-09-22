@@ -735,6 +735,20 @@ returns `[Block … not found]`, new refs restart from m00001).
   on the plugin API being unable to mutate context (that capability varies
   by 2.x build).
 
+## Compaction model selection
+
+By default every summary bili writes itself (preflight overflow summaries) uses the request's own model. To route that work to a cheaper or faster model on the same upstream:
+
+```bash
+bili claude --compact-model claude-haiku-4-5        # or: bili --compact-model claude-haiku-4-5 claude
+bili codex --compact-model=gpt-5-mini
+BILI_COMPACT_MODEL=claude-haiku-4-5 bili start      # standalone proxy
+```
+
+or in config (global, per-provider or per-model): `"compress": { "summaryModel": "claude-haiku-4-5" }`. Only the `model` field of the summary call changes (same URL, headers and protocol). If the upstream rejects that model with a non-transient 4xx, bili warns and falls back to the request model.
+
+Add `--delegate-summary` (or `"delegateSummary": true`) to go further: in proxy mode the main model only picks which ranges to compress, and bili writes each summary with the summary model. Plugin mode (the agent runs `compress` itself) and non-streaming requests keep the normal behavior. Claude Code's own `/compact` and Codex's native compaction are not rerouted. Details: [CONFIGURATION.md → `summaryModel` / `delegateSummary`](CONFIGURATION.md#summarymodel).
+
 ## Running the proxy
 
 ### Flags

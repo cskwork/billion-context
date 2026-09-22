@@ -40,6 +40,7 @@ import {
     clearStartingMarker,
     isPidAlive,
     isProxyInstanceFile,
+    launcherSummaryConfig,
     readProxyInstanceFile,
     readStartingMarker,
     removeStartingMarker,
@@ -190,6 +191,12 @@ export interface LaunchOptions {
      * native posture dials a STATIC url baked into settings.json; a proxy
      * that silently landed on port+1 would strand every model request). */
     strictPort?: boolean;
+    /** Summary model for the proxy's own summary calls
+     *  (`--compact-model`), handed to the child as BILI_COMPACT_MODEL. */
+    compactModel?: string;
+    /** Delegated summary mode (`--delegate-summary`), handed to the child as
+     *  BILI_DELEGATE_SUMMARY=1. */
+    delegateSummary?: boolean;
 }
 
 export interface ProxyHandle {
@@ -2375,6 +2382,7 @@ function instanceCompatible(inst: ProxyInstanceFile, opts: LaunchOptions): boole
     const keys = Object.keys(wantWindows);
     if (Object.keys(inst.modelWindows).length !== keys.length) return false;
     if (!keys.every((k) => inst.modelWindows[k] === wantWindows[k])) return false;
+    if ((inst.compactModel ?? "") !== (opts.compactModel ?? "") || (inst.delegateSummary === true) !== (opts.delegateSummary === true)) return false;
     const wantMax = opts.modelMaxOutputs ?? {};
     const maxKeys = Object.keys(wantMax);
     if (Object.keys(inst.modelMaxOutputs ?? {}).length !== maxKeys.length) return false;
@@ -2537,9 +2545,14 @@ export function resolveNodeRuntime(
 }
 
 export async function ensureProxyRunning(
-    opts: LaunchOptions,
+    launchOpts: LaunchOptions,
     deps: LauncherDeps = {},
 ): Promise<ProxyHandle> {
+    // Every in-tree caller (launcher, native hooks, agent plugins) inherits
+    // BILI_COMPACT_MODEL / BILI_DELEGATE_SUMMARY from its env into the child;
+    // default the attach comparison from the same env so a shell-exported
+    // value never makes a matching running proxy look incompatible.
+    const opts: LaunchOptions = { ...launcherSummaryConfig(process.env), ...launchOpts };
     const fetchImpl = deps.fetchImpl ?? defaultFetch;
     const fetchHealthInfo = deps.fetchHealthInfo ?? fetchHealthInfoDefault;
     const readInstance = deps.readInstanceFile ?? readProxyInstanceFile;
@@ -2649,6 +2662,8 @@ export async function ensureProxyRunning(
                             ? { BILI_LAUNCHER_MODEL_MAX_OUTPUTS: JSON.stringify(opts.modelMaxOutputs) }
                             : {}),
                         ...(opts.strictPort ? { BILI_STRICT_PORT: "1" } : {}),
+                        ...(opts.compactModel ? { BILI_COMPACT_MODEL: opts.compactModel } : {}),
+                        ...(opts.delegateSummary ? { BILI_DELEGATE_SUMMARY: "1" } : {}),
                     },
                 },
             );
@@ -2968,7 +2983,7 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
     // used to resolve the budget-alignment window, #321).
     const biliRoutes = loadRoutes(process.env);
     const domains = dedupeInOrder([...routes.httpsDomains, ...(params.mitmDomains ?? [])]);
-    const handle = await ensureProxyRunning({ host, port, passthrough, debug, mitmDomains: domains, modelWindows: collectModelWindows(config, base), modelMaxOutputs: collectModelMaxOutputs(config, base) }, deps);
+    const handle = await ensureProxyRunning({ host, port, passthrough, debug, mitmDomains: domains, modelWindows: collectModelWindows(config, base), modelMaxOutputs: collectModelMaxOutputs(config, base), ...launcherSummaryConfig(params.overrides) }, deps);
     console.error(
         `bili: started proxy at ${handle.origin} (MITM domains: ${domains.length ? domains.join(", ") : "defaults"})` +
             ((base !== "kimi" && base !== "mcode" && base !== "aider" && routes.httpRewrites.length > 0) ? ` (HTTP /bili/ rewrites: ${routes.httpRewrites.length})` : "") +
@@ -3466,7 +3481,7 @@ export async function runTestPi(params: RunTestPiParams, deps: LauncherDeps = {}
         ...discoverDomains("pi", config),
         ...(params.mitmDomains ?? []),
     ]);
-    const handle = await ensureProxyRunning({ host, port, passthrough, debug, mitmDomains: domains, modelWindows: collectModelWindows(config, "pi"), modelMaxOutputs: collectModelMaxOutputs(config, "pi") }, deps);
+    const handle = await ensureProxyRunning({ host, port, passthrough, debug, mitmDomains: domains, modelWindows: collectModelWindows(config, "pi"), modelMaxOutputs: collectModelMaxOutputs(config, "pi"), ...launcherSummaryConfig(params.overrides) }, deps);
     console.error(
         `bili: started proxy at ${handle.origin} (MITM domains: ${domains.length ? domains.join(", ") : "defaults"})`,
     );
