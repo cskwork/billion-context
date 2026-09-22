@@ -497,7 +497,7 @@ Windows 下会自动发现常见 Clash/Mihomo 静态系统代理;Web UI 会显�
 
 ### 会话文件清理（#1082）
 
-短命会话会留下永远不会再被恢复的小状态文件。持久化开启时，bili 在启动时和每小时扫描一次会话目录：年龄超过 `BILI_SESSION_GC_MAX_AGE_DAYS`（默认 7 天）且最近一次请求体 token 数 ≤ `BILI_SESSION_GC_MAX_TOKENS`（默认 1M）的文件会被删除 —— 继续对话会用客户端自己的历史重建上下文，代价只是一次冷重建。没有记录大小的旧文件则要求**没有活跃压缩块**且 `contextTokens` 不超过同一上限。活会话、不可读文件和加密文件（判断前先用 `BILI_ENCRYPTION_KEY` 解码）都按保守策略处理。设 `BILI_SESSION_GC=0` 可关闭。详见 [CONFIGURATION.zh-CN.md](CONFIGURATION.zh-CN.md)。
+短命会话会留下永远不会再被恢复的小状态文件。清理是**可选开启（opt-in）**的：设 `BILI_SESSION_GC=1` 才启用（默认关闭 —— 会话文件属于用户数据，不应有静默删除策略）。启用且持久化开启时，bili 在启动时和每小时扫描一次会话目录，且只有**两个条件同时满足**才删除一个文件：年龄超过 `BILI_SESSION_GC_MAX_AGE_DAYS`（默认 7 天），并且该会话**从未被压缩过**（没有折叠块）、最近一次请求体 ≤ `BILI_SESSION_GC_MAX_TOKENS` token（默认 1M；未记录大小的旧文件用 `contextTokens`）—— 这样删除只丢字节不丢内容：继续对话会用客户端自己的历史重建上下文，代价只是一次冷重建。被压缩过的会话永不删除（其摘要无法无损重建）。每次删除都会逐条写审计日志，另有一次非空扫描的汇总日志。活会话、不可读文件和加密文件（判断前先用 `BILI_ENCRYPTION_KEY` 解码）都按保守策略处理。详见 [CONFIGURATION.zh-CN.md](CONFIGURATION.zh-CN.md)。
 
 ## 状态
 

@@ -6,28 +6,33 @@ import { sessionsDir } from "./paths.js";
 import { dropSessionForGc, peekSession } from "./session.js";
 
 /**
- * Session-file garbage collection (#1082).
+ * Session-file garbage collection (#1082). OPT-IN: disabled unless
+ * BILI_SESSION_GC is set to 1/true/on. Session files are user data
+ * (exportable, resumable), so there is no silent deletion policy — the
+ * kernel store never deletes, and this sweep only runs when asked to.
  *
- * The kernel StateStore never deletes files, so every conversation that ever
- * touched the proxy leaves `<protocol>/<host>_<hash>.json` under the sessions
- * dir forever. Users open many short throwaway sessions; those files are
- * worthless ballast. This sweep deletes files whose rebuild cost is provably
- * cheap:
+ * When enabled, the sweep deletes a file only when BOTH conditions hold
+ * (owner requirement #1082: both are load-bearing, neither alone suffices):
  *
- *   1. last activity (envelope savedAt) older than BILI_SESSION_GC_MAX_AGE_DAYS
- *      (default 7d) — an idle conversation is unlikely to be resumed soon;
- *   2. re-send size small enough that losing the persisted state costs
- *      nothing functional — the client simply re-sends its full history and
- *      the proxy rebuilds from scratch:
+ *   1. AGE: last activity (envelope savedAt) older than
+ *      BILI_SESSION_GC_MAX_AGE_DAYS (default 7d). The threshold must stay far
+ *      beyond any plausible resume window: after deletion a resumed session
+ *      restarts numbering from m00001 while a resuming agent's transcript may
+ *      still cite old numbers (kernel contract: ids are never reused), so a
+ *      short threshold risks silent misattribution.
+ *   2. SMALL / LOSSLESS REBUILD: the session was NEVER compressed (zero
+ *      blocks, active or inactive, and no blockContents) AND its re-send size
+ *      is bounded — deleting it loses no summaries, only bytes:
  *        2a. metadata.rawInputTokens known (recorded per turn since #1082):
  *            rawInputTokens <= BILI_SESSION_GC_MAX_TOKENS (default 1M);
- *        2b. unknown (legacy/pre-upgrade file): no ACTIVE compression blocks
- *            AND stats.contextTokens <= the same threshold. With no blocks
- *            nothing was ever folded, so current context ≈ the raw history
- *            the client would re-send. A session WITH active blocks can read
- *            small in context yet carry huge raw history (compressed 300K →
- *            20K) — deleting it would make the resumed request overflow the
- *            window, so those files are always kept.
+ *        2b. unknown (legacy/pre-upgrade file): stats.contextTokens <= the
+ *            same threshold. A session WITH folds can read small in context
+ *            yet carry huge raw history (compressed 300K → 20K) and its
+ *            summaries cannot be rebuilt losslessly — those files are always
+ *            kept, regardless of size.
+ *
+ * Every deletion is audit-logged individually (path, size, age) plus one
+ * summary line per non-empty sweep. The sweep touches ONLY the sessions dir.
  *
  * The sweep walks the DISK tree, not the in-memory map: sessions evicted by
  * the MAX_SESSIONS LRU cap or dropped at boot still have files, and only a
@@ -53,8 +58,9 @@ const DEFAULT_INTERVAL_MS = 3_600_000;
 const DAY_MS = 86_400_000;
 
 export function gcConfigFromEnv(): GcConfig {
-    const env = process.env.BILI_SESSION_GC;
-    const enabled = env !== "0" && env !== "false" && env !== "off";
+    // Opt-in only (owner requirement #1082): unset means disabled.
+    const env = process.env.BILI_SESSION_GC?.toLowerCase();
+    const enabled = env === "1" || env === "true" || env === "on";
     return {
         enabled,
         maxAgeMs: intEnv("BILI_SESSION_GC_MAX_AGE_DAYS", DEFAULT_MAX_AGE_DAYS) * DAY_MS,
@@ -74,7 +80,7 @@ interface FileView {
     id: string | null;
     savedAt: number;
     contextTokens: number;
-    hasActiveBlocks: boolean;
+    everCompressed: boolean;
     rawInputTokens: number | null;
 }
 
@@ -97,11 +103,11 @@ export function viewFromParsed(parsed: unknown): FileView | null {
     if (savedAt === null || savedAt <= 0) return null;
     const state = asRecord(rec.state);
     const blocks = Array.isArray(state?.blocks) ? (state!.blocks as unknown[]) : [];
-    // Missing `active` counts as active — conservative (keeps the file).
-    const hasActiveBlocks = blocks.some((b) => {
-        const blk = asRecord(b);
-        return blk !== null && blk.active !== false;
-    });
+    // Any block — active OR inactive — or any stored fold content means the
+    // session was compressed at some point: its summaries cannot be rebuilt
+    // losslessly from a client re-send, so the file is never GC-eligible.
+    const blockContents = asRecord(rec.blockContents);
+    const everCompressed = blocks.length > 0 || (blockContents !== null && Object.keys(blockContents).length > 0);
     const stats = asRecord(rec.stats);
     const contextTokens = num(stats?.contextTokens ?? rec.contextTokens) ?? 0;
     const metadata = asRecord(rec.metadata);
@@ -109,13 +115,15 @@ export function viewFromParsed(parsed: unknown): FileView | null {
     const id = typeof top.id === "string" ? top.id
         : typeof rec.id === "string" ? rec.id
             : null;
-    return { id, savedAt, contextTokens, hasActiveBlocks, rawInputTokens };
+    return { id, savedAt, contextTokens, everCompressed, rawInputTokens };
 }
 
 export function isGcEligible(view: FileView, now: number, cfg: Pick<GcConfig, "maxAgeMs" | "maxTokens">): boolean {
     if (now - view.savedAt < cfg.maxAgeMs) return false;
-    if (view.rawInputTokens !== null) return view.rawInputTokens <= cfg.maxTokens;
-    return !view.hasActiveBlocks && view.contextTokens <= cfg.maxTokens;
+    if (view.everCompressed) return false;
+    return view.rawInputTokens !== null
+        ? view.rawInputTokens <= cfg.maxTokens
+        : view.contextTokens <= cfg.maxTokens;
 }
 
 async function walkSessionFiles(dir: string): Promise<string[]> {
@@ -194,6 +202,9 @@ export async function gcSessionFiles(opts?: { dir?: string; store?: SessionStore
             result.kept++;
             continue;
         }
+        // Audit trail (owner requirement #1082): every deletion is individually
+        // traceable — which file, how big, how old.
+        loggerLog("info", `[gc] removed ${path.relative(dir, file)} (${st.size} B, age ${Math.round((now - view.savedAt) / DAY_MS)}d)`);
         result.removed++;
         result.bytesFreed += st.size;
         const parent = path.dirname(file);
