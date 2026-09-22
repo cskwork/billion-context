@@ -92,6 +92,12 @@ jobs:
                           }' | sort -un > prnums.txt
                       N_TOTAL=$(wc -l < prnums.txt)
                       echo "numeric pr-* tags [$PKG]: $N_TOTAL"
+                      # Zero pr-* tags is a valid end-state after a full sweep; skip
+                      # early or xargs would run prstate.sh once with no argument.
+                      if [ "$N_TOTAL" -eq 0 ]; then
+                          echo "no pr-* tags [$PKG] — nothing to sweep"
+                          continue
+                      fi
 
                       # 2) Query each PR's state (parallel)
                       cat prnums.txt | xargs -P 8 -n1 ./prstate.sh > prstates.tsv
