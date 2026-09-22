@@ -1,0 +1,133 @@
+name: Clean Stale PR Dist-Tags
+
+on:
+    # Weekly sweep keeps the npm packument from growing without bound (#1149).
+    schedule:
+        - cron: '0 3 * * 0'
+    workflow_dispatch:
+        inputs:
+            dry_run:
+                description: 'List removable pr-* dist-tags without removing them'
+                type: boolean
+                default: true
+            buffer_days:
+                description: 'Keep pr-* tags whose PR was closed within this many days'
+                type: number
+                default: 3
+
+permissions:
+    contents: read
+    pull-requests: read
+
+jobs:
+    cleanup-dist-tags:
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/setup-node@v4
+              with:
+                  node-version: 22
+                  registry-url: https://registry.npmjs.org
+
+            - name: Remove stale pr-* dist-tags
+              env:
+                  NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+                  GH_TOKEN: ${{ github.token }}
+                  DRY_RUN_INPUT: ${{ inputs.dry_run }}
+                  BUFFER_DAYS_INPUT: ${{ inputs.buffer_days }}
+                  EVENT_NAME: ${{ github.event_name }}
+              run: |
+                  set -uo pipefail
+                  REPO="${{ github.repository }}"
+                  PKG="billion-context"
+
+                  BUF="$BUFFER_DAYS_INPUT"
+                  case "$BUF" in ''|*[!0-9]*) BUF=3 ;; esac
+                  DRY="$DRY_RUN_INPUT"
+                  [ -z "$DRY" ] && DRY="true"
+                  [ "$EVENT_NAME" = "schedule" ] && DRY="false"
+                  [ "$DRY" = "false" ] || DRY="true"
+                  echo "package=$PKG dry_run=$DRY buffer_days=$BUF event=$EVENT_NAME"
+
+                  # 1) Collect pr-<number> dist-tags
+                  npm view "$PKG" dist-tags --json > tags.json
+                  node -p "'total dist-tags: ' + Object.keys(JSON.parse(require('fs').readFileSync('tags.json','utf8'))).length"
+                  node -e '
+                      const t = JSON.parse(require("fs").readFileSync("tags.json", "utf8"));
+                      for (const tag of Object.keys(t)) {
+                          const m = /^pr-(\d+)$/ .exec(tag);
+                          if (m) console.log(m[1]);
+                      }' | sort -un > prnums.txt
+                  N_TOTAL=$(wc -l < prnums.txt)
+                  echo "numeric pr-* tags: $N_TOTAL"
+
+                  # 2) Query each PR's state (parallel)
+                  cat > prstate.sh <<'EOF'
+                  #!/bin/sh
+                  n="$1"
+                  errf=$(mktemp)
+                  out=$(gh api repos/"$REPO"/pulls/"$n" --jq '"\(.state)\t\(.closed_at // "")"' 2>"$errf")
+                  rc=$?
+                  if [ $rc -ne 0 ]; then
+                      if grep -q 'HTTP 404' "$errf"; then
+                          printf '%s\tNOTFOUND\n' "$n"
+                      else
+                          sleep 2
+                          out=$(gh api repos/"$REPO"/pulls/"$n" --jq '"\(.state)\t\(.closed_at // "")"' 2>>"$errf")
+                          rc=$?
+                      fi
+                  fi
+                  rm -f "$errf"
+                  # Any failure other than a definite 404 -> ERR (never deletable)
+                  [ $rc -eq 0 ] || { printf '%s\tERR\n' "$n"; exit 0; }
+                  printf '%s\t%s\n' "$n" "$out"
+                  EOF
+                  chmod +x prstate.sh
+                  cat prnums.txt | xargs -P 8 -n1 ./prstate.sh > prstates.tsv
+
+                  # Safety guardrail: if the GitHub API looked down, most lookups
+                  # fail -> almost everything reads NOTFOUND. Abort instead of
+                  # mass-deleting.
+                  N_NF=$(grep -c 'NOTFOUND' prstates.tsv || true)
+                  if [ "$N_NF" -gt 0 ] && [ $((N_NF * 4)) -gt "$N_TOTAL" ]; then
+                      echo "::error::aborted: $N_NF/$N_TOTAL PR lookups returned NOTFOUND (GitHub API failure suspected)"
+                      exit 1
+                  fi
+
+                  # 3) Classify: deletable = PR gone (deleted) OR closed before cutoff
+                  CUTOFF=$(date -u -d "@$(( $(date -u +%s) - BUF * 86400 ))" +%Y-%m-%dT%H:%M:%SZ)
+                  echo "cutoff: $CUTOFF (deletable = closed before this date, or PR deleted)"
+                  : > del_notfound.txt
+                  : > del_closed.txt
+                  awk -F'\t' -v cut="$CUTOFF" '
+                      $2 == "NOTFOUND"           { print $1 >> "del_notfound.txt" }
+                      $2 == "closed" && $3 != "" && $3 < cut { print $1 >> "del_closed.txt" }
+                  ' prstates.tsv
+                  sort -n del_notfound.txt del_closed.txt > deletable.txt
+                  N_DEL=$(wc -l < deletable.txt)
+                  N_CLOSED=$(wc -l < del_closed.txt)
+                  N_OPEN=$(awk -F'\t' '$2=="open"' prstates.tsv | wc -l)
+                  N_ERR=$(awk -F'\t' '$2=="ERR"' prstates.tsv | wc -l)
+                  echo "summary: deletable=$N_DEL (closed-stale=$N_CLOSED, pr-deleted=$N_NF) open-kept=$N_OPEN recent-kept=$((N_TOTAL - N_DEL - N_OPEN)) lookup-errors-skipped=$N_ERR"
+
+                  # 4) Execute (or report)
+                  if [ "$DRY" = "true" ]; then
+                      echo "### DRY RUN — would remove $N_DEL dist-tags:"
+                      sed 's/^/  pr-/' deletable.txt
+                      exit 0
+                  fi
+                  ok=0
+                  fail=0
+                  : > rm-errors.log
+                  while read -r n; do
+                      if npm dist-tag rm "$PKG" "pr-$n" >/dev/null 2>>rm-errors.log; then
+                          ok=$((ok + 1))
+                      else
+                          fail=$((fail + 1))
+                          echo "failed: pr-$n"
+                      fi
+                  done < deletable.txt
+                  echo "removed: ok=$ok failed=$fail"
+                  [ -s rm-errors.log ] && tail -n 50 rm-errors.log
+                  npm view "$PKG" dist-tags --json > after.json
+                  node -p "'dist-tags remaining: ' + Object.keys(JSON.parse(require('fs').readFileSync('after.json','utf8'))).length"
+                  [ "$fail" -eq 0 ] || exit 1
