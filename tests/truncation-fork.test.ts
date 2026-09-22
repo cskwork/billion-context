@@ -18,7 +18,7 @@ function chain(n: number, prefix = "msg"): Record<string, unknown>[] {
     return out;
 }
 
-test("tail-window: truncated replay (drop oldest) reattaches the original session", () => {
+test("truncation: truncated replay (drop oldest) forks a new session (#1115)", () => {
     const r = new PrefixAffinityResolver();
     const full = chain(10);
     const a = r.resolve(full)!;
@@ -26,54 +26,56 @@ test("tail-window: truncated replay (drop oldest) reattaches the original sessio
     r.note(a.sessionId, a.incomingDepth, a.tailHash, a.itemHashes);
 
     // Client keeps a fixed recent window: drops the 2 oldest, appends 1 new.
-    // Incoming head (first 8) == stored tail (last 8) → tail-window reattach.
+    // Mid-chain adoption was removed in #1115 (symmetric evidence is not an
+    // ownership proof): this must fork, with the birth attributed via
+    // lineage=truncated — attribution only, never matching.
     const truncated = [...full.slice(2), user("a brand new tenth-plus turn here")];
     const b = r.resolve(truncated)!;
-    assert.equal(b.sessionId, a.sessionId, "truncated replay must reattach the original session");
-    assert.equal(b.via, "tail-window");
-    assert.equal(b.matchedDepth, 8, "window is capped at TAIL_WINDOW=8");
-    assert.equal(b.storedDepth, 10);
-    assert.equal(b.incomingDepth, 9);
+    assert.notEqual(b.sessionId, a.sessionId, "a truncated replay must NOT adopt the stored session");
+    assert.equal(b.via, "new");
+    assert.equal(b.matchedDepth, 0);
+    assert.equal(b.lineage?.reason, "truncated");
+    assert.deepEqual(b.lineage?.parents, [a.sessionId]);
 });
 
-test("tail-window: rolling-window client retaining > TAIL_WINDOW items reattaches at any offset", () => {
-    // A dsh-style web client keeps a 20-30 item rolling window: the retained
-    // suffix is LONGER than TAIL_WINDOW, so the incoming head matches the
-    // stored chain in the middle, not at its tail. The any-offset substring
-    // search must still find it (tail-pinned matching would orphan it).
+test("truncation: rolling-window client forks on every slide (#1115)", () => {
     const r = new PrefixAffinityResolver();
     const full = chain(30);
     const a = r.resolve(full)!;
-    assert.equal(a.via, "new");
     r.note(a.sessionId, a.incomingDepth, a.tailHash, a.itemHashes);
 
-    // Sliding window: retains the last 20 (> TAIL_WINDOW=8), appends 1 new.
+    // Sliding window: retains 20 items, appends 1 new. Forks off A.
     const slid = [...full.slice(10), user("a brand new turn after the window slid")];
     const b = r.resolve(slid)!;
-    assert.equal(b.sessionId, a.sessionId, "a >8-item rolling window must reattach the original session");
-    assert.equal(b.via, "tail-window");
-    assert.equal(b.matchedDepth, 8);
+    assert.notEqual(b.sessionId, a.sessionId);
+    assert.equal(b.via, "new");
+    assert.equal(b.lineage?.reason, "truncated");
+    assert.deepEqual(b.lineage?.parents, [a.sessionId]);
 
-    // Deeper slides keep reattaching as the window keeps sliding.
+    // The next slide forks off the FORKED session's own chain (A is still a
+    // valid attribution parent too — both are recorded).
     r.note(b.sessionId, b.incomingDepth, b.tailHash, b.itemHashes);
-    const slid2 = [...full.slice(20), user("yet another turn after sliding again")];
+    const slid2 = [...slid.slice(5), user("yet another turn after sliding again")];
     const c = r.resolve(slid2)!;
-    assert.equal(c.sessionId, a.sessionId, "a second slide must reattach the same session");
-    assert.equal(c.via, "tail-window");
+    assert.notEqual(c.sessionId, b.sessionId);
+    assert.equal(c.via, "new");
+    assert.equal(c.lineage?.reason, "truncated");
+    assert.ok(c.lineage?.parents.includes(b.sessionId));
+    assert.ok(c.lineage?.parents.includes(a.sessionId));
 });
 
-test("tail-window: append-only continuation still resolves via prefix (regression)", () => {
+test("affinity: append-only continuation still resolves via prefix (regression)", () => {
     const r = new PrefixAffinityResolver();
     const base = chain(4);
     const a = r.resolve(base)!;
     r.note(a.sessionId, a.incomingDepth, a.tailHash, a.itemHashes);
     const b = r.resolve([...base, user("an appended continuation turn")])!;
     assert.equal(b.sessionId, a.sessionId);
-    assert.equal(b.via, "prefix", "a true prefix extension must not be misread as a tail reattach");
+    assert.equal(b.via, "prefix", "a true prefix extension must keep matching head-anchored");
     assert.equal(b.matchedDepth, 4);
 });
 
-test("tail-window: brand-new conversation resolves via new (regression)", () => {
+test("affinity: brand-new conversation resolves via new (regression)", () => {
     const r = new PrefixAffinityResolver();
     const a = r.resolve(chain(3, "alpha"))!;
     r.note(a.sessionId, a.incomingDepth, a.tailHash, a.itemHashes);
@@ -83,20 +85,22 @@ test("tail-window: brand-new conversation resolves via new (regression)", () => 
     assert.notEqual(b.sessionId, a.sessionId);
 });
 
-test("tail-window: distinct conversation sharing a long templated head must NOT merge (offset-0 guard)", () => {
+test("affinity: distinct conversation sharing a long templated head must NOT merge", () => {
     const r = new PrefixAffinityResolver();
     const sharedHead = chain(8, "templated-onboarding");
     const aFull = [...sharedHead, ...chain(4, "conv-a-body")];
     const a = r.resolve(aFull)!;
     r.note(a.sessionId, a.incomingDepth, a.tailHash, a.itemHashes);
 
-    // B shares the entire 8-item head and diverges after it. A truncation
-    // reattach can never start at the stored head (such a client would be
-    // caught by the full-prefix step), so B must NOT be merged into A.
+    // B shares the entire 8-item head and diverges after it. Head-anchored
+    // matching only can never merge it into A; the birth is attributed as a
+    // fork (leading-prefix LCP = 8).
     const bIncoming = [...sharedHead, ...chain(3, "conv-b-body")];
     const b = r.resolve(bIncoming)!;
-    assert.equal(b.via, "new", "a shared templated head must not reattach the other conversation");
+    assert.equal(b.via, "new", "a shared templated head must not merge the other conversation");
     assert.notEqual(b.sessionId, a.sessionId);
+    assert.equal(b.lineage?.reason, "forked");
+    assert.equal(b.lineage?.sharedPrefix, 8);
 });
 
 test("fork lineage: divergent continuation records forked lineage (UI/debug only)", () => {
@@ -115,11 +119,12 @@ test("fork lineage: divergent continuation records forked lineage (UI/debug only
     assert.equal(b.lineage?.sharedPrefix, 3);
 });
 
-test("truncated lineage: ambiguous multi-candidate records truncated lineage", () => {
+test("truncation lineage: ambiguous multi-parent mid-chain run records all parents (attribution only)", () => {
     const r = new PrefixAffinityResolver();
     // Two tracked chains that share the same trailing 8 items but differ in
-    // their oldest items. A truncated replay whose head == that shared tail is
-    // ambiguous → new session with a "truncated" lineage naming both parents.
+    // their oldest items. A truncated replay whose head == that shared run is
+    // ambiguous → new session with a "truncated" lineage naming both parents
+    // (never a guessed adoption — #1115).
     const tail = chain(8, "common-tail");
     const aFull = [...chain(2, "branch-a-head"), ...tail];
     const bFull = [...chain(2, "branch-b-head"), ...tail];
@@ -130,17 +135,18 @@ test("truncated lineage: ambiguous multi-candidate records truncated lineage", (
 
     const incoming = [...tail, user("a fresh turn after truncation")];
     const c = r.resolve(incoming)!;
-    assert.equal(c.via, "new", "an ambiguous tail match must not guess a parent");
+    assert.equal(c.via, "new", "an ambiguous mid-chain run must not guess a parent");
     assert.equal(c.lineage?.reason, "truncated");
     assert.ok(c.lineage?.parents.includes(a.sessionId));
     assert.ok(c.lineage?.parents.includes(b.sessionId));
 });
 
-// Kernel reconcile anchor (#316 / PR-B): a truncated replay against
-// block-bearing state must NOT throw, must deactivate the affected block
-// gracefully (active → false), and must revive it (survivedCount++) when the
-// full history returns. This is what makes tail-window reattach safe with zero
-// kernel changes.
+// Kernel reconcile anchor: a truncated replay against block-bearing state
+// must NOT throw, must deactivate the affected block gracefully (active →
+// false), and must revive it (survivedCount++) when the full history returns.
+// Still load-bearing for plugin-mode sessions that receive truncated replays
+// (host-side compaction/retry) — and it bounds what a #1115 truncation fork
+// loses: blocks whose messages remain live keep working in their own session.
 test("kernel reconcile: truncated replay deactivates blocks, full replay revives them (no throw)", () => {
     const core = createCore();
     const config = defaultConfig(200000);

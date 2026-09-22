@@ -83,6 +83,7 @@ test("prefix-affinity: short crafted window cannot adopt an unrelated stored ses
     r.note(a!.sessionId, a!.incomingDepth, a!.tailHash, a!.itemHashes);
     // Replaying only 3 contiguous middle turns (sub-8 window) used to auto-adopt
     // the victim's session via "tail-window"; it must now fall through to a new one.
+    // Mid-chain adoption no longer exists at any window size (#1115).
     const crafted = [chain[2]!, chain[3]!, chain[4]!];
     const b = r.resolve(crafted);
     assert.ok(b);
