@@ -913,6 +913,8 @@ export function applyUsageSample(session: Session, sample: UsageSample, protocol
         // compress tool results shrink the next request, not this report.
         session.stats.lastInputTokens = Math.max(0, total - (session.stats.compressCreditTokens ?? 0));
         session.stats.lastInputTokensSource = "usage";
+        // #1110: a real usage report retires the one-shot overflow arm.
+        delete session.stats.overflowArmTokens;
         warnCacheCollapse(session, total, sample.cachedTokens ?? 0);
         // #695: per-request parity with the wire path's [acp-usage] — without
         // this, post-fold cache cliffs cannot be attributed from logs.

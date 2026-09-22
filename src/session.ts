@@ -95,6 +95,16 @@ export type Session = {
          *  overflow-evidence gate, stale-limit retraction) treat absent as
          *  untrusted. */
         lastInputTokensSource?: "usage" | "estimate";
+        /** #1110: one-shot emergency ceiling armed by an upstream context-
+         *  overflow 400 (server.ts overflow handler) — live evidence this
+         *  session cannot exceed that size. Kept SEPARATE from lastInputTokens
+         *  (the nudge baseline): a healthy compressed host turn keeps that
+         *  baseline low, and feeding it into the side-request guard (#554)
+         *  clamped an unrelated in-process caller's fixed-size request to a
+         *  permanent 413. The guard reads THIS only. Cleared by the next real
+         *  usage report (one-shot, per the #554 contract) and on compression
+         *  reset. Absent on legacy session files → treated as no arm. */
+        overflowArmTokens?: number;
         /** Tokens compressed THIS turn whose fold has not yet materialized in
          *  an upstream usage report (the post-compress re-request re-sends the
          *  UNFOLDED history for prefix-cache reasons, so its usage report
@@ -397,6 +407,10 @@ export function resetSessionCompression(session: Session): void {
     session.stats.lastInputTokens = 0;
     // #857: a zeroed baseline carries no provenance — drop any stale flag.
     delete session.stats.lastInputTokensSource;
+    // #1110: the conversation was rebuilt — a pre-compaction overflow arm no
+    // longer bounds this session; drop it so the guard falls back to the
+    // declared window instead of clamping to a stale ceiling.
+    delete session.stats.overflowArmTokens;
     // #728: the pre-compaction outbound payload is gone — the old estimate
     // (measured against the pre-compaction wire) would read high and blind
     // the nudge fallback early; let the next prepare* re-measure.

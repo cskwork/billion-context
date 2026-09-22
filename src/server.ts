@@ -1558,7 +1558,13 @@ async function handle(
             // hammering the upstream). Gate on the raw body estimate and fail
             // fast locally instead of forwarding (#301 precedent).
             const reqModel = requestModel;
-            const armedForGuard = session.stats.lastInputTokensSource === "usage" ? session.stats.lastInputTokens : 0;
+            // #1110: only a genuine overflow arm bounds the guard — never the
+            // nudge baseline (lastInputTokens). A healthy compressed host turn
+            // keeps that baseline low, which permanently 413'd an unrelated
+            // in-process caller's fixed-size request even though it fit the
+            // model's real window. overflowArmTokens is set ONLY by an upstream
+            // context-overflow 400 and cleared by the next real usage report.
+            const armedForGuard = typeof session.stats.overflowArmTokens === "number" && session.stats.overflowArmTokens > 0 ? session.stats.overflowArmTokens : 0;
             const guard = sideRequestGuard(parsed, protocol, reqConfig.modelContextLimit, imageBillingFor(opts, route?.rewrittenUrl ?? upstreamOrigin), headroomCap, armedForGuard);
             if (guard.blocked) {
                 log("warn", `[${session.id}] side request (~${guard.estimate} tokens) ≥ effective window ${guard.limit} (model=${reqModel ?? "?"}) — NOT forwarded: guaranteed upstream 400 (side requests bypass preflight by design, #388)`);
@@ -4081,6 +4087,9 @@ async function forward(
                     // usage report on the next successful turn overwrites it.
                     s.stats.lastInputTokens = info.window;
                     s.stats.lastInputTokensSource = "usage";
+                    // #1110: record the arm SEPARATELY so the side-request guard
+                    // can read it without ever touching the nudge baseline.
+                    s.stats.overflowArmTokens = info.window;
                     log("warn", `[${s.id}] upstream context overflow (model=${reqModel ?? "unknown"}) — window ${info.window} stated upstream; armed emergency shrink, declared window unchanged (#987)`);
                 } else {
                     // No window number stated — nothing to learn (and #987
@@ -4102,6 +4111,7 @@ async function forward(
                     if (arm > 0) {
                         s.stats.lastInputTokens = arm;
                         s.stats.lastInputTokensSource = "usage";
+                        s.stats.overflowArmTokens = arm; // #1110: guard reads this, not the baseline
                     }
                     log("warn", `[${s.id}] upstream context overflow (window not parseable, model=${reqModel ?? "unknown"}) — armed emergency shrink at ~${arm} tokens (min of declared ${declared} and payload estimate), nothing learned (#987): ${info.message}`);
                 }
@@ -4576,6 +4586,8 @@ async function forward(
                         total - (prepared.session.stats.compressCreditTokens ?? 0),
                     );
                     prepared.session.stats.lastInputTokensSource = "usage";
+                    // #1110: a real usage report retires the one-shot overflow arm.
+                    delete prepared.session.stats.overflowArmTokens;
                     if (typeof cached === "number") {
                         prepared.session.stats.cachedTokens += cached;
                         prepared.session.stats.cacheSamples += 1;
