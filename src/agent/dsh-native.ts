@@ -391,6 +391,8 @@ export function apply(ctx: PluginContext): void {
         state.ready = start();
     }
 
+    state.takeoverGate = (_url) => sessionIdOf(ctx) !== undefined;
+
     state.headersFor = (_url) => {
         maybeRetry(ctx);
         if (!register.toolsReady) return undefined;
@@ -455,4 +457,8 @@ export function _resetRegisterForTest(base: string | undefined): void {
 
 export function _stateHeadersForTest(): ((url: string) => Record<string, string> | undefined) | undefined {
     return state.headersFor;
+}
+
+export function _stateTakeoverGateForTest(): ((url: string) => boolean) | undefined {
+    return state.takeoverGate;
 }

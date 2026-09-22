@@ -98,7 +98,7 @@ import { flushPrefixAffinity, hydratePrefixAffinity, scheduleAffinityPersist } f
 import { consumePluginRegisterFor, flushConversations, handlePluginCompact, handlePluginManifest, handlePluginRegister, handlePluginRuntimeInfo, handlePluginStatus, handlePluginTool, loadConversations, pipePluginChatWithStrip, pipePluginJson, pipePluginResponsesWithStrip, pluginAgentHeader, pluginConversationHeader, pluginHeadersMatchModel, pluginReportedContextWindow, pluginReportedMaxOutput, pluginRuntimeInfoFor, recordPluginSession, rememberPluginMessages, takePendingPluginRegister } from "./plugin.js";
 import { setupMitm, readMitmUpstream, getBlindTunnelStats } from "./mitm.js";
 import type { BiliMessage } from "acp-kernel/wire";
-import { BILI_PLUGIN_BYPASS_HEADER, hardenOpenaiAssistantContent, isLoopbackAddress, inspectContextOverflow, reserveOutputHeadroom, resolveOutputHeadroomCap, shouldReserveOutputHeadroom, systemToUser, usageOutputTotal, usageTotals, type WireProtocol } from "./util.js";
+import { BILI_PASSTHROUGH_HEADER, BILI_PLUGIN_BYPASS_HEADER, hardenOpenaiAssistantContent, isLoopbackAddress, inspectContextOverflow, reserveOutputHeadroom, resolveOutputHeadroomCap, shouldReserveOutputHeadroom, systemToUser, usageOutputTotal, usageTotals, type WireProtocol } from "./util.js";
 
 import { BILI_TUNNEL_HEADER, checkTunnelDestination, classifyIp, localMachineIps, normalizeIpLiteral, parseIpLiteral, tunnelAllowlistFromEnv } from "./tunnel-guard.js";
 import { dumpRejectedBody } from "./error-dump.js";
@@ -915,6 +915,9 @@ async function handle(
     // does before handing off. inboundBytes stays the raw wire size (pre-decode).
     const reqT0 = performance.now();
     let inboundBytes = 0;
+    // #1117: read before the body decode below — a passthrough-marked request
+    // must relay its ORIGINAL bytes (content-encoding included) untouched.
+    const passthroughMark = headerValue(req, BILI_PASSTHROUGH_HEADER) === "1";
     try {
         bodyBuffer = await readBody(req);
         inboundBytes = bodyBuffer.length;
@@ -959,7 +962,7 @@ async function handle(
         googleModel = protocol === "google" ? googleModelFromPath(urlPath) : undefined;
         // Issue #99: decode body only for known protocols — passthrough requests
         // (e.g. GET /models) must forward raw bytes without content-encoding decode.
-        if (protocol !== null && bodyBuffer.length > 0) {
+        if (!passthroughMark && protocol !== null && bodyBuffer.length > 0) {
             try {
                 const decoded = await decodeRequestBody(headerValue(req, "content-encoding"), bodyBuffer, MAX_REQUEST_BYTES);
                 bodyBuffer = decoded.body;
@@ -985,6 +988,16 @@ async function handle(
         log("warn", `failed to prepare inbound request (${String(err)}) - 400`);
         res.writeHead(400, { "content-type": "application/json" });
         res.end(JSON.stringify({ error: { type: "invalid_request", message: String(err) } }));
+        return;
+    }
+    // #1117: an unattributed in-process caller (native patch marked it — its
+    // URL was already /bili/-routed by the settings overlay, so refusal was
+    // impossible client-side) relays byte-untouched, mirroring a direct send
+    // without the overlay: no session, no injection, no guard. Same raw
+    // forward as the #920 bypass.
+    if (passthroughMark) {
+        log("debug", `passthrough: ${req.method ?? "?"} ${maskUrlForLog(req.url ?? "")} — unattributed in-process caller (#1117), relaying verbatim`);
+        await forward(req, res, opts, bodyBuffer, null, core, config, log, route, instanceId, undefined);
         return;
     }
     // #300: bili→bili chain detection. If the inbound request already carries

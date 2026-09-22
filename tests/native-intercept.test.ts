@@ -368,3 +368,93 @@ test("install: spawn mode stamps headers on the rewritten request (#941)", async
         _resetForTest();
     }
 });
+
+test("#1117 takeoverGate: unattributed model URL sends direct, never rewritten", async () => {
+    const state: NativeInterceptState = { origin: "http://127.0.0.1:40001", ready: Promise.resolve("http://127.0.0.1:40001"), takeoverGate: () => false };
+    const { sink } = await withPatch(state, async (fetch) => {
+        const res = await fetch("http://127.0.0.1:8199/v1/messages", { method: "POST" });
+        assert.equal(res.status, 200);
+    });
+    assert.deepEqual(sink, ["http://127.0.0.1:8199/v1/messages"]);
+});
+
+test("#1117 takeoverGate: attributed model URL still rewrites", async () => {
+    const state: NativeInterceptState = { origin: "http://127.0.0.1:40001", ready: Promise.resolve("http://127.0.0.1:40001"), takeoverGate: () => true };
+    const { sink } = await withPatch(state, async (fetch) => {
+        const res = await fetch("http://127.0.0.1:8199/v1/messages", { method: "POST" });
+        assert.equal(res.status, 200);
+    });
+    assert.deepEqual(sink, ["http://127.0.0.1:40001/bili/http://127.0.0.1:8199/v1/messages"]);
+});
+
+test("#1117 takeoverGate: unattributed /bili/-routed URL is marked x-bili-passthrough", async () => {
+    const saved = globalThis.fetch;
+    _resetForTest();
+    let passthrough = "";
+    let pluginHeader = "";
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+        const h = new Headers(init?.headers);
+        passthrough = h.get("x-bili-passthrough") ?? "";
+        pluginHeader = h.get("x-bili-plugin") ?? "";
+        return new Response("{}", { status: 200 });
+    }) as typeof fetch;
+    try {
+        const state: NativeInterceptState = {
+            origin: "http://127.0.0.1:40001",
+            ready: Promise.resolve("http://127.0.0.1:40001"),
+            takeoverGate: () => false,
+            headersFor: () => ({ "x-bili-plugin": "dsh" }),
+        };
+        assert.equal(installNativeFetchIntercept(state), true);
+        const res = await globalThis.fetch("http://127.0.0.1:40001/bili/http://127.0.0.1:8199/v1/messages", { method: "POST" });
+        assert.equal(res.status, 200);
+        assert.equal(passthrough, "1", "unattributed routed request carries the passthrough marker");
+        assert.equal(pluginHeader, "", "plugin headers are not stamped on an unattributed request");
+    } finally {
+        globalThis.fetch = saved;
+        _resetForTest();
+    }
+});
+
+test("#1117 takeoverGate: attributed /bili/-routed URL keeps plugin headers (no marker)", async () => {
+    const saved = globalThis.fetch;
+    _resetForTest();
+    let passthrough = "";
+    let pluginHeader = "";
+    globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+        const h = new Headers(init?.headers);
+        passthrough = h.get("x-bili-passthrough") ?? "";
+        pluginHeader = h.get("x-bili-plugin") ?? "";
+        return new Response("{}", { status: 200 });
+    }) as typeof fetch;
+    try {
+        const state: NativeInterceptState = {
+            origin: "http://127.0.0.1:40001",
+            ready: Promise.resolve("http://127.0.0.1:40001"),
+            takeoverGate: () => true,
+            headersFor: () => ({ "x-bili-plugin": "dsh" }),
+        };
+        assert.equal(installNativeFetchIntercept(state), true);
+        const res = await globalThis.fetch("http://127.0.0.1:40001/bili/http://127.0.0.1:8199/v1/messages", { method: "POST" });
+        assert.equal(res.status, 200);
+        assert.equal(passthrough, "");
+        assert.equal(pluginHeader, "dsh");
+    } finally {
+        globalThis.fetch = saved;
+        _resetForTest();
+    }
+});
+
+test("#1117 takeoverGate: round-1 wire mode is preserved (attributed, no headers yet → still rewrites)", async () => {
+    const state: NativeInterceptState = {
+        origin: "http://127.0.0.1:40001",
+        ready: Promise.resolve("http://127.0.0.1:40001"),
+        takeoverGate: () => true,
+        headersFor: () => undefined,
+    };
+    const { sink } = await withPatch(state, async (fetch) => {
+        const res = await fetch("http://127.0.0.1:8199/v1/messages", { method: "POST" });
+        assert.equal(res.status, 200);
+    });
+    assert.deepEqual(sink, ["http://127.0.0.1:40001/bili/http://127.0.0.1:8199/v1/messages"]);
+});
