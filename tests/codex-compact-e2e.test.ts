@@ -338,6 +338,48 @@ test("e2e E2 (trigger form): post-forge turn — echo replaced by a history-born
     });
 });
 
+test("e2e E2 (trigger form): drop-only legacy marker echo still re-injects forge-time summaries (#1064)", async () => {
+    await withHarness({ mode: "intercept", firstTurnTokens: 1000 }, async (h) => {
+        const afterSetup = await setupCompressedSession(h);
+
+        // Turn 2: native auto-compact trigger → intercepted + forged.
+        const r2 = await fetch(h.url, {
+            method: "POST",
+            headers: { "content-type": "application/json", "user-agent": CODEX_UA },
+            body: JSON.stringify({ model: "gpt-resp", stream: true, session_id: SESSION, instructions: "You are the test coding agent.", input: [...conversation(), { type: "compaction_trigger" }] }),
+        });
+        assert.equal(r2.status, 200);
+        await r2.text();
+
+        const s = listSessions().find((x) => x.meta.label === SESSION)!;
+        const captured = s.metadata.codexForgedSummaries as string[] | undefined;
+        assert.ok(Array.isArray(captured) && captured.some((t) => t.includes("MAIN-SUMMARY-SETUP")), "forge captured the active block summaries");
+
+        // Turn 3: codex echoes back a LEGACY compaction item — id-prefix only,
+        // no sentinel blob (older build) — so nothing is extractable and the
+        // item is DROPPED rather than replaced. The drop must NOT suppress the
+        // forge-time summary fallback (#1064): the summaries come back via the
+        // developer message instead of being silently lost.
+        const r3 = await fetch(h.url, {
+            method: "POST",
+            headers: { "content-type": "application/json", "user-agent": CODEX_UA },
+            body: JSON.stringify({ model: "gpt-resp", stream: true, session_id: SESSION, instructions: "You are the test coding agent.", input: [{ type: "compaction", id: "fc_bili_legacy-no-blob" }, ...conversation().slice(-2), { type: "message", role: "user", content: "continue the work" }] }),
+        });
+        assert.equal(r3.status, 200);
+        await r3.text();
+        assert.equal(h.bodies.length, afterSetup + 1, "drop-only turn forwarded to upstream exactly once");
+
+        const fwd = h.bodies[h.bodies.length - 1];
+        assert.ok(!fwd.includes("fc_bili_"), "legacy marker dropped before forwarding");
+        const fwdBody = JSON.parse(fwd) as { input: Array<{ type?: string; role?: string }> };
+        const handoff = fwdBody.input.find((i) => JSON.stringify(i).includes("[bili] context summary after compaction"));
+        assert.ok(!handoff, "no replacement handoff — nothing extractable from a blob-less legacy marker");
+        const dev = fwdBody.input.find((i) => i.type === "message" && i.role === "developer");
+        assert.ok(dev, "developer message present on the drop-only turn");
+        assert.ok(JSON.stringify(dev).includes("MAIN-SUMMARY-SETUP"), "drop-only echo must not suppress the forge-time summary re-injection");
+    });
+});
+
 test("e2e E2 (endpoint form): intercept + healthy ACP → forged JSON {output}, upstream untouched", async () => {
     await withHarness({ mode: "intercept", firstTurnTokens: 1000 }, async (h) => {
         const afterSetup = await setupCompressedSession(h);

@@ -698,7 +698,14 @@ function codexInstall(): string {
     const text = fs.existsSync(file) ? fs.readFileSync(file, "utf8") : "";
     const existing = /^[ \t]*\[mcp_servers\.bili\][ \t]*$/m.exec(text);
     if (existing !== null) {
-        const block = text.slice(existing.index, text.indexOf("\n[", existing.index + 1) === -1 ? undefined : text.indexOf("\n[", existing.index + 1));
+        // End the block at the next TABLE header line (optional indent + `[`),
+        // matching codexRemove. A plain indexOf("\n[") misses an indented next
+        // table and lets the block run to EOF, deleting everything after it.
+        const after = text.slice(existing.index);
+        const firstNewline = after.indexOf("\n");
+        const nextTable = firstNewline < 0 ? -1 : after.slice(firstNewline + 1).search(/^[ \t]*\[/m);
+        const blockEnd = nextTable >= 0 ? existing.index + firstNewline + 1 + nextTable : text.length;
+        const block = text.slice(existing.index, blockEnd);
         const canonical = codexBlock().replace(/^\n/, "");
         if (block.trimEnd() === canonical.trimEnd()) return `codex: already installed (${file})`;
         const refreshed = text.slice(0, existing.index) + canonical + text.slice(existing.index + block.length);
