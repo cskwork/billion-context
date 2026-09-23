@@ -1,4 +1,5 @@
 import { Agent } from "undici";
+import { bedrockControlPlane, bedrockOutbound, bedrockResponseToSse } from "./bedrock.js";
 
 /** HTTP robustness helpers for the proxy.
 
@@ -131,8 +132,15 @@ export async function fetchWithTimeout(
         if (onExternalAbort && externalSignal) externalSignal.removeEventListener("abort", onExternalAbort);
     };
     try {
+        // Bedrock pass-through: an Anthropic-shaped body on a Bedrock invoke
+        // URL is sent in Bedrock shape and its event-stream answer is read back
+        // as Anthropic SSE, for every caller (forward, loop, summaries).
+        const bedrock = bedrockOutbound(url, opts.body);
+        const controlPlane = bedrock ? undefined : bedrockControlPlane(url, opts.headers);
         const finalOpts: Omit<RequestInit, "dispatcher"> & { dispatcher?: object } = {
             ...opts,
+            ...(bedrock ? { body: bedrock.body } : {}),
+            ...(controlPlane ? { headers: controlPlane.headers } : {}),
             signal: controller.signal,
             dispatcher: opts.dispatcher ?? directDispatcher(effective),
             // Forward-proxy correctness: never silently follow a redirect.
@@ -148,7 +156,8 @@ export async function fetchWithTimeout(
         // which structurally conflicts with the `undici` package's exported
         // Dispatcher — but at runtime they're the same thing. Assert to the
         // concrete RequestInit type (no `as any`) to satisfy the call site.
-        const raw = await fetch(url, finalOpts as RequestInit) as Response;
+        const fetched = await fetch(bedrock?.url ?? controlPlane?.url ?? url, finalOpts as RequestInit) as Response;
+        const raw = bedrock ? bedrockResponseToSse(fetched) : fetched;
         if (raw.body) {
             // Wrap the body so each chunk re-arms the timer (idle timeout); carry
             // status/headers onto a fresh Response so callers see an identical shape.
