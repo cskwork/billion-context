@@ -987,7 +987,12 @@ export function buildClaudeEnv(
     httpsRewrites: HttpRewrite[],
     baseEnv: NodeJS.ProcessEnv,
 ): NodeJS.ProcessEnv {
-    const env: NodeJS.ProcessEnv = { ...baseEnv, HTTPS_PROXY: origin, NODE_EXTRA_CA_CERTS: caPath, BILLION_CONTEXT_PROXY: origin };
+    // claude (≥ 2.1.280) sends EVERY request through HTTPS_PROXY, the plain-http
+    // loopback base URL included, so a /bili/ base URL arrived at this proxy
+    // as an absolute-form forward of itself and was denied (tunnel self-target
+    // 403). Loopback must stay direct; the user's own exclusions are kept.
+    const noProxy = dedupeInOrder([...(baseEnv.NO_PROXY ?? baseEnv.no_proxy ?? "").split(",").map((h) => h.trim()).filter(Boolean), "localhost", "127.0.0.1", "::1"]).join(",");
+    const env: NodeJS.ProcessEnv = { ...baseEnv, HTTPS_PROXY: origin, NODE_EXTRA_CA_CERTS: caPath, BILLION_CONTEXT_PROXY: origin, NO_PROXY: noProxy, no_proxy: noProxy };
     const r = httpRewrites.find((rw) => rw.key === "ANTHROPIC_BASE_URL");
     if (r) env.ANTHROPIC_BASE_URL = wrapUpstream(origin, r.realUpstream);
     const hr = httpsRewrites.find((rw) => rw.key === "ANTHROPIC_BASE_URL");
@@ -1011,15 +1016,14 @@ export function claudeBedrockUpstream(env: NodeJS.ProcessEnv, settings: ClaudeSe
 }
 
 /** Bedrock mode spawn env: claude's Bedrock client dials the proxy through
- *  ANTHROPIC_BEDROCK_BASE_URL (/bili/<runtime>); loopback rides NO_PROXY so the
- *  HTTPS_PROXY MITM leg (kept for claude's other traffic) never swallows it.
- *  The same pair goes into `--settings` (CLI settings outrank the user's
- *  settings env block, which would otherwise win over process env). */
+ *  ANTHROPIC_BEDROCK_BASE_URL (/bili/<runtime>); buildClaudeEnv keeps loopback
+ *  on NO_PROXY so the HTTPS_PROXY MITM leg never swallows it. The same pair
+ *  goes into `--settings` (CLI settings outrank the user's settings env
+ *  block, which would otherwise win over process env). */
 export function buildClaudeBedrockLaunch(origin: string, caPath: string, upstream: string, baseEnv: NodeJS.ProcessEnv): { env: NodeJS.ProcessEnv; settingsArg: string } {
     const bedrockEnv = { CLAUDE_CODE_USE_BEDROCK: "1", ANTHROPIC_BEDROCK_BASE_URL: wrapUpstream(origin, upstream) };
-    const noProxy = dedupeInOrder([...(baseEnv.NO_PROXY ?? baseEnv.no_proxy ?? "").split(",").map((h) => h.trim()).filter(Boolean), "localhost", "127.0.0.1", "::1"]).join(",");
     return {
-        env: { ...buildClaudeEnv(origin, caPath, [], [], baseEnv), ...bedrockEnv, NO_PROXY: noProxy, no_proxy: noProxy },
+        env: { ...buildClaudeEnv(origin, caPath, [], [], baseEnv), ...bedrockEnv },
         settingsArg: JSON.stringify({ env: bedrockEnv }),
     };
 }
