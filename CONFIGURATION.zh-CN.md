@@ -567,6 +567,7 @@
 | `BILI_LAUNCHER_PLUGIN` | 设 `0` 关闭 launcher 为 claude/codex 注入 bili MCP 服务器（退回纯 wire 模式）；设 `1` 强制插件模式。默认注入——但 codex 上游为本地/私网地址时自动退回 wire 模式（sglang/vllm/ollama 不解析 codex 的 namespace 工具类型）。见[启动器参考](#启动器参考)。 |
 | `BILI_LAUNCHER_DIRECT` | 设 `1` 启用 launcher 直连 URL 路由（放弃 MITM/CA 信任）。见[启动器参考](#启动器参考)。 |
 | `BILI_CLAUDE_UPSTREAM` | claude 直连模式：当 `ANTHROPIC_BASE_URL` 已指向某个 relay 时，用它指定你的 relay 端点（否则会被旁路）。 |
+| `BILI_CLAUDE_BEDROCK` | `bili claude` Bedrock 模式：`1` 强制开启（即使 settings 里 `CLAUDE_CODE_USE_BEDROCK=0`），`0` 关闭。不设 = 跟随 claude 自身的 `CLAUDE_CODE_USE_BEDROCK`（先 settings env 块，再 shell）。见 [Claude on AWS Bedrock](#claude-on-aws-bedrock)。 |
 | `BILI_CODEX_COMPACT` | codex 原生压缩处理。默认 `intercept`：安全门通过时（transform 成功 + 稳态用量 < 窗口 90% + 至少一个活跃压缩块）拦截 codex 的压缩请求，在本地伪造向 ACP 状态的交接——trigger 形态伪造 2 帧 SSE，endpoint 形态伪造 `{output}`——且不接触上游。伪造的 ACP 摘要经历史承载交接消息注入（缺席时 developer 消息兜底），保证 codex 截断历史后压缩内容仍可见。设为 `pass` 可退出，把 codex 的压缩请求转发给上游（原生压缩兜底）。任一安全门失败则原样透传。 |
 
 ---
@@ -806,6 +807,10 @@ Claude Code 的 undici fetch 忽略 `HTTPS_PROXY`，所以证书 MITM 拦不到�
 
 - **codex 直连模式**：LLM 流量**不**经过代理，压缩不生效 —— 只有 bili MCP 工具调用经过。要完整压缩请用默认 MITM 模式（不设 `BILI_LAUNCHER_DIRECT`）。
 - **claude 直连模式**：`ANTHROPIC_BASE_URL` 被覆盖指向代理；预先配置的 relay 被旁路，除非设 `BILI_CLAUDE_UPSTREAM=<relay>`。OAuth 订阅流量需要默认 MITM 模式。
+
+### Claude on AWS Bedrock
+
+claude 运行在 Bedrock 上时（`~/.claude/settings.json` env 或 shell 里 `CLAUDE_CODE_USE_BEDROCK` 为真，或 `BILI_CLAUDE_BEDROCK=1`），`bili claude` 把 claude 的 `ANTHROPIC_BEDROCK_BASE_URL` 指向 `/bili/https://bedrock-runtime.<AWS_REGION>.amazonaws.com`（或你已配置的 `ANTHROPIC_BEDROCK_BASE_URL` 网关）—— 通过拉起环境变量和 `--settings`，从不改写你的 settings 文件。代理接收 `POST /model/{id}/invoke-with-response-stream` 与 `/invoke`，对请求体跑常规 Anthropic 管线（model 与 stream 取自路径），再以 Bedrock 形态发回上游，并双向转换 `application/vnd.amazon.eventstream` 响应（帧带 CRC 校验；Bedrock 异常帧原样到达 claude）。`Authorization` 头原样转发：bearer token 认证（`AWS_BEARER_TOKEN_BEDROCK`）可用；SigV4 签名请求无法承受请求体改写。Bedrock 放在请求体里的长上下文 beta（`anthropic_beta: ["context-1m-…"]`）与 Anthropic 线路上的 header 一样决定窗口。模型发现调用（`/inference-profiles`、`/foundation-models`）路由到区域控制面主机；其他 Bedrock 路径原样转发。用 `BILI_CLAUDE_BEDROCK=0` 退出。
 
 `--mitm-domain <domain>`（可重复）在自动发现之外追加 MITM 白名单域名 —— 适用于客户端在运行时才获取、不写进配置文件的主机。默认端口被占用时启动器自动换空闲端口；`--passthrough` / `--debug` / `--no-auto-update` 与普通 `bili` 用法相同。
 
