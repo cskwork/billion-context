@@ -89,7 +89,7 @@ AI 编程助手的<strong>通用上下文压缩代理</strong>
 | **dsh** | [`billion-context`](https://github.com/ranxianglei/billion-context) —— `bili dsh`（启动器，经 `--patch` 注入完整原生插件：工具、会话绑定 `/acp`、fetch 拦截）或 `bili plugin install dsh` ≡ `dsh plugin --profile <name> add billion-context`（统一泳道 —— pnpm 把包装进各 profile、由 dsh 挂载包内 patch 层；bili 形式只是替你按 profile 驱动 dsh 自己的通道，并顺带迁移旧版受管块） |
 | **kimi** | `bili plugin install kimi`（自拉起原生插件，免启动器 —— 需 Kimi Code ≥ 2.0.0；每会话在 `~/.kimi-code/config.toml` 写入路由块）或 `bili kimi`（启动器，证书 MITM）或 `/bili/` 前缀 |
 | **hermes** | `bili plugin install hermes`（自拉起原生插件，免启动器 —— Python 插件，#958）或 `bili hermes`（启动器，证书 MITM） |
-| **claude** | `bili claude`(启动器)或 `bili plugin install claude`(原生姿态,#964 —— 受管 settings 块 + 会话自管代理;见下方"注意") |
+| **claude** | `bili claude`(启动器)或 `bili plugin install claude`(原生姿态,#964 —— 受管 settings 块 + 会话自管代理;见下方"注意")。在 AWS Bedrock 上(`CLAUDE_CODE_USE_BEDROCK`)`bili claude` 同样压缩 Bedrock 线路 —— 见 [CONFIGURATION.zh-CN.md › Claude on AWS Bedrock](CONFIGURATION.zh-CN.md#claude-on-aws-bedrock) |
 | **jcode** | [`billion-context`](https://github.com/ranxianglei/billion-context)，`bili jcode`（启动器，cert-MITM）或 `/bili/` 前缀 —— 无法做原生插件：编译型 Rust 二进制、无插件接缝，其静态 provider 配置无法按请求打头（[#962](https://github.com/ranxianglei/billion-context/issues/962)） |
 | **gemini**（Gemini CLI） | `bili gemini`（启动器，`GOOGLE_GEMINI_BASE_URL` `/bili/` 改写）或 `/bili/` 前缀 —— 仅启动器模式：gemini-cli 的扩展体系只到自定义命令，没有环内工具注入接缝（#1043） |
 | **iflow**（iFlow CLI） | `bili iflow`（启动器，`IFLOW_BASE_URL` `/bili/` 改写）或 `/bili/` 前缀 |

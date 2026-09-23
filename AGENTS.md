@@ -44,6 +44,7 @@ billion-context/
 │   ├── launcher.ts               # `bili <client>` launchers (pi/codex/claude/omp/opencode/hermes/dsh/codebuddy/qoder/trae/jcode/kimi)
 │   ├── client-config.ts          # READ-only discovery of each client's upstream config
 │   ├── mitm.ts / ca.ts           # Cert-MITM proxying + lazily generated root CA
+│   ├── bedrock.ts                # AWS Bedrock pass-through (path↔body, event-stream codec)
 │   ├── mcp.ts                    # Plugin-in-launcher MCP shell (spawn-time injection)
 │   ├── plugin.ts / plugin-install.ts # Cooperative plugin protocol + `bili plugin install`
 │   ├── registry.ts               # models.dev context-window registry (snapshot-first)

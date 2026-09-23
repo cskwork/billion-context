@@ -15,7 +15,14 @@ export interface ClaudeSettings {
      *  or `env.CLAUDE_CODE_AUTO_COMPACT_WINDOW`) — when set, the launcher
      *  must NOT override it with its own budget injection (#321). */
     autoCompactWindow?: number;
+    /** Settings-env Bedrock keys (claude applies the settings env block over
+     *  the inherited process env, so these outrank the shell). */
+    bedrockEnv?: Partial<Record<(typeof CLAUDE_BEDROCK_ENV_KEYS)[number], string>>;
+    /** Settings env carries AWS_BEARER_TOKEN_BEDROCK (presence only, never the value). */
+    bedrockBearer?: boolean;
 }
+
+export const CLAUDE_BEDROCK_ENV_KEYS = ["CLAUDE_CODE_USE_BEDROCK", "ANTHROPIC_BEDROCK_BASE_URL", "AWS_REGION"] as const;
 
 export interface ModelWindow {
     id: string;
@@ -566,11 +573,15 @@ export function readClaudeSettings(homeDir: string, cwd: string, env: NodeJS.Pro
     let anthropicBaseUrl: string | undefined;
     let model: string | undefined;
     let autoCompactWindow: number | undefined;
+    const bedrockEnv: NonNullable<ClaudeSettings["bedrockEnv"]> = {};
+    let bedrockBearer = false;
     for (const f of files) {
         const obj = readJsonObject(f);
         const settingsEnv = obj?.env;
         if (settingsEnv && typeof settingsEnv === "object" && !Array.isArray(settingsEnv)) {
             const e = settingsEnv as Record<string, unknown>;
+            for (const k of CLAUDE_BEDROCK_ENV_KEYS) if (typeof e[k] === "string") bedrockEnv[k] = e[k] as string;
+            if (nonEmpty(e.AWS_BEARER_TOKEN_BEDROCK)) bedrockBearer = true;
             const v = e.ANTHROPIC_BASE_URL;
             if (nonEmpty(v)) anthropicBaseUrl = v;
             // env-block values beat same-file top-level settings (claude applies
@@ -592,6 +603,8 @@ export function readClaudeSettings(homeDir: string, cwd: string, env: NodeJS.Pro
         ...(anthropicBaseUrl ? { anthropicBaseUrl } : {}),
         ...(model ? { model } : {}),
         ...(autoCompactWindow ? { autoCompactWindow } : {}),
+        ...(Object.keys(bedrockEnv).length > 0 ? { bedrockEnv } : {}),
+        ...(bedrockBearer ? { bedrockBearer } : {}),
     };
 }
 

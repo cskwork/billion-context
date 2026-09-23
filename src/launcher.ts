@@ -56,7 +56,7 @@ import { selfPackageRoot, isBiliPiEntry, ompPluginLoadedFrom, dshNativeInstalled
 function selfDistFile(name: string): string {
     return path.join(selfPackageRoot(), "dist", name);
 }
-import { nonEmpty, resolvePiHome, resolveOmpHome, resolveDshHome, resolveCodexHome, loadClientConfig, collectModelWindows, collectModelMaxOutputs, type ClientConfig, type CodexConfig, resolveOpencodeConfigFile, readOpencodeConfigRoot, opencodePluginBaseDir, type OpencodeConfig, type OpencodeProvider, type HermesConfig, type HermesProvider, qoderIsCnSite, QODER_DEFAULT_MODEL_HOSTS, resolveTraeHome, readTraeConfig, TRAE_DEFAULT_MODEL_HOSTS, JCODE_DEFAULT_MODEL_HOSTS, type TraeConfig, resolveKimiHome, readKimiConfig, parseKimiToml, KIMI_DEFAULT_MODEL_HOSTS, QWEN_DEFAULT_MODEL_HOSTS, type KimiConfig, type KimiProvider, readOpencodeProjectLayer, type OpencodeProjectLayer, readMcodeConfig, resolveMcodeInstallDir, MCODE_DEFAULT_MODEL_HOSTS, type McodeConfig, discoverAiderArgUrls, AIDER_DEFAULT_MODEL_HOSTS, COPILOT_DEFAULT_MODEL_HOSTS, AMP_DEFAULT_MODEL_HOSTS, resolveGooseDirs, readGooseConfig, type GooseConfig, type GooseDirs } from "./client-config.js";
+import { nonEmpty, type ClaudeSettings, resolvePiHome, resolveOmpHome, resolveDshHome, resolveCodexHome, loadClientConfig, collectModelWindows, collectModelMaxOutputs, type ClientConfig, type CodexConfig, resolveOpencodeConfigFile, readOpencodeConfigRoot, opencodePluginBaseDir, type OpencodeConfig, type OpencodeProvider, type HermesConfig, type HermesProvider, qoderIsCnSite, QODER_DEFAULT_MODEL_HOSTS, resolveTraeHome, readTraeConfig, TRAE_DEFAULT_MODEL_HOSTS, JCODE_DEFAULT_MODEL_HOSTS, type TraeConfig, resolveKimiHome, readKimiConfig, parseKimiToml, KIMI_DEFAULT_MODEL_HOSTS, QWEN_DEFAULT_MODEL_HOSTS, type KimiConfig, type KimiProvider, readOpencodeProjectLayer, type OpencodeProjectLayer, readMcodeConfig, resolveMcodeInstallDir, MCODE_DEFAULT_MODEL_HOSTS, type McodeConfig, discoverAiderArgUrls, AIDER_DEFAULT_MODEL_HOSTS, COPILOT_DEFAULT_MODEL_HOSTS, AMP_DEFAULT_MODEL_HOSTS, resolveGooseDirs, readGooseConfig, type GooseConfig, type GooseDirs } from "./client-config.js";
 import { loadRoutes, resolveConfiguredContextLimit, lookupContextLimit, type ProviderRoutes } from "./config.js";
 import { contextFromRegistry } from "./registry.js";
 
@@ -987,12 +987,45 @@ export function buildClaudeEnv(
     httpsRewrites: HttpRewrite[],
     baseEnv: NodeJS.ProcessEnv,
 ): NodeJS.ProcessEnv {
-    const env: NodeJS.ProcessEnv = { ...baseEnv, HTTPS_PROXY: origin, NODE_EXTRA_CA_CERTS: caPath, BILLION_CONTEXT_PROXY: origin };
+    // claude (≥ 2.1.280) sends EVERY request through HTTPS_PROXY, the plain-http
+    // loopback base URL included, so a /bili/ base URL arrived at this proxy
+    // as an absolute-form forward of itself and was denied (tunnel self-target
+    // 403). Loopback must stay direct; the user's own exclusions are kept.
+    const noProxy = dedupeInOrder([...(baseEnv.NO_PROXY ?? baseEnv.no_proxy ?? "").split(",").map((h) => h.trim()).filter(Boolean), "localhost", "127.0.0.1", "::1"]).join(",");
+    const env: NodeJS.ProcessEnv = { ...baseEnv, HTTPS_PROXY: origin, NODE_EXTRA_CA_CERTS: caPath, BILLION_CONTEXT_PROXY: origin, NO_PROXY: noProxy, no_proxy: noProxy };
     const r = httpRewrites.find((rw) => rw.key === "ANTHROPIC_BASE_URL");
     if (r) env.ANTHROPIC_BASE_URL = wrapUpstream(origin, r.realUpstream);
     const hr = httpsRewrites.find((rw) => rw.key === "ANTHROPIC_BASE_URL");
     if (hr) env.ANTHROPIC_BASE_URL = hr.realUpstream;
     return env;
+}
+
+/** Bedrock pass-through: the real Bedrock runtime endpoint when claude will
+ *  run on AWS Bedrock, else undefined. Mode = BILI_CLAUDE_BEDROCK ("1"/"0",
+ *  explicit) or claude's own CLAUDE_CODE_USE_BEDROCK — the settings env block
+ *  outranks the shell, as it does inside claude. Endpoint = a configured
+ *  ANTHROPIC_BEDROCK_BASE_URL (gateway) or the regional runtime host. */
+export function claudeBedrockUpstream(env: NodeJS.ProcessEnv, settings: ClaudeSettings | undefined): string | undefined {
+    const pick = (k: "CLAUDE_CODE_USE_BEDROCK" | "ANTHROPIC_BEDROCK_BASE_URL" | "AWS_REGION"): string | undefined => settings?.bedrockEnv?.[k] ?? env[k];
+    const force = env.BILI_CLAUDE_BEDROCK?.trim();
+    const on = force === "1" || force === "0" ? force === "1" : ["1", "true", "yes", "on"].includes((pick("CLAUDE_CODE_USE_BEDROCK") ?? "").trim().toLowerCase());
+    if (!on) return undefined;
+    const base = pick("ANTHROPIC_BEDROCK_BASE_URL")?.trim();
+    if (base) return unwrapUpstream(base).replace(/\/+$/, "");
+    return `https://bedrock-runtime.${pick("AWS_REGION")?.trim() || "us-east-1"}.amazonaws.com`;
+}
+
+/** Bedrock mode spawn env: claude's Bedrock client dials the proxy through
+ *  ANTHROPIC_BEDROCK_BASE_URL (/bili/<runtime>); buildClaudeEnv keeps loopback
+ *  on NO_PROXY so the HTTPS_PROXY MITM leg never swallows it. The same pair
+ *  goes into `--settings` (CLI settings outrank the user's settings env
+ *  block, which would otherwise win over process env). */
+export function buildClaudeBedrockLaunch(origin: string, caPath: string, upstream: string, baseEnv: NodeJS.ProcessEnv): { env: NodeJS.ProcessEnv; settingsArg: string } {
+    const bedrockEnv = { CLAUDE_CODE_USE_BEDROCK: "1", ANTHROPIC_BEDROCK_BASE_URL: wrapUpstream(origin, upstream) };
+    return {
+        env: { ...buildClaudeEnv(origin, caPath, [], [], baseEnv), ...bedrockEnv },
+        settingsArg: JSON.stringify({ env: bedrockEnv }),
+    };
 }
 
 /** codebuddy budget alignment (#321 pattern, mirrors resolveClaudeBudgetEnv):
@@ -3392,16 +3425,27 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
             console.error(`bili: codebuddy budget aligned — CODEBUDDY_AUTO_COMPACT_WINDOW=${codebuddyBudget.CODEBUDDY_AUTO_COMPACT_WINDOW}`);
         }
     } else {
-        env = directUrl
-            ? buildClaudePluginEnv(origin, true, process.env)
-            : buildClaudeEnv(origin, ca, routes.httpRewrites, routes.httpsRewrites, process.env);
-        if (directUrl) env.BILLION_CONTEXT_PROXY = origin;
+        const bedrockUpstream = claudeBedrockUpstream(process.env, config.claude);
+        if (bedrockUpstream) {
+            const launch = buildClaudeBedrockLaunch(origin, ca, bedrockUpstream, process.env);
+            env = launch.env;
+            clientArgs = ["--settings", launch.settingsArg, ...clientArgs];
+            console.error(`bili: claude Bedrock mode — ANTHROPIC_BEDROCK_BASE_URL=${env.ANTHROPIC_BEDROCK_BASE_URL} (compression on the Bedrock wire; set BILI_CLAUDE_BEDROCK=0 to opt out).`);
+            if (!config.claude?.bedrockBearer && !nonEmpty(process.env.AWS_BEARER_TOKEN_BEDROCK)) {
+                console.error("bili: warning — no AWS_BEARER_TOKEN_BEDROCK found. Bedrock mode forwards Authorization untouched, so it needs bearer-token auth (or a gateway); AWS SigV4-signed requests will be rejected upstream once routed through the proxy.");
+            }
+        } else {
+            env = directUrl
+                ? buildClaudePluginEnv(origin, true, process.env)
+                : buildClaudeEnv(origin, ca, routes.httpRewrites, routes.httpsRewrites, process.env);
+            if (directUrl) env.BILLION_CONTEXT_PROXY = origin;
+        }
         const claudeBudget = await resolveClaudeBudgetEnv({
             model: nonEmpty(process.env.ANTHROPIC_MODEL) ? process.env.ANTHROPIC_MODEL : config.claude?.model,
             userAutoCompactWindow: config.claude?.autoCompactWindow,
             shellAutoCompactWindow: process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW,
             routes: biliRoutes,
-            upstreamUrl: config.claude?.anthropicBaseUrl ?? "https://api.anthropic.com",
+            upstreamUrl: bedrockUpstream ?? config.claude?.anthropicBaseUrl ?? "https://api.anthropic.com",
         });
         Object.assign(env, claudeBudget);
         if (claudeBudget.CLAUDE_CODE_AUTO_COMPACT_WINDOW !== undefined) {
@@ -3418,7 +3462,7 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         // inherited process env). The upstream is the user's real relay
         // (BILI_CLAUDE_UPSTREAM beats discovery), UNWRAPPED first — with the
         // native block installed, discovery reads the managed static URL.
-        if (claudeNativeInstalled()) {
+        if (!bedrockUpstream && claudeNativeInstalled()) {
             const relay = (env.BILI_CLAUDE_UPSTREAM?.trim() || undefined) ?? unwrapUpstream(config.claude?.anthropicBaseUrl ?? "https://api.anthropic.com");
             const override = wrapUpstream(origin, relay);
             env.ANTHROPIC_BASE_URL = override;
