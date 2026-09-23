@@ -13,6 +13,7 @@ import { FALLBACK_EFFECTIVE_WINDOW_FLOOR, findRoute, lookupContextLimit, resolve
 import { contextFromRegistry, loadRegistry, peekRegistryContext, peekRegistryOutputLimit } from "./registry.js";
 import { codexAlignedWindow } from "./codex-models.js";
 import { fetchWithTimeout, MAX_REQUEST_BYTES, upstreamTimeoutMs } from "./fetch-util.js";
+import { bedrockInvokePath, installBedrockResponseEncoder, normalizeBedrockRequest } from "./bedrock.js";
 import { formatUpstreamError, getUpstreamConnectionStatus, recordUpstreamConnection, resolveProxy, resolveProxyDecision, proxyDispatcher, type UpstreamProxyDecision } from "./upstream-proxy.js";
 import { maskHeaderForLog, maskHeadersForLog, maskHostPortForLog, setMaskHostsEnabled, maskUrlForLog, maskUrlsInText } from "./log-mask.js";
 // Protocol codecs + the historical-image strip primitive live in the kernel now
@@ -974,7 +975,9 @@ async function handle(
                         ? "responses"
                         : googlePathKind(urlPath) !== null
                           ? "google"
-                          : null
+                          : bedrockInvokePath(urlPath) !== null
+                            ? "anthropic"
+                            : null
                 : null);
         // Gemini carries the model in the PATH, not the body — resolve it here so
         // the window/config block below and every later model-keyed decision see
@@ -996,6 +999,18 @@ async function handle(
                 // applies its own decode - mirroring the JSON.parse path.
                 protocol = null;
                 log("warn", `decode body failed (${String(decErr)}) - forwarding raw body verbatim to ${upstreamOrigin}`);
+            }
+        }
+        // Bedrock invoke (Claude Code on AWS Bedrock): run the Anthropic
+        // pipeline on the normalized body; fetchWithTimeout restores the
+        // Bedrock shape upstream and the encoder restores event-stream frames.
+        const bedrockInvoke = !passthroughMark && protocol === "anthropic" ? bedrockInvokePath(urlPath) : null;
+        if (bedrockInvoke) {
+            const normalized = normalizeBedrockRequest(bodyBuffer, bedrockInvoke);
+            if (normalized) {
+                bodyBuffer = normalized;
+                installBedrockResponseEncoder(res);
+                log("debug", `[bedrock] ${bedrockInvoke.stream ? "invoke-with-response-stream" : "invoke"} model=${bedrockInvoke.modelId} → anthropic pipeline`);
             }
         }
     } catch (err) {
@@ -1177,7 +1192,11 @@ async function handle(
             // fallback. Operator tuning via compress.modelContextLimit still
             // outranks everything inside resolveRequestConfig.
             const host = (() => { try { return embeddedUrl ? new URL(embeddedUrl).host : undefined; } catch { return undefined; } })();
-            const betaWindow = anthropicBetaContextWindow(req.headers);
+            // Bedrock carries the long-context beta in the body (`anthropic_beta`),
+            // not the header — Claude Code routes context-1m there on Bedrock.
+            const bodyBetas = (parsed as { anthropic_beta?: unknown }).anthropic_beta;
+            const betaWindow = anthropicBetaContextWindow(req.headers)
+                ?? (Array.isArray(bodyBetas) ? anthropicBetaContextWindow({ "anthropic-beta": bodyBetas.filter((b): b is string => typeof b === "string").join(",") }) : undefined);
             const pluginWindow = pluginHeadersMatchModel(req.headers, model) ? pluginReportedContextWindow(req.headers) : undefined;
             // Runtime-table fallback for the window (#955): only when this
             // request's plugin sent no window header AND the agent's latest
