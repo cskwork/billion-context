@@ -3932,10 +3932,9 @@ async function forward(
             const v = req.headers[k] ?? req.headers[k.toLowerCase()];
             if (v) {
                 const s = Array.isArray(v) ? v.join(",") : String(v);
-                // Mask all but a short prefix so the header NAME is visible
-                // (so we know the key is sent and roughly how) without leaking
-                // the credential into the log.
-                const masked = /key|auth|token/i.test(k) ? s.slice(0, 8) + "..." + s.slice(-4) + ` (${s.length} chars)` : s.slice(0, 60);
+                // Credential values never reach the log, not even a prefix or
+                // suffix — the header NAME and length are the debug signal.
+                const masked = /key|auth|token/i.test(k) ? maskHeaderForLog("authorization", s) : s.slice(0, 60);
                 log("info", `[${sid}] client hdr ${k}=${masked}`);
             }
         }
